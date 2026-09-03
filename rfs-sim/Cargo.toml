@@ -1,0 +1,16 @@
+[package]
+name = "rfs-sim"
+version = "0.4.0"
+edition = "2021"
+description = "RFS engine simulation: sessions, carry/hydrants, atomic persistence"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+rfs-core = { workspace = true }
+
+[dev-dependencies]
+glam = { workspace = true }
+rfs-engine-render = { path = "../rfs-engine-render", version = "0.4.0" }
+rfs-engine-net = { path = "../rfs-engine-net", version = "0.4.0" }
