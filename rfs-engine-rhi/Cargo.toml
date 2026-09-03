@@ -1,0 +1,17 @@
+[package]
+name = "rfs-engine-rhi"
+version = "0.4.0"
+edition = "2021"
+description = "RFS engine RHI: traits plus OpenGL (working) and Vulkan (WIP) backends, ported from RFS-0.3"
+
+[dependencies]
+glow = "0.14"
+bytemuck = { version = "1.16", features = ["derive"] }
+tracing = "0.1"
+ash = { version = "0.38", optional = true }
+naga = { version = "25", optional = true, default-features = false, features = ["glsl-in", "spv-out"] }
+
+[features]
+default = ["opengl"]
+opengl = []
+vulkan = ["ash", "naga"]

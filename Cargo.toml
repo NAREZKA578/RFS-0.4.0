@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rfs-core", "rfs-engine-render", "rfs-engine-net", "rfs-sim"]
+members = ["rfs-core", "rfs-engine-render", "rfs-engine-net", "rfs-sim", "rfs-engine-rhi"]
 
 [workspace.dependencies]
 glam = { version = "0.28", features = ["serde"] }

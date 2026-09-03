@@ -9,13 +9,14 @@
 | Крейт | Что внутри | Донор |
 |---|---|---|
 | `rfs-core` | типы, `NetMessage`, протокол, spatial/collider (копия как есть + bump v2) | `RFS-0.3/rfs-core` целиком |
-| `rfs-engine-render` | RHI-трейты (без DX/Vulkan-заглушек), камера, фрустум, свет | `src/rhi/*.rs` (трейты), `src/graphics/camera.rs`, `frustum.rs`, `lighting.rs` |
+| `rfs-engine-render` | минимальный RHI-контракт (`NullBackend`), камера, фрустум, свет — для headless-тестов; боевой RHI — в `rfs-engine-rhi` | `src/graphics/camera.rs`, `frustum.rs`, `lighting.rs` |
 | `rfs-engine-net` | снапшот-мерж, интерполятор, очередь событий, лимиты чата | `src/net/handler.rs`, `snapshot.rs`, `game/interpolation.rs`, `server/mod.rs:1762` |
 | `rfs-sim` | сессии/ reconnect-cleanup, carry/гидранты, атомарная запись | `rfs-server/.../connection.rs`, `server/mod.rs`, `fire_sim.rs`, `screens/server_browser.rs` |
+| `rfs-engine-rhi` | полный RHI-слой: трейты + OpenGL (рабочий) + Vulkan (недоделан) | `RFS-0.3/src/rhi` целиком, минус `backends/dx11\|dx12` |
 
 ## Что намеренно НЕ тащили
 
-- `rhi/backends/dx11|dx12` (заглушки с `panic!`), недособранный Vulkan-бэкенд.
+- `rhi/backends/dx11|dx12` (заглушки с `panic!`) — остались в доноре.
 - `game_renderer` (тянет `game/`-типы — разрыв будет отдельной работой), `menu_renderer`, шутерное наследие.
 - OBJ DSL-парсер (`parse_obj_to_mesh_data`, 0 вызывающих), мёртвый `textures.rs`.
 - Ассеты (273 МБ, дубликаты) — подкладываются позже вручную.
@@ -36,4 +37,5 @@
 cargo build
 cargo test
 cargo run --example engine_demo
+cargo bench
 ```
