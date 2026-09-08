@@ -1,0 +1,13 @@
+[package]
+name = "rfs_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+glam = { workspace = true }
+bitflags = { workspace = true }
+smallvec = { workspace = true }
+uuid = { workspace = true }

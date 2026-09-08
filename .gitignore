@@ -1,4 +1,11 @@
-/target
-*.tmp
-*.log
+# Rust build output (workspace target dir and any crate-level target dirs)
+target/
+**/*.rs.bk
+
+# Editor / OS artefacts
+.vscode/
+.idea/
+*.swp
+*~
 .DS_Store
+Thumbs.db

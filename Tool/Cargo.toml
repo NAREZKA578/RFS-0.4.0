@@ -1,0 +1,5 @@
+# Side-only test/metric tooling. Deliberately a SEPARATE workspace:
+# no test or metric code lives inside server_src crates.
+[workspace]
+resolver = "2"
+members = ["harness"]

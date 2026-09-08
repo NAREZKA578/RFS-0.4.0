@@ -1,0 +1,20 @@
+[package]
+name = "rfs_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rfs_core = { path = "../core" }
+rfs_net = { path = "../net" }
+rfs_sim = { path = "../sim" }
+rfs_ship = { path = "../ship" }
+rfs_damage = { path = "../damage" }
+tokio = { workspace = true, features = ["full"] }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "server"
+path = "src/main.rs"

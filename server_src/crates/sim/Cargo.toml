@@ -1,0 +1,16 @@
+[package]
+name = "rfs_sim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rfs_core = { path = "../core" }
+rfs_ship = { path = "../ship" }
+rfs_damage = { path = "../damage" }
+serde = { workspace = true, features = ["derive"] }
+smallvec = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }
+rayon = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

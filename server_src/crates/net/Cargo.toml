@@ -1,0 +1,18 @@
+[package]
+name = "rfs_net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rfs_core = { path = "../core" }
+serde = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }
+smallvec = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

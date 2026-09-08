@@ -1,0 +1,16 @@
+[package]
+name = "rfs_ship"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rfs_core = { path = "../core" }
+rfs_damage = { path = "../damage" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+smallvec = { workspace = true }
+parking_lot = { workspace = true }
+fastrand = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

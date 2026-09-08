@@ -1,0 +1,13 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rfs_core = { path = "../../server_src/crates/core" }
+rfs_net = { path = "../../server_src/crates/net" }
+rfs_sim = { path = "../../server_src/crates/sim" }
+rfs_ship = { path = "../../server_src/crates/ship" }
+rfs_damage = { path = "../../server_src/crates/damage" }
+bincode = "1.3"
+uuid = { version = "1.7", features = ["v4", "serde"] }
