@@ -1,7 +1,8 @@
 // Side-only tests for the tick hit path (plan §4, bug №40).
 use rfs_core::entity::EntityId;
-use rfs_core::math::{Bounds, Vec3f};
+use rfs_core::math::{Bounds, Transform, Vec3f};
 use rfs_core::packet::ProjectileType;
+use rfs_sim::collision::{CollisionConfig, CollisionObject, CollisionShape, CollisionShapeType, CollisionSystem};
 use rfs_core::time::{Tick, FIXED_DT};
 use rfs_damage::damage::DamageSystem;
 use rfs_ship::loader::create_default_frigate;
@@ -144,9 +145,10 @@ fn ballistic_step_applies_drag_and_gravity() {
 }
 
 #[test]
-fn underwater_branch_decelerates_hard() {
-    // Below y=0 the water branch (buoyancy + water drag) must engage:
-    // air drag at 100 m/s would shave ~0.1, water kills most of it.
+fn underwater_shell_stops_dead_no_teleport() {
+    // Below y=0 the water branch engages: the x10 water drag stops a
+    // 100 m/s shell within the tick (clamped, never reversed), and the
+    // position stays within meters — no 189 km slingshot.
     let mut sim = TickSystem::new();
     sim.fire_projectile(make_free_shell(0.0, -5.0, 100.0));
 
@@ -158,31 +160,41 @@ fn underwater_branch_decelerates_hard() {
         "water drag must bite, speed={}",
         live[0].velocity.length()
     );
+    assert!(
+        (live[0].position.x - 0.0).abs() < 10.0,
+        "no teleport, x={}",
+        live[0].position.x
+    );
 }
 
 #[test]
 fn shell_despawns_at_max_range() {
-    // Cannonball max_range=5000: ~380 m/tick at 12000 m/s, so ticks 1-5
-    // alive, gone by tick 20 while lifetime (12 s) is barely touched.
+    // Cannonball max_range=5000 at 12000 m/s: drag bleeds speed, so the
+    // shell must still die by range long before the 12 s lifetime.
     let mut sim = TickSystem::new();
     sim.fire_projectile(make_free_shell(0.0, 500.0, 12000.0));
 
-    for _ in 0..5 {
+    let mut ticks_used = 0;
+    for _ in 0..200 {
         sim.tick();
-    }
-    assert_eq!(sim.get_active_projectiles().len(), 1, "still flying at ~1900 m");
-    for _ in 0..15 {
-        sim.tick();
+        ticks_used += 1;
+        if sim.get_active_projectiles().is_empty() {
+            break;
+        }
     }
     assert!(
         sim.get_active_projectiles().is_empty(),
-        "must expire by range, not by the 12 s lifetime"
+        "must expire by range"
+    );
+    assert!(
+        ticks_used as f32 * FIXED_DT < 12.0,
+        "despawn must come from max_range, not the 12 s lifetime"
     );
 }
 
 #[test]
 fn ballistic_arc_rejects_degenerate_inputs() {
-    // №45: vertical shots / dead configs return None, never inf/NaN.
+    // №45: vertical shots return None, never inf/NaN.
     let calc = BallisticsCalculator::new(BallisticsConfig::default());
     assert!(calc
         .solve_ballistic_arc(Vec3f::ZERO, Vec3f::new(0.0, 100.0, 0.0), ProjectileType::Cannonball)
@@ -197,4 +209,46 @@ fn ballistic_arc_rejects_degenerate_inputs() {
     );
     assert!(pen.impact_angle.is_finite());
     assert!(!pen.penetrated);
+}
+
+fn raycast_box_system() -> CollisionSystem {
+    let mut sys = CollisionSystem::new(CollisionConfig::default());
+    sys.add_object(CollisionObject {
+        entity_id: EntityId::new(1),
+        shapes: vec![CollisionShape {
+            shape_type: CollisionShapeType::Box,
+            half_extents: Vec3f::new(1.0, 1.0, 1.0),
+            radius: 0.0,
+            height: 0.0,
+            local_transform: Transform::IDENTITY,
+        }],
+        transform: Transform::IDENTITY,
+        velocity: Vec3f::ZERO,
+        angular_velocity: Vec3f::ZERO,
+        mass: 1.0,
+        is_static: true,
+        collision_layers: 1,
+        collision_mask: 1,
+    });
+    sys
+}
+
+#[test]
+fn raycast_hits_box_parallel_to_face_plane() {
+    // №46: dir.x == 0 and the origin sits exactly on the +x slab boundary —
+    // the old slab method produced 0*inf = NaN here and silently missed.
+    let sys = raycast_box_system();
+    let hit = sys
+        .raycast(Vec3f::new(1.0, 0.0, -5.0), Vec3f::new(0.0, 0.0, 1.0), 100.0, 1)
+        .expect("ray parallel to a face must still hit the box");
+    assert!((hit.distance - 4.0).abs() < 1e-3, "dist {}", hit.distance);
+    assert!(hit.point.x.is_finite() && hit.point.y.is_finite() && hit.point.z.is_finite());
+    assert!(hit.normal.x.is_finite() && hit.normal.y.is_finite() && hit.normal.z.is_finite());
+}
+
+#[test]
+fn raycast_parallel_to_face_outside_slab_misses() {
+    // №46: ray parallel to the x-faces but outside the y-slab must miss.
+    let sys = raycast_box_system();
+    assert!(sys.raycast(Vec3f::new(0.0, 5.0, -5.0), Vec3f::new(0.0, 0.0, 1.0), 100.0, 1).is_none());
 }

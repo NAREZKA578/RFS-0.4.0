@@ -2,4 +2,4 @@
 # no test or metric code lives inside server_src crates.
 [workspace]
 resolver = "2"
-members = ["harness"]
+members = ["harness", "client_tests"]

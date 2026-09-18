@@ -1,6 +1,7 @@
 use rfs_core::packet::PacketType;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// Wire layout of a [`PacketType::Fragment`] payload:
 /// `[orig_type: u8][total_chunks: u16 LE][index: u16 LE][total_len: u32 LE][msg_id: u32 LE][chunk bytes...]`
@@ -31,12 +32,18 @@ struct FragmentGroup {
 #[derive(Default)]
 pub struct FragmentAssembler {
     groups: HashMap<(u8, u32), FragmentGroup>,
+    /// Highest msg_id seen per original type (drives supersede decisions).
+    latest_seen: HashMap<u8, u32>,
+    /// Highest msg_id that fully assembled per original type.
+    latest_completed: HashMap<u8, u32>,
 }
 
 impl FragmentAssembler {
     pub fn new() -> Self {
         Self {
             groups: HashMap::new(),
+            latest_seen: HashMap::new(),
+            latest_completed: HashMap::new(),
         }
     }
 
@@ -64,15 +71,32 @@ impl FragmentAssembler {
         }
         let packet_type = PacketType::from_u8(orig_type)?;
 
-        // A newer message of the same type supersedes older incomplete ones.
-        let stale: Vec<(u8, u32)> = self
-            .groups
-            .keys()
-            .filter(|(t, m)| *t == orig_type && *m != msg_id)
-            .copied()
-            .collect();
-        for key in stale {
-            self.groups.remove(&key);
+        // Bug №17: a fragment of an *older* message must never evict a
+        // fresher in-progress group. Only a strictly newer msg_id supersedes.
+        if let Some(&completed) = self.latest_completed.get(&orig_type) {
+            if msg_id <= completed {
+                // Retransmission of an already-delivered message.
+                return None;
+            }
+        }
+        if let Some(&seen) = self.latest_seen.get(&orig_type) {
+            if msg_id < seen {
+                return None;
+            }
+            if msg_id > seen {
+                self.latest_seen.insert(orig_type, msg_id);
+                let stale: Vec<(u8, u32)> = self
+                    .groups
+                    .keys()
+                    .filter(|(t, m)| *t == orig_type && *m != msg_id)
+                    .copied()
+                    .collect();
+                for key in stale {
+                    self.groups.remove(&key);
+                }
+            }
+        } else {
+            self.latest_seen.insert(orig_type, msg_id);
         }
 
         let chunk = &payload[FRAGMENT_HEADER_SIZE..];
@@ -103,6 +127,10 @@ impl FragmentAssembler {
             }
             if message.len() != group.total_len {
                 return None;
+            }
+            let last = self.latest_completed.entry(orig_type).or_insert(0);
+            if msg_id > *last {
+                *last = msg_id;
             }
             return Some((packet_type, message));
         }
@@ -137,8 +165,19 @@ pub fn make_fragments(
     msg_id: u32,
     max_payload: usize,
 ) -> Vec<Vec<u8>> {
+    // Bug №17: `chunks.len() as u16` / `data.len() as u32` below used to
+    // wrap silently on absurd inputs. Refuse loudly instead — the receiver
+    // would reject such a message anyway (MAX_* guards in push).
+    if data.len() > MAX_REASSEMBLED_SIZE {
+        warn!("make_fragments: message too large ({}), dropping", data.len());
+        return Vec::new();
+    }
     let chunk_size = max_payload.saturating_sub(FRAGMENT_HEADER_SIZE).max(1);
     let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+    if chunks.len() > MAX_FRAGMENTS_PER_MESSAGE as usize {
+        warn!("make_fragments: too many chunks ({}), dropping", chunks.len());
+        return Vec::new();
+    }
     let total_chunks = chunks.len() as u16;
     let mut out = Vec::with_capacity(chunks.len());
     for (i, chunk) in chunks.iter().enumerate() {

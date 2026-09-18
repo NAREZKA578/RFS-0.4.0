@@ -108,7 +108,12 @@ pub fn create_default_frigate() -> ShipClass {
                         seal_strength: 500.0,
                     },
                 ],
-                stations: vec!["anchor_winch".to_string()],
+                // Bug №87: "anchor_winch" referenced a StationTemplate that
+                // does not exist anywhere in the tree — the name lookup
+                // produced a nil id and the entity was silently skipped. The
+                // anchor mechanic is not implemented yet, so drop the stale
+                // ref instead of spawning a dead station.
+                stations: Vec::new(),
             },
             CompartmentTemplate {
                 name: "forward_magazine".to_string(),
@@ -343,7 +348,11 @@ pub fn create_default_frigate() -> ShipClass {
             StationTemplate {
                 name: "gun_3".to_string(),
                 station_type: StationType::Gun,
-                compartment_name: "forecastle".to_string(),
+                // Bug №86: the barrel sits at z=-40 in the aft_magazine
+                // (z in -50..-30), not the forecastle — wrong compartment
+                // coupling made bow damage silence the stern guns and vice
+                // versa.
+                compartment_name: "aft_magazine".to_string(),
                 local_transform: Transform::new(
                     Vec3f::new(-6.0, 3.0, -40.0),
                     Quatf::from_euler(0.0, 0.0, 0.0),
@@ -359,7 +368,8 @@ pub fn create_default_frigate() -> ShipClass {
             StationTemplate {
                 name: "gun_4".to_string(),
                 station_type: StationType::Gun,
-                compartment_name: "forecastle".to_string(),
+                // Bug №86: same as gun_3 — stern gun belongs to aft_magazine.
+                compartment_name: "aft_magazine".to_string(),
                 local_transform: Transform::new(
                     Vec3f::new(6.0, 3.0, -40.0),
                     Quatf::from_euler(0.0, 0.0, 0.0),

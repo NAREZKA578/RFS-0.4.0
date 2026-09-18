@@ -15,6 +15,12 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_RELIABLE_WINDOW: u32 = 32;
 
+/// Wrap-aware "is `a` newer than `b`?" for u32 transport sequences
+/// (bug №11): plain `>` freezes at the MAX->0 wrap, this doesn't.
+pub fn seq_is_newer(a: u32, b: u32) -> bool {
+    a != b && a.wrapping_sub(b) < (1 << 31)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Connecting,
@@ -77,8 +83,17 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(id: u32, addr: SocketAddr, config: ConnectionConfig) -> Self {
+    pub fn new(id: u32, addr: SocketAddr, mut config: ConnectionConfig) -> Self {
         let channels = config.channels.iter().map(|c| Channel::new(c.clone())).collect();
+        // Bug №10: a max_packet_size below the header size would underflow
+        // every `max_packet_size - HEADER_SIZE`. Clamp once, loudly.
+        if config.max_packet_size <= HEADER_SIZE {
+            warn!(
+                "max_packet_size {} <= HEADER_SIZE {}, clamping",
+                config.max_packet_size, HEADER_SIZE
+            );
+            config.max_packet_size = HEADER_SIZE + 1;
+        }
 
         Self {
             id,
@@ -155,13 +170,29 @@ impl Connection {
         *seq
     }
 
+    /// Bug №77: feed one inbound header into the peer tracking so outbound
+    /// packets can carry a real `ack`/`ack_bitfield` and the far side can GC
+    /// its reliable queue. The client does not route every packet through
+    /// `handle_packet`, so this is the light-weight equivalent of its header
+    /// bookkeeping block.
+    pub fn record_remote(&self, sequence: u32, ack: u32, ack_bitfield: u32) {
+        {
+            let mut remote_sequence = self.remote_sequence.lock();
+            if seq_is_newer(sequence, *remote_sequence) {
+                *remote_sequence = sequence;
+            }
+        }
+        *self.remote_ack.lock() = ack;
+        *self.remote_ack_bitfield.lock() = ack_bitfield;
+    }
+
     pub fn handle_packet(&self, header: PacketHeader, payload: &[u8]) -> Result<Vec<OutgoingPacket>, ConnectionError> {
         *self.last_received.lock() = Instant::now();
         self.bandwidth.record_received(payload.len());
 
         {
             let mut remote_sequence = self.remote_sequence.lock();
-            if header.sequence > *remote_sequence {
+            if seq_is_newer(header.sequence, *remote_sequence) {
                 *remote_sequence = header.sequence;
             }
         }
@@ -175,7 +206,9 @@ impl Connection {
                 self.send_heartbeat_ack(header.sequence)
             }
             Some(PacketType::HeartbeatAck) => {
-                let rtt = self.last_received.lock().elapsed();
+                // Bug №12: RTT is measured against the last heartbeat WE
+                // sent (stamped in send_heartbeat), not against "now".
+                let rtt = self.last_heartbeat.lock().elapsed();
                 let mut current = self.rtt.lock();
                 *current = Duration::from_millis(
                     ((current.as_millis() as u64 * 3 + rtt.as_millis() as u64) / 4) as u64
@@ -210,22 +243,39 @@ impl Connection {
     }
 
     fn process_acks(&self) {
-        let mut pending = self.pending_acks.lock();
         let remote_ack = *self.remote_ack.lock();
         let remote_ack_bitfield = *self.remote_ack_bitfield.lock();
 
-        while let Some(&front) = pending.front() {
-            if front <= remote_ack ||
-               (remote_ack_bitfield & (1 << (front.wrapping_sub(remote_ack) & 31))) != 0 {
-                pending.pop_front();
-            } else {
-                break;
+        // Bug №13: the old loop stopped at the first unacked entry, so one
+        // lost packet pinned the whole queue (head-of-line blocking). SACK
+        // bitfield entries clear individually now; the queue is also capped
+        // (bug №14), so this scan stays cheap.
+        self.pending_acks.lock().retain(|seq| {
+            if *seq == remote_ack || !seq_is_newer(*seq, remote_ack) {
+                return false; // cumulatively acked
+            }
+            let offset = seq.wrapping_sub(remote_ack) & 31;
+            (remote_ack_bitfield & (1 << offset)) == 0
+        });
+    }
+
+    /// Record a reliable sequence number, keeping the queue within
+    /// `reliable_window` (bug №14). Dropped entries are unrecoverable anyway
+    /// (no retransmit layer exists yet) — this is pure GC, done loudly.
+    fn track_reliable(&self, seq: u32) {
+        let mut pending = self.pending_acks.lock();
+        pending.push_back(seq);
+        let cap = self.config.reliable_window.max(1) as usize;
+        while pending.len() > cap {
+            if let Some(dropped) = pending.pop_front() {
+                warn!("pending_acks overflow, dropping unacked seq {}", dropped);
             }
         }
     }
 
-    pub fn send_heartbeat(&self) -> OutgoingPacket {
+    pub fn send_heartbeat(&self) -> Option<OutgoingPacket> {
         let seq = self.next_sequence();
+        *self.last_heartbeat.lock() = Instant::now();
         let packet = HeartbeatPacket {
             client_time: 0.0,
             server_time: 0.0,
@@ -237,8 +287,8 @@ impl Connection {
             *self.remote_sequence.lock(),
             *self.remote_ack_bitfield.lock(),
             0,
-        );
-        self.pending_acks.lock().push_back(seq);
+        );  
+        self.track_reliable(seq);
         OutgoingPacket::new(header, packet)
     }
 
@@ -256,10 +306,10 @@ impl Connection {
             *self.remote_ack_bitfield.lock(),
             0,
         );
-        Ok(vec![OutgoingPacket::new(header, packet)])
+        Ok(OutgoingPacket::new(header, packet).into_iter().collect())
     }
 
-    pub fn send_connect_accept(&self, server_tick: u64, server_time: f64, match_id: Uuid) -> OutgoingPacket {
+    pub fn send_connect_accept(&self, server_tick: u64, server_time: f64, match_id: Uuid) -> Option<OutgoingPacket> {
         let seq = self.next_sequence();
         let packet = ConnectAcceptPacket {
             server_tick,
@@ -276,15 +326,23 @@ impl Connection {
             *self.remote_ack_bitfield.lock(),
             0,
         );
-        self.pending_acks.lock().push_back(seq);
+        self.track_reliable(seq);
         OutgoingPacket::new(header, packet)
     }
 
     pub fn send_state(&self, state: StatePacket) -> Vec<OutgoingPacket> {
         let mut packets = Vec::new();
-        let serialized = bincode::serialize(&state).unwrap_or_default();
+        // Bug №8: a masked serialize error used to go out as an empty
+        // State that the peer drops in deserialize. Skip loudly instead.
+        let serialized = match bincode::serialize(&state) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("send_state serialize failed, skipping: {e}");
+                return packets;
+            }
+        };
 
-        if serialized.len() <= self.config.max_packet_size - HEADER_SIZE {
+        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
             let seq = self.next_sequence();
             let header = PacketHeader::new(
                 PacketType::State,
@@ -294,7 +352,7 @@ impl Connection {
                 *self.remote_ack_bitfield.lock(),
                 serialized.len() as u16,
             );
-            packets.push(OutgoingPacket::new(header, state));
+            packets.extend(OutgoingPacket::new(header, state));
         } else {
             packets.extend(self.fragment_large_packet::<StatePacket>(PacketType::State, serialized));
         }
@@ -303,9 +361,15 @@ impl Connection {
 
     pub fn send_state_delta(&self, delta: StateDeltaPacket) -> Vec<OutgoingPacket> {
         let mut packets = Vec::new();
-        let serialized = bincode::serialize(&delta).unwrap_or_default();
+        let serialized = match bincode::serialize(&delta) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("send_state_delta serialize failed, skipping: {e}");
+                return packets;
+            }
+        };
 
-        if serialized.len() <= self.config.max_packet_size - HEADER_SIZE {
+        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
             let seq = self.next_sequence();
             let header = PacketHeader::new(
                 PacketType::StateDelta,
@@ -315,7 +379,7 @@ impl Connection {
                 *self.remote_ack_bitfield.lock(),
                 serialized.len() as u16,
             );
-            packets.push(OutgoingPacket::new(header, delta));
+            packets.extend(OutgoingPacket::new(header, delta));
         } else {
             packets.extend(self.fragment_large_packet::<StateDeltaPacket>(PacketType::StateDelta, serialized));
         }
@@ -323,50 +387,95 @@ impl Connection {
     }
 
     pub fn send_event(&self, event: EventPacket) -> Vec<OutgoingPacket> {
-        let seq = self.next_sequence();
-        let header = PacketHeader::new(
-            PacketType::Event,
-            ChannelType::ReliableUnordered,
-            seq,
-            *self.remote_sequence.lock(),
-            *self.remote_ack_bitfield.lock(),
-            0,
-        );
-        self.pending_acks.lock().push_back(seq);
-        vec![OutgoingPacket::new(header, event)]
+        // Bug №28: large events are fragmentable just like State/Delta —
+        // previously they overflowed the MTU guard and were dropped by the
+        // `let _` at the call site.
+        let serialized = match bincode::serialize(&event) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("send_event serialize failed, skipping: {e}");
+                return Vec::new();
+            }
+        };
+
+        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+            let seq = self.next_sequence();
+            let header = PacketHeader::new(
+                PacketType::Event,
+                ChannelType::ReliableUnordered,
+                seq,
+                *self.remote_sequence.lock(),
+                *self.remote_ack_bitfield.lock(),
+                serialized.len() as u16,
+            );
+            self.track_reliable(seq);
+            OutgoingPacket::raw(header, serialized).into_iter().collect()
+        } else {
+            self.fragment_large_packet::<EventPacket>(PacketType::Event, serialized)
+        }
     }
 
-    pub fn send_command_ack(&self, command_id: u64, success: bool, error: Option<String>) -> OutgoingPacket {
-        let seq = self.next_sequence();
+    pub fn send_command_ack(&self, command_id: u64, success: bool, error: Option<String>) -> Vec<OutgoingPacket> {
         let packet = CommandAckPacket { command_id, success, error };
-        let header = PacketHeader::new(
-            PacketType::CommandAck,
-            ChannelType::ReliableOrdered,
-            seq,
-            *self.remote_sequence.lock(),
-            *self.remote_ack_bitfield.lock(),
-            0,
-        );
-        self.pending_acks.lock().push_back(seq);
-        OutgoingPacket::new(header, packet)
+        let serialized = match bincode::serialize(&packet) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("send_command_ack serialize failed, skipping: {e}");
+                return Vec::new();
+            }
+        };
+
+        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+            let seq = self.next_sequence();
+            let header = PacketHeader::new(
+                PacketType::CommandAck,
+                ChannelType::ReliableOrdered,
+                seq,
+                *self.remote_sequence.lock(),
+                *self.remote_ack_bitfield.lock(),
+                serialized.len() as u16,
+            );
+            self.track_reliable(seq);
+            OutgoingPacket::raw(header, serialized).into_iter().collect()
+        } else {
+            self.fragment_large_packet::<CommandAckPacket>(PacketType::CommandAck, serialized)
+        }
     }
 
-    pub fn send_input_ack(&self, ack: InputAckPacket) -> OutgoingPacket {
-        let seq = self.next_sequence();
-        let header = PacketHeader::new(
-            PacketType::InputAck,
-            ChannelType::ReliableOrdered,
-            seq,
-            *self.remote_sequence.lock(),
-            *self.remote_ack_bitfield.lock(),
-            0,
-        );
-        OutgoingPacket::new(header, ack)
+    pub fn send_input_ack(&self, ack: InputAckPacket) -> Vec<OutgoingPacket> {
+        let serialized = match bincode::serialize(&ack) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("send_input_ack serialize failed, skipping: {e}");
+                return Vec::new();
+            }
+        };
+
+        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+            let seq = self.next_sequence();
+            let header = PacketHeader::new(
+                PacketType::InputAck,
+                ChannelType::ReliableOrdered,
+                seq,
+                *self.remote_sequence.lock(),
+                *self.remote_ack_bitfield.lock(),
+                serialized.len() as u16,
+            );
+            OutgoingPacket::raw(header, serialized).into_iter().collect()
+        } else {
+            self.fragment_large_packet::<InputAckPacket>(PacketType::InputAck, serialized)
+        }
     }
 
     fn fragment_large_packet<T: Serializable>(&self, packet_type: PacketType, data: Vec<u8>) -> Vec<OutgoingPacket> {
         let mut packets = Vec::new();
-        let max_payload = self.config.max_packet_size - HEADER_SIZE - FRAGMENT_HEADER_SIZE;
+        let max_payload = self.config.max_packet_size
+            .saturating_sub(HEADER_SIZE)
+            .saturating_sub(FRAGMENT_HEADER_SIZE);
+        if max_payload == 0 {
+            warn!("max_packet_size leaves no room for fragments, dropping");
+            return packets;
+        }
         let msg_id = {
             let mut id = self.next_fragment_id.lock();
             *id = id.wrapping_add(1);
@@ -386,7 +495,7 @@ impl Connection {
                 *self.remote_ack_bitfield.lock(),
                 payload.len() as u16,
             );
-            packets.push(OutgoingPacket::raw(header, payload));
+            packets.extend(OutgoingPacket::raw(header, payload));
         }
         packets
     }
@@ -421,21 +530,33 @@ pub struct OutgoingPacket {
 }
 
 impl OutgoingPacket {
-    pub fn new(mut header: PacketHeader, packet: impl Serializable) -> Self {
-        let payload = bincode::serialize(&packet).unwrap_or_default();
-        header.payload_size = payload.len() as u16;
-        Self {
-            header,
-            payload,
-        }
+    /// Bug №8/№9: serialization failure or an over-u16 payload used to be
+    /// masked (`unwrap_or_default` + `as u16`) into a corrupt packet the
+    /// peer drops in deserialize. Now it refuses loudly instead.
+    pub fn new(header: PacketHeader, packet: impl Serializable) -> Option<Self> {
+        let payload = match bincode::serialize(&packet) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("OutgoingPacket serialize failed, dropping: {e}");
+                return None;
+            }
+        };
+        Self::raw(header, payload)
     }
 
-    pub fn raw(mut header: PacketHeader, payload: Vec<u8>) -> Self {
-        header.payload_size = payload.len() as u16;
-        Self {
+    pub fn raw(mut header: PacketHeader, payload: Vec<u8>) -> Option<Self> {
+        let len = match u16::try_from(payload.len()) {
+            Ok(len) => len,
+            Err(_) => {
+                warn!("OutgoingPacket payload {} exceeds u16, dropping", payload.len());
+                return None;
+            }
+        };
+        header.payload_size = len;
+        Some(Self {
             header,
             payload,
-        }
+        })
     }
 
     pub fn total_size(&self) -> usize {
@@ -451,6 +572,8 @@ pub enum ConnectionError {
     InvalidPacketType(u8),
     #[error("Packet too large: {0} > {1}")]
     PacketTooLarge(usize, usize),
+    #[error("Packet too small: {0} < {1}")]
+    PacketTooSmall(usize, usize),
     #[error("Connection timed out")]
     Timeout,
     #[error("Connection closed")]

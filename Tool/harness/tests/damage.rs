@@ -65,8 +65,11 @@ fn test_apply_damage() {
 fn test_damage_falloff_outside_radius() {
     let system = DamageSystem::new();
     let target = TestTarget::new();
+    // Bug №65: the blast is far outside max_damage_radius — the hull used to
+    // take the FULL 100 while every compartment took 0. Now hull damage
+    // scales with the falloff like everything else.
     system.apply_damage_to_ship(&target, Vec3f::new(100.0, 100.0, 100.0), 100.0);
-    assert_eq!(*target.health.borrow(), 900.0);
+    assert_eq!(*target.health.borrow(), 1000.0);
     assert_eq!(target.damaged.borrow().len(), 0);
 }
 

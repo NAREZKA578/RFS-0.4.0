@@ -489,3 +489,389 @@
 Статус: Исправлен
 Исправлен как: vacate больше не трогает is_operational (операционность определяют health/затопление в update()); найден и закрыт боковым тестом occupancy_is_single_sourced_no_double_occupation.
 ---
+
+Баг№77
+Баг в файле: C:\RFS-0.4.0\src\rhi\resource\buffer.rs (структура Buffer, строки 20-30)
+В чём заключается баг: Buffer не реализует Clone (14 мест: деривайте Clone в дескрипторных массивах, в т.ч. в связке (Buffer, u64)) и Default (1 место). cargo check: "the trait bound `resource::buffer::Buffer: Clone` is not satisfied" ×14 и "`: Default`" ×1 — 15 ошибок E0277 на один тип. Рендер-граф не может клонировать/дефолтить буферы.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№78
+Баг в файле: C:\RFS-0.4.0\src\rhi\types\flags.rs (bitflags AccessFlags ст.87, PipelineStage ст.71, ColorComponentFlags ст.142, ShaderStage ст.21+57, TextureAspectFlags ст.48)
+В чём заключается баг: пять bitflags не реализуют Default: AccessFlags — 8 ошибок, PipelineStage — 4, штучно ColorComponentFlags/ShaderStage/TextureAspectFlags — по 1. Всего 15 ошибок E0277. Каждый `#[derive(Default)]` на структурах с этими полями (пайплайны, барьеры, сабпассы) не собирается; флагу нельзя задать «пустое» значение по умолчанию.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№79
+Баг в файле: C:\RFS-0.4.0\src\rhi\resource\texture.rs (enum TextureLayout ст.70, struct TextureView ст.63)
+В чём заключается баг: TextureLayout не реализует Default (5 ошибок — везде используются дефолтные значения при создании вью/аспектов), TextureView не реализует Clone (4 ошибки). Итого 9 ошибок E0277. Нельзя сделать вью клонируемой и задать layout по умолчанию.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№80
+Баг в файле: C:\RFS-0.4.0\src\rhi\pipeline\graphics.rs (enum'ы ст.61-178) + C:\RFS-0.4.0\src\rhi\types\primitives.rs (PrimitiveTopology ст.184)
+В чём заключается баг: enum'ы состояния растеризации не реализуют Default: BlendFactor (4), StencilOp (3), BlendOp (2), PipelineShaderStage (2), PolygonMode (1), CullMode (1), FrontFace (1), LogicOp (1) — в graphics.rs, PrimitiveTopology (1) — в primitives.rs; плюс GraphicsPipeline не реализует Clone (1). Итого 17 ошибок E0277. GraphcisPipelineDesc не может собраться с derive(Default).
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№81
+Баг в файле: C:\RFS-0.4.0\src\rhi\resource\sampler.rs (enum FilterMode ст.11, AddressMode ст.18, CompareOp ст.28, BorderColor ст.41, struct Sampler ст.70)
+В чём заключается баг: FilterMode (3), AddressMode (3), CompareOp (3), BorderColor (1) не реализуют Default, Sampler не реализует Clone (1). Итого 11 ошибок E0277. Нельзя создать сэмплер со значениями по умолчанию и клонировать его при передаче в декс.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№82
+Баг в файле: C:\RFS-0.4.0\src\rhi\shader\module.rs (enum ShaderFormat ст.11, struct ShaderModule ст.30) + C:\RFS-0.4.0\src\rhi\shader\compiler.rs (OptimizationLevel ст.30, ShaderTargetEnv ст.38)
+В чём заключается баг: ShaderModule не реализует Clone (2), ShaderFormat/OptimizationLevel/ShaderTargetEnv не реализуют Default (по 1). Итого 5 ошибок. Модуль шейдера нельзя клонировать в кэш, компилятору нельзя задать параметры по умолчанию.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№83
+Баг в файле: C:\RFS-0.4.0\src\rhi\command\pass\render.rs (enum LoadOp ст.12, StoreOp ст.20, PipelineBindPoint ст.47, SubpassFlags ст.55, DependencyFlags ст.75; struct RenderPass ст.103, Framebuffer ст.136)
+В чём заключается баг: LoadOp (2), StoreOp (2), PipelineBindPoint/SubpassFlags/DependencyFlags (по 1) не реализуют Default; RenderPass не реализует Clone (2)+Default (2), Framebuffer — Clone (1)+Default (1). Итого 13 ошибок. RenderPassDesc/FramebufferDesc с derive(Default) не собираются.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№84
+Баг в файле: C:\RFS-0.4.0\src\rhi\swapchain\swapchain.rs (ColorSpace ст.13, PresentMode ст.22, SurfaceTransform ст.31, CompositeAlpha ст.41, FullscreenExclusive ст.50) + C:\RFS-0.4.0\src\rhi\swapchain\surface.rs (struct Surface ст.16)
+В чём заключается баг: все пять enum — по 1 ошибке Default, Surface — по 1 Default и 1 Clone. Итого 7 ошибок. SwapchainDesc не собирается с derive(Default), Surface нельзя клонировать при передаче в контекст/обмен.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№85
+Баг в файле: C:\RFS-0.4.0\src\rhi\command\buffer.rs (CommandBufferLevel ст.12, CommandBufferFlags ст.30) + C:\RFS-0.4.0\src\rhi\command\pool.rs (CommandPoolFlags ст.22)
+В чём заключается баг: CommandBufferLevel, CommandBufferFlags и CommandPoolFlags не реализуют Default — по 1 ошибке на каждый, итого 3. Descriptor/дескс командного буфера и пула с derive(Default) не собираются.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№86
+Баг в файле: C:\RFS-0.4.0\src\rhi\query\pool.rs (enum QueryType ст.11, bitflags QueryPoolFlags ст.22)
+В чём заключается баг: QueryType и QueryPoolFlags не реализуют Default — 2 ошибки. QueryPoolDesc с derive(Default) не собирается.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№87
+Баг в файле: C:\RFS-0.4.0\src\rhi\sync\semaphore.rs (bitflags SemaphoreFlags ст.12)
+В чём заключается баг: SemaphoreFlags не реализует Default — 1 ошибка. SemaphoreDesc с derive(Default) не собирается.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№88
+Баг в файле: C:\RFS-0.4.0\src\rhi\resource\acceleration\blas.rs (struct Blas ст.95) + C:\RFS-0.4.0\src\rhi\resource\acceleration\tlas.rs (struct Tlas ст.42)
+В чём заключается баг: Blas не реализует Clone (2), Tlas — Clone (1). Итого 3 ошибки. BLAS/TLAS нельзя клонировать при построении иерархии ускорения.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№89
+Баг в файле: C:\RFS-0.4.0\src\rhi\descriptor\set.rs (struct DescriptorSet ст.12) + C:\RFS-0.4.0\src\rhi\descriptor\layout.rs (struct DescriptorSetLayout ст.53)
+В чём заключается баг: DescriptorSet не реализует Clone (2), DescriptorSetLayout — Clone (1). Итого 3 ошибки. Дескрипторные сеты/лейауты нельзя клонировать при переиспользовании в пайплайнах.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№90
+Баг в файле: C:\RFS-0.4.0\src\rhi\pipeline\compute.rs (struct ComputePipeline ст.17)
+В чём заключается баг: ComputePipeline не реализует Clone — 1 ошибка. Вычислительный пайплайн нельзя клонировать при реюзе в графе/контексте.
+Тип бага: Компиляция (этикетки трейтов)
+Статус: не исправлен
+
+Баг№91
+Баг в файле: C:\RFS-0.4.0\src\rhi\descriptor\layout.rs (строка 33)
+В чём заключается баг: E0425 — "cannot find type `Sampler` in this scope". Поле immutable_samplers: Option<Vec<Sampler>> в DescriptorSetLayoutDesc объявлено без импорта типа Sampler (resource::sampler::Sampler). Даже после добавления Clone/Default дескс не скомпилируется без этого импорта.
+Тип бага: Синтаксический (отсутствующий импорт)
+Статус: не исправлен
+
+Баг№92
+Баг в файле: C:\RFS-0.4.0\src\rhi\shader\stage.rs (строка 15)
+В чём заключается баг: E0599 — "no associated function or constant named `INTERSECTION` found for struct `flags::ShaderStage`". Констá INTERSECTION_SHADER использует ShaderStage::INTERSECTION, но в bitflags ShaderStage (types/flags.rs) такого флага нет (только VERTEX/FRAGMENT/COMPUTE/RAY_GEN/ANY_HIT/CLOSEST_HIT/MISS и т.п.). Нельзя объявить интерсекшн-шейдер.
+Тип бага: Синтаксический (несуществующий член bitflags)
+Статус: не исправлен
+
+Баг№93
+Баг в файле: C:\RFS-0.4.0\src\render (весь модуль, 78 файлов) — блокируется багами №77-92
+В чём заключается баг: модуль Render зависит от RHI; пока пакет rhi не компилируется (137 ошибок выше), `cargo check` клиента падает на RHI раньше, чем доходит до Render. Реальные ошибки Render (битые пути, missing импорты, конфликты типов EffectSettings/EffectQuality между effects, particles и core::settings) сейчас не видны и будут видны только после закрытия №77-92.
+Тип бага: Архитектурный (порядок сборки/блокер верификации)
+Статус: не исправлен
+---
+
+Баг№94
+Баг в файле: C:\RFS-0.4.0\src\rhi\lib.rs (строки 26-49)
+В чём заключается баг: rhi не реэкспортирует на корень типы из resource/pipeline/shader/command/descriptor/sync/swapchain/query (реэкспортируются только config/error/types/core/backend::Backend). Любой `use crate::rhi::{Texture, Buffer, Sampler, CommandEncoder, RenderPass, Pipeline, ...}` в render-коде даёт E0432/E0433. Это корень десятков битых импортов во всех пассах, материалах, мешах, текстурах.
+Тип бага: Битые связи модулей (реэкспорт)
+Статус: не исправлен
+
+Баг№95
+Баг в файле: C:\RFS-0.4.0\src\lib.rs (строки 42-50)
+В чём заключается баг: корень rfs-client делает `pub use rhi::{BufferDesc, CommandBuffer, DeviceFeatures, DeviceType, FormatCaps, GraphicsPipeline, Image, ImageDesc, ImageUsage, PipelineLayoutDesc, QueueType, Sampler, ShaderModule, SwapChain, Texture, ...}` — большинства этих имён нет в корне rhi (нет DeviceFeatures — есть Features, нет DeviceType — есть PhysicalDeviceType, нет FormatCaps — есть DeviceCaps, нет Image/ImageDesc/ImageUsage/QueueType/PipelineLayoutDesc вообще; текстурные/баферные/командные типы не реэкспортированы). E0432 прямо в lib.rs — весь клиент не собирается.
+Тип бага: Битые связи модулей (реэкспорт)
+Статус: не исправлен
+
+Баг№96
+Баг в файле: C:\RFS-0.4.0\src\rhi\mod.rs (строка 8) + C:\RFS-0.4.0\src\rhi\prelude.rs (строка 5)
+В чём заключается баг: mod.rs объявляет `pub mod lib;` (циклическое самовключение), prelude.rs делает `pub use crate::rhi::{...}` на несуществующий модуль crate::rhi (корень — lib.rs). Оба файла «мёртвые», ни один не объявлен в lib.rs. Если их включить — крейт не соберётся.
+Тип бага: Синтаксический (битые пути/цикл модулей)
+Статус: не исправлен
+
+Баг№97
+Баг в файле: C:\RFS-0.4.0\Cargo.toml (строки 27-30, 54-62) + C:\RFS-0.4.0\src\lib.rs (строка 27)
+В чём заключается баг: rhi одновременно зависит как path-крейт (`rhi = { path = "src/rhi" }`, `[workspace] members = ["src/rhi", "."]`, `[workspace.dependencies] rhi = ...`) И объявлен локальным модулем `pub mod rhi;`. Внутренние пути use crate::types::* / crate::error::* внутри src/rhi/ при компиляции как встроенного модуля ссылаются на rfs-client (где таких модулей нет) — каскад E0432. Зависимости неоднозначны, дублируются.
+Тип бага: Архитектурный (структура крейта/workspace)
+Статус: не исправлен
+
+Баг№98
+Баг в файле: C:\RFS-0.4.0\src\render\core\renderer.rs (строки 39,41,45-50,56-69,92-104,138,148,156-157,168-176,223)
+В чём заключается баг: Renderer::new использует: raw_window_handle::HasRawWindowHandle (зависимость winit/raw-window-handle закомментирована в Cargo.toml — E0432); crate::rhi::create_device_and_queues(...), device.create_swapchain(...), device.name()/vendor()/memory()/features()/limits(), config.width/height/vsync (у RhiConfig таких полей нет), self.swapchain.present(&Queue) (реально present(u32)), swapchain.resize()/extent() (методов нет). RenderContext::new ждёт GraphicsSettings, а передаёт RendererSettings. Все — E0599/E0308. Плюс unwrap() на acquire_next_image/present/resize (паника на стабах).
+Тип бага: Битые связи модулей (API Device/SwapChain/RhiConfig)
+Статус: не исправлен
+
+Баг№99
+Баг в файле: C:\RFS-0.4.0\src\render\core\settings.rs (строки 278-285 и 640-646)
+В чём заключается баг: `pub enum RayTracingQuality` объявлен ДВАЖДЫ в одном файле — E0428 (duplicate definition), плюс пресеты apply_high/apply_medium_preset (стр. 566 и др.) присваивают advanced.ray_tracing_quality. Файл не компилируется.
+Тип бага: Синтаксический (дубликат типа)
+Статус: не исправлен
+
+Баг№100
+Баг в файле: C:\RFS-0.4.0\src\render\core\context.rs (строки 8,20,53,68,75,79,83,90-103) + C:\RFS-0.4.0\src\render\core\resource_manager.rs (строки 5,8,161-170,369)
+В чём заключается баг: context.rs импортирует rhi::{Swapchain, Texture, TextureView, TextureViewDesc} — их нет на корне rhi (есть SwapChain). Методы swapchain.extent()/get_current_view()/image_count(), texture.create_view()/extent(), device.create_texture(), Format::Depth32Float — не существуют. resource_manager.rs импортирует Texture дважды (rhi и render::textures — E0252), вызывает Mesh::load/cone/torus, Texture::load/color/procedural, Material::load, MaterialLibrary::insert, Device::default() — таких методов/реализаций нет.
+Тип бага: Битые связи модулей (API RHI) + Синтаксический
+Статус: не исправлен
+
+Баг№101
+Баг в файле: C:\RFS-0.4.0\src\render\graph\node.rs (строка 6,10) + C:\RFS-0.4.0\src\render\graph\resource.rs (строки 85,110)
+В чём заключается баг: `ResourceUsage` импортирован приватно (`use super::types::ResourceUsage`) и не попал в `pub use` — все 7 пассов (base.rs:31, gbuffer.rs:18, lighting.rs:18, shadow.rs:16, transparent.rs:14, ui.rs:13, water.rs:17) дают `use crate::render::graph::node::ResourceUsage` → E0432. Также node.rs:6 и resource.rs:85,110 используют rhi::{CommandEncoder, TextureView} (нет в корне) и `Format::Undefined` (нет такого варианта в rhi).
+Тип бага: Битые связи модулей (приватный реэкспорт)
+Статус: не исправлен
+
+Баг№102
+Баг в файле: C:\RFS-0.4.0\src\render\graph\types.rs (строки 25-38)
+В чём заключается баг: оператор BitOr у ResourceUsage НЕ коммутативен и теряет комбинации: Sampled | Storage → Sampled, Storage | Sampled → Storage, ColorAttachment | Sampled → ColorAttachment. Объединение usage ресурса, используемого несколькими пассами, схлопывается в неверную комбинацию — тихий отбор неправильного формата/вью.
+Тип бага: Логический (операторы)
+Статус: не исправлен
+
+Баг№103
+Баг в файле: C:\RFS-0.4.0\src\render\graph\graph.rs (строки ~33-43, 66-155, 199-232) + resource.rs (строка 121)
+В чём заключается баг: RenderGraph фактически пуст: add_pass нигде не вызывается (grep по всему src — только определение), initialize() регистрирует ресурсы с texture: None, GraphResource::create() нигде не вызывается, execute() проходит пустой execution_order (no-op). Внутренние текстуры пассов (position_texture и т.п.) в resources не кладутся → любые super::base::get_texture(resources, "...") всегда вернут None. Даже при рабочей компиляции граф не отрисует ни одного кадра.
+Тип бага: Архитектурный (пустой граф/нет регистрации пассов)
+Статус: не исправлен
+
+Баг№104
+Баг в файле: C:\RFS-0.4.0\src\render\graph\graph.rs (строки ~118-124) vs C:\RFS-0.4.0\src\render\passes\shadow.rs (строка 62) vs lighting.rs (строки 86, 283-285)
+В чём заключается баг: в графе регистрируется одна текстура "shadow_map", а пассы создают/читают "shadow_map_cascade_{0..3}" (итерация (0..4) в lighting.rs жёстко зашита, не зависит от cascade_count). Граф никогда не свяжет ресурс с пассом — тени молча не работают.
+Тип бага: Логический (несогласованность имён ресурсов)
+Статус: не исправлен
+
+Баг№105
+Баг в файле: C:\RFS-0.4.0\src\render\scene\scene.rs (строка 220) + C:\RFS-0.4.0\src\render\scene\culling.rs (строки 89-100, 188)
+В чём заключается баг: frustum_culler.is_visible(&aabb, &view_proj) вызывается с двумя аргументами, а сигнатура is_visible(&self, aabb: &Aabb) — один (E0061). FrustumCuller::update нигде не вызывается → отсечение работает с placeholder-плоскостями Vec3::ZERO; параметр context в cull/update не используется.
+Тип бага: Синтаксический (E0061) + Логический (неинициализированный фрустум)
+Статус: не исправлен
+
+Баг№106
+Баг в файле: C:\RFS-0.4.0\src\render\scene\entity.rs (строка 206) + C:\RFS-0.4.0\src\render\scene\components.rs (строки 152, 180, 241, 267-271)
+В чём заключается баг: context.camera_position() не существует (метод есть у Scene) — E0599, вся LOD-логика (distance_from_camera) сломана. Производные `#[derive(Clone, Debug)]` на SceneComponent/MeshComponent/MaterialComponent при полях Arc<Mesh>/Material/PbrMaterial/WaterMaterial и Arc<dyn Camera> без супертрейта Debug — E0277. Entity::create_standard_camera выдаёт заглушку.
+Тип бага: Синтаксический (E0599/E0277)
+Статус: не исправлен
+
+Баг№107
+Баг в файле: C:\RFS-0.4.0\src\render\camera\controller.rs (строки ~214-225) + C:\RFS-0.4.0\src\render\camera\camera.rs (строки 78, 82-86, 221-227)
+В чём заключается баг: downcast_ref::<OrthographicCamera>() на Box<dyn Camera> без супертрейта Any — E0599; даже после каста запись camera.left = ... требует &mut, а downcast_ref даёт & (E0596). В look_at параметр up ИГНОРИРУЕТСЯ (всегда Vec3::Y) — для камеры с нестандартным up неверная матрица. viewport: (0,0, aspect*near, near) — физически бессмысленный прямоугольник. frustum_planes возвращает [Mat4; 6] — тип-заглушка, не стыкуется с Frustum из scene/culling.
+Тип бага: Синтаксический + Логический (игнор up, мусорный viewport/frustum)
+Статус: не исправлен
+
+Баг№108
+Баг в файле: C:\RFS-0.4.0\src\render\passes\water.rs (строки 116,120 vs 159,161 и 301,339)
+В чём заключается баг: поля объявлены как reflection_framebuffer/water_framebuffer, конструктор инициализирует и использует reflection_frame_buffer/water_frame_buffer (другие имена) — E0560 (struct has no field) + E0063 (missing fields). Файл не компилируется.
+Тип бага: Синтаксический (опечатка имён полей)
+Статус: не исправлен
+
+Баг№109
+Баг в файле: C:\RFS-0.4.0\src\render\passes\transparent.rs (строки 15, 27, 257, 296)
+В чём заключается баг: импорт `use crate::render::passes::base::{BaseRenderPass, BlendMode}` — в base.rs BlendMode НЕТ (E0432) + локально в transparent.rs объявлен СВОЙ pub enum BlendMode (E0255-конфликт, и ещё один BlendMode есть в materials::material). entity.blend_mode() возвращает materials::material::BlendMode, а TransparentObject.blend_mode — локальный transparent::BlendMode — несовпадение типов (E0308).
+Тип бага: Синтаксический (несуществующий импорт/дубль типа) + Логический
+Статус: не исправлен
+
+Баг№110
+Баг в файле: C:\RFS-0.4.0\src\render\passes\lighting.rs (строки 224, 292, 298, 301)
+В чём заключается баг: `let clear_colors: Vec<[f32;4]> = vec![...]` затем push — нет mut (E0596); `attachments.len() - 1 as u32` — usize - u32 (E0308); (0..4) жёстко зашито в чтении каскадов теней вместо config.cascade_count (логический).
+Тип бага: Синтаксический (E0596/E0308) + Логический
+Статус: не исправлен
+
+Баг№111
+Баг в файле: C:\RFS-0.4.0\src\render\lighting\light.rs (строки 139-163, 365-381)
+В чём заключается баг: UB-касты `unsafe { &*(self as *const Light as *const DirectionalLight) }` — реинтерпретация меньшей структуры Light как большей PointLight/SpotLight (чтение байтов за пределами объекта, мусор в position/direction/range). Плюс .with_color()/.with_intensity() вызываются на DirectionalLight/PointLight/SpotLight, где этих методов нет (E0599 — они объявлены только на базовом Light).
+Тип бага: Логический (UB/небезопасные касты) + Синтаксический
+Статус: не исправлен
+
+Баг№112
+Баг в файле: C:\RFS-0.4.0\src\render\passes\mod.rs (строка 13) + C:\RFS-0.4.0\src\render\passes\base.rs (строка 10) + C:\RFS-0.4.0\src\render\lighting\shadows.rs (строки 168, 259)
+В чём заключается баг: passes/mod.rs делает `pub use base::RenderPass;`, но RenderPass в base.rs импортирован приватно (use crate::render::graph::node::{RenderPass, ...}) — E0365 (private re-export). shadows.rs вызывает crate::rhi::Device::default().create_texture(...) — Device не реализует Default и create_texture не существует (E0599/E0277).
+Тип бага: Синтаксический (приватный реэкспорт, несуществующие методы)
+Статус: не исправлен
+
+Баг№113
+Баг в файле: C:\RFS-0.4.0\src\render\passes\ui.rs (строки 211-212, 126-132) + C:\RFS-0.4.0\src\render\passes\gbuffer.rs (строки 81-85, 122, 246) + transparent.rs (строки 144, 166, 282) + shadow.rs (строки 103, 127, 193) + water.rs (строки 207, 250, 351)
+В чём заключается баг: пассы используют несуществующие члены RHI: Format::RGBA16Float/RGBA8Unorm/R8Unorm/Depth32Float (в rhi есть SCREAMING_SNAKE имена: RGBA32_SFLOAT, D32_SFLOAT и т.п.), TextureLayout::ColorAttachmentOptimal (его нет), AttachmentDescription.samples передаётся числом 1 вместо SampleCount::X1, Rect2D задаётся плоскими полями {x,y,width,height} вместо {offset, extent}. В ui.rs методы трейта Camera используются без импорта трейта.
+Тип бага: Синтаксический (несовпадение API с rhi)
+Статус: не исправлен
+
+Баг№114
+Баг в файле: C:\RFS-0.4.0\src\render\meshes\mesh.rs (строки 120-121, 278-302, 316-366, 431-432, 445-450, 489-495, 509-521)
+В чём заключается баг: `pub struct MeshFlags: u32` — невалидный синтаксис (E0403/E0658). Размер index-buffer считается `type.size() * indices.len()`, но indices всегда Vec<u32> — для U8/U16 буфер выделяется в 2-4 раза меньше данных (переполнение/обрезка). Более того, геометрия неверна: левая грань куба имеет обратный wind-порядок (невидима при backface-culling), сфера построена «наизнанку» (видна изнутри), плоскость norm-normal вниз (-Y) — вода с CullMode::Back невидима сверху, крышки цилиндра закручены в чужие кольца.
+Тип бага: Синтаксический + Логический (геометрия/индексы)
+Статус: не исправлен
+
+Баг№115
+Баг в файле: C:\RFS-0.4.0\src\render\water\surface.rs (строки 27,40,49-53,71-79) + C:\RFS-0.4.0\src\render\water\waves.rs (строки 124,138-152,142,152,160,165-180)
+В чём заключается баг: Vec2 не импортирован в surface.rs (E0412); wave.direction.dot(position.xz()) — Vec3::dot(Vec2), 4 места (E0308). Двойное масштабирование воды: create_mesh уже строит plane размера size, model_matrix дополнительно умножает на size (реальный размер size² — при 128 → 16384). resolution/tessellation_factor не учитываются. get_simple_normal на спокойной воде (0,0,0).normalize() даёт NaN-нормаль; нормаль жёстко y=0 и не соответствует геометрии (height считает steepness², normal — amplitude*steepness).
+Тип бага: Синтаксический + Логический (масштаб, NaN-нормали)
+Статус: не исправлен
+
+Баг№116
+Баг в файле: C:\RFS-0.4.0\src\render\textures\texture.rs (строки 46-66, 282-300, 421-450) + C:\RFS-0.4.0\src\render\textures\library.rs (строки 95, 122-123) + C:\RFS-0.4.0\src\render\meshes\library.rs (строка 36)
+В чём заключается баг: impl From<TextureFormat> for Format — 16 ветвей мапят на несуществующие варианты RHI Format (RGBA16Unorm, Depth32Float и т.п.) (E0599). new_cube(...layers...) — слой layers отбрасывается, куб-текстура всегда 1 слой вместо 6. TextureUsage::Storage → RhiTextureUsage::SAMPLED — STORAGE-бит теряется (SSAO/SSR в compute не получат STORAGE). library.rs: Device::default() не существует (E0599), vec![128u8,128u8,255u8,255u8; 256*256] — невалидный vec!-синтаксис с потроением списка. meshes/library.rs: (*mesh).clone() — Mesh не реализует Clone (E0277).
+Тип бага: Синтаксический + Логический (слои, usage-бит)
+Статус: не исправлен
+
+Баг№117
+Баг в файле: C:\RFS-0.4.0\src\render\materials\material.rs (строки 6-8, 92, 114-195) + materials\pbr.rs (строки 18, 314) + materials\water.rs (строки 113-114, 167-168) + materials\library.rs
+В чём заключается баг: Material/PbrMaterial/WaterMaterial не реализуют Debug/Clone, но scene/components.rs диреивирует MaterialComponent с ними (E0277). material.rs строит PipelineDesc с полями shader_modules/vertex_input/rasterizer/depth_stencil/blend/layouts, которых нет у RHI GraphicsPipelineDesc (там vertex_shader/fragment_shader/input/...), плюс вызов device.create_graphics_pipeline (E0599). resource_manager ждёт PbrMaterial::new(name,config), а pbr.rs имеет new(name) (E0061). set_clarity клампит поле, но в uniform шлёт сырое значение — рассинхрон. PbrMaterial::water() даёт MaterialType::Pbr вместо Water.
+Тип бага: Синтаксический + Логический
+Статус: не исправлен
+
+Баг№118
+Баг в файле: C:\RFS-0.4.0\src\render\meshes\loader.rs (строки 12-30)
+В чём заключается баг: OBJ/GLTF/FBX-лоадеры — заглушки: load_obj(...) → Some(Mesh::cube()), load_gltf → cube(), load_fbx → cube(). Любой .obj/.gltf/.fbx в игре молча рендерится кубом, без ошибок и предупреждений. Реального парсинга индексов нет.
+Тип бага: Логический (молчаливая заглушка)
+Статус: не исправлен
+
+Баг№119
+Баг в файле: C:\RFS-0.4.0\src\render\postprocess\manager.rs (строка 83) + C:\RFS-0.4.0\src\render\postprocess\mod.rs (строки 26-30) + C:\RFS-0.4.0\src\render\effects\manager.rs (строки 319-322)
+В чём заключается баг: postprocess/manager.rs вызывает scene.get_velocity_texture() — у Scene такого метода/текстуры нет (E0599). PostProcessConfig.bloom/motion_blur/hdr — это bool, а effects/manager.rs читает их как вложенные `.bloom.enabled` (PostProcessSettings-модель из core/settings.rs) — код смешивает две несовместимые модели настроек. Плюс Format::RGBA16Float/Depth32Float в initialize (см. №113).
+Тип бага: Синтаксический (E0599) + Логический (конфликт моделей настроек)
+Статус: не исправлен
+
+Баг№120
+Баг в файле: C:\RFS-0.4.0\src\render\mod.rs (строки 63, 67) + C:\RFS-0.4.0\src\render\particles\mod.rs (строки 12-15) + C:\RFS-0.4.0\src\render\particles\effect_manager.rs + C:\RFS-0.4.0\src\render\effects\manager.rs + C:\RFS-0.4.0\src\render\core\settings.rs (строки 45, 192-199)
+В чём заключается баг: render/mod.rs:63 реэкспортирует ParticleEffect/ParticleEffectType — таких типов нет (есть ParticleEffectManager, EffectHandle; ParticleEffect объявлен в particles/effects.rs? — фактически в модуле нет, E0432). Типы EffectSettings/EffectQuality определены ТРИ раза (effects/manager.rs, particles/effect_manager.rs, core/settings.rs) с разными полями; EffectSettings в core/settings.rs — третий тип, не реэкспортированный. render::EffectSettings из render/mod.rs приходит только из effects. Три параллих системы эффектов несовместимы.
+Тип бага: Архитектурный (тройное дублирование типов) + Синтаксический
+Статус: не исправлен
+
+Баг№121
+Баг в файле: C:\RFS-0.4.0\src\render\effects\manager.rs + C:\RFS-0.4.0\src\render\particles\effect_manager.rs
+В чём заключается баг: оба менеджера вызывают `context.device()` как метод, но у RenderContext поле device (не метод) — E0599. Плюс в particles/effect_manager.rs и effects/manager.rs дублируются понятия EffectHandle/EffectSettings (см. №120).
+Тип бага: Синтаксический (несуществующий метод)
+Статус: не исправлен
+
+Баг№122
+Баг в файле: C:\RFS-0.4.0\src\render\water\mod.rs (строки 12, 63) + C:\RFS-0.4.0\src\render\passes\water.rs (строки 21, 35-46, 55-70) + C:\RFS-0.4.0\src\render\water\waves.rs (строки 9-12)
+В чём заключается баг: water/mod.rs делает `pub use super::WaterRenderer;` И одновременно объявляет `pub struct WaterRenderer` — двойное определение WaterRenderer в модуле (E0255). WaterConfig/WaveMethod определены по два раза: render/water vs render/passes/water — два набора полей с одинаковыми именами, несовместимы. Передача одного типа в WaveSystem::new (ждущий WaveMethod из своего модуля) — конфликт типов.
+Тип бага: Синтаксический (E0255 дубль) + Архитектурный (дубли типов)
+Статус: не исправлен
+
+Баг№123
+Баг в файле: C:\RFS-0.4.0\src\rhi\resource\acceleration\tlas.rs (строки 18-26, 42-45) + C:\RFS-0.4.0\src\rhi\resource\texture.rs (строки 63-66 vs 43-53)
+В чём заключается баг: TlasInstance хранит BLAS по значению (вместе с Vec<AccelerationStructureGeometry>, содержащей Buffer) — бессмысленные копии GPU-описаний на каждый инстанс и семантически неверно. TextureView { texture: Texture, desc: TextureViewDesc } при том, что и TextureViewDesc содержит texture: Texture — одна сущность в двух местах без инварианта согласованности.
+Тип бага: Архитектурный (дублирование данных)
+Статус: не исправлен
+
+Баг№124
+Баг в файле: C:\RFS-0.4.0\src\rhi\types\primitives.rs (строки 183-188, 150-154) + C:\RFS-0.4.0\src\rhi\pipeline\graphics.rs (строки 42-50) + C:\RFS-0.4.0\src\rhi\core\device.rs (строки 33-37) + C:\RFS-0.4.0\src\rhi\memory\heap.rs (строки 10-13) + C:\RFS-0.4.0\src\rhi\resource\sampler.rs (строка 52) vs C:\RFS-0.4.0\src\render\textures\texture.rs (строка 147)
+В чём заключается баг: дублирование типов с одинаковым именем: PrimitiveTopology (types/primitives.rs и pipeline/graphics.rs), MemoryHeap (core/device.rs {size,flags} и memory/heap.rs {index,size,flags}), SamplerDesc (rhi/resource/sampler.rs и render/textures/texture.rs). При glob-импортах — E0659 ambiguity, тихая подмена значений по контракту.
+Тип бага: Архитектурный (дубли типов)
+Статус: не исправлен
+
+Баг№125
+Баг в файле: C:\RFS-0.4.0\src\rhi\sync\barrier.rs (строки 28-35, 57-60, 18-25) + C:\RFS-0.4.0\src\rhi\command\pass\render.rs (строки 83-92)
+В чём заключается баг: TextureBarrier не имеет subresource_range (аспект/мип/слой) — нельзя переводить layout отдельного depth-аспекта; TextureAspectFlags определён, но нигде не используется (потеряно поле). BufferBarrier/TextureBarrier не имеют src/dst_queue_family_index (нет ownership transfer между очередями). BufferTextureCopy лишён image_offset/image_extent/image_subresource (физически нереализуемо). SubpassDependency не имеет VK_SUBPASS_EXTERNAL (=!0u32), поля u32 не выражают «весь пасс».
+Тип бага: Архитектурный (неполнота до Vulkan)
+Статус: не исправлен
+
+Баг№126
+Баг в файле: C:\RFS-0.4.0\src\rhi\types\flags.rs (строки 57-67, 65) + C:\RFS-0.4.0\src\rhi\shader\stage.rs (строки 8-18) + C:\RFS-0.4.0\src\rhi\types\features.rs (строки 10-12)
+В чём заключается баг: наборы стадий шейдеров неполны и несовместимы: stage.rs не имеет GEOMETRY/TESSELLATION_CONTROL/TESSELLATION_EVALUATION/MESH/TASK/CALLABLE констант, flags.rs не имеет соответсвующих битов (включая INTERSECTION, баг №92). ALL_GRAPHICS = VERTEX|FRAGMENT неполон (не включает geometry/tessellation/mesh). При этом features.rs заявляет geometry_shader/tessellation_shader/mesh_shader — фичи невыразимы через ShaderStage. Mesh/RayTracing-пайплайны невозможно описать.
+Тип бага: Архитектурный (некомпатные стадии шейдеров)
+Статус: не исправлен
+
+Баг№127
+Баг в файле: C:\RFS-0.4.0\src\rhi\commands?.rs — C:\RFS-0.4.0\src\rhi\utils\conversion.rs (строки 15-26) + C:\RFS-0.4.0\src\rhi\utils\alignment.rs (строки 6-18) + C:\RFS-0.4.0\src\rhi\utils\hash.rs (строки 22-24)
+В чём заключается баг: to_vulkan/to_dxgi/to_gl у всех Format — unimplemented!() (любая конвертация формата — гарантированная паника). align_up(value, 0) → alignment-1 = u64::MAX → value+u64::MAX переполнение (debug-паника); is_aligned(x,0) всегда false; нет guard на 0. hash_pipeline_desc всегда возвращает 0 — кэш пайплайнов будет иметь тотальные коллизии.
+Тип бага: Логический (unimplemented/паника) + Архитектурный (кэш)
+Статус: не исправлен
+
+Баг№128
+Баг в файле: C:\RFS-0.4.0\src\rhi\utils\hash.rs — кэш пайплайнов (см. №127) + C:\RFS-0.4.0\src\rhi\pipeline\graphics.rs (строки 231-241) + C:\RFS-0.4.0\src\rhi\pipeline\compute.rs (строки 12-14) + C:\RFS-0.4.0\src\rhi\pipeline\state.rs (строки 10-14)
+В чём заключается баг: GraphicsPipelineDesc/ComputePipelineDesc НЕ содержат layout: PipelineLayout и render_pass/subpass — дескрипторные сеты и push-константы невозможно связать с пайплайном через типы; PipelineLayout/PushConstantRange — мёртвый код. line_width.rasterizer дефолт 0.0 (невалидно, API требует 1.0); дефолт CullMode=None (обычно Back). Device::wait_idle(), SwapChain::acquire_next_image/present, allocator/backend/semaphore/fence — unimplemented!() (паника при первом же вызове).
+Тип бага: Архитектурный (неполный API пайплайнов/синхронизации)
+Статус: не исправлен
+
+Баг№129
+Баг в файле: C:\RFS-0.4.0\src\render\passes\lighting.rs (строки 276-285) + transparent.rs (строки 96-99, 247) + water.rs (строки 131-134, 342-345) + C:\RFS-0.4.0\src\render\lighting\ (light.rs, shadows.rs, probe.rs) + C:\RFS-0.4.0\src\render\scene\components.rs (LightComponent)
+В чём заключается баг: три несвязанных представления света: пассы не используют lighting::{Light, DirectionalLight, PointLight, SpotLight}, ShadowPass опирается на свой локальный ShadowConfig, сцена хранит LightComponent. Пассы fallback'ов полагаются на имена ресурсов (gbuffer_position, depth, lighting), которых нет в графе (см. №103). LightProbe::bake/get_light — заглушки (get_light всегда Vec3::ONE). lighting/shadows.rs vs passes/shadow.rs — два разных ShadowConfig с одним именем.
+Тип бага: Архитектурный (разрыв световой модели) + Логический
+Статус: не исправлен
+
+Баг№130
+Баг в файле: C:\RFS-0.4.0\src\rhi\resource\buffer.rs (строки 20-30, поле device_address) + C:\RFS-0.4.0\src\rhi\resource\sampler.rs (строки 70-72) + C:\RFS-0.4.0\src\rhi\swapchain\swapchain.rs (строки 76, 83, images) 
+В чём заключается баг: Buffer.device_address всегда None, геттера нет — поле мёртвое (ускоренные бэкенды не могут получить адрес буфера). Sampler не имеет конструктора (публичных полей нет) — неконструируем. SwapChainImage — мёртвый тип: images = Vec::new() в new(), acquire/current_image_index никогда не заполняются.
+Тип бага: Архитектурный (мёртвые поля/неконструируемые типы)
+Статус: не исправлен
+
+Баг№131
+Баг в файле: C:\RFS-0.4.0\src\render\particles\effects.rs + C:\RFS-0.4.0\src\render\particles\system.rs + C:\RFS-0.4.0\src\render\particles\emitter.rs
+В чём заключается баг: ParticleEffect/ParticleEffectType реэкспортированы в render/mod.rs:63, но фактически (по глубокой проверке) этих типов нет в particles/effects.rs (там SmokeEffect/FireEffect/... и EffectQuality) — E0432 на корне render. Плюс частицы не имеют подключения к RHI-квизам/пайплайнам компута — скорее всего система мертва. Требуется сверка фактического содержимого particles при исправлении.
+Тип бага: Синтаксический (несуществующий реэкспорт)
+Статус: не исправлен
+
+Баг№132
+Баг в файле: C:\RFS-0.4.0\src\render\ui\ (hud.rs, minimap.rs, menu.rs) + C:\RFS-0.4.0\src\render\passes\ui.rs (строки 57-58, 119-132, 195, 289)
+В чём заключается баг: ui pass использует swapchain.load_op: Load и layout TransferDstOptimal→TransferSrcOptimal, но никто не делает TransferSrc-конверсию перед презентом — логическая незавершённость цепочки рендера UI. ui.rs:57-58 зависит от "water/water" и "transparent/final", но ресурс "water" в графе не зарегистрирован. self.output_view.as_ref().and_then(|v| v.texture().device()) — TextureView.texture()/device() не существуют.
+Тип бага: Логический + Синтаксический
+Статус: не исправлен
+
+Баг№133
+Баг в файле: C:\RFS-0.4.0\src\render\core\renderer.rs (строки ~132, ~151)
+В чём заключается баг: frame_number инкрементится ДВАЖДЫ за кадр (в begin_frame и в конце render_frame) — статистика FPS/кадров завышена вдвое. RenderStats создаётся, но нигде не заполняется наружу (мёртвый код).
+Тип бага: Логический (двойной инкремент)
+Статус: не исправлен
+
+Баг№134
+Баг в файле: C:\RFS-0.4.0\src\rhi\command\commands.rs (строки 88-94) + C:\RFS-0.4.0\src\rhi\sync\barrier.rs (строки 38-45)
+В чём заключается баг: Command::PipelineBarrier полностью дублирует структуру PipelineBarrier из sync/barrier.rs (src_stage/dst_stage/memory_barriers/buffer_barriers/texture_barriers). При эволюции типов они расползутся — заложенная мина рассинхронизации (сейчас поля совпадают).
+Тип бага: Архитектурный (дублирование структуры)
+Статус: не исправлен
+
+Баг№135
+Баг в файле: C:\RFS-0.4.0\src\render\particles\effect_manager.rs (EffectSettings, строки 41-66) + C:\RFS-0.4.0\src\render\effects\manager.rs (EffectSettings, строки 51-59) + C:\RFS-0.4.0\src\render\core\settings.rs (EffectSettings, строки 192-199, 315, 391)
+В чём заключается баг: полевые наборы трёх EffectSettings различаются: particle-версия (quality, spawn_rate?, max_particles?), effects-версия (quality + поля эффектов), settings-версия (ssao/ssr/god_rays...). RendererSettings.effects: EffectSettings (core-версия) передаётся в EffectManager (effects-версия) — несовпадение типов при использовании. Система эффектов/частиц/настроек не работает как единое целое.
+Тип бага: Архитектурный (конфликт типов настроек)
+Статус: не исправлен
+
+Баг№136
+Баг в файле: C:\RFS-0.4.0\src\render\passes\base.rs (строки 25-40) + C:\RFS-0.4.0\src\render\passes\shadow.rs (строки 20-39)
+В чём заключается баг: BaseRenderPass регистрирует пустые pipelines: HashMap::new() и заглушку execute() — «проход» ничего не рисует. ShadowPass имеет cascаде-count жёстко зашитый (0..4 в lighting, и 4 каскада в shadow.rs) без привязки к ShadowConfig из lighting — конфиги рассинхронизированы.
+Тип бага: Логический (пустые пайплайны, жёсткие каскады)
+Статус: не исправлен
+
+Баг№137
+Баг в файле: C:\RFS-0.4.0\src\render\passes\water.rs (строки 242, 453-460) + C:\RFS-0.4.0\src\render\water\ (surface.rs, waves.rs, interaction.rs, mod.rs)
+В чём заключается баг: водный проход НЕ использует render/water систему (WaterSurface, WaveSystem, WaterInteraction, WaterRenderer): water_mesh: Option<Mesh> всегда None, вода никогда не получает геометрию; проход имеет собственные WaterConfig/WaveMethod/WaveData. Два параллельных «водных мира», не связанных между собой: рендер-модуль воды имеет реальную реализацию, а проход — заглушку.
+Тип бага: Архитектурный (две несвязанные системы воды)
+Статус: не исправлен
+
+Баг№138
+Баг в файле: C:\RFS-0.4.0\src\rhi\utils\pkg + backends: C:\RFS-0.4.0\src\rhi\backend\ (vulkan/d3d12/d3d11/opengl)
+В чём заключается баг: все бэкенды при включённых фичах (default vulkan+d3d12+d3d11+opengl в rhi/Cargo.toml) — unimplemented!() и практически пустые стабы: нет никакой реальной ширины конверсии и создания объектов. Система рендеринга на данном этапе физически не может ничего отрисовать на любом бэкенде — это не «баг компиляции», а архитектурное состояние «скелета».
+Тип бага: Архитектурный (пустые бэкенды)
+Статус: не исправлен
+
+Баг№139
+Баг в файле: C:\RFS-0.4.0\src\render\core\renderer.rs (строки 111-118) + C:\RFS-0.4.0\src\render\graph\graph.rs
+В чём заключается баг: Renderer::initialize() не вызывает self.context.initialize() и пассы не добавляются в граф (add_pass нигде не вызывается, см. №103). Даже после компиляционных правок инициализация рендера не выполнит ни создания текстуры глубины/свапчейна, ни регистрации пассов — пустой кадр.
+Тип бага: Логический (неинициализированная цепочка)
+Статус: не исправлен
+
+Баг№140
+Баг в файле: C:\RFS-0.4.0\src\rhi\types\flags.rs (строки 22, 35, 57, 71, 87, 107, 142, 48)
+В чём заключается баг: разнобой в derive: BufferUsage/TextureUsage/MemoryPropertyFlags имеют Default, а ShaderStage/PipelineStage/AccessFlags/TextureAspectFlags/ColorComponentFlags — нет (см. №78). Это создаёт асимметричный контракт: половина bitflags дефолтна, половина нет — источник каскадных E0277 везде, где derive(Default). Требуется единая политика.
+Тип бага: Архитектурный (асимметрия derive)
+Статус: не исправлен
+---

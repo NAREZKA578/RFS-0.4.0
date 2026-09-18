@@ -179,23 +179,23 @@ impl Default for BandwidthStats {
 }
 
 pub struct BandwidthLimiter {
-    max_bps: f64,
     bucket: Mutex<TokenBucket>,
 }
 
 struct TokenBucket {
     tokens: f64,
     max_tokens: f64,
+    max_bps: f64,
     last_update: Instant,
 }
 
 impl BandwidthLimiter {
     pub fn new(max_bps: f64) -> Self {
         Self {
-            max_bps,
             bucket: Mutex::new(TokenBucket {
                 tokens: max_bps,
                 max_tokens: max_bps,
+                max_bps,
                 last_update: Instant::now(),
             }),
         }
@@ -207,7 +207,7 @@ impl BandwidthLimiter {
         let elapsed = now - bucket.last_update;
         bucket.last_update = now;
         
-        bucket.tokens += elapsed.as_secs_f64() * self.max_bps;
+        bucket.tokens += elapsed.as_secs_f64() * bucket.max_bps;
         if bucket.tokens > bucket.max_tokens {
             bucket.tokens = bucket.max_tokens;
         }
@@ -231,12 +231,17 @@ impl BandwidthLimiter {
         }
         
         let needed = cost - tokens;
-        let seconds = needed / self.max_bps;
+        let seconds = needed / bucket.max_bps;
         Duration::from_secs_f64(seconds)
     }
 
     pub fn set_max_bps(&self, max_bps: f64) {
+        let max_bps = max_bps.max(0.0);
+        // Bug №39: bumping max_tokens alone left the bucket refill rate at
+        // the OLD tempo, so the "new" limit silently did nothing. Update the
+        // rate too.
         let mut bucket = self.bucket.lock();
+        bucket.max_bps = max_bps;
         bucket.max_tokens = max_bps;
         if bucket.tokens > max_bps {
             bucket.tokens = max_bps;

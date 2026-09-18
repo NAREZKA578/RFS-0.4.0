@@ -11,7 +11,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -28,9 +28,8 @@ pub struct NetServer {
     delta_compressor: Arc<DeltaCompressor>,
     client_layers: Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
     interest_manager: Arc<InterestManager>,
-    bandwidth_tracker: BandwidthTracker,
-    #[allow(dead_code)]
-    bandwidth_limiter: BandwidthLimiter,
+    bandwidth_tracker: Arc<BandwidthTracker>,
+    bandwidth_limiter: Arc<BandwidthLimiter>,
     tick_rate: u32,
     current_tick: Arc<Mutex<Tick>>,
     server_time: Arc<Mutex<f64>>,
@@ -40,6 +39,22 @@ pub struct NetServer {
     event_sender: mpsc::UnboundedSender<ServerEvent>,
     event_receiver: Mutex<Option<mpsc::UnboundedReceiver<ServerEvent>>>,
     match_id: Uuid,
+    /// Per-address Connect token buckets (bug №27).
+    connect_limits: Arc<Mutex<HashMap<SocketAddr, ConnectLimit>>>,
+}
+
+/// Token bucket for inbound Connects from one source address (bug №27).
+/// Burst 4, refill 4/sec: a legitimate client (1 Connect + 250 ms retries
+/// while the Accept is in flight) never notices; a sprayer is capped.
+const CONNECT_BURST: f64 = 4.0;
+const CONNECT_REFILL_PER_SEC: f64 = 4.0;
+/// Upper bound for the limiter table itself; oldest entries are evicted past it.
+const CONNECT_TABLE_CAP: usize = 4096;
+
+#[derive(Debug)]
+struct ConnectLimit {
+    tokens: f64,
+    last: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -98,9 +113,11 @@ impl NetServer {
             delta_compressor: Arc::new(DeltaCompressor::new()),
             client_layers: Arc::new(RwLock::new(HashMap::new())),
             interest_manager: Arc::new(InterestManager::new(config.interest_config)),
-            bandwidth_tracker: BandwidthTracker::new(),
-            bandwidth_limiter: BandwidthLimiter::new(config.max_bandwidth_bps),
-            tick_rate: config.tick_rate,
+            bandwidth_tracker: Arc::new(BandwidthTracker::new()),
+            bandwidth_limiter: Arc::new(BandwidthLimiter::new(config.max_bandwidth_bps)),
+            // Bug №31: tick_rate 0 panics on 1000/0 and >1000 busy-loops the
+            // send task. Clamp to the sane interval of 1..=1000 ticks/sec.
+            tick_rate: config.tick_rate.clamp(1, 1000),
             current_tick: Arc::new(Mutex::new(Tick(0))),
             server_time: Arc::new(Mutex::new(0.0)),
             running: Arc::new(Mutex::new(false)),
@@ -109,6 +126,7 @@ impl NetServer {
             event_sender,
             event_receiver: Mutex::new(Some(event_receiver)),
             match_id,
+            connect_limits: Arc::new(Mutex::new(HashMap::new())),
         };
         
         Ok(server)
@@ -135,9 +153,11 @@ impl NetServer {
     }
 
     pub fn get_connection_by_addr(&self, addr: SocketAddr) -> Option<Arc<Connection>> {
-        self.connection_by_addr.read()
-            .get(&addr)
-            .and_then(|id| self.connections.read().get(id).cloned())
+        // Bug №79: never hold the addr map and the connection map at once.
+        // remove_connection takes them in the opposite order — nested locks
+        // here are an ABBA deadlock (parking_lot is not reentrant).
+        let id = self.connection_by_addr.read().get(&addr).copied()?;
+        self.connections.read().get(&id).cloned()
     }
 
     pub fn start(&self) {
@@ -167,12 +187,17 @@ impl NetServer {
         let connection_by_addr = self.connection_by_addr.clone();
         let next_id = self.next_connection_id.clone();
         let config = self.config.clone();
-        let bandwidth_tracker = BandwidthTracker::new();
+        let bandwidth_tracker = self.bandwidth_tracker.clone();
+        let bandwidth_limiter = self.bandwidth_limiter.clone();
+        let limit_enabled = self.config.enable_bandwidth_limit;
+        let connect_limits = self.connect_limits.clone();
         let running = self.running.clone();
         let event_sender = self.event_sender.clone();
         let current_tick = self.current_tick.clone();
         let server_time = self.server_time.clone();
         let match_id = self.match_id;
+        let delta_compressor = self.delta_compressor.clone();
+        let client_layers = self.client_layers.clone();
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -189,10 +214,16 @@ impl NetServer {
                             &connection_by_addr,
                             &next_id,
                             &config,
+                            &bandwidth_tracker,
+                            &bandwidth_limiter,
+                            limit_enabled,
+                            &connect_limits,
                             &event_sender,
                             &current_tick,
                             &server_time,
                             match_id,
+                            &delta_compressor,
+                            &client_layers,
                             addr,
                             data,
                         ).await {
@@ -215,16 +246,50 @@ impl NetServer {
         *self.recv_handle.lock() = Some(handle);
     }
 
+    /// Token-bucket admission for inbound Connects (bug №27).
+    /// Returns true if this Connect may proceed, false if the sender is over rate.
+    fn check_connect_rate(
+        limits: &Arc<Mutex<HashMap<SocketAddr, ConnectLimit>>>,
+        addr: SocketAddr,
+    ) -> bool {
+        let mut limits = limits.lock();
+        let now = Instant::now();
+        // Bound the table itself: evict entries idle > 60 s when over cap.
+        if limits.len() > CONNECT_TABLE_CAP {
+            limits.retain(|_, e| now.duration_since(e.last) < Duration::from_secs(60));
+        }
+        let entry = limits.entry(addr).or_insert(ConnectLimit {
+            tokens: CONNECT_BURST,
+            last: now,
+        });
+        entry.tokens = (entry.tokens
+            + now.duration_since(entry.last).as_secs_f64() * CONNECT_REFILL_PER_SEC)
+            .min(CONNECT_BURST);
+        entry.last = now;
+        if entry.tokens >= 1.0 {
+            entry.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
     async fn handle_received_packet(
         socket: &Arc<UdpSocket>,
         connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
         connection_by_addr: &Arc<RwLock<HashMap<SocketAddr, u32>>>,
         next_id: &Arc<Mutex<u32>>,
         config: &ServerConfig,
+        bandwidth: &BandwidthTracker,
+        limiter: &BandwidthLimiter,
+        limit_enabled: bool,
+        connect_limits: &Arc<Mutex<HashMap<SocketAddr, ConnectLimit>>>,
         event_sender: &mpsc::UnboundedSender<ServerEvent>,
         current_tick: &Arc<Mutex<Tick>>,
         server_time: &Arc<Mutex<f64>>,
         match_id: Uuid,
+        delta_compressor: &Arc<DeltaCompressor>,
+        client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
         addr: SocketAddr,
         data: &[u8],
     ) -> anyhow::Result<()> {
@@ -239,7 +304,44 @@ impl NetServer {
             if let Some(id) = existing {
                 id
             } else {
-                if connections.read().len() >= config.max_connections {
+                // Bug №27: only a Connect opens a connection. Any other packet
+                // from an unknown address is stray traffic (late duplicate,
+                // scanner, spoof) — it must not allocate state or spawn a player.
+                if PacketType::from_u8(header.packet_type) != Some(PacketType::Connect) {
+                    return Ok(());
+                }
+                // ...and Connects themselves are rate-limited per address, so
+                // one sender cannot spray registrations at full line rate.
+                if !Self::check_connect_rate(connect_limits, addr) {
+                    return Ok(());
+                }
+
+                // Bug №27: the cap check and the registration run under one
+                // write lock, so a concurrent Connect cannot slip between the
+                // len check and the insert (TOCTOU in the old read-then-write).
+                let admitted: Option<(u32, Arc<Connection>)> = {
+                    let mut conns = connections.write();
+                    if conns.len() >= config.max_connections {
+                        None
+                    } else {
+                        let id = {
+                            let mut id_gen = next_id.lock();
+                            let id = *id_gen;
+                            *id_gen = id_gen.wrapping_add(1);
+                            if *id_gen == 0 { *id_gen = 1; }
+                            id
+                        };
+
+                        let conn = Connection::new(id, addr, config.connection_config.clone());
+                        conn.set_state(ConnectionState::Connected);
+                        let conn_arc = Arc::new(conn);
+                        conns.insert(id, conn_arc.clone());
+                        connection_by_addr.write().insert(addr, id);
+                        Some((id, conn_arc))
+                    }
+                };
+
+                let Some((id, conn_arc)) = admitted else {
                     let reject = ConnectRejectPacket { reason: ConnectRejectReason::ServerFull };
                     let header = PacketHeader::new(
                         PacketType::ConnectReject,
@@ -248,33 +350,21 @@ impl NetServer {
                     );
                     let packet_data = serialize_packet(&reject, header)?;
                     socket.send_to(&packet_data, addr).await?;
+                    bandwidth.record_sent(packet_data.len());
                     return Ok(());
-                }
-
-                let id = {
-                    let mut id_gen = next_id.lock();
-                    let id = *id_gen;
-                    *id_gen = id_gen.wrapping_add(1);
-                    if *id_gen == 0 { *id_gen = 1; }
-                    id
                 };
-
-                let conn = Connection::new(id, addr, config.connection_config.clone());
-                conn.set_state(ConnectionState::Connected);
 
                 let accept = {
                     let tick = current_tick.lock().value();
                     let time = *server_time.lock();
-                    conn.send_connect_accept(tick, time, match_id)
+                    conn_arc.send_connect_accept(tick, time, match_id)
                 };
-
-                let conn_arc = Arc::new(conn);
-                connections.write().insert(id, conn_arc.clone());
-                connection_by_addr.write().insert(addr, id);
 
                 let _ = event_sender.send(ServerEvent::ClientConnected { connection_id: id, addr });
 
-                Self::send_packet(socket, &conn_arc, &accept).await?;
+                if let Some(accept) = accept {
+                    Self::send_packet(socket, &conn_arc, &accept, bandwidth, limiter, limit_enabled).await.map(|_| ())?;
+                }
 
                 id
             }
@@ -286,7 +376,7 @@ impl NetServer {
             let packets = conn.handle_packet(header, payload)?;
             
             for packet in packets {
-                Self::send_packet(socket, &conn, &packet).await?;
+                Self::send_packet(socket, &conn, &packet, bandwidth, limiter, limit_enabled).await.map(|_| ())?;
             }
 
             match PacketType::from_u8(header.packet_type) {
@@ -298,6 +388,18 @@ impl NetServer {
                 Some(PacketType::Command) => {
                     if let Ok(command) = bincode::deserialize::<CommandPacket>(payload) {
                         let _ = event_sender.send(ServerEvent::ClientCommand { connection_id, command });
+                    }
+                }
+                Some(PacketType::Connect) => {
+                    // Duplicate Connect: our Accept never made it back.
+                    // Registration is keyed by addr, so re-sending is idempotent.
+                    let accept = {
+                        let tick = current_tick.lock().value();
+                        let time = *server_time.lock();
+                        conn.send_connect_accept(tick, time, match_id)
+                    };
+                    if let Some(accept) = accept {
+                        Self::send_packet(socket, &conn, &accept, bandwidth, limiter, limit_enabled).await.map(|_| ())?;
                     }
                 }
                 Some(PacketType::Fragment) => {
@@ -317,6 +419,28 @@ impl NetServer {
                         }
                     }
                 }
+                Some(PacketType::Disconnect) => {
+                    // Bug №68: a client Disconnect used to fall into `_ => {}` —
+                    // only `last_received` was refreshed (extending the timeout!)
+                    // and the player slot stayed occupied until the 10 s sweep.
+                    // Remove the connection right here, idempotently.
+                    let reason = bincode::deserialize::<DisconnectPacket>(payload)
+                        .map(|d| d.reason)
+                        .unwrap_or(DisconnectReason::ClientQuit);
+                    if Self::remove_connection(
+                        connection_by_addr,
+                        connections,
+                        delta_compressor,
+                        client_layers,
+                        connection_id,
+                        addr,
+                    ) {
+                        let _ = event_sender.send(ServerEvent::ClientDisconnected {
+                            connection_id,
+                            reason,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -328,10 +452,21 @@ impl NetServer {
         socket: &Arc<UdpSocket>,
         conn: &Connection,
         packet: &OutgoingPacket,
-    ) -> anyhow::Result<()> {
+        bandwidth: &BandwidthTracker,
+        limiter: &BandwidthLimiter,
+        limit_enabled: bool,
+    ) -> anyhow::Result<bool> {
         let total_size = HEADER_SIZE + packet.payload.len();
-        if total_size > MAX_PACKET_SIZE {
-            return Err(anyhow::anyhow!("Packet too large: {} > {}", total_size, MAX_PACKET_SIZE));
+        // Bug №30: the MTU comes from the connection's own config — the same
+        // value the packet builders fragment against — not a stray constant.
+        let max = conn.config.max_packet_size;
+        if total_size > max {
+            return Err(anyhow::anyhow!("Packet too large: {} > {}", total_size, max));
+        }
+        // Bug №39: the limiter finally gates the wire. Drops are silent by
+        // design (unreliable channel resends); oversize is still an error.
+        if limit_enabled && !limiter.try_consume(total_size) {
+            return Ok(false);
         }
 
         let mut buffer = BytesMut::with_capacity(total_size);
@@ -339,16 +474,22 @@ impl NetServer {
         buffer.extend_from_slice(&packet.payload);
         
         socket.send_to(&buffer, conn.addr).await?;
-        Ok(())
+        bandwidth.record_sent(total_size);
+        Ok(true)
     }
 
     fn start_send_loop(&self) {
         let socket = self.socket.clone();
         let connections = self.connections.clone();
+        let connection_by_addr = self.connection_by_addr.clone();
         let client_layers = self.client_layers.clone();
         let snapshot_buffer = self.snapshot_buffer.clone();
         let delta_compressor = self.delta_compressor.clone();
         let interest_manager = self.interest_manager.clone();
+        let bandwidth_tracker = self.bandwidth_tracker.clone();
+        let bandwidth_limiter = self.bandwidth_limiter.clone();
+        let limit_enabled = self.config.enable_bandwidth_limit;
+        let event_sender = self.event_sender.clone();
         let running = self.running.clone();
         let current_tick = self.current_tick.clone();
         let server_time = self.server_time.clone();
@@ -356,22 +497,34 @@ impl NetServer {
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(1000 / tick_rate as u64));
-            
+
             while *running.lock() {
                 interval.tick().await;
-                
+
                 let tick = {
                     let mut ct = current_tick.lock();
                     *ct = ct.next();
                     *ct
                 };
-                
+
                 let time = tick.value() as f64 * TICK_DURATION.as_secs_f64();
                 *server_time.lock() = time;
-                
+
+                // Bug №28: reap silent connections once a second so dead
+                // clients stop consuming snapshots, interest and ids.
+                if tick.value() % tick_rate as u64 == 0 {
+                    Self::sweep_timeouts(
+                        &connections,
+                        &connection_by_addr,
+                        &delta_compressor,
+                        &client_layers,
+                        &event_sender,
+                    );
+                }
+
                 let snapshot = Self::build_snapshot(tick, time, &interest_manager);
                 snapshot_buffer.write_snapshot(snapshot.clone());
-                
+
                 Self::send_snapshots(
                     &socket,
                     &connections,
@@ -379,14 +532,64 @@ impl NetServer {
                     &snapshot_buffer,
                     &delta_compressor,
                     &interest_manager,
+                    &bandwidth_tracker,
+                    &bandwidth_limiter,
+                    limit_enabled,
                     tick,
                 ).await;
-                
-                Self::send_heartbeats(&socket, &connections).await;
+
+                Self::send_heartbeats(&socket, &connections, &bandwidth_tracker, &bandwidth_limiter, limit_enabled).await;
             }
         });
-        
+
         *self.send_handle.lock() = Some(handle);
+    }
+
+    /// Remove every connection that stopped answering (bug №28). Removal and
+    /// event emission go through one helper so each timeout is reported
+    /// exactly once even if a manual disconnect races it (bug №32).
+    fn sweep_timeouts(
+        connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
+        connection_by_addr: &Arc<RwLock<HashMap<SocketAddr, u32>>>,
+        delta_compressor: &Arc<DeltaCompressor>,
+        client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+        event_sender: &mpsc::UnboundedSender<ServerEvent>,
+    ) {
+        let timed_out: Vec<(u32, SocketAddr)> = {
+            let conns = connections.read();
+            conns
+                .iter()
+                .filter(|(_, conn)| conn.is_timed_out())
+                .map(|(id, conn)| (*id, conn.addr))
+                .collect()
+        };
+        for (id, addr) in timed_out {
+            if Self::remove_connection(connection_by_addr, connections, delta_compressor, client_layers, id, addr) {
+                let _ = event_sender.send(ServerEvent::ClientDisconnected {
+                    connection_id: id,
+                    reason: DisconnectReason::Timeout,
+                });
+                let _ = event_sender.send(ServerEvent::ClientTimeout { connection_id: id });
+            }
+        }
+    }
+
+    /// Erase a connection from every table. Returns true if it was present —
+    /// callers emit disconnect events only then, so a timeout racing a manual
+    /// disconnect cannot double-report (bug №32).
+    fn remove_connection(
+        connection_by_addr: &Arc<RwLock<HashMap<SocketAddr, u32>>>,
+        connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
+        delta_compressor: &Arc<DeltaCompressor>,
+        client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+        connection_id: u32,
+        addr: SocketAddr,
+    ) -> bool {
+        let removed = connections.write().remove(&connection_id);
+        connection_by_addr.write().remove(&addr);
+        delta_compressor.remove_client(connection_id);
+        client_layers.write().remove(&connection_id);
+        removed.is_some()
     }
 
     fn build_snapshot(
@@ -429,6 +632,9 @@ impl NetServer {
         snapshot_buffer: &Arc<SnapshotBuffer>,
         delta_compressor: &Arc<DeltaCompressor>,
         interest_manager: &Arc<InterestManager>,
+        bandwidth: &BandwidthTracker,
+        limiter: &BandwidthLimiter,
+        limit_enabled: bool,
         current_tick: Tick,
     ) {
         let snapshot = snapshot_buffer.get_latest().unwrap_or_else(|| Snapshot {
@@ -441,84 +647,111 @@ impl NetServer {
 
         let mut pending_sends: Vec<(Arc<Connection>, OutgoingPacket)> = Vec::new();
 
-        {
+        // Bug №29: snapshot the client list first, then take the layers lock
+        // per client and only for map access. Serialization, fragmentation
+        // and delta diffing (the expensive parts at 200 clients) run without
+        // any global lock held, so disconnects/timeouts never stall behind them.
+        let clients: Vec<(u32, Arc<Connection>)> = {
             let conns = connections.read();
-            let mut layers = client_layers.write();
+            conns.iter().map(|(id, conn)| (*id, conn.clone())).collect()
+        };
 
-            for (client_id, conn) in conns.iter() {
-                if conn.state() != ConnectionState::Connected {
-                    continue;
-                }
+        for (client_id, conn) in &clients {
+            if conn.state() != ConnectionState::Connected {
+                continue;
+            }
 
-                let filtered = Self::filter_snapshot(&snapshot, interest_manager, *client_id);
-                let tick = filtered.tick.value();
+            let filtered = Self::filter_snapshot(&snapshot, interest_manager, *client_id);
+            let tick = filtered.tick.value();
 
-                let entry = layers.entry(*client_id).or_insert_with(|| {
+            {
+                let mut layers = client_layers.write();
+                layers.entry(*client_id).or_insert_with(|| {
                     // First contact: full state now, layer bases start from it.
                     for packet in conn.send_state(filtered.to_state_packet()) {
                         pending_sends.push((conn.clone(), packet));
                     }
                     Self::split_layers(&filtered, tick)
                 });
+            }
 
-                for layer in 0..LAYER_COUNT {
-                    let layer_u8 = layer as u8;
-                    let base = &entry[layer];
-                    let since = tick.saturating_sub(base.last_sent_tick);
-
-                    // Current content of this layer.
-                    let cur_entities: Vec<EntitySnapshot> = filtered.entities.iter()
-                        .filter(|e| entity_layer(e.entity_type) == layer_u8)
-                        .cloned()
-                        .collect();
-                    let cur_projectiles: Vec<ProjectileSnapshot> = if layer_u8 == crate::snapshot::LAYER_PROJECTILE {
-                        filtered.projectiles.clone()
-                    } else {
-                        Vec::new()
-                    };
-                    let content_empty = cur_entities.is_empty() && cur_projectiles.is_empty();
-
-                    // Layer 1 has no fixed rate: it goes out on change, plus resync.
-                    let scheduled = since >= LAYER_INTERVAL_TICKS[layer];
-                    let resync = since >= LAYER_RESYNC_TICKS[layer] && !content_empty;
-                    let on_change = LAYER_INTERVAL_TICKS[layer] == u64::MAX;
-                    if !scheduled && !resync && !on_change {
-                        continue;
+            for layer in 0..LAYER_COUNT {
+                let layer_u8 = layer as u8;
+                let (base_entities, base_projectiles, last_sent_tick) = {
+                    let layers = client_layers.read();
+                    match layers.get(client_id) {
+                        Some(entry) => (
+                            entry[layer].entities.clone(),
+                            entry[layer].projectiles.clone(),
+                            entry[layer].last_sent_tick,
+                        ),
+                        None => continue,
                     }
+                };
+                let since = tick.saturating_sub(last_sent_tick);
 
-                    let base_snapshot = Snapshot {
-                        tick: Tick(base.last_sent_tick),
-                        time: filtered.time,
-                        entities: if resync { Vec::new() } else { base.entities.clone() },
-                        projectiles: if resync { Vec::new() } else { base.projectiles.clone() },
-                        events: Vec::new(),
-                    };
-                    let target_snapshot = Snapshot {
-                        tick: filtered.tick,
-                        time: filtered.time,
-                        entities: cur_entities.clone(),
-                        projectiles: cur_projectiles.clone(),
-                        events: Vec::new(),
-                    };
-                    let delta = delta_compressor.create_delta(*client_id, layer_u8, &base_snapshot, &target_snapshot);
-                    if delta.is_empty() {
-                        continue;
-                    }
+                // Current content of this layer.
+                let cur_entities: Vec<EntitySnapshot> = filtered.entities.iter()
+                    .filter(|e| entity_layer(e.entity_type) == layer_u8)
+                    .cloned()
+                    .collect();
+                let cur_projectiles: Vec<ProjectileSnapshot> = if layer_u8 == crate::snapshot::LAYER_PROJECTILE {
+                    filtered.projectiles.clone()
+                } else {
+                    Vec::new()
+                };
+                let content_empty = cur_entities.is_empty() && cur_projectiles.is_empty();
 
-                    for packet in conn.send_state_delta(delta.to_state_delta()) {
-                        pending_sends.push((conn.clone(), packet));
+                // Layer 1 has no fixed rate: it goes out on change, plus resync.
+                let scheduled = since >= LAYER_INTERVAL_TICKS[layer];
+                let resync = since >= LAYER_RESYNC_TICKS[layer] && !content_empty;
+                let on_change = LAYER_INTERVAL_TICKS[layer] == u64::MAX;
+                if !scheduled && !resync && !on_change {
+                    continue;
+                }
+
+                let base_snapshot = Snapshot {
+                    tick: Tick(last_sent_tick),
+                    time: filtered.time,
+                    entities: if resync { Vec::new() } else { base_entities },
+                    projectiles: if resync { Vec::new() } else { base_projectiles },
+                    events: Vec::new(),
+                };
+                let target_snapshot = Snapshot {
+                    tick: filtered.tick,
+                    time: filtered.time,
+                    entities: cur_entities.clone(),
+                    projectiles: cur_projectiles.clone(),
+                    events: Vec::new(),
+                };
+                let delta = delta_compressor.create_delta(*client_id, layer_u8, &base_snapshot, &target_snapshot);
+                if delta.is_empty() {
+                    continue;
+                }
+                // Bug №23/№78: a resync diffed against an empty base is a full
+                // layer replacement. Flag it so the client applies it even after
+                // a lost delta left its base behind, and prunes the old layer.
+                let mut state_delta = delta.to_state_delta();
+                state_delta.is_resync = resync;
+
+                for packet in conn.send_state_delta(state_delta) {
+                    pending_sends.push((conn.clone(), packet));
+                }
+                {
+                    let mut layers = client_layers.write();
+                    if let Some(entry) = layers.get_mut(client_id) {
+                        entry[layer] = LayerBase {
+                            entities: cur_entities,
+                            projectiles: cur_projectiles,
+                            last_sent_tick: tick,
+                        };
                     }
-                    entry[layer] = LayerBase {
-                        entities: cur_entities,
-                        projectiles: cur_projectiles,
-                        last_sent_tick: tick,
-                    };
                 }
             }
         }
 
         for (conn, packet) in pending_sends {
-            let _ = Self::send_packet(socket, &conn, &packet).await;
+            let _ = Self::send_packet(socket, &conn, &packet, bandwidth, limiter, limit_enabled).await;
         }
     }
 
@@ -561,6 +794,9 @@ impl NetServer {
     async fn send_heartbeats(
         socket: &Arc<UdpSocket>,
         connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
+        bandwidth: &BandwidthTracker,
+        limiter: &BandwidthLimiter,
+        limit_enabled: bool,
     ) {
         let mut pending_heartbeats: Vec<(Arc<Connection>, OutgoingPacket)> = Vec::new();
 
@@ -569,13 +805,15 @@ impl NetServer {
 
             for conn in conns.values() {
                 if conn.state() == ConnectionState::Connected && conn.should_send_heartbeat() {
-                    pending_heartbeats.push((conn.clone(), conn.send_heartbeat()));
+                    if let Some(packet) = conn.send_heartbeat() {
+                        pending_heartbeats.push((conn.clone(), packet));
+                    }
                 }
             }
         }
 
         for (conn, packet) in pending_heartbeats {
-            let _ = Self::send_packet(socket, &conn, &packet).await;
+            let _ = Self::send_packet(socket, &conn, &packet, bandwidth, limiter, limit_enabled).await;
         }
     }
 
@@ -606,69 +844,110 @@ impl NetServer {
     pub fn broadcast_event(&self, event: GameEvent) {
         let event_packet = EventPacket { events: vec![event] };
         let conns = self.connections.read();
-        
+        let limit_enabled = self.config.enable_bandwidth_limit;
+
         for conn in conns.values() {
             if conn.state() == ConnectionState::Connected {
                 let packets = conn.send_event(event_packet.clone());
-                for packet in packets {
-                    let socket = self.socket.clone();
-                    let conn_clone = conn.clone();
-                    tokio::spawn(async move {
-                        let _ = Self::send_packet(&socket, &conn_clone, &packet).await;
-                    });
+                if packets.is_empty() {
+                    continue;
                 }
+                // Bug №32: one task per connection draining all its packets —
+                // never one spawned task per (conn, fragment), which floods
+                // the scheduler on mass events.
+                let socket = self.socket.clone();
+                let conn_clone = conn.clone();
+                let bandwidth = self.bandwidth_tracker.clone();
+                let limiter = self.bandwidth_limiter.clone();
+                tokio::spawn(async move {
+                    for packet in packets {
+                        let _ = Self::send_packet(&socket, &conn_clone, &packet, &bandwidth, &limiter, limit_enabled).await;
+                    }
+                });
             }
         }
     }
 
     pub fn send_command_ack(&self, connection_id: u32, command_id: u64, success: bool, error: Option<String>) {
         if let Some(conn) = self.get_connection(connection_id) {
-            let packet = conn.send_command_ack(command_id, success, error);
+            let packets = conn.send_command_ack(command_id, success, error);
+            if packets.is_empty() {
+                return;
+            }
             let socket = self.socket.clone();
             let conn_clone = conn.clone();
+            let bandwidth = self.bandwidth_tracker.clone();
+            let limiter = self.bandwidth_limiter.clone();
+            let limit_enabled = self.config.enable_bandwidth_limit;
             tokio::spawn(async move {
-                let _ = Self::send_packet(&socket, &conn_clone, &packet).await;
+                for packet in packets {
+                    let _ = Self::send_packet(&socket, &conn_clone, &packet, &bandwidth, &limiter, limit_enabled).await;
+                }
             });
         }
     }
 
     pub fn send_input_ack(&self, connection_id: u32, ack: InputAckPacket) {
         if let Some(conn) = self.get_connection(connection_id) {
-            let packet = conn.send_input_ack(ack);
+            let packets = conn.send_input_ack(ack);
+            if packets.is_empty() {
+                return;
+            }
             let socket = self.socket.clone();
             let conn_clone = conn.clone();
+            let bandwidth = self.bandwidth_tracker.clone();
+            let limiter = self.bandwidth_limiter.clone();
+            let limit_enabled = self.config.enable_bandwidth_limit;
             tokio::spawn(async move {
-                let _ = Self::send_packet(&socket, &conn_clone, &packet).await;
+                for packet in packets {
+                    let _ = Self::send_packet(&socket, &conn_clone, &packet, &bandwidth, &limiter, limit_enabled).await;
+                }
             });
         }
     }
 
-    pub fn disconnect_client(&self, connection_id: u32, reason: DisconnectReason) {
-        let conn = self.get_connection(connection_id);
-        if let Some(conn) = conn {
-            let socket = self.socket.clone();
-            let conn_clone = conn.clone();
-            
-            tokio::spawn(async move {
-                let packet = DisconnectPacket { reason };
-                let header = PacketHeader::new(
-                    PacketType::Disconnect,
-                    ChannelType::ReliableOrdered,
-                    conn_clone.next_sequence(),
-                    0, 0, 0,
-                );
-                let _ = Self::send_packet(&socket, &conn_clone, &OutgoingPacket::new(header, packet)).await;
-            });
-            
-            self.connections.write().remove(&connection_id);
-            self.connection_by_addr.write().remove(&conn.addr);
-            self.delta_compressor.remove_client(connection_id);
-            self.client_layers.write().remove(&connection_id);
-            
+    /// Disconnect a client. Returns true if this call actually removed the
+    /// connection — callers emit disconnect events only then, so running this
+    /// against an already-removed id (or racing the timeout sweep) cannot
+    /// double-report (bug №32, №80).
+    pub fn disconnect_client(&self, connection_id: u32, reason: DisconnectReason) -> bool {
+        let Some(conn) = self.get_connection(connection_id) else {
+            return false;
+        };
+        let socket = self.socket.clone();
+        let conn_clone = conn.clone();
+        let bandwidth = self.bandwidth_tracker.clone();
+        let limiter = self.bandwidth_limiter.clone();
+        let limit_enabled = self.config.enable_bandwidth_limit;
+
+        tokio::spawn(async move {
+            let packet = DisconnectPacket { reason };
+            let header = PacketHeader::new(
+                PacketType::Disconnect,
+                ChannelType::ReliableOrdered,
+                conn_clone.next_sequence(),
+                0, 0, 0,
+            );
+            if let Some(out) = OutgoingPacket::new(header, packet) {
+                let _ = Self::send_packet(&socket, &conn_clone, &out, &bandwidth, &limiter, limit_enabled).await;
+            }
+        });
+
+        if Self::remove_connection(
+            &self.connection_by_addr,
+            &self.connections,
+            &self.delta_compressor,
+            &self.client_layers,
+            connection_id,
+            conn.addr,
+        ) {
             let _ = self.event_sender.send(ServerEvent::ClientDisconnected {
                 connection_id,
                 reason,
             });
+            true
+        } else {
+            false
         }
     }
 
@@ -689,10 +968,14 @@ impl NetServer {
                 }
             }
         }
-        
+
         for id in timed_out {
-            self.disconnect_client(id, DisconnectReason::Timeout);
-            let _ = self.event_sender.send(ServerEvent::ClientTimeout { connection_id: id });
+            // Bug №80: emit ClientTimeout only if we actually removed the
+            // connection — the sweep loop or a manual disconnect may have
+            // raced us, and double-emission breaks the №32 uniqueness contract.
+            if self.disconnect_client(id, DisconnectReason::Timeout) {
+                let _ = self.event_sender.send(ServerEvent::ClientTimeout { connection_id: id });
+            }
         }
     }
 

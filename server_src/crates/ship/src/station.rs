@@ -95,10 +95,13 @@ impl Station {
             local_transform: template.local_transform,
             max_ammo: template.max_ammo,
             default_ammo_type: template.default_ammo_type,
-            reload_time: template.cooldown,
+            // Bug №56: honor the declared ranges verbatim — the old code
+            // mirrored them off the upper bound, throwing away an asymmetric
+            // sector's lower edge (yaw_range.0 was ignored).
+            reload_time: template.cooldown.max(0.1),
             max_health: template.max_health,
-            yaw_range: (-template.yaw_range.1, template.yaw_range.1),
-            pitch_range: (-template.pitch_range.1, template.pitch_range.1),
+            yaw_range: template.yaw_range,
+            pitch_range: template.pitch_range,
             turn_speed: 2.0,
             fire_rate: 1.0 / template.cooldown.max(0.1),
         };
@@ -132,24 +135,30 @@ impl Station {
     }
 
     pub fn update(&self, dt: f32, state: &mut StationState, compartment_state: Option<&crate::compartment::CompartmentState>) {
-        if !state.is_operational || state.health <= 0.0 {
+        if state.health <= 0.0 {
             return;
         }
 
-        if let Some(comp) = compartment_state {
-            if comp.is_flooded() || comp.fire_intensity > 0.5 {
-                state.is_operational = false;
-                return;
-            }
+        // Bug №56: operational-ness is re-derived from the compartment every
+        // tick — no latch. Pump the water out / quench the fire and the
+        // station comes back by itself.
+        let compartment_dead = compartment_state
+            .map_or(false, |c| c.is_flooded() || c.fire_intensity > 0.5);
+        state.is_operational = !compartment_dead;
+        if !state.is_operational {
+            return;
         }
 
         state.cooldown = (state.cooldown - dt).max(0.0);
 
         let yaw_diff = state.target_yaw - state.yaw;
         let pitch_diff = state.target_pitch - state.pitch;
-        
-        state.yaw += yaw_diff.signum() * self.config.turn_speed * dt;
-        state.pitch += pitch_diff.signum() * self.config.turn_speed * dt;
+
+        // Bug №56: step capped at |diff| — the old `signum() * turn_speed`
+        // overshot through the target and jittered forever.
+        let max_step = self.config.turn_speed * dt;
+        state.yaw += yaw_diff.clamp(-max_step, max_step);
+        state.pitch += pitch_diff.clamp(-max_step, max_step);
         
         state.yaw = state.yaw.clamp(self.config.yaw_range.0, self.config.yaw_range.1);
         state.pitch = state.pitch.clamp(self.config.pitch_range.0, self.config.pitch_range.1);
@@ -249,7 +258,12 @@ impl Station {
     }
 
     pub fn reload(&self, state: &mut StationState, ammo_type: u8) {
-        if state.reload_progress >= 1.0 && state.ammo_count < state.max_ammo {
+        // Bug №84: finishing one reload cycle actually loads a shell. The old
+        // code reset the progress and swapped ammo_type but never touched
+        // ammo_count, so a fired gun stayed empty forever (progress reset
+        // endlessly with ammo_count < max_ammo never becoming false).
+        if state.ammo_count < state.max_ammo && state.reload_progress >= 1.0 {
+            state.ammo_count += 1;
             state.ammo_type = ammo_type;
             state.reload_progress = 0.0;
         }

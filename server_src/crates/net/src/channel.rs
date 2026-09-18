@@ -3,6 +3,8 @@ use std::collections::{HashMap, VecDeque};
 
 pub use rfs_core::packet::ChannelType;
 
+use super::connection::seq_is_newer;
+
 #[derive(Debug, Clone)]
 pub struct ChannelConfig {
     pub channel_type: ChannelType,
@@ -129,20 +131,22 @@ impl Channel {
     pub fn handle_ack(&self, ack: u32, ack_bitfield: u32) {
         let mut queue = self.send_queue.lock();
         let mut pending = self.pending_acks.lock();
-        let mut bitfield = self.ack_bitfield.lock();
-        
-        *bitfield = ack_bitfield;
-        
-        while let Some(&front_seq) = pending.front() {
-            if front_seq <= ack || (ack_bitfield & (1 << (front_seq.wrapping_sub(ack) & 31))) != 0 {
-                if let Some(idx) = queue.iter().position(|p| p.sequence == front_seq) {
+
+        *self.ack_bitfield.lock() = ack_bitfield;
+
+        // Bug №15: the old loop stopped at the first unacked entry, so one
+        // lost packet pinned the whole send queue. SACK entries clear
+        // individually now, with wrap-aware sequence comparison.
+        pending.retain(|front_seq| {
+            let acked = !seq_is_newer(*front_seq, ack)
+                || (ack_bitfield & (1 << (front_seq.wrapping_sub(ack) & 31))) != 0;
+            if acked {
+                if let Some(idx) = queue.iter().position(|p| p.sequence == *front_seq) {
                     queue[idx].acked = true;
                 }
-                pending.pop_front();
-            } else {
-                break;
             }
-        }
+            !acked
+        });
 
         queue.retain(|p| !p.acked);
     }
@@ -153,47 +157,71 @@ impl Channel {
         let mut pending = self.pending_acks.lock();
         let mut stats = self.stats.lock();
 
-        if sequence <= *remote_seq {
+        // Bug №16: wrap-aware staleness check (`<=` died at the u32 wrap).
+        if !seq_is_newer(sequence, *remote_seq) {
             return Ok(None);
         }
 
-        *remote_seq = sequence;
         stats.packets_received += 1;
         stats.bytes_received += data.len() as u64;
 
         match self.config.channel_type {
             ChannelType::Unreliable => {
+                *remote_seq = sequence;
                 Ok(Some(data))
             }
             ChannelType::UnreliableSequenced => {
-                if sequence == *remote_seq {
+                // Old code assigned remote_seq BEFORE comparing, so the
+                // equality check below was always true and the loss counter
+                // dead. Compare against the previous value instead.
+                let prev = *remote_seq;
+                if seq_is_newer(sequence, prev) {
+                    stats.packets_lost += sequence.wrapping_sub(prev).saturating_sub(1) as u64;
+                    *remote_seq = sequence;
                     Ok(Some(data))
                 } else {
-                    stats.packets_lost += (sequence - *remote_seq - 1) as u64;
                     Ok(None)
                 }
             }
             ChannelType::ReliableUnordered => {
+                if buffer.len() >= self.config.receive_buffer_size.max(1) {
+                    return Err(ChannelError::ReceiveBufferFull);
+                }
                 buffer.insert(sequence, ReceivedPacket { sequence, data: data.clone() });
-                pending.push_back(sequence);
+                if !pending.contains(&sequence) {
+                    pending.push_back(sequence);
+                }
+                *remote_seq = sequence;
                 Ok(Some(data))
             }
             ChannelType::ReliableOrdered => {
+                if buffer.len() >= self.config.receive_buffer_size.max(1) {
+                    return Err(ChannelError::ReceiveBufferFull);
+                }
                 buffer.insert(sequence, ReceivedPacket { sequence, data: data.clone() });
-                pending.push_back(sequence);
-                
+                if !pending.contains(&sequence) {
+                    pending.push_back(sequence);
+                }
+
+                // Drain in order starting AFTER the last delivered sequence —
+                // the old code started after the just-received one, so the
+                // current packet sat in the buffer forever and gaps never
+                // closed (remote_seq jumped over them on entry).
                 let mut output = Vec::new();
                 let mut expected = *remote_seq;
-                
+
                 loop {
-                    expected = expected.wrapping_add(1);
-                    if let Some(packet) = buffer.remove(&expected) {
+                    let next = expected.wrapping_add(1);
+                    if let Some(packet) = buffer.remove(&next) {
                         output.push(packet.data);
+                        expected = next;
                     } else {
                         break;
                     }
                 }
-                
+
+                *remote_seq = expected;
+
                 if output.is_empty() {
                     Ok(None)
                 } else if output.len() == 1 {
@@ -211,17 +239,13 @@ impl Channel {
 
     pub fn get_ack_info(&self) -> (u32, u32) {
         let remote_seq = *self.remote_sequence.lock();
-        let bitfield = *self.ack_bitfield.lock();
-        
+
         let mut pending = self.pending_acks.lock();
-        while let Some(&front) = pending.front() {
-            if front <= remote_seq || (bitfield & (1 << (front.wrapping_sub(remote_seq) & 31))) != 0 {
-                pending.pop_front();
-            } else {
-                break;
-            }
-        }
-        
+        // Bug №15: same HOL/wrap problem as handle_ack — drop everything
+        // that is not newer than the cumulative ack, then rebuild the
+        // bitfield from what remains.
+        pending.retain(|seq| seq_is_newer(*seq, remote_seq));
+
         let mut new_bitfield = 0u32;
         for &seq in pending.iter() {
             let diff = seq.wrapping_sub(remote_seq);
@@ -229,7 +253,7 @@ impl Channel {
                 new_bitfield |= 1 << diff;
             }
         }
-        
+
         *self.ack_bitfield.lock() = new_bitfield;
         (remote_seq, new_bitfield)
     }

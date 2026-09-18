@@ -108,8 +108,26 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
             }
         }
 
+        // Bug №62: MAX_ENTITIES_PER_CELL was never enforced — the SmallVec
+        // grew on the heap without limit. Overflow parks in a spare
+        // neighbouring cell; queries still filter by true position/bounds,
+        // so the spill is invisible to them.
+        let cell = self.spill_cell(cell);
         self.entity_cells.insert(id, cell);
         self.cells.entry(cell).or_default().push(entity);
+    }
+
+    /// Pick the closest cell with room left for `MAX_ENTITIES_PER_CELL`.
+    fn spill_cell(&self, cell: CellCoord) -> CellCoord {
+        if self.cells.get(&cell).map_or(0, |v| v.len()) < MAX_ENTITIES_PER_CELL {
+            return cell;
+        }
+        for candidate in cell.neighbors() {
+            if self.cells.get(&candidate).map_or(0, |v| v.len()) < MAX_ENTITIES_PER_CELL {
+                return candidate;
+            }
+        }
+        cell
     }
 
     pub fn remove(&mut self, id: EntityId) -> Option<T> {
@@ -127,18 +145,48 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
         None
     }
 
-    pub fn update_position(&mut self, id: EntityId, _new_pos: Vec3f) -> bool {
-        if let Some(entity) = self.remove(id) {
-            self.insert(entity);
-            true
-        } else {
-            false
+    pub fn update_position(&mut self, id: EntityId, new_pos: Vec3f) -> bool {
+        // Bug №62: new_pos was ignored — the entity was removed and
+        // re-inserted from its STORED (stale) position, so it could never
+        // change cell. The supplied position now drives the relocation.
+        if !new_pos.x.is_finite() || !new_pos.y.is_finite() || !new_pos.z.is_finite() {
+            return false;
         }
+        let Some(&old_cell) = self.entity_cells.get(&id) else {
+            return false;
+        };
+        let new_cell = CellCoord::from_position(new_pos);
+        if old_cell == new_cell {
+            return true;
+        }
+
+        let entity = {
+            let Some(ents) = self.cells.get_mut(&old_cell) else {
+                return false;
+            };
+            let Some(idx) = ents.iter().position(|e| e.entity_id() == id) else {
+                return false;
+            };
+            let e = ents.swap_remove(idx);
+            if ents.is_empty() {
+                self.cells.remove(&old_cell);
+            }
+            e
+        };
+
+        let new_cell = self.spill_cell(new_cell);
+        self.entity_cells.insert(id, new_cell);
+        self.cells.entry(new_cell).or_default().push(entity);
+        true
     }
 
     pub fn query_radius(&self, center: Vec3f, radius: f32) -> SmallVec<[&T; 32]> {
         let mut result = SmallVec::new();
-        if !radius.is_finite() || radius < 0.0 {
+        // Bug №62: a non-finite center used to collapse into cell (0,0,0)
+        // and walk nonsense ranges.
+        if !radius.is_finite() || radius < 0.0
+            || !center.x.is_finite() || !center.y.is_finite() || !center.z.is_finite()
+        {
             return result;
         }
         let min_cell = CellCoord::from_position(center - Vec3f::new(radius, radius, radius));
@@ -184,6 +232,12 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
 
     pub fn query_bounds(&self, bounds: &Bounds) -> SmallVec<[&T; 32]> {
         let mut result = SmallVec::new();
+        // Bug №62: NaN bounds collapse to cell (0,0,0) and scan everything.
+        if !bounds.min.x.is_finite() || !bounds.min.y.is_finite() || !bounds.min.z.is_finite()
+            || !bounds.max.x.is_finite() || !bounds.max.y.is_finite() || !bounds.max.z.is_finite()
+        {
+            return result;
+        }
         let min_cell = CellCoord::from_position(bounds.min);
         let max_cell = CellCoord::from_position(bounds.max);
         

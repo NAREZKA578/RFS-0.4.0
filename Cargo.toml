@@ -1,0 +1,62 @@
+[package]
+name = "rfs-client"
+version = "0.1.0"
+edition = "2021"
+authors = ["RFS Team"]
+description = "Client-side rendering for RFS naval combat game"
+license = "Proprietary"
+
+[dependencies]
+# RHI - our own rendering abstraction
+rhi = { path = "src/rhi" }
+
+# Math
+glam = "0.26"
+
+# Windowing (for testing)
+# winit = "0.29"
+# raw-window-handle = "0.5"
+
+# Image loading (for texture loading)
+# image = "0.24"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+# tracing = "0.1"
+# tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Random
+rand = "0.8"
+
+[profile.dev]
+opt-level = 1
+debug = true
+debug-assertions = true
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+debug-assertions = true
+
+[workspace]
+members = [
+    "src/rhi",
+    ".",
+]
+
+[workspace.dependencies]
+# RHI dependencies
+rhi = { path = "src/rhi" }

@@ -191,6 +191,14 @@ impl InterestManager {
             interests.get(&player_id).cloned().unwrap_or_default()
         };
 
+        // Bug №19: only write back into player_interests for ids that are
+        // actually tracked. Unknown/spoofed ids otherwise pollute the map
+        // and drive query traffic around the ZERO origin forever.
+        let known = {
+            let interests = self.player_interests.read();
+            interests.contains_key(&player_id)
+        };
+
         let ship_id = interest.ship_id;
         let position = interest.position;
 
@@ -253,8 +261,10 @@ impl InterestManager {
         }
 
         interest.last_update = std::time::Instant::now();
-        
-        self.player_interests.write().insert(player_id, interest.clone());
+
+        if known {
+            self.player_interests.write().insert(player_id, interest.clone());
+        }
         interest
     }
 

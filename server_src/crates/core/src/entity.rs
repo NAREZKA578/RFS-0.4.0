@@ -70,6 +70,9 @@ pub struct CompartmentEntity {
     pub is_sealed: bool,
     pub is_breached: bool,
     pub fire_intensity: f32,
+    /// Bug №61: pump activity is replicated health for the client; it was
+    /// only ever a server-side flag.
+    pub pump_active: bool,
     pub connected_compartments: SmallVec<[EntityId; 4]>,
     pub stations: SmallVec<[EntityId; 8]>,
     pub pump_capacity: f32,

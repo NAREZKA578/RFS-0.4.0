@@ -1,7 +1,7 @@
 use crate::graph::{DamageGraph, CompartmentNode};
 use rfs_core::entity::EntityId;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubstanceType {
@@ -39,6 +39,11 @@ impl Default for PropagationConfig {
 pub struct PropagationSystem {
     config: PropagationConfig,
     event_queue: VecDeque<PropagationEvent>,
+    // Bug №64: Flooded/Critical were pushed every tick regardless of any
+    // change. These track the last emitted state so events only fire on
+    // transitions (edge-triggered).
+    flooded_known: HashMap<EntityId, bool>,
+    critical_known: HashMap<EntityId, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +75,8 @@ impl PropagationSystem {
         Self {
             config,
             event_queue: VecDeque::new(),
+            flooded_known: HashMap::new(),
+            critical_known: HashMap::new(),
         }
     }
 
@@ -86,30 +93,40 @@ impl PropagationSystem {
     }
 
     fn propagate_water(&self, graph: &mut DamageGraph, dt: f32, events: &mut Vec<PropagationEvent>) {
-        let compartments: Vec<(EntityId, CompartmentNode)> = graph
+        // Bug №63: intake used to run inside the up-to-10 iteration loop
+        // against flags captured ONCE into a stale snapshot — every breached
+        // compartment flooded up to x10 per tick. It runs exactly once now.
+        let breached: Vec<EntityId> = graph
             .iter_nodes()
-            .map(|(id, node)| (id, node.clone()))
+            .filter(|(_, c)| c.is_breached && !c.is_sealed)
+            .map(|(id, _)| id)
             .collect();
-        
-        for _ in 0..self.config.max_iterations_per_tick {
-            let mut any_flow = false;
-            
-            for (comp_id, comp) in &compartments {
-                if comp.is_breached && !comp.is_sealed {
-                    let intake = self.config.water_flow_rate * dt;
-                    let added = graph.add_water(*comp_id, intake);
-                    if added > 0.0 {
-                        events.push(PropagationEvent {
-                            event_type: PropagationEventType::WaterIntake,
-                            source: *comp_id,
-                            target: None,
-                            amount: added,
-                            substance: SubstanceType::Water,
-                        });
-                    }
-                }
+
+        for comp_id in breached {
+            let intake = self.config.water_flow_rate * dt;
+            let added = graph.add_water(comp_id, intake);
+            if added > 0.0 {
+                events.push(PropagationEvent {
+                    event_type: PropagationEventType::WaterIntake,
+                    source: comp_id,
+                    target: None,
+                    amount: added,
+                    substance: SubstanceType::Water,
+                });
             }
-            
+        }
+
+        for _ in 0..self.config.max_iterations_per_tick {
+            // Bug №63: one clone was reused for all iterations, so water
+            // already moved this tick was "moved" again. A fresh snapshot per
+            // iteration keeps the iteration count meaningful.
+            let compartments: Vec<(EntityId, CompartmentNode)> = graph
+                .iter_nodes()
+                .map(|(id, node)| (id, node.clone()))
+                .collect();
+
+            let mut any_flow = false;
+
             for (comp_id, comp) in &compartments {
                 if comp.current_level <= 0.0 {
                     continue;
@@ -118,44 +135,62 @@ impl PropagationSystem {
                 let connected = graph.get_connected_compartments(*comp_id);
 
                 for target_id in connected {
-                    if let Some(bulkhead_id) = graph.get_bulkhead_between(*comp_id, target_id) {
-                        let bulkhead_passable = graph
-                            .get_bulkhead(bulkhead_id)
-                            .map(|b| b.is_passable())
-                            .unwrap_or(false);
+                    let Some(bulkhead_id) = graph.get_bulkhead_between(*comp_id, target_id) else {
+                        continue;
+                    };
+                    let Some(bulkhead) = graph.get_bulkhead(bulkhead_id) else {
+                        continue;
+                    };
+                    if !bulkhead.is_passable() {
+                        continue;
+                    }
+                    let Some(source) = graph.get_compartment(*comp_id) else {
+                        continue;
+                    };
+                    let Some(target) = graph.get_compartment(target_id) else {
+                        continue;
+                    };
 
-                        if bulkhead_passable {
-                            let target_fill = graph
-                                .get_compartment(target_id)
-                                .map(|target| target.fill_ratio())
-                                .unwrap_or(0.0);
+                    let pressure_diff = source.fill_ratio() - target.fill_ratio();
+                    if pressure_diff <= 0.01 {
+                        continue;
+                    }
 
-                            let pressure_diff = comp.fill_ratio() - target_fill;
+                    // Bug №63: overflow past the sink's capacity used to be
+                    // silently dropped — water vanished. Cap by the room.
+                    let room = (target.max_capacity - target.current_level).max(0.0);
+                    if room <= 0.0 {
+                        continue;
+                    }
 
-                            if pressure_diff > 0.01 {
-                                let flow = pressure_diff * self.config.water_equalization_rate * dt * 100.0;
-                                let actual_flow = flow.min(comp.current_level);
+                    // Bug №63: the hidden *100 was never documented and the
+                    // bulkhead resistance was never consulted. Now the
+                    // resistance slows the flow towards the sink.
+                    let resistance = bulkhead.effective_resistance().max(0.05);
+                    let flow = pressure_diff
+                        * self.config.water_equalization_rate
+                        * dt
+                        * 100.0
+                        / resistance;
+                    let actual_flow = flow.min(source.current_level).min(room);
 
-                                if actual_flow > 0.0 {
-                                    graph.pump_water(*comp_id, actual_flow);
-                                    graph.add_water(target_id, actual_flow);
+                    if actual_flow > 0.0 {
+                        graph.pump_water(*comp_id, actual_flow);
+                        graph.add_water(target_id, actual_flow);
 
-                                    events.push(PropagationEvent {
-                                        event_type: PropagationEventType::WaterFlow,
-                                        source: *comp_id,
-                                        target: Some(target_id),
-                                        amount: actual_flow,
-                                        substance: SubstanceType::Water,
-                                    });
+                        events.push(PropagationEvent {
+                            event_type: PropagationEventType::WaterFlow,
+                            source: *comp_id,
+                            target: Some(target_id),
+                            amount: actual_flow,
+                            substance: SubstanceType::Water,
+                        });
 
-                                    any_flow = true;
-                                }
-                            }
-                        }
+                        any_flow = true;
                     }
                 }
             }
-            
+
             if !any_flow {
                 break;
             }
@@ -200,28 +235,33 @@ impl PropagationSystem {
                         .unwrap_or(false);
 
                     if bulkhead_passable {
-                        let target_intensity = graph
-                            .get_compartment(target_id)
-                            .map(|target| target.fire_intensity)
-                            .unwrap_or(1.0);
+                        // Bug №64: a MISSING compartment used to default to
+                        // fire_intensity 1.0 and silently block the spread.
+                        let Some(target) = graph.get_compartment(target_id) else {
+                            continue;
+                        };
+                        if target.fire_intensity >= self.config.fire_spread_threshold {
+                            continue;
+                        }
 
-                        if target_intensity < self.config.fire_spread_threshold {
-                            let spread_chance = comp.fire_intensity * self.config.fire_spread_rate * dt;
+                        // Bug №64: growth was gated by fastrand — replays and
+                        // the authoritative tick became nondeterministic. A
+                        // deterministic amount is added per tick instead.
+                        let growth = comp.fire_intensity * self.config.fire_spread_rate * dt;
+                        if growth <= 0.0 {
+                            continue;
+                        }
+                        let new_intensity = (target.fire_intensity + growth).min(1.0);
+                        if let Some(node) = graph.get_compartment_mut(target_id) {
+                            node.fire_intensity = new_intensity;
 
-                            if fastrand::f32() < spread_chance {
-                                let new_intensity = (target_intensity + 0.1).min(1.0);
-                                if let Some(node) = graph.get_compartment_mut(target_id) {
-                                    node.fire_intensity = new_intensity;
-
-                                    events.push(PropagationEvent {
-                                        event_type: PropagationEventType::FireSpread,
-                                        source: *comp_id,
-                                        target: Some(target_id),
-                                        amount: new_intensity,
-                                        substance: SubstanceType::Fire,
-                                    });
-                                }
-                            }
+                            events.push(PropagationEvent {
+                                event_type: PropagationEventType::FireSpread,
+                                source: *comp_id,
+                                target: Some(target_id),
+                                amount: new_intensity,
+                                substance: SubstanceType::Fire,
+                            });
                         }
                     }
                 }
@@ -253,9 +293,12 @@ impl PropagationSystem {
         }
     }
 
-    fn check_critical_states(&self, graph: &DamageGraph, events: &mut Vec<PropagationEvent>) {
+    fn check_critical_states(&mut self, graph: &DamageGraph, events: &mut Vec<PropagationEvent>) {
+        // Bug №64: Flooded/Critical were emitted every tick — event flood.
+        // Compare with the last reported state; only fire on transitions.
         for (comp_id, comp) in graph.iter_nodes() {
-            if comp.is_flooded() {
+            let flooded = comp.is_flooded();
+            if flooded && !self.flooded_known.get(&comp_id).copied().unwrap_or(false) {
                 events.push(PropagationEvent {
                     event_type: PropagationEventType::CompartmentFlooded,
                     source: comp_id,
@@ -263,7 +306,11 @@ impl PropagationSystem {
                     amount: comp.fill_ratio(),
                     substance: SubstanceType::Water,
                 });
-            } else if comp.is_critical() {
+            }
+            self.flooded_known.insert(comp_id, flooded);
+
+            let critical = comp.is_critical();
+            if critical && !flooded && !self.critical_known.get(&comp_id).copied().unwrap_or(false) {
                 events.push(PropagationEvent {
                     event_type: PropagationEventType::CompartmentCritical,
                     source: comp_id,
@@ -272,6 +319,7 @@ impl PropagationSystem {
                     substance: SubstanceType::Water,
                 });
             }
+            self.critical_known.insert(comp_id, critical);
         }
     }
 
@@ -462,7 +510,12 @@ impl FloodingSimulator {
     pub fn is_ship_lost(&self) -> bool {
         let total_capacity: f32 = self.graph.all_compartments().iter().map(|c| c.max_capacity).sum();
         let total_water: f32 = self.graph.all_compartments().iter().map(|c| c.current_level).sum();
-        
+
+        // Bug №83: 0/0 = NaN never compares > 0.7 — an empty graph meant the
+        // ship could never be counted as lost.
+        if total_capacity <= 0.0 {
+            return false;
+        }
         total_water / total_capacity > 0.7
     }
 }

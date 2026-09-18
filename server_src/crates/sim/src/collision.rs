@@ -502,8 +502,13 @@ impl CollisionSystem {
             let inv_mass_b = if b.is_static { 0.0 } else { 1.0 / b.mass };
             
             let mut impulse_mag = -(1.0 + restitution) * vel_along_normal;
-            impulse_mag /= inv_mass_a + inv_mass_b;
-            
+            // Bug №88: two static bodies give 0/0 = inf. Guard the divisor
+            // so the impulse set stays finite.
+            let inv_mass_sum = inv_mass_a + inv_mass_b;
+            if inv_mass_sum > 0.0 {
+                impulse_mag /= inv_mass_sum;
+            }
+
             let max_impulse = penetration * 1000.0;
             impulse_mag = impulse_mag.clamp(-max_impulse, max_impulse);
             
@@ -579,20 +584,28 @@ impl CollisionSystem {
     }
 
     fn raycast_box(&self, origin: Vec3f, dir: Vec3f, half: Vec3f) -> Option<(f32, Vec3f)> {
-        let inv_dir = Vec3f::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
-        let t1 = (-half - origin) * inv_dir;
-        let t2 = (half - origin) * inv_dir;
-        
-        let tmin = Vec3f::new(t1.x.min(t2.x), t1.y.min(t2.y), t1.z.min(t2.z));
-        let tmax = Vec3f::new(t1.x.max(t2.x), t1.y.max(t2.y), t1.z.max(t2.z));
-        
-        let enter = tmin.x.max(tmin.y).max(tmin.z);
-        let exit = tmax.x.min(tmax.y).min(tmax.z);
-        
+        // Bug №46: a zero direction component used to produce 1.0/0.0 = inf,
+        // and 0*inf = NaN when the origin lay exactly on a face plane, so the
+        // hit was silently dropped. Robust slab method below skips the axis
+        // when the ray is parallel to it (accepting it iff origin is inside).
+        let mut enter = f32::NEG_INFINITY;
+        let mut exit = f32::INFINITY;
+        for (d, lo, o, hi) in [(dir.x, -half.x, origin.x, half.x), (dir.y, -half.y, origin.y, half.y), (dir.z, -half.z, origin.z, half.z)] {
+            if d.abs() > f32::EPSILON {
+                let inv = 1.0 / d;
+                let t1 = (lo - o) * inv;
+                let t2 = (hi - o) * inv;
+                enter = enter.max(t1.min(t2));
+                exit = exit.min(t1.max(t2));
+            } else if o < lo || o > hi {
+                return None;
+            }
+        }
+
         if exit < 0.0 || enter > exit {
             return None;
         }
-        
+
         let dist = enter.max(0.0);
         let hit_point = origin + dir * dist;
         

@@ -9,6 +9,10 @@ pub const MAX_PACKET_SIZE: usize = 1400;
 pub const HEADER_SIZE: usize = 24;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// Bug №60: bincode 1.3 codes this enum POSITIONALLY on the wire — the
+// explicit `= N` discriminants are for `from_u8` only and DO NOT stabilize
+// the marker channel. Keep declaration order stable (pinned by
+// Tool/harness/tests/protocol.rs); a reorder requires a PROTOCOL_VERSION bump.
 pub enum PacketType {
     Connect = 0x01,
     ConnectAccept = 0x02,
@@ -309,6 +313,9 @@ pub struct CompartmentState {
     pub is_sealed: bool,
     pub is_breached: bool,
     pub fire_intensity: f32,
+    /// Bug №61: pump activity used to be dropped on the wire, so the client
+    /// could never show whether a pump is running.
+    pub pump_active: bool,
     pub connected_compartments: SmallVec<[EntityId; 4]>,
 }
 
@@ -320,6 +327,14 @@ pub struct StationStateData {
     pub pitch: f32,
     pub reload_progress: f32,
     pub ammo_type: u8,
+    /// Bug №61: the full station suite — the client had no access to
+    /// ammunition, health or cooldown before.
+    pub ammo_count: u32,
+    pub max_ammo: u32,
+    pub health: f32,
+    pub max_health: f32,
+    pub cooldown: f32,
+    pub max_cooldown: f32,
     pub is_operational: bool,
 }
 
@@ -388,6 +403,11 @@ pub struct StateDeltaPacket {
     pub base_tick: u32,
     pub server_tick: u32,
     pub server_time: f64,
+    /// Bug №23/№78: true when the server diffed against an empty base, so this
+    /// delta is a complete replacement for the layer. The client applies it
+    /// even when its base tick does not match (healing lost deltas) and prunes
+    /// everything it previously held for this layer as a full replace.
+    pub is_resync: bool,
     pub created: Vec<EntityState>,
     pub updated: Vec<EntityStateUpdate>,
     pub destroyed: Vec<EntityId>,
@@ -399,9 +419,11 @@ pub struct StateDeltaPacket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectileStateUpdate {
     pub entity_id: EntityId,
-    pub position: Vec3f,
-    pub velocity: Vec3f,
-    pub lifetime: f32,
+    /// Bug №24: Options preserve "unchanged" — the old non-Option fields
+    /// zeroed position/velocity/lifetime on every partial update.
+    pub position: Option<Vec3f>,
+    pub velocity: Option<Vec3f>,
+    pub lifetime: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -571,7 +593,9 @@ pub struct RpcResponsePacket {
 pub fn serialize_packet<T: Serializable>(packet: &T, header: PacketHeader) -> Result<Vec<u8>, bincode::Error> {
     let payload = bincode::serialize(packet)?;
     let mut header = header;
-    header.payload_size = payload.len() as u16;
+    // Bug №9: `as u16` truncation used to let a lying header reach the wire.
+    header.payload_size = u16::try_from(payload.len())
+        .map_err(|_| bincode::Error::new(bincode::ErrorKind::SizeLimit))?;
     let mut buffer = Vec::with_capacity(HEADER_SIZE + payload.len());
     buffer.extend_from_slice(&bincode::serialize(&header)?);
     buffer.extend_from_slice(&payload);

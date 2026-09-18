@@ -1,8 +1,7 @@
 use rfs_core::entity::{ShipClass, CompartmentTemplate, StationTemplate, StationType, EntityId};
 use rfs_core::math::{Vec3f, Transform, Quatf, Bounds as CoreBounds};
-use rfs_core::time::FIXED_DT;
 use crate::station::{FireResult, Station, StationState};
-use crate::compartment::{Compartment, CompartmentState};
+use crate::compartment::{Compartment, CompartmentState, WaterTransfer};
 use rfs_damage::damage::{CompartmentHit, DamageSystem, DamageTarget};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -67,6 +66,9 @@ pub struct ShipState {
     pub station_states: HashMap<EntityId, StationState>,
     pub is_sinking: bool,
     pub sink_timer: f32,
+    /// Bug №57: one-shot "the ship went under" flag — it lets the sim remove
+    /// the ship instead of sinking forever.
+    pub has_sunk: bool,
 }
 
 impl Default for ShipState {
@@ -85,6 +87,7 @@ impl Default for ShipState {
             station_states: HashMap::new(),
             is_sinking: false,
             sink_timer: 0.0,
+            has_sunk: false,
         }
     }
 }
@@ -115,7 +118,41 @@ impl Ship {
         
         ship.initialize_compartments();
         ship.initialize_stations();
-        
+
+        // Bug №65: the production DamageSystem graph must know the real
+        // topology, otherwise water has no edges to flow through — lazily
+        // created nodes would have arrived with no bulkheads at all.
+        {
+            let nodes: Vec<(EntityId, String, f32, f32)> = ship
+                .compartments
+                .iter()
+                .map(|(id, comp)| {
+                    let cfg = comp.config();
+                    (*id, cfg.name.clone(), cfg.max_water_level, cfg.pump_capacity)
+                })
+                .collect();
+            let edges: Vec<(EntityId, EntityId, EntityId, f32)> = ship
+                .compartments
+                .values()
+                .flat_map(|comp| {
+                    let cfg = comp.config();
+                    cfg.bulkheads
+                        .iter()
+                        .filter(|b| !b.connects_to.is_nil())
+                        .map(|b| {
+                            (
+                                b.entity_id,
+                                comp.entity_id(),
+                                b.connects_to,
+                                b.seal_strength,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            ship.damage_system.register_topology(&nodes, &edges);
+        }
+
         ship
     }
 
@@ -293,7 +330,7 @@ impl Ship {
         self.update_physics(dt, state);
         self.update_compartments(dt, state);
         self.update_stations(dt, state);
-        self.check_sinking(state);
+        self.check_sinking(dt, state);
     }
 
     fn update_physics(&self, dt: f32, state: &mut ShipState) {
@@ -304,11 +341,15 @@ impl Ship {
         let rudder = state.rudder_angle.clamp(-turn_limit, turn_limit);
         
         let forward = state.transform.rotation.mul_vec3(Vec3f::FORWARD);
+
+        // Bug №57: unvalidated JSON mass (0 / negative / NaN) used to divide
+        // into inf/NaN. Clamp to a floor so dynamics always stay finite.
+        let mass = self.config.mass.max(0.0001);
         
-        let thrust_force = throttle * self.config.acceleration * self.config.mass;
+        let thrust_force = throttle * self.config.acceleration * mass;
         let drag_force = -state.velocity.length() * state.velocity * 0.1;
         
-        let acceleration = (forward * thrust_force + drag_force) / self.config.mass;
+        let acceleration = (forward * thrust_force + drag_force) / mass;
         state.velocity += acceleration * dt;
         state.transform.position += state.velocity * dt;
         
@@ -325,10 +366,48 @@ impl Ship {
     }
 
     fn update_compartments(&self, dt: f32, state: &mut ShipState) {
-        let compartment_states = state.compartment_states.clone();
-        for (comp_id, compartment) in &self.compartments {
-            if let Some(comp_state) = state.compartment_states.get_mut(comp_id) {
-                compartment.update(dt, comp_state, &compartment_states);
+        // Phase 1: per-compartment intake / pump outflow / fire decay.
+        for comp in self.compartments.values() {
+            if let Some(comp_state) = state.compartment_states.get_mut(&comp.entity_id()) {
+                comp.update(dt, comp_state);
+            }
+        }
+
+        // Bug №90: phase 2 collects all transfers/spreads first, then applies
+        // them to the real map. The old code passed a read-only CLONE to the
+        // neighbours and subtracted from it — the receiver never gained the
+        // water, so total_water_volume shrank every tick (x2 with two flooded
+        // neighbours). Fire spread was computed and then discarded.
+        let mut water_transfers: Vec<WaterTransfer> = Vec::new();
+        let mut fire_spreads: Vec<(EntityId, f32)> = Vec::new();
+        for comp in self.compartments.values() {
+            let comp_id = comp.entity_id();
+            if let Some(cs) = state.compartment_states.get(&comp_id) {
+                water_transfers.extend(comp.compute_water_spread(cs, &state.compartment_states, dt));
+                fire_spreads.extend(comp.fire_spread(cs, &state.compartment_states, dt));
+            }
+        }
+
+        for transfer in water_transfers {
+            let from = transfer.from;
+            let to = transfer.to;
+            let amount = transfer.amount;
+            let Some(src) = state.compartment_states.get_mut(&from) else {
+                continue;
+            };
+            if amount <= 0.0 || src.water_level <= 0.0 {
+                continue;
+            }
+            let moved = amount.min(src.water_level);
+            src.water_level -= moved;
+            if let Some(dst) = state.compartment_states.get_mut(&to) {
+                dst.water_level = (dst.water_level + moved).min(dst.max_water_level);
+            }
+        }
+
+        for (id, amount) in fire_spreads {
+            if let Some(cs) = state.compartment_states.get_mut(&id) {
+                cs.fire_intensity = (cs.fire_intensity + amount).min(1.0);
             }
         }
     }
@@ -342,17 +421,23 @@ impl Ship {
         }
     }
 
-    fn check_sinking(&self, state: &mut ShipState) {
+    fn check_sinking(&self, dt: f32, state: &mut ShipState) {
         if state.health <= 0.0 && !state.is_sinking {
             state.is_sinking = true;
             state.sink_timer = 30.0;
         }
         
         if state.is_sinking {
-            state.sink_timer -= FIXED_DT;
-            state.transform.position.y -= 0.1 * FIXED_DT;
+            // Bug №57: use the real dt — the old FIXED_DT timer lied the
+            // moment the tick rate changed.
+            state.sink_timer -= dt;
+            state.transform.position.y -= 0.1 * dt;
             
+            // Bug №57: the old body was an empty `if` — the sink never
+            // finished and the ship was never removed. Flag it for the sim
+            // to despawn.
             if state.sink_timer <= 0.0 {
+                state.has_sunk = true;
             }
         }
     }
@@ -401,8 +486,10 @@ impl Ship {
         if !station.can_occupy(station_state) {
             return false;
         }
+        // Bug №58: occupancy must NOT resurrect a station's operational flag
+        // (can_occupy already guarantees it is operational). The old
+        // unconditional `is_operational = true` undid damage-based deactivation.
         station_state.occupant = Some(player_id);
-        station_state.is_operational = true;
         true
     }
 

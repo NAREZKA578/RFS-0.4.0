@@ -48,6 +48,8 @@ struct StationStatic {
     compartment_id: EntityId,
     max_ammo: u32,
     max_health: f32,
+    /// Bug №85: the real reload-cycle time, not `max_ammo`.
+    reload_time: f32,
 }
 
 struct TrackedShip {
@@ -110,6 +112,9 @@ impl TrackedShip {
                         .unwrap_or(EntityId::nil()),
                     max_ammo: sstate.max_ammo,
                     max_health: sstate.max_health,
+                    reload_time: station
+                        .map(|s| s.config().reload_time)
+                        .unwrap_or(0.0),
                 },
             );
         }
@@ -176,6 +181,8 @@ impl TrackedShip {
                     is_sealed: live.map_or(false, |c| c.is_sealed),
                     is_breached: live.map_or(false, |c| c.is_breached),
                     fire_intensity: live.map_or(0.0, |c| c.fire_intensity),
+                    // Bug №61: expose pump activity to replication.
+                    pump_active: live.map_or(false, |c| c.pump_active),
                     connected_compartments: cs.connected_compartments.iter().copied().collect(),
                     stations: station_ids.into(),
                     pump_capacity: cs.pump_capacity,
@@ -214,7 +221,9 @@ impl TrackedShip {
                     health: live.map_or(0.0, |s| s.health),
                     max_health: ss.max_health,
                     cooldown: live.map_or(0.0, |s| s.cooldown),
-                    max_cooldown: live.map_or(0.0, |s| s.max_ammo as f32),
+                    // Bug №85: the cooldown gauge reflects the real reload
+                    // cycle (seconds), not the magazine size.
+                    max_cooldown: ss.reload_time,
                 }
             })
             .collect()
@@ -262,38 +271,70 @@ fn spawn_player(net: &NetServer, ship: &Ship, connection_id: u32, name: &str) ->
     }
 }
 
-fn despawn_player(net: &NetServer, connection_id: u32, players: &mut HashMap<u32, PlayerMeta>) {
+fn despawn_player(sim: &TickSystem, net: &NetServer, connection_id: u32, players: &mut HashMap<u32, PlayerMeta>) {
     if let Some(meta) = players.remove(&connection_id) {
         net.remove_player(connection_id, meta.player_entity_id);
+        // Bug №58: vacate any station the leaving player still occupies —
+        // otherwise the occupant dangles on a dead player forever, the
+        // station is blocked and the ghost occupant gets replicated.
+        if let Some(ship) = sim.get_ship(meta.ship_id) {
+            let occupied = ship
+                .get_state()
+                .station_states
+                .iter()
+                .find(|(_, s)| s.occupant == Some(meta.player_entity_id))
+                .map(|(id, _)| *id);
+            if let Some(sid) = occupied {
+                ship.vacate_station(sid);
+            }
+        }
     }
+}
+
+/// Bug №59: the current helmsman — the player occupying a Helm station.
+fn current_helm_occupant(ship: &Ship) -> Option<EntityId> {
+    ship.get_state()
+        .station_states
+        .values()
+        .find(|s| s.station_type == rfs_core::entity::StationType::Helm && s.occupant.is_some())
+        .and_then(|s| s.occupant)
 }
 
 fn apply_input(
-    net: &NetServer,
     sim: &TickSystem,
     ship: &Ship,
-    connection_id: u32,
+    player_id: EntityId,
     input: &InputPacket,
 ) {
-    ship.set_throttle(input.move_forward.clamp(-1.0, 1.0));
-    let rudder = (input.move_right.clamp(-1.0, 1.0) + input.yaw.clamp(-1.0, 1.0) * 0.5)
-        .clamp(-1.0, 1.0);
-    ship.set_rudder(rudder);
-
-    if let Some(interaction) = &input.station_interaction {
-        handle_station_interaction(sim, ship, interaction);
+    // Bug №59: steering is arbitrated — whoever ended up at a Helm seat, and
+    // only that player, may drive. With nobody at the helm, anyone may (the
+    // ship is un-manned). This replaces "last packet of the tick wins".
+    let helm = current_helm_occupant(ship);
+    if helm.is_none() || helm == Some(player_id) {
+        ship.set_throttle(input.move_forward.clamp(-1.0, 1.0));
+        let rudder = (input.move_right.clamp(-1.0, 1.0) + input.yaw.clamp(-1.0, 1.0) * 0.5)
+            .clamp(-1.0, 1.0);
+        ship.set_rudder(rudder);
     }
 
-    net.send_input_ack(
-        connection_id,
-        InputAckPacket {
-            tick: sim.current_tick().0 as u32,
-            accepted: true,
-        },
-    );
+    if let Some(interaction) = &input.station_interaction {
+        handle_station_interaction(sim, ship, player_id, interaction);
+    }
 }
 
-fn handle_station_interaction(sim: &TickSystem, ship: &Ship, interaction: &StationInteraction) {
+fn handle_station_interaction(sim: &TickSystem, ship: &Ship, player_id: EntityId, interaction: &StationInteraction) {
+    // Bug №59: only the occupant may operate a station — the old code let
+    // any crew member yaw/fire/reload any gun of their ship without ever
+    // entering the station.
+    let occupied_by = ship
+        .get_state()
+        .station_states
+        .get(&interaction.station_id)
+        .and_then(|s| s.occupant);
+    if occupied_by != Some(player_id) {
+        return;
+    }
+
     match interaction.action {
         StationAction::SetYaw => {
             if let Some((_, pitch)) = ship.station_angles(interaction.station_id) {
@@ -354,32 +395,49 @@ fn handle_command(
     sim: &TickSystem,
     ship: &Ship,
     connection_id: u32,
+    player_id: EntityId,
     command: &CommandPacket,
 ) {
-    let (success, error) = translate_command(sim, ship, &command.command);
+    let (success, error) = translate_command(sim, ship, player_id, &command.command);
     net.send_command_ack(connection_id, command.command_id, success, error);
 }
 
-fn translate_command(sim: &TickSystem, ship: &Ship, command: &ServerCommand) -> (bool, Option<String>) {
+fn translate_command(sim: &TickSystem, ship: &Ship, player_id: EntityId, command: &ServerCommand) -> (bool, Option<String>) {
+    // Bug №59: a command on a station is only valid for its occupant.
+    let commands_station = |station_id: &EntityId| {
+        ship.get_state()
+            .station_states
+            .get(station_id)
+            .and_then(|s| s.occupant)
+            == Some(player_id)
+    };
+    // Bug №59: steering follows the same helm arbitration as inputs.
+    let stance = || {
+        let helm = current_helm_occupant(ship);
+        helm.is_none() || helm == Some(player_id)
+    };
+
     match command {
         ServerCommand::SetShipThrottle { ship: target, throttle } => {
-            if *target == ship.entity_id() {
+            if *target == ship.entity_id() && stance() {
                 ship.set_throttle(*throttle);
                 (true, None)
             } else {
-                (false, Some("unknown ship".into()))
+                (false, Some(if *target == ship.entity_id() { "not at the helm".into() } else { "unknown ship".into() }))
             }
         }
         ServerCommand::SetShipRudder { ship: target, rudder } => {
-            if *target == ship.entity_id() {
+            if *target == ship.entity_id() && stance() {
                 ship.set_rudder(*rudder);
                 (true, None)
             } else {
-                (false, Some("unknown ship".into()))
+                (false, Some(if *target == ship.entity_id() { "not at the helm".into() } else { "unknown ship".into() }))
             }
         }
         ServerCommand::FireWeapon { station, .. } => {
-            if let Some(result) = ship.try_fire_station(*station, None) {
+            if !commands_station(station) {
+                (false, Some("station not occupied by you".into()))
+            } else if let Some(result) = ship.try_fire_station(*station, None) {
                 spawn_projectile(sim, ship, *station, result);
                 (true, None)
             } else {
@@ -387,8 +445,12 @@ fn translate_command(sim: &TickSystem, ship: &Ship, command: &ServerCommand) -> 
             }
         }
         ServerCommand::ReloadWeapon { station, ammo_type } => {
-            ship.reload_station(*station, *ammo_type);
-            (true, None)
+            if !commands_station(station) {
+                (false, Some("station not occupied by you".into()))
+            } else {
+                ship.reload_station(*station, *ammo_type);
+                (true, None)
+            }
         }
         ServerCommand::EnterStation { player, station } => {
             if ship.occupy_station(*station, *player) {
@@ -491,7 +553,7 @@ async fn main() -> Result<()> {
         let ship_id = EntityId::new(SHIP_ID + i as u64 * SHIP_ID_STRIDE);
         let class = create_default_frigate();
         let ship_config: ShipConfig = class.into();
-        let mut ship = Ship::new(ship_config, ship_id, Arc::new(DamageSystem::new()));
+        let ship = Ship::new(ship_config, ship_id, Arc::new(DamageSystem::new()));
         let mut initial_state = ship.get_state();
         initial_state.transform = Transform::new(
             Vec3f::new(i as f32 * SHIP_SPACING, 0.0, 0.0),
@@ -548,23 +610,37 @@ async fn main() -> Result<()> {
                 }
                 ServerEvent::ClientDisconnected { connection_id, .. } => {
                     info!("client {connection_id} disconnected");
-                    despawn_player(&net, connection_id, &mut players);
+                    despawn_player(&sim, &net, connection_id, &mut players);
                 }
                 ServerEvent::ClientTimeout { connection_id } => {
                     info!("client {connection_id} timed out");
-                    despawn_player(&net, connection_id, &mut players);
+                    despawn_player(&sim, &net, connection_id, &mut players);
                 }
                 ServerEvent::ClientInput { connection_id, input } => {
-                    if let Some(meta) = players.get(&connection_id) {
-                        if let Some(ship) = sim.get_ship(meta.ship_id) {
-                            apply_input(&net, &sim, &ship, connection_id, &input);
-                        }
-                    }
+                    // Bug №82/#71: echo back the client's own input.tick so its
+                    // pending map can be keyed by the same value, and always
+                    // answer — reject with a negative ack when the client is
+                    // unknown, so its pending inputs cannot grow forever.
+                    let accepted = players
+                        .get(&connection_id)
+                        .and_then(|meta| sim.get_ship(meta.ship_id).map(|ship| (meta.player_entity_id, ship)))
+                        .map(|(player_id, ship)| {
+                            apply_input(&sim, &ship, player_id, &input);
+                            true
+                        })
+                        .unwrap_or(false);
+                    net.send_input_ack(connection_id, InputAckPacket {
+                        tick: input.tick,
+                        accepted,
+                    });
                 }
                 ServerEvent::ClientCommand { connection_id, command } => {
-                    let ship_id = players.get(&connection_id).map(|m| m.ship_id);
-                    match ship_id.and_then(|id| sim.get_ship(id)) {
-                        Some(ship) => handle_command(&net, &sim, &ship, connection_id, &command),
+                    let actor = players.get(&connection_id).map(|m| (m.ship_id, m.player_entity_id));
+                    match actor.and_then(|(ship_id, _)| sim.get_ship(ship_id)) {
+                        Some(ship) => {
+                            let player_id = players.get(&connection_id).map(|m| m.player_entity_id).unwrap_or(EntityId::nil());
+                            handle_command(&net, &sim, &ship, connection_id, player_id, &command);
+                        }
                         None => {
                             net.send_command_ack(
                                 connection_id,

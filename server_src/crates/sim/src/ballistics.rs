@@ -219,8 +219,11 @@ impl BallisticsCalculator {
         let gravity = Vec3f::new(0.0, -self.config.gravity, 0.0);
         let total_accel = gravity + drag_dir * drag_accel;
         
-        let new_vel = velocity + total_accel * dt;
-        let new_pos = position + velocity * dt + total_accel * dt * dt * 0.5;
+        // Semi-implicit Euler: the position rides the already-clamped
+        // velocity, so a huge drag step can stop the shell but never
+        // teleport it.
+        let new_vel = self.clamp_no_reverse(velocity, velocity + total_accel * dt);
+        let new_pos = position + new_vel * dt;
         
         (new_pos, new_vel)
     }
@@ -367,10 +370,21 @@ impl BallisticsCalculator {
         let buoyancy = Vec3f::new(0.0, self.config.water_density * 9.81 * 0.001, 0.0);
         let total_accel = drag_dir * drag_accel + buoyancy / config.mass;
         
-        let new_vel = velocity + total_accel * dt;
-        let new_pos = position + velocity * dt + total_accel * dt * dt * 0.5;
+        let new_vel = self.clamp_no_reverse(velocity, velocity + total_accel * dt);
+        let new_pos = position + new_vel * dt;
         
         (new_pos, new_vel)
+    }
+
+    /// Explicit Euler goes unstable when one step removes more speed than
+    /// the shell holds (water entry at 400 m/s with the x10 water drag):
+    /// drag may stop the shell dead, never slingshot it backwards.
+    fn clamp_no_reverse(&self, old_velocity: Vec3f, new_velocity: Vec3f) -> Vec3f {
+        if new_velocity.dot(old_velocity) < 0.0 {
+            Vec3f::ZERO
+        } else {
+            new_velocity
+        }
     }
 
     fn calculate_drag_underwater(&self, speed: f32, config: &ProjectileConfig) -> f32 {

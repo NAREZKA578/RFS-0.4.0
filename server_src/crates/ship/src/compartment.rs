@@ -53,6 +53,15 @@ pub struct CompartmentState {
     pub connected_compartments: Vec<EntityId>,
 }
 
+/// A pending water move between two compartments (Bug №90). The ship applies
+/// both sides of the transfer so volume is conserved.
+#[derive(Debug, Clone, Copy)]
+pub struct WaterTransfer {
+    pub from: EntityId,
+    pub to: EntityId,
+    pub amount: f32,
+}
+
 impl CompartmentState {
     pub fn is_flooded(&self) -> bool {
         self.water_level > self.max_water_level * 0.9
@@ -132,7 +141,7 @@ impl Compartment {
         }
     }
 
-    pub fn update(&self, dt: f32, state: &mut CompartmentState, all_compartments: &HashMap<EntityId, CompartmentState>) {
+    pub fn update(&self, dt: f32, state: &mut CompartmentState) {
         if state.is_breached && !state.is_sealed {
             let intake_rate = 10.0;
             state.water_level = (state.water_level + intake_rate * dt).min(state.max_water_level);
@@ -146,49 +155,76 @@ impl Compartment {
         if state.fire_intensity > 0.0 {
             state.fire_intensity = (state.fire_intensity - dt * 0.1).max(0.0);
         }
-
-        self.spread_water(state, all_compartments, dt);
-        self.spread_fire(state, all_compartments, dt);
     }
 
-    fn spread_water(&self, state: &mut CompartmentState, all_compartments: &HashMap<EntityId, CompartmentState>, dt: f32) {
+    /// Bug №90: compute how much water this compartment wants to push into
+    /// each open neighbour. The caller applies the transfers to the real map,
+    /// so the receiver actually gains what the source loses.
+    pub fn compute_water_spread(
+        &self,
+        state: &CompartmentState,
+        all_compartments: &HashMap<EntityId, CompartmentState>,
+        dt: f32,
+    ) -> Vec<WaterTransfer> {
+        let mut transfers = Vec::new();
+        if state.water_level <= 0.0 {
+            return transfers;
+        }
         for &connected_id in &state.connected_compartments {
             if let Some(other) = all_compartments.get(&connected_id) {
                 let bulkhead = state.bulkhead_states.iter()
                     .find(|b| b.connects_to == connected_id);
-                
                 if let Some(bh) = bulkhead {
                     if !bh.is_sealed || bh.is_destroyed {
-                        let pressure_diff = state.fill_ratio() - other.fill_ratio();
-                        if pressure_diff > 0.0 {
-                            let flow_rate = pressure_diff * 50.0 * dt;
-                            let transfer = flow_rate.min(state.water_level);
-                            
-                            state.water_level -= transfer;
+                        let diff = state.fill_ratio() - other.fill_ratio();
+                        if diff > 0.0 {
+                            let flow = diff * 50.0 * dt;
+                            // Cap by what the receiver has room for; the
+                            // caller additionally caps by the source water.
+                            let room = (other.max_water_level - other.water_level).max(0.0);
+                            let transfer = flow.min(state.water_level).min(room);
+                            if transfer > 0.0 {
+                                transfers.push(WaterTransfer {
+                                    from: self.entity_id,
+                                    to: connected_id,
+                                    amount: transfer,
+                                });
+                            }
                         }
                     }
                 }
             }
         }
+        transfers
     }
 
-    fn spread_fire(&self, state: &mut CompartmentState, all_compartments: &HashMap<EntityId, CompartmentState>, dt: f32) {
+    /// Bug №90: fire spreads to open neighbours instead of the old dead code
+    /// that computed `_spread_chance` and threw it away.
+    pub fn fire_spread(
+        &self,
+        state: &CompartmentState,
+        all_compartments: &HashMap<EntityId, CompartmentState>,
+        dt: f32,
+    ) -> Vec<(EntityId, f32)> {
+        let mut spreads = Vec::new();
         if state.fire_intensity <= 0.0 {
-            return;
+            return spreads;
         }
-
         for &connected_id in &state.connected_compartments {
             if let Some(_other) = all_compartments.get(&connected_id) {
                 let bulkhead = state.bulkhead_states.iter()
                     .find(|b| b.connects_to == connected_id);
-                
                 if let Some(bh) = bulkhead {
                     if !bh.is_sealed || bh.is_destroyed {
-                        let _spread_chance = state.fire_intensity * 0.1 * dt;
+                        let amount = (state.fire_intensity * 0.1 * dt).clamp(0.0, 1.0);
+                        if amount > 0.0 {
+                            spreads.push((connected_id, amount));
+                        }
                     }
                 }
             }
         }
+        spreads
     }
 
     pub fn breach(&self, state: &mut CompartmentState) {

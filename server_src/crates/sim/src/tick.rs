@@ -111,8 +111,19 @@ impl TickSystem {
 
         drop(ships);
 
-        let ships = self.ships.write();
+        let mut ships = self.ships.write();
         for (id, state) in updates {
+            // Bug №57: a ship that finished sinking leaves the simulation —
+            // the old code kept it around forever with an empty sink-timer
+            // body.
+            if state.has_sunk {
+                ships.remove(&id);
+                result.events.push(GameEvent::ShipSunk {
+                    ship: id,
+                    position: state.transform.position,
+                });
+                continue;
+            }
             if let Some(ship) = ships.get(&id) {
                 ship.apply_state(state);
                 result.ship_updates.push(ShipUpdate {
@@ -150,8 +161,9 @@ impl TickSystem {
             proj.prev_position = proj.position;
             let (new_pos, new_vel) = match ballistics.get_config(proj.projectile_type) {
                 Some(config) => {
-                    let step = if proj.position.y <= 0.0 {
-                        // Below the waterline: buoyancy + water drag.
+                    // Strictly below the surface: buoyancy + water drag.
+                    // y == 0 is still air (sea-skimmers must not teleport).
+                    let step = if proj.position.y < 0.0 {
                         ballistics.simulate_underwater(proj.position, proj.velocity, config, dt)
                     } else {
                         ballistics.integrate_step(proj.position, proj.velocity, config, dt)

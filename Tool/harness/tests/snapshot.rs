@@ -104,6 +104,7 @@ fn apply_delta_upserts_created_without_duplicates() {
         base_tick: 1,
         server_tick: 2,
         server_time: 0.0,
+        is_resync: false,
         created: vec![test_entity(1, EntityType::Ship, 50.0).to_state()],
         updated: vec![],
         destroyed: vec![],

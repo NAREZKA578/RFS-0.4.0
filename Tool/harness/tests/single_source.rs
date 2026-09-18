@@ -76,7 +76,7 @@ fn bulkheads_and_connections_resolve_to_real_ship_compartments() {
     let comp_ids: HashSet<EntityId> = state.compartment_states.keys().copied().collect();
     assert!(!comp_ids.is_empty());
 
-    for (_, cs) in &state.compartment_states {
+    for cs in state.compartment_states.values() {
         assert!(
             !cs.connected_compartments.is_empty(),
             "compartment must be wired to neighbors"
@@ -94,7 +94,7 @@ fn bulkheads_and_connections_resolve_to_real_ship_compartments() {
         }
     }
 
-    for (sid, _) in &state.station_states {
+    for sid in state.station_states.keys() {
         let compartment_id = ship.get_station(*sid).map(|s| s.compartment_id());
         assert!(
             compartment_id.is_some_and(|cid| comp_ids.contains(&cid) || cid == EntityId::nil()),

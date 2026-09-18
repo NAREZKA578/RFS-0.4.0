@@ -5,9 +5,21 @@ use rfs_core::time::Tick;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use parking_lot::RwLock;
+use tracing::warn;
 
 pub const MAX_SNAPSHOT_HISTORY: usize = 128;
 pub const SNAPSHOT_INTERVAL_TICKS: u32 = 1;
+/// Bug №24: per-delta budget. `created` beats `updated` beats projectiles;
+/// `destroyed` is never cut (it is tiny and dropping it resurrects ghosts).
+/// The layer base still advances to the full content, so anything cut here
+/// converges on the next change or periodic resync.
+pub const MAX_DELTA_CREATED: usize = 512;
+pub const MAX_DELTA_UPDATED: usize = 512;
+pub const MAX_DELTA_PROJECTILES: usize = 512;
+/// Bug №20: hard caps so a corrupt/malicious snapshot cannot balloon client
+/// memory through the interpolator. Normal snapshots are hundreds of entries.
+pub const MAX_ENTITIES_PER_SNAPSHOT: usize = 4096;
+pub const MAX_PROJECTILES_PER_SNAPSHOT: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -55,6 +67,8 @@ pub struct CompartmentSnapshot {
     pub is_sealed: bool,
     pub is_breached: bool,
     pub fire_intensity: f32,
+    /// Bug №61: mirrors `CompartmentState.pump_active` instead of dropping it.
+    pub pump_active: bool,
     pub connected_compartments: SmallVec<[EntityId; 4]>,
 }
 
@@ -66,6 +80,13 @@ pub struct StationSnapshotData {
     pub pitch: f32,
     pub reload_progress: f32,
     pub ammo_type: u8,
+    // Bug №61: the station's full live suite makes it onto the wire now.
+    pub ammo_count: u32,
+    pub max_ammo: u32,
+    pub health: f32,
+    pub max_health: f32,
+    pub cooldown: f32,
+    pub max_cooldown: f32,
     pub is_operational: bool,
 }
 
@@ -134,79 +155,87 @@ impl LayerBase {
 }
 
 pub struct SnapshotBuffer {
-    snapshots: RwLock<Vec<Option<Snapshot>>>,
-    current_index: RwLock<usize>,
-    base_tick: RwLock<Tick>,
+    // Bug №21: this used to be three separate locks (snapshots/base/index)
+    // taken in different orders by readers and writers — a lock-inversion
+    // deadlock. One lock, one order, no cycle possible.
+    inner: RwLock<SnapshotBufferInner>,
     max_history: usize,
+}
+
+struct SnapshotBufferInner {
+    snapshots: Vec<Option<Snapshot>>,
+    current_index: usize,
+    base_tick: Tick,
 }
 
 impl SnapshotBuffer {
     pub fn new(max_history: usize) -> Self {
+        // Bug №20: a zero window would `% 0` panic on every write/get. Clamp
+        // to at least one slot so no valid call site can divide by zero.
+        let max_history = max_history.max(1);
         let mut snapshots = Vec::with_capacity(max_history);
         snapshots.resize_with(max_history, || None);
-        
+
         Self {
-            snapshots: RwLock::new(snapshots),
-            current_index: RwLock::new(0),
-            base_tick: RwLock::new(Tick(0)),
+            inner: RwLock::new(SnapshotBufferInner {
+                snapshots,
+                current_index: 0,
+                base_tick: Tick(0),
+            }),
             max_history,
         }
     }
 
     pub fn write_snapshot(&self, snapshot: Snapshot) {
-        let mut snapshots = self.snapshots.write();
-        let mut base = self.base_tick.write();
-        let mut index = self.current_index.write();
+        let mut inner = self.inner.write();
 
         let tick = snapshot.tick;
 
-        if tick < *base {
+        if tick < inner.base_tick {
             return;
         }
 
-        let diff = (tick - *base) as usize;
+        let diff = (tick - inner.base_tick) as usize;
         if diff >= self.max_history {
             let advance = diff - self.max_history + 1;
             // Clear the slots that will fall out of the window.
             for i in 0..advance.min(self.max_history) {
-                let clear_idx = (*index + i) % self.max_history;
-                snapshots[clear_idx] = None;
+                let clear_idx = (inner.current_index + i) % self.max_history;
+                inner.snapshots[clear_idx] = None;
             }
-            *base = *base + advance as u64;
-            *index = (*index + advance) % self.max_history;
+            inner.base_tick = inner.base_tick + advance as u64;
+            inner.current_index = (inner.current_index + advance) % self.max_history;
         }
 
         // Recompute diff against the (possibly) advanced base.
-        let diff2 = (tick - *base) as usize;
-        let idx = (*index + diff2) % self.max_history;
-        snapshots[idx] = Some(snapshot);
+        let diff2 = (tick - inner.base_tick) as usize;
+        let idx = (inner.current_index + diff2) % self.max_history;
+        inner.snapshots[idx] = Some(snapshot);
     }
 
     pub fn get_snapshot(&self, tick: Tick) -> Option<Snapshot> {
-        let snapshots = self.snapshots.read();
-        let base = *self.base_tick.read();
-        
-        if tick < base {
+        let inner = self.inner.read();
+
+        if tick < inner.base_tick {
             return None;
         }
-        
-        let diff = (tick - base) as usize;
+
+        let diff = (tick - inner.base_tick) as usize;
         if diff >= self.max_history {
             return None;
         }
-        
-        let index = *self.current_index.read();
-        let idx = (index + diff) % self.max_history;
-        snapshots[idx].clone()
+
+        let idx = (inner.current_index + diff) % self.max_history;
+        inner.snapshots[idx].clone()
     }
 
     pub fn get_latest(&self) -> Option<Snapshot> {
-        let snapshots = self.snapshots.read();
+        let inner = self.inner.read();
         // Scan for the snapshot with the greatest tick — `current_index` points at `base_tick`,
         // not at the newest entry, so the old `snapshots[index]` was always stale/empty.
         let mut best: Option<Snapshot> = None;
         let mut best_tick = Tick(0);
-        for slot in snapshots.iter().flatten() {
+        for slot in inner.snapshots.iter().flatten() {
             if best.is_none() || slot.tick > best_tick {
                 best_tick = slot.tick;
                 best = Some(slot.clone());
@@ -216,21 +245,19 @@ impl SnapshotBuffer {
     }
 
     pub fn get_base_tick(&self) -> Tick {
-        *self.base_tick.read()
+        self.inner.read().base_tick
     }
 
     pub fn get_latest_tick(&self) -> Tick {
-        let base = *self.base_tick.read();
-        let index = *self.current_index.read();
-        let snapshots = self.snapshots.read();
-        
+        let inner = self.inner.read();
+
         for i in (0..self.max_history).rev() {
-            let idx = (index + i) % self.max_history;
-            if let Some(snap) = snapshots[idx].as_ref() {
+            let idx = (inner.current_index + i) % self.max_history;
+            if let Some(snap) = inner.snapshots[idx].as_ref() {
                 return snap.tick;
             }
         }
-        base
+        inner.base_tick
     }
 }
 
@@ -301,9 +328,14 @@ impl DeltaCompressor {
         let mut last = self.last_snapshots.write();
         let key = (client_id, layer);
         let base_tick = last.get(&key).copied().unwrap_or(base_snapshot.tick);
-        
+
+        // Bug №22/№78: the old code advanced the ring on this early return
+        // even though nothing is sent (and the client applies nothing). That
+        // raced the ring ahead of the server's LayerBase.last_sent_tick, which
+        // only moves on real sends — the next non-empty delta declared a base
+        // tick the client had never applied and was dropped, freezing the
+        // layer forever. Keep the ring in lockstep: no send, no advance.
         if target_snapshot.tick <= base_tick {
-            *last.entry(key).or_insert(target_snapshot.tick) = target_snapshot.tick;
             return DeltaSnapshot {
                 layer,
                 base_tick: target_snapshot.tick,
@@ -372,6 +404,47 @@ impl DeltaCompressor {
             if !target_projectiles.contains_key(id) {
                 projectile_destroyed.push(*id);
             }
+        }
+
+        // Bug №24: bound the delta even if the world explodes in one tick.
+        if created.len() > MAX_DELTA_CREATED {
+            warn!("create_delta: truncating {} created to {}", created.len(), MAX_DELTA_CREATED);
+            created.truncate(MAX_DELTA_CREATED);
+        }
+        if updated.len() > MAX_DELTA_UPDATED {
+            warn!("create_delta: truncating {} updated to {}", updated.len(), MAX_DELTA_UPDATED);
+            updated.truncate(MAX_DELTA_UPDATED);
+        }
+        if projectile_created.len() + projectile_updated.len() > MAX_DELTA_PROJECTILES {
+            warn!("create_delta: truncating projectile updates to {}", MAX_DELTA_PROJECTILES);
+            let keep_created = projectile_created.len().min(MAX_DELTA_PROJECTILES);
+            projectile_created.truncate(keep_created);
+            projectile_updated.truncate(MAX_DELTA_PROJECTILES.saturating_sub(keep_created));
+        }
+
+        let is_empty = created.is_empty()
+            && updated.is_empty()
+            && destroyed.is_empty()
+            && projectile_created.is_empty()
+            && projectile_updated.is_empty()
+            && projectile_destroyed.is_empty();
+
+        // Bug №22/№78: an empty delta is never sent, so the client base does
+        // not advance. Advancing the ring here used to desync it from the
+        // server's LayerBase and freeze replication for every client.
+        if is_empty {
+            return DeltaSnapshot {
+                layer,
+                base_tick,
+                target_tick: target_snapshot.tick,
+                target_time: target_snapshot.time,
+                created: Vec::new(),
+                updated: Vec::new(),
+                destroyed: Vec::new(),
+                projectile_created: Vec::new(),
+                projectile_updated: Vec::new(),
+                projectile_destroyed: Vec::new(),
+            };
         }
 
         *last.entry(key).or_insert(target_snapshot.tick) = target_snapshot.tick;
@@ -504,7 +577,24 @@ impl SnapshotInterpolator {
         }
     }
 
-    pub fn add_snapshot(&mut self, snapshot: Snapshot) {
+    pub fn add_snapshot(&mut self, mut snapshot: Snapshot) {
+        // Bug №20: truncate oversized snapshots instead of buffering them whole.
+        if snapshot.entities.len() > MAX_ENTITIES_PER_SNAPSHOT {
+            warn!(
+                "add_snapshot: truncating {} entities to {}",
+                snapshot.entities.len(),
+                MAX_ENTITIES_PER_SNAPSHOT
+            );
+            snapshot.entities.truncate(MAX_ENTITIES_PER_SNAPSHOT);
+        }
+        if snapshot.projectiles.len() > MAX_PROJECTILES_PER_SNAPSHOT {
+            warn!(
+                "add_snapshot: truncating {} projectiles to {}",
+                snapshot.projectiles.len(),
+                MAX_PROJECTILES_PER_SNAPSHOT
+            );
+            snapshot.projectiles.truncate(MAX_PROJECTILES_PER_SNAPSHOT);
+        }
         self.snapshots.push(snapshot);
         if self.snapshots.len() > self.max_snapshots {
             self.snapshots.remove(0);
@@ -530,7 +620,13 @@ impl SnapshotInterpolator {
 
         match (before, after) {
             (Some(b), Some(a)) => {
-                let alpha = ((target_time - b.time) / (a.time - b.time)) as f32;
+                // Bug №22: unclamped alpha extrapolated wildly past the
+                // interval on unordered/duplicate timestamps.
+                let alpha = if a.time > b.time {
+                    ((target_time - b.time) / (a.time - b.time)).clamp(0.0, 1.0) as f32
+                } else {
+                    0.0
+                };
                 Some(self.interpolate_snapshots(b, a, alpha))
             }
             (Some(b), None) => Some(b.clone()),
@@ -554,6 +650,13 @@ impl SnapshotInterpolator {
                     Some((*b_entity).clone())
                 }
             })
+            .chain(
+                // Bug №22: entities created in `after` used to be invisible
+                // until the NEXT snapshot. Take them as-is.
+                after_entities.iter()
+                    .filter(|(id, _)| !before_entities.contains_key(id))
+                    .map(|(_, a_entity)| (*a_entity).clone()),
+            )
             .collect();
 
         let before_projs: HashMap<_, _> = before.projectiles.iter().map(|p| (p.entity_id, p)).collect();
@@ -567,18 +670,37 @@ impl SnapshotInterpolator {
                     Some((*b_proj).clone())
                 }
             })
+            .chain(
+                after_projs.iter()
+                    .filter(|(id, _)| !before_projs.contains_key(id))
+                    .map(|(_, a_proj)| (*a_proj).clone()),
+            )
             .collect();
 
         result
     }
 
+    fn finite_rotation(q: rfs_core::math::Quatf) -> bool {
+        (q.x + q.y + q.z + q.w).is_finite()
+    }
+
     fn interpolate_entity(&self, before: &EntitySnapshot, after: &EntitySnapshot, alpha: f32) -> EntitySnapshot {
+        // Bug №22: slerp with a non-finite endpoint yields NaN rotations
+        // that poison everything downstream. Fall back to the finite side.
+        let rotation = if Self::finite_rotation(before.transform.rotation)
+            && Self::finite_rotation(after.transform.rotation) {
+            before.transform.rotation.slerp(after.transform.rotation, alpha)
+        } else if Self::finite_rotation(before.transform.rotation) {
+            before.transform.rotation
+        } else {
+            after.transform.rotation
+        };
         EntitySnapshot {
             entity_id: before.entity_id,
             entity_type: before.entity_type,
             transform: Transform {
                 position: before.transform.position.lerp(after.transform.position, alpha),
-                rotation: before.transform.rotation.slerp(after.transform.rotation, alpha),
+                rotation,
                 scale: before.transform.scale.lerp(after.transform.scale, alpha),
             },
             velocity: before.velocity.lerp(after.velocity, alpha),
@@ -627,6 +749,7 @@ impl From<&ShipEntity> for EntitySnapshot {
                     is_sealed: c.is_sealed,
                     is_breached: c.is_breached,
                     fire_intensity: c.fire_intensity,
+                    pump_active: c.pump_active,
                     connected_compartments: c.connected_compartments.clone(),
                 }).collect(),
                 stations: ship.stations.iter().map(|s| s.entity_id).collect(),
@@ -690,6 +813,13 @@ impl From<&StationEntity> for EntitySnapshot {
                 reload_progress: station.reload_progress,
                 ammo_type: station.ammo_type,
                 is_operational: station.is_operational,
+                // Bug №61: carry the full station state the entity exposes.
+                ammo_count: station.ammo_count,
+                max_ammo: station.max_ammo,
+                health: station.health,
+                max_health: station.max_health,
+                cooldown: station.cooldown,
+                max_cooldown: station.max_cooldown,
             }),
             player_data: None,
         }
@@ -774,6 +904,7 @@ impl From<&CompartmentState> for CompartmentSnapshot {
             is_sealed: s.is_sealed,
             is_breached: s.is_breached,
             fire_intensity: s.fire_intensity,
+            pump_active: s.pump_active,
             connected_compartments: s.connected_compartments.clone(),
         }
     }
@@ -789,6 +920,12 @@ impl From<&StationStateData> for StationSnapshotData {
             reload_progress: s.reload_progress,
             ammo_type: s.ammo_type,
             is_operational: s.is_operational,
+            ammo_count: s.ammo_count,
+            max_ammo: s.max_ammo,
+            health: s.health,
+            max_health: s.max_health,
+            cooldown: s.cooldown,
+            max_cooldown: s.max_cooldown,
         }
     }
 }
@@ -916,6 +1053,7 @@ impl CompartmentSnapshot {
             is_sealed: self.is_sealed,
             is_breached: self.is_breached,
             fire_intensity: self.fire_intensity,
+            pump_active: self.pump_active,
             connected_compartments: self.connected_compartments.clone(),
         }
     }
@@ -931,6 +1069,12 @@ impl StationSnapshotData {
             reload_progress: self.reload_progress,
             ammo_type: self.ammo_type,
             is_operational: self.is_operational,
+            ammo_count: self.ammo_count,
+            max_ammo: self.max_ammo,
+            health: self.health,
+            max_health: self.max_health,
+            cooldown: self.cooldown,
+            max_cooldown: self.max_cooldown,
         }
     }
 }
@@ -965,9 +1109,17 @@ impl ProjectileSnapshot {
     }
 
     pub fn apply_state_update(&mut self, update: &ProjectileStateUpdate) {
-        self.position = update.position;
-        self.velocity = update.velocity;
-        self.lifetime = update.lifetime;
+        // Bug №24: only overwrite fields the delta actually carried; None
+        // means "unchanged", mirroring EntityStateUpdate semantics.
+        if let Some(p) = update.position {
+            self.position = p;
+        }
+        if let Some(v) = update.velocity {
+            self.velocity = v;
+        }
+        if let Some(l) = update.lifetime {
+            self.lifetime = l;
+        }
     }
 }
 
@@ -1036,9 +1188,10 @@ impl ProjectileUpdate {
     pub fn to_state_update(&self) -> ProjectileStateUpdate {
         ProjectileStateUpdate {
             entity_id: self.entity_id,
-            position: self.position.unwrap_or_default(),
-            velocity: self.velocity.unwrap_or_default(),
-            lifetime: self.lifetime.unwrap_or_default(),
+            // Bug №24: keep None as None — no zeroing of unchanged fields.
+            position: self.position,
+            velocity: self.velocity,
+            lifetime: self.lifetime,
         }
     }
 }
@@ -1050,6 +1203,7 @@ impl DeltaSnapshot {
             base_tick: self.base_tick.value() as u32,
             server_tick: self.target_tick.value() as u32,
             server_time: self.target_time,
+            is_resync: false,
             created: self.created.iter().map(EntitySnapshot::to_state).collect(),
             updated: self.updated.iter().map(EntityUpdate::to_state_update).collect(),
             destroyed: self.destroyed.clone(),

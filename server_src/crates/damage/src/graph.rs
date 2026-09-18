@@ -117,6 +117,12 @@ impl DamageGraph {
     }
 
     pub fn add_compartment(&mut self, node: CompartmentNode) -> NodeIndex {
+        // Bug №64: a duplicate id used to add a second (orphan) node — the
+        // graph weight and node_map then disagreed. Update in place instead.
+        if let Some(&idx) = self.node_map.get(&node.entity_id) {
+            self.graph[idx] = node;
+            return idx;
+        }
         let idx = self.graph.add_node(node.clone());
         self.node_map.insert(node.entity_id, idx);
         idx
@@ -124,7 +130,12 @@ impl DamageGraph {
 
     pub fn remove_compartment(&mut self, entity_id: EntityId) -> Option<CompartmentNode> {
         if let Some(idx) = self.node_map.remove(&entity_id) {
-            self.graph.remove_node(idx)
+            let removed = self.graph.remove_node(idx);
+            // Bug №64: petgraph's remove_node can shift the remaining
+            // NodeIndex values, leaving the maps pointing at wrong nodes.
+            // Rebuild both maps from the surviving weights.
+            self.rebuild_maps();
+            removed
         } else {
             None
         }
@@ -141,9 +152,26 @@ impl DamageGraph {
 
     pub fn remove_bulkhead(&mut self, entity_id: EntityId) -> Option<BulkheadEdge> {
         if let Some(idx) = self.edge_map.remove(&entity_id) {
-            self.graph.remove_edge(idx)
+            let removed = self.graph.remove_edge(idx);
+            self.rebuild_maps();
+            removed
         } else {
             None
+        }
+    }
+
+    /// Re-derive node_map/edge_map from the surviving weights (Bug №64:
+    /// petgraph indices can shift on node removal).
+    fn rebuild_maps(&mut self) {
+        self.node_map.clear();
+        for idx in self.graph.node_indices() {
+            let id = self.graph[idx].entity_id;
+            self.node_map.insert(id, idx);
+        }
+        self.edge_map.clear();
+        for edge in self.graph.edge_references() {
+            let id = edge.weight().entity_id;
+            self.edge_map.insert(id, edge.id());
         }
     }
 
@@ -203,7 +231,7 @@ impl DamageGraph {
 
     pub fn damage_bulkhead(&mut self, bulkhead_id: EntityId, damage: f32) -> bool {
         if let Some(edge) = self.get_bulkhead_mut(bulkhead_id) {
-            edge.health -= damage;
+            edge.health -= damage.max(0.0);
             if edge.health <= 0.0 {
                 edge.is_destroyed = true;
                 edge.is_sealed = false;
@@ -217,9 +245,14 @@ impl DamageGraph {
 
     pub fn repair_bulkhead(&mut self, bulkhead_id: EntityId, amount: f32) -> bool {
         if let Some(edge) = self.get_bulkhead_mut(bulkhead_id) {
-            edge.health = (edge.health + amount).min(edge.max_health);
+            edge.health = (edge.health + amount.max(0.0)).min(edge.max_health);
             if edge.health > 0.0 && edge.is_destroyed {
+                // Bug №64: a repaired bulkhead used to stay OPEN forever
+                // (is_destroyed cleared, but is_sealed stayed false and the
+                // resistance was never restored).
                 edge.is_destroyed = false;
+                edge.is_sealed = true;
+                edge.flow_resistance = 1.0 / edge.seal_strength.max(0.1);
             }
             true
         } else {
@@ -247,8 +280,12 @@ impl DamageGraph {
     }
 
     pub fn add_water(&mut self, compartment_id: EntityId, amount: f32) -> f32 {
+        // Bug №64: negative amounts drained the compartment in reverse.
+        if amount <= 0.0 {
+            return 0.0;
+        }
         if let Some(node) = self.get_compartment_mut(compartment_id) {
-            let space = node.max_capacity - node.current_level;
+            let space = (node.max_capacity - node.current_level).max(0.0);
             let added = amount.min(space);
             node.current_level += added;
             added
@@ -258,6 +295,10 @@ impl DamageGraph {
     }
 
     pub fn pump_water(&mut self, compartment_id: EntityId, amount: f32) -> f32 {
+        // Bug №64: negative amounts filled the compartment in reverse.
+        if amount <= 0.0 {
+            return 0.0;
+        }
         if let Some(node) = self.get_compartment_mut(compartment_id) {
             let pumped = amount.min(node.current_level);
             node.current_level -= pumped;
@@ -286,6 +327,10 @@ impl DamageGraph {
     }
 
     pub fn apply_damage(&mut self, compartment_id: EntityId, damage: f32) -> bool {
+        // Bug №64: negative damage healed the compartment.
+        if damage <= 0.0 {
+            return false;
+        }
         if let Some(node) = self.get_compartment_mut(compartment_id) {
             node.damage = (node.damage + damage).min(node.max_damage);
             if node.damage >= node.max_damage {
