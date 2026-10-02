@@ -246,6 +246,12 @@ pub struct EntityBuilder {
     _next_id: EntityId,
 }
 
+impl Default for EntityBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EntityBuilder {
     pub fn new() -> Self {
         Self {

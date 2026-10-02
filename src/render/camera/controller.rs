@@ -4,7 +4,7 @@
 //!
 //! Handles camera movement and control.
 
-use super::camera::{Camera, OrthographicCamera, PerspectiveCamera};
+use super::camera::{Camera, CameraMode, OrthographicCamera, PerspectiveCamera};
 use glam::{Quat, Vec3};
 use std::time::Duration;
 
@@ -29,6 +29,12 @@ pub struct CameraController {
     movement: CameraMovement,
     /// Is the camera being controlled
     pub enabled: bool,
+    /// Camera control mode
+    pub mode: CameraMode,
+    /// Orbital target (for orbital mode)
+    pub orbital_target: Vec3,
+    /// Orbital distance (for orbital mode)
+    pub orbital_distance: f32,
 }
 
 /// Camera movement state
@@ -59,6 +65,9 @@ impl CameraController {
             invert_y: false,
             movement: CameraMovement::default(),
             enabled: true,
+            mode: CameraMode::FirstPerson,
+            orbital_target: Vec3::ZERO,
+            orbital_distance: 10.0,
         }
     }
 
@@ -93,8 +102,8 @@ impl CameraController {
     }
 
     /// Get the camera
-    pub fn camera(&self) -> &Box<dyn Camera> {
-        &self.camera
+    pub fn camera(&self) -> &dyn Camera {
+        self.camera.as_ref()
     }
 
     /// Get mutable camera
@@ -248,6 +257,47 @@ impl CameraController {
         self.yaw = 0.0;
         self.pitch = 0.0;
         self.movement = CameraMovement::default();
+    }
+
+    /// Set camera mode
+    pub fn set_mode(&mut self, mode: CameraMode) {
+        self.mode = mode;
+    }
+
+    /// Get camera mode
+    pub fn mode(&self) -> CameraMode {
+        self.mode
+    }
+
+    /// Set orbital target
+    pub fn set_orbital_target(&mut self, target: Vec3) {
+        self.orbital_target = target;
+    }
+
+    /// Set orbital distance
+    pub fn set_orbital_distance(&mut self, distance: f32) {
+        self.orbital_distance = distance.max(0.1);
+    }
+
+    /// Update camera based on mode
+    pub fn update_with_mode(&mut self, delta_time: Duration) {
+        match self.mode {
+            CameraMode::FirstPerson => self.update(delta_time),
+            CameraMode::ThirdPerson => self.update_third_person(delta_time),
+            CameraMode::Orbital => self.update_orbital(delta_time),
+        }
+    }
+
+    fn update_third_person(&mut self, delta_time: Duration) {
+        self.update(delta_time);
+    }
+
+    fn update_orbital(&mut self, _delta_time: Duration) {
+        let forward = Quat::from_euler(glam::EulerRot::YXZ, self.yaw, self.pitch, 0.0) * Vec3::NEG_Z;
+        let position = self.orbital_target - forward * self.orbital_distance;
+        self.camera.set_position(position);
+        let rotation = Quat::from_rotation_arc(Vec3::Z, forward);
+        self.camera.set_rotation(rotation);
     }
 }
 

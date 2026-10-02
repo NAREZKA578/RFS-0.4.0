@@ -7,7 +7,7 @@ use rhi::memory::allocator::{Allocation, AllocationDesc, MemoryAllocator, Memory
 use rhi::memory::buddy::{BuddyAllocator, BuddyBlock};
 use rhi::memory::budget::{MemoryBudget, MemoryBudgetManager};
 use rhi::memory::linear::LinearAllocator;
-use rhi::memory::pool::{PoolAllocator, PoolBlock};
+use rhi::memory::pool::{FreeRun, PoolAllocator, PoolBlock};
 
 #[test]
 fn allocation_desc_default() {
@@ -83,13 +83,16 @@ fn pool_allocator_new_stats() {
 
 #[test]
 fn pool_block_struct() {
+    // Bug №226: the free list is now a list of (offset, size) runs rather than
+    // bare offsets, so a block can satisfy allocations smaller than itself.
     let block = PoolBlock {
         offset: 0,
         size: 1024,
-        free_list: vec![0],
+        free_runs: vec![FreeRun { offset: 0, size: 1024 }],
     };
     assert_eq!(block.size, 1024);
-    assert_eq!(block.free_list.len(), 1);
+    assert_eq!(block.free_runs.len(), 1);
+    assert_eq!(block.free_runs[0].size, 1024);
 }
 
 #[test]
@@ -146,6 +149,7 @@ fn linear_allocator_allocates_with_alignment() {
     let b = alloc
         .allocate(&AllocationDesc {
             size: 100,
+            alignment: 256,
             ..Default::default()
         })
         .unwrap();
@@ -156,7 +160,12 @@ fn linear_allocator_allocates_with_alignment() {
     assert_eq!(stats.allocation_count, 2);
     assert_eq!(stats.current_usage, 164);
     assert_eq!(stats.peak_usage, 164);
-    assert!(stats.free_block_count == 0);
+    // Bug №227: this used to assert `free_block_count == 0`, which held only
+    // because the field was never written by any allocator. A bump allocator
+    // has exactly one free region — the tail above the bump pointer — and the
+    // tail is genuinely still free here.
+    assert_eq!(stats.free_block_count, 1);
+    assert!(alloc.has_live_allocations());
 }
 
 #[test]
@@ -170,7 +179,7 @@ fn linear_allocator_out_of_memory() {
 }
 
 #[test]
-fn linear_allocator_free_asserts() {
+fn linear_allocator_free_is_noop() {
     let mut alloc = LinearAllocator::new(1, 4096);
     let a = alloc
         .allocate(&AllocationDesc {
@@ -178,11 +187,11 @@ fn linear_allocator_free_asserts() {
             ..Default::default()
         })
         .unwrap();
-    alloc.free(a).unwrap();
+    alloc.free(a.clone()).unwrap();
     let stats = alloc.get_memory_stats();
-    assert_eq!(stats.current_usage, 0);
-    assert_eq!(stats.total_freed, 512);
-    assert_eq!(stats.allocation_count, 0);
+    // Linear allocators don't reclaim individual allocations.
+    assert_eq!(stats.current_usage, 512);
+    assert_eq!(stats.allocation_count, 1);
 }
 
 #[test]
@@ -267,20 +276,37 @@ fn pool_allocator_roundtrip() {
 
 #[test]
 fn pool_allocator_grows_when_exhausted() {
+    // Bug №226: the pool used to consume a whole block per allocation, so two
+    // 32-byte requests needed two 512-byte blocks. It now sub-allocates within
+    // a block, so the pool only grows once the block is genuinely full.
     let mut alloc = PoolAllocator::new(0, 512, 1);
-    let _ = alloc
-        .allocate(&AllocationDesc {
-            size: 32,
-            ..Default::default()
-        })
-        .unwrap();
-    let _ = alloc
-        .allocate(&AllocationDesc {
-            size: 32,
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(alloc.block_count(), 2);
+
+    // These all fit in the first block.
+    for _ in 0..4 {
+        let a = alloc
+            .allocate(&AllocationDesc {
+                size: 32,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(a.offset < 512, "still inside the first block: {a:?}");
+    }
+    assert_eq!(alloc.block_count(), 1);
+
+    // Exhausting the first block forces a new one.
+    for _ in 0..16 {
+        alloc
+            .allocate(&AllocationDesc {
+                size: 32,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    assert!(
+        alloc.block_count() > 1,
+        "a full block must force the pool to grow, got {} blocks",
+        alloc.block_count()
+    );
 }
 
 #[test]

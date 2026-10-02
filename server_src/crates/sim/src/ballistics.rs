@@ -137,6 +137,43 @@ impl ProjectileConfig {
             turn_rate: 10.0,
         }
     }
+
+    // Bug №161: GrapeShot and DepthCharge mapped in station ammo but had no
+    // ballistics config — they fell back to the legacy gravity Euler and,
+    // worse, their max_range/damage were fabricated here.
+    pub fn grape_shot() -> Self {
+        Self {
+            projectile_type: ProjectileType::GrapeShot,
+            mass: 8.0,
+            diameter: 0.5,
+            drag_coefficient: 1.5,
+            initial_velocity: 300.0,
+            max_range: 400.0,
+            damage: 15.0,
+            penetration: 5.0,
+            explosion_radius: 0.0,
+            fuse_delay: 0.0,
+            is_guided: false,
+            turn_rate: 0.0,
+        }
+    }
+
+    pub fn depth_charge() -> Self {
+        Self {
+            projectile_type: ProjectileType::DepthCharge,
+            mass: 120.0,
+            diameter: 0.35,
+            drag_coefficient: 1.0,
+            initial_velocity: 25.0,
+            max_range: 150.0,
+            damage: 300.0,
+            penetration: 0.0,
+            explosion_radius: 25.0,
+            fuse_delay: 5.0,
+            is_guided: false,
+            turn_rate: 0.0,
+        }
+    }
 }
 
 pub struct BallisticsCalculator {
@@ -152,6 +189,10 @@ impl BallisticsCalculator {
         configs.insert(ProjectileType::ArmorPiercing, ProjectileConfig::armor_piercing());
         configs.insert(ProjectileType::ChainShot, ProjectileConfig::chain_shot());
         configs.insert(ProjectileType::Torpedo, ProjectileConfig::torpedo());
+        // Bug №161: register the missing ammo types so they fly by their real
+        // ballistics instead of the legacy gravity fallback.
+        configs.insert(ProjectileType::GrapeShot, ProjectileConfig::grape_shot());
+        configs.insert(ProjectileType::DepthCharge, ProjectileConfig::depth_charge());
         
         Self {
             config,
@@ -187,11 +228,23 @@ impl BallisticsCalculator {
                 velocity: vel,
                 speed: vel.length(),
             });
-            
+
             let (new_pos, new_vel) = self.integrate_step(pos, vel, config, time_step);
             pos = new_pos;
             vel = new_vel;
-            time += time_step;
+            // Bug №242: `time += time_step` with `time_step <= 0` never advances
+            // `time`, so the loop condition never became false and the calling
+            // thread hung forever. Any non-positive or non-finite step is a
+            // caller error, and it is now rejected instead of hanging.
+            let next_time = time + time_step;
+            if !next_time.is_finite() || next_time <= time {
+                eprintln!(
+                    "[sim] calculate_trajectory: time_step {time_step} does not advance time; \
+                     stopping integration to avoid an infinite loop"
+                );
+                break;
+            }
+            time = next_time;
         }
         
         points
@@ -255,8 +308,23 @@ impl BallisticsCalculator {
         let effective_thickness = armor_thickness / armor_angle.cos().max(0.01);
         
         let mut penetration = projectile.penetration * (impact_speed / projectile.initial_velocity).sqrt();
-        
-        penetration *= 1.0 + (self.config.penetration_rng_factor * 2.0 - 1.0) * 0.5;
+
+        // Bug №156: the "RNG factor" was a nonexistent RNG — the expression
+        // `(2*penetration_rng_factor-1)*0.5` with the default 0.1 evaluated to
+        // a constant -0.4, i.e. every shot ate a flat 40% of its penetration.
+        // Derive a deterministic jitter from the impact itself (keeps replays
+        // deterministic, unlike fastrand) and center it on +1.0 so the roll is
+        // -factor..+factor around the base value.
+        if self.config.penetration_rng_factor > 0.0 && self.config.penetration_rng_factor.is_finite() {
+            let seed = impact_velocity.x * 0.7243
+                + impact_velocity.y * 0.5129
+                + impact_velocity.z * 0.1967
+                + impact_normal.x * 0.3181
+                + impact_normal.z * 0.5637;
+            let jitter = (seed.rem_euclid(1.0) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            penetration *= 1.0 + jitter * self.config.penetration_rng_factor;
+            penetration = penetration.max(0.0);
+        }
         
         let ricochet = self.config.enable_ricochet 
             && impact_angle > self.config.ricochet_angle_threshold 
@@ -265,16 +333,15 @@ impl BallisticsCalculator {
         let penetrated = penetration > effective_thickness && !ricochet;
         let remaining_penetration = (penetration - effective_thickness).max(0.0);
         
-        let post_pen_velocity;
-        if penetrated {
+        let post_pen_velocity = if penetrated {
             let speed_loss = effective_thickness / penetration.max(0.01);
-            post_pen_velocity = impact_velocity * (1.0 - speed_loss * 0.5);
+            impact_velocity * (1.0 - speed_loss * 0.5)
         } else if ricochet {
             let reflect = impact_velocity - impact_normal * 2.0 * impact_velocity.dot(impact_normal);
-            post_pen_velocity = reflect * 0.3;
+            reflect * 0.3
         } else {
-            post_pen_velocity = Vec3f::ZERO;
-        }
+            Vec3f::ZERO
+        };
         
         PenetrationResult {
             penetrated,
@@ -398,9 +465,7 @@ impl BallisticsCalculator {
         to: Vec3f,
         projectile_type: ProjectileType,
     ) -> Option<BallisticSolution> {
-        let Some(config) = self.projectile_configs.get(&projectile_type) else {
-            return None;
-        };
+        let config = self.projectile_configs.get(&projectile_type)?;
         let v0 = config.initial_velocity;
         let g = self.config.gravity;
 

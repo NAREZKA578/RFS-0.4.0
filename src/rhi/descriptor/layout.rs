@@ -4,12 +4,14 @@
 //! **TODO: Full implementation required**
 
 use crate::resource::sampler::Sampler;
+use crate::resource::GpuResource;
 use crate::types::*;
 use bitflags::bitflags;
 
 /// Descriptor type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DescriptorType {
+    Sampler,
     UniformBuffer,
     DynamicUniformBuffer,
     StorageBuffer,
@@ -54,11 +56,29 @@ bitflags! {
 #[derive(Debug, Clone)]
 pub struct DescriptorSetLayout {
     desc: DescriptorSetLayoutDesc,
+    pub(crate) backend: Option<GpuResource>,
 }
 
 impl DescriptorSetLayout {
     pub fn new(desc: DescriptorSetLayoutDesc) -> Self {
-        Self { desc }
+        Self {
+            desc,
+            backend: None,
+        }
+    }
+
+    /// Attaches a native handle produced by the active backend.
+    pub(crate) fn set_backend(&mut self, backend: GpuResource) {
+        self.backend = Some(backend);
+    }
+
+    /// Returns `true` when the layout has a native backend handle.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    pub(crate) fn backend(&self) -> Option<GpuResource> {
+        self.backend
     }
 
     pub fn desc(&self) -> &DescriptorSetLayoutDesc {

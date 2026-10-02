@@ -118,6 +118,7 @@ pub enum MsaaSamples {
 
 /// Post-process settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct PostProcessSettings {
     pub bloom: BloomSettings,
     pub motion_blur: MotionBlurSettings,
@@ -324,17 +325,6 @@ impl Default for GraphicsSettings {
     }
 }
 
-impl Default for PostProcessSettings {
-    fn default() -> Self {
-        Self {
-            bloom: BloomSettings::default(),
-            motion_blur: MotionBlurSettings::default(),
-            depth_of_field: DepthOfFieldSettings::default(),
-            hdr: HdrSettings::default(),
-            fxaa: FxaaSettings::default(),
-        }
-    }
-}
 
 impl Default for BloomSettings {
     fn default() -> Self {

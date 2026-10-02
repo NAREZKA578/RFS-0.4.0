@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 /// Material type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum MaterialType {
     /// Standard PBR material
+    #[default]
     Pbr,
     /// Water material
     Water,
@@ -21,16 +23,13 @@ pub enum MaterialType {
     Custom,
 }
 
-impl Default for MaterialType {
-    fn default() -> Self {
-        Self::Pbr
-    }
-}
 
 /// Blend mode for transparent materials
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum BlendMode {
     /// Opaque (no blending)
+    #[default]
     Opaque,
     /// Standard alpha blending
     Alpha,
@@ -42,31 +41,24 @@ pub enum BlendMode {
     Screen,
 }
 
-impl Default for BlendMode {
-    fn default() -> Self {
-        Self::Opaque
-    }
-}
 
 /// Cull mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum CullMode {
     /// No culling
     None,
     /// Cull front faces
     Front,
     /// Cull back faces
+    #[default]
     Back,
 }
 
-impl Default for CullMode {
-    fn default() -> Self {
-        Self::Back
-    }
-}
 
 /// Material parameters that can be updated at runtime
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct MaterialParameters {
     /// Custom float parameters
     pub floats: HashMap<String, f32>,
@@ -78,16 +70,6 @@ pub struct MaterialParameters {
     pub textures: HashMap<String, Arc<Texture>>,
 }
 
-impl Default for MaterialParameters {
-    fn default() -> Self {
-        Self {
-            floats: HashMap::new(),
-            vectors: HashMap::new(),
-            colors: HashMap::new(),
-            textures: HashMap::new(),
-        }
-    }
-}
 
 /// Base material struct
 #[derive(Debug, Clone)]
@@ -249,12 +231,17 @@ impl Material {
 
     /// Bind the material for rendering
     pub fn bind(&self, encoder: &mut crate::rhi::CommandEncoder) {
-        if let Some(pipeline) = &self.pipeline {
-            encoder.bind_pipeline(pipeline);
-        }
+        // The pipeline is required, not optional: binding a descriptor set
+        // needs the bound pipeline's `PipelineLayout`, and Vulkan has no way
+        // to bind a set without one. The descriptor set is therefore only
+        // bound when a pipeline is actually present.
+        let Some(pipeline) = &self.pipeline else {
+            return;
+        };
+        encoder.bind_pipeline(pipeline);
 
         if let Some(descriptor_set) = &self.descriptor_set {
-            encoder.bind_descriptor_set(descriptor_set, 0);
+            encoder.bind_descriptor_set(pipeline, descriptor_set, 0);
         }
     }
 

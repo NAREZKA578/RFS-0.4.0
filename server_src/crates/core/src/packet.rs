@@ -1,4 +1,5 @@
 pub use crate::spatial::EntityId;
+use crate::entity::HitMark;
 use crate::math::{Vec3f, Transform};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -303,6 +304,8 @@ pub struct ShipStateData {
     pub heading: f32,
     pub rudder_angle: f32,
     pub throttle: f32,
+    /// Bug №272: the last hit, replicated so the impact survives a lost event.
+    pub last_hit: Option<HitMark>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -356,6 +359,10 @@ pub struct PlayerStateData {
     pub name: String,
     pub team: u8,
     pub current_station: Option<EntityId>,
+    /// Bug №274: which ship this player rides. The player's position is derived
+    /// from the ship's transform, so without this a client cannot tell which
+    /// ship it is on — it has to reverse-engineer the ship's station list.
+    pub current_ship: Option<EntityId>,
     pub posture: PlayerPosture,
     pub health: f32,
     pub stamina: f32,

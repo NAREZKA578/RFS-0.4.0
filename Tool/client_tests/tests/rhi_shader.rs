@@ -102,3 +102,114 @@ fn shader_stage_constants_are_type() {
     let _ = stage::MISS_SHADER;
     let _ = stage::INTERSECTION_SHADER;
 }
+
+#[test]
+fn shader_reflection_new_and_empty() {
+    use rhi::shader::reflection::{ShaderReflection, ScalarType, ShaderVariable, ShaderVariableType};
+    let empty = ShaderReflection::default();
+    assert!(empty.is_empty());
+    assert_eq!(empty.push_constant_size(), 0);
+    assert!(empty.find_resource(0, 0).is_none());
+
+    let reflection = ShaderReflection::new(
+        vec![ShaderVariable {
+            name: "in_pos".into(),
+            location: 0,
+            ty: ShaderVariableType::Vector(ScalarType::Float, 3),
+            size: 12,
+            offset: 0,
+        }],
+        vec![],
+        vec![],
+        vec![],
+    );
+    assert!(!reflection.is_empty());
+    assert_eq!(reflection.inputs.len(), 1);
+    assert_eq!(reflection.inputs[0].size, 12);
+}
+
+#[test]
+fn shader_reflection_find_resource() {
+    use rhi::descriptor::layout::DescriptorType;
+    use rhi::shader::reflection::{
+        ShaderReflection, ShaderResource, ShaderResourceAccess, ShaderResourceDimensions,
+    };
+    let reflection = ShaderReflection::new(
+        vec![],
+        vec![],
+        vec![ShaderResource {
+            name: "ubo".into(),
+            binding: 1,
+            set: 0,
+            ty: DescriptorType::UniformBuffer,
+            access: ShaderResourceAccess::Read,
+            dimensions: ShaderResourceDimensions::Buffer,
+            format: None,
+        }],
+        vec![],
+    );
+    assert!(reflection.find_resource(0, 1).is_some());
+    assert!(reflection.find_resource(0, 2).is_none());
+    assert!(reflection.find_resource(1, 1).is_none());
+}
+
+#[test]
+fn shader_reflection_push_constants() {
+    use rhi::shader::reflection::{ShaderPushConstant, ShaderReflection};
+    let reflection = ShaderReflection::new(
+        vec![],
+        vec![],
+        vec![],
+        vec![
+            ShaderPushConstant {
+                name: "a".into(),
+                offset: 0,
+                size: 16,
+                stages: rhi::ShaderStage::VERTEX,
+            },
+            ShaderPushConstant {
+                name: "b".into(),
+                offset: 16,
+                size: 16,
+                stages: rhi::ShaderStage::FRAGMENT,
+            },
+        ],
+    );
+    assert_eq!(reflection.push_constant_size(), 32);
+}
+
+#[test]
+fn stub_compiler_compiles_and_roundtrips() {
+    use rhi::shader::compiler::{ShaderCompiler, StubShaderCompiler};
+    let compiler = StubShaderCompiler;
+    let desc = ShaderModuleDesc {
+        code: vec![1, 2, 3],
+        format: ShaderFormat::SpirV,
+        entry_point: Some("main".into()),
+        name: Some("vs".into()),
+    };
+    let module = compiler.compile(&desc).unwrap();
+    assert_eq!(module.desc().code, vec![1, 2, 3]);
+
+    let spirv = compiler
+        .compile_to_spirv("void main(){}", rhi::ShaderStage::VERTEX)
+        .unwrap();
+    assert_eq!(spirv, b"void main(){}");
+
+    let glsl = compiler
+        .compile_to_glsl(&spirv, rhi::ShaderStage::VERTEX)
+        .unwrap();
+    assert_eq!(glsl, "void main(){}");
+
+    let reflection = compiler.reflect(&[], ShaderFormat::SpirV).unwrap();
+    assert!(reflection.is_empty());
+}
+
+#[test]
+fn compile_options_defaults() {
+    use rhi::shader::compiler::{CompileOptions, OptimizationLevel, ShaderTargetEnv};
+    let opts = CompileOptions::default();
+    assert_eq!(opts.optimization_level, OptimizationLevel::None);
+    assert_eq!(opts.target_env, ShaderTargetEnv::Vulkan);
+    assert!(!opts.generate_debug_info);
+}

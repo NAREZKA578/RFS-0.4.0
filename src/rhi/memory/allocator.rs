@@ -18,6 +18,7 @@ pub struct AllocationDesc {
 }
 
 /// Memory allocation
+#[derive(Debug, Clone)]
 pub struct Allocation {
     pub offset: u64,
     pub size: u64,

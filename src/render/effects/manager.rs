@@ -56,19 +56,16 @@ pub struct EffectSettings {
 
 /// Global effect quality
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum EffectQuality {
     Off,
     Low,
+    #[default]
     Medium,
     High,
     Ultra,
 }
 
-impl Default for EffectQuality {
-    fn default() -> Self {
-        Self::Medium
-    }
-}
 
 /// Central effect manager
 pub struct EffectManager {
@@ -302,7 +299,7 @@ impl EffectManager {
             && self
                 .effect_settings
                 .get(&effect_type)
-                .map_or(false, |s| s.enabled)
+                .is_some_and(|s| s.enabled)
     }
 
     /// Sets effect quality

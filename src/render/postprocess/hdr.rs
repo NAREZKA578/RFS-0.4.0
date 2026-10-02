@@ -67,21 +67,21 @@ impl HDREffect {
     pub fn apply(
         &mut self,
         encoder: &mut CommandEncoder,
-        context: &RenderContext,
+        _context: &RenderContext,
         input: &TextureView,
-        _output: &TextureView,
+        output: &TextureView,
     ) {
         if !self.enabled {
             return;
         }
-
-        let _ = (encoder, context, input);
-
-        // Apply HDR tone mapping
-        // This would convert from HDR to LDR with tone mapping
-
-        // For now, this is a placeholder
-        let _ = self.output_view.as_ref();
+        if std::ptr::eq(input, output) {
+            if let Some(ref temp) = self.output_view {
+                encoder.copy_texture(input, temp);
+                encoder.copy_texture(temp, output);
+            }
+        } else {
+            encoder.copy_texture(input, output);
+        }
     }
 
     pub fn resize(&mut self, device: &Arc<Device>, context: &RenderContext, input_format: Format) {

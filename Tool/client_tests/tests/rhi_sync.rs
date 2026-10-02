@@ -117,10 +117,13 @@ fn buffer_copy_regions() {
 }
 
 #[test]
-fn fence_state_machine() {
-    let fence = Fence::new(FenceDesc { signaled: false });
-    assert!(!fence.get_status().unwrap());
-    assert!(!fence.wait(None).unwrap());
+    fn fence_state_machine() {
+        let fence = Fence::new(FenceDesc { signaled: false });
+        assert!(!fence.get_status().unwrap());
+        // Bug №181: `wait` used to ignore its timeout and answer instantly, so
+        // these polls now pass an explicit `Some(0)` to say "check now" — a
+        // `None` would mean the one-second default budget.
+        assert!(!fence.wait(Some(0)).unwrap());
 
     fence.signal().unwrap();
     assert!(fence.get_status().unwrap());
@@ -153,10 +156,35 @@ fn timeline_semaphore_value_progression() {
     assert_eq!(ts.initial_value(), 5);
     assert_eq!(ts.get_value().unwrap(), 5);
 
-    assert!(!ts.wait(10, None).unwrap());
+    // Bug №182: `wait` used to ignore its timeout and answer instantly. An
+    // explicit `Some(0)` is a non-blocking poll; `None` is a one-second budget.
+    assert!(!ts.wait(10, Some(0)).unwrap());
 
     ts.signal(10).unwrap();
     assert!(ts.wait(10, None).unwrap());
     assert!(ts.wait(8, None).unwrap());
     assert!(!ts.wait(11, Some(0)).unwrap());
+
+    // Bug №182: a timeline semaphore may not go backwards.
+    assert!(ts.signal(9).is_err());
+    assert_eq!(ts.get_value().unwrap(), 10, "the value must not move back");
+}
+
+#[test]
+fn timeline_semaphore_actually_blocks_until_signalled() {
+    use std::sync::Arc;
+    let ts = Arc::new(TimelineSemaphore::new(0));
+    let writer = ts.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        writer.signal(1).unwrap();
+    });
+
+    let start = std::time::Instant::now();
+    assert!(ts.wait(1, Some(5_000)).unwrap());
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(25),
+        "wait returned before the signal arrived"
+    );
+    handle.join().unwrap();
 }

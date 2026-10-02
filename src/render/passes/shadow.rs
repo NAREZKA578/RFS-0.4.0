@@ -1,4 +1,4 @@
-//! Shadow Render Pass
+﻿//! Shadow Render Pass
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
@@ -49,7 +49,7 @@ pub struct ShadowPass {
     shadow_maps: Vec<Option<crate::rhi::Texture>>,
     shadow_views: Vec<Option<crate::rhi::TextureView>>,
     /// Depth pipeline
-    _depth_pipeline: Option<GraphicsPipeline>,
+    depth_pipeline: Option<GraphicsPipeline>,
     /// Render pass
     render_pass: Option<crate::rhi::RenderPass>,
     /// Framebuffers (one per cascade)
@@ -74,7 +74,7 @@ impl ShadowPass {
             config,
             shadow_maps: vec![None; cascade_count],
             shadow_views: vec![None; cascade_count],
-            _depth_pipeline: None,
+            depth_pipeline: None,
             render_pass: None,
             framebuffers: vec![None; cascade_count],
         }
@@ -86,6 +86,99 @@ impl ShadowPass {
 
     pub fn config_mut(&mut self) -> &mut ShadowConfig {
         &mut self.config
+    }
+
+    fn create_pipeline(&self, device: &crate::rhi::Device) -> Option<GraphicsPipeline> {
+        use crate::rhi::pipeline::graphics::PrimitiveTopology;
+
+        let spirv = include_bytes!("../../../Tool/client_tests/assets/shaders/shadow.spv");
+        let vs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
+            code: spirv.to_vec(),
+            format: crate::rhi::ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("shadow_vs".into()),
+        });
+        let fs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
+            code: spirv.to_vec(),
+            format: crate::rhi::ShaderFormat::SpirV,
+            entry_point: Some("fs_main".into()),
+            name: Some("shadow_fs".into()),
+        });
+
+        let render_pass = self.render_pass.clone()?;
+        let pipeline = device.create_gpu_graphics_pipeline(
+            &crate::rhi::GraphicsPipelineDesc {
+                shader_stages: vec![
+                    crate::rhi::PipelineShaderStage {
+                        stage: crate::rhi::ShaderStage::VERTEX,
+                        module: vs_module,
+                        entry_point: "vs_main".into(),
+                    },
+                    crate::rhi::PipelineShaderStage {
+                        stage: crate::rhi::ShaderStage::FRAGMENT,
+                        module: fs_module,
+                        entry_point: "fs_main".into(),
+                    },
+                ],
+                vertex_input_state: Some(crate::rhi::VertexInputState {
+                    bindings: vec![crate::rhi::VertexBinding {
+                        binding: 0,
+                        stride: std::mem::size_of::<crate::render::meshes::Vertex>() as u32,
+                        input_rate: crate::rhi::VertexInputRate::Vertex,
+                    }],
+                    attributes: vec![
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 0,
+                            format: crate::rhi::Format::R32G32B32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, position) as u32,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 1,
+                            format: crate::rhi::Format::R32G32B32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, normal) as u32,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 2,
+                            format: crate::rhi::Format::RGBA32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, tangent) as u32,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 3,
+                            format: crate::rhi::Format::R32G32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, tex_coord) as u32,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 4,
+                            format: crate::rhi::Format::RGBA32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, color) as u32,
+                        },
+                    ],
+                }),
+                input_assembly_state: crate::rhi::InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                rasterizer_state: Some(crate::rhi::RasterizerState::double_sided()),
+                multisample_state: crate::rhi::MultisampleState {
+                    sample_count: crate::rhi::SampleCount::X1,
+                    ..Default::default()
+                },
+                color_blend_state: Some(crate::rhi::ColorBlendState {
+                    attachments: vec![],
+                    ..Default::default()
+                }),
+                depth_stencil_state: Some(crate::rhi::DepthStencilState::enabled()),
+                ..Default::default()
+            },
+            &render_pass,
+            &[],
+        );
+        pipeline.ok()
     }
 }
 
@@ -102,7 +195,7 @@ impl RenderPass for ShadowPass {
         self.base.outputs()
     }
 
-    fn initialize(&mut self, _device: &crate::rhi::Device, _context: &RenderContext) {
+    fn initialize(&mut self, device: &crate::rhi::Device, _context: &RenderContext) {
         let resolution = self.config.resolution;
         let depth_format = crate::rhi::Format::D32_SFLOAT;
 
@@ -176,19 +269,85 @@ impl RenderPass for ShadowPass {
         }
 
         // Create depth pipeline
-        // This would require a shadow shader
-        // For now, we'll leave it as None
+        self.depth_pipeline = self.create_pipeline(device);
     }
 
     fn execute(
         &mut self,
-        _encoder: &mut CommandEncoder,
+        encoder: &mut CommandEncoder,
         _context: &mut RenderContext,
-        _scene: &mut Scene,
+        scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
     ) {
         if !self.base.is_enabled() {
             return;
+        }
+        let Some(render_pass) = self.render_pass.as_ref() else {
+            return;
+        };
+        let Some(pipeline) = self.depth_pipeline.as_ref() else {
+            return;
+        };
+
+        for i in 0..self.config.cascade_count {
+            let Some(framebuffer) = self.framebuffers[i].as_ref() else {
+                continue;
+            };
+
+            encoder.begin_render_pass(
+                render_pass,
+                framebuffer,
+                crate::rhi::Rect2D {
+                    offset: crate::rhi::Offset2D { x: 0, y: 0 },
+                    extent: crate::rhi::Extent2D {
+                        width: self.config.resolution,
+                        height: self.config.resolution,
+                    },
+                },
+                &[crate::rhi::ClearValue::depth_stencil(1.0, 0)],
+                1.0,
+                0,
+            );
+
+            encoder.set_viewport(
+                0.0,
+                0.0,
+                self.config.resolution as f32,
+                self.config.resolution as f32,
+                0.0,
+                1.0,
+            );
+            encoder.set_scissor(
+                0,
+                0,
+                self.config.resolution,
+                self.config.resolution,
+            );
+
+            encoder.bind_pipeline(pipeline);
+
+            for entity_id in scene.shadow_casting_entities() {
+                if let Some(entity) = scene.get_entity(entity_id) {
+                    if let Some(mesh_component) = entity.mesh() {
+                        let mesh = mesh_component.get_lod_mesh(0);
+                        if let Some(vertex_buffer) = mesh.vertex_buffer() {
+                            if let Some(index_buffer) = mesh.index_buffer() {
+                                encoder.bind_vertex_buffer(vertex_buffer);
+                                encoder.bind_index_buffer(index_buffer, crate::rhi::IndexType::U32);
+                                encoder.draw_indexed_instanced(
+                                    mesh.index_count(),
+                                    1,
+                                    0,
+                                    0,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            encoder.end_render_pass();
         }
     }
 
@@ -211,3 +370,4 @@ impl Default for ShadowPass {
         Self::new(ShadowConfig::default())
     }
 }
+

@@ -310,26 +310,51 @@ fn buffer_desc_validation() {
 
 #[test]
 fn buffer_alignment_rules() {
+    // Bug №222: this test asserted uniform = 64 and storage = 256, which is the
+    // exact inversion of the declared constants (UNIFORM_BUFFER_ALIGNMENT = 256,
+    // STORAGE_BUFFER_ALIGNMENT = 16). It was locking in undefined behaviour on
+    // the device rather than a deliberate requirement.
     let uniform = BufferDesc {
         usage: BufferUsage::UNIFORM,
         ..Default::default()
     };
-    assert_eq!(uniform.alignment(), 64);
+    assert_eq!(uniform.alignment(), 256);
 
     let storage = BufferDesc {
         usage: BufferUsage::STORAGE,
         ..Default::default()
     };
-    assert_eq!(storage.alignment(), 256);
+    assert_eq!(storage.alignment(), 16);
 
-    let vertex = BufferDesc {
+    // Bug №222: the old check was `contains(VERTEX | INDEX)`, so each of these
+    // on its own used to miss and fall through to the 4-byte default.
+    for usage in [BufferUsage::VERTEX, BufferUsage::INDEX] {
+        let desc = BufferDesc {
+            usage,
+            ..Default::default()
+        };
+        assert!(
+            desc.alignment() >= 4,
+            "{usage:?} alone must still be handled, got {}",
+            desc.alignment()
+        );
+    }
+    let both = BufferDesc {
         usage: BufferUsage::VERTEX | BufferUsage::INDEX,
         ..Default::default()
     };
-    assert_eq!(vertex.alignment(), 16);
+    assert_eq!(both.alignment(), 4);
 
+    // A buffer that is both uniform and storage must satisfy the stricter one.
+    let dual = BufferDesc {
+        usage: BufferUsage::UNIFORM | BufferUsage::STORAGE,
+        ..Default::default()
+    };
+    assert_eq!(dual.alignment(), 256);
+
+    // No usage at all means nothing to satisfy.
     let generic = BufferDesc::default();
-    assert_eq!(generic.alignment(), 4);
+    assert_eq!(generic.alignment(), 1);
 }
 
 #[test]

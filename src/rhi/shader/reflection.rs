@@ -7,11 +7,48 @@ use crate::descriptor::layout::DescriptorType;
 use crate::types::*;
 
 /// Shader reflection
+#[derive(Debug, Clone, Default)]
 pub struct ShaderReflection {
     pub inputs: Vec<ShaderVariable>,
     pub outputs: Vec<ShaderVariable>,
     pub resources: Vec<ShaderResource>,
     pub push_constants: Vec<ShaderPushConstant>,
+}
+
+impl ShaderReflection {
+    pub fn new(
+        inputs: Vec<ShaderVariable>,
+        outputs: Vec<ShaderVariable>,
+        resources: Vec<ShaderResource>,
+        push_constants: Vec<ShaderPushConstant>,
+    ) -> Self {
+        Self {
+            inputs,
+            outputs,
+            resources,
+            push_constants,
+        }
+    }
+
+    /// Returns `true` when the reflection contains no data.
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty()
+            && self.outputs.is_empty()
+            && self.resources.is_empty()
+            && self.push_constants.is_empty()
+    }
+
+    /// Finds a resource by descriptor set and binding.
+    pub fn find_resource(&self, set: u32, binding: u32) -> Option<&ShaderResource> {
+        self.resources
+            .iter()
+            .find(|r| r.set == set && r.binding == binding)
+    }
+
+    /// Returns the total push constant size in bytes.
+    pub fn push_constant_size(&self) -> u32 {
+        self.push_constants.iter().map(|p| p.size).sum()
+    }
 }
 
 /// Shader variable type

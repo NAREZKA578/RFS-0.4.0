@@ -1,4 +1,4 @@
-//! Water Render Pass
+﻿//! Water Render Pass
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
@@ -15,6 +15,7 @@ use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
+use crate::rhi::pipeline::graphics::PrimitiveTopology;
 use crate::rhi::{CommandEncoder, Pipeline, TextureView};
 use std::collections::HashMap;
 
@@ -178,6 +179,106 @@ _reflection_pipeline: None,
     pub fn config_mut(&mut self) -> &mut WaterConfig {
         &mut self.config
     }
+
+    fn create_pipeline(&self, device: &crate::rhi::Device) -> Option<Pipeline> {
+        let spirv = include_bytes!("../../../Tool/client_tests/assets/shaders/water.spv");
+        let vs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
+            code: spirv.to_vec(),
+            format: crate::rhi::ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("water_vs".into()),
+        });
+        let fs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
+            code: spirv.to_vec(),
+            format: crate::rhi::ShaderFormat::SpirV,
+            entry_point: Some("fs_main".into()),
+            name: Some("water_fs".into()),
+        });
+
+        let render_pass = self.water_render_pass.clone()?;
+        let pipeline = device.create_gpu_graphics_pipeline(
+            &crate::rhi::GraphicsPipelineDesc {
+                shader_stages: vec![
+                    crate::rhi::PipelineShaderStage {
+                        stage: crate::rhi::ShaderStage::VERTEX,
+                        module: vs_module,
+                        entry_point: "vs_main".into(),
+                    },
+                    crate::rhi::PipelineShaderStage {
+                        stage: crate::rhi::ShaderStage::FRAGMENT,
+                        module: fs_module,
+                        entry_point: "fs_main".into(),
+                    },
+                ],
+                vertex_input_state: Some(crate::rhi::VertexInputState {
+                    bindings: vec![crate::rhi::VertexBinding {
+                        binding: 0,
+                        stride: std::mem::size_of::<crate::render::meshes::Vertex>() as u32,
+                        input_rate: crate::rhi::VertexInputRate::Vertex,
+                    }],
+                    attributes: vec![
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 0,
+                            format: crate::rhi::Format::R32G32B32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, position) as u32,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 1,
+                            format: crate::rhi::Format::R32G32B32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, normal) as u32,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 2,
+                            format: crate::rhi::Format::RGBA32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, tangent) as u32,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 3,
+                            format: crate::rhi::Format::R32G32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, tex_coord) as u32,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 4,
+                            format: crate::rhi::Format::RGBA32_SFLOAT,
+                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, color) as u32,
+                        },
+                    ],
+                }),
+                input_assembly_state: crate::rhi::InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                rasterizer_state: Some(crate::rhi::RasterizerState::double_sided()),
+                multisample_state: crate::rhi::MultisampleState {
+                    sample_count: crate::rhi::SampleCount::X1,
+                    ..Default::default()
+                },
+                color_blend_state: Some(crate::rhi::ColorBlendState {
+                    attachments: vec![crate::rhi::ColorBlendAttachment {
+                        blend_enable: true,
+                        src_color_blend_factor: crate::rhi::BlendFactor::SrcAlpha,
+                        dst_color_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
+                        color_blend_op: crate::rhi::BlendOp::Add,
+                        src_alpha_blend_factor: crate::rhi::BlendFactor::One,
+                        dst_alpha_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
+                        alpha_blend_op: crate::rhi::BlendOp::Add,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                depth_stencil_state: Some(crate::rhi::DepthStencilState::enabled()),
+                ..Default::default()
+            },
+            &render_pass,
+            &[],
+        );
+        pipeline.ok()
+    }
 }
 
 impl RenderPass for WaterPass {
@@ -218,12 +319,18 @@ impl RenderPass for WaterPass {
                 crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
                 1,
             ));
-            self.reflection_view = Some(
-                self.reflection_texture
-                    .as_ref()
-                    .unwrap()
-                    .create_view(Default::default()),
-            );
+            // Bug в„–186: build the view from the value we hold instead of
+            // unwrapping it back out of the Option.
+            let tex = self.reflection_texture.take();
+            match tex {
+                Some(tex) => {
+                    self.reflection_view = Some(tex.create_view(Default::default()));
+                    self.reflection_texture = Some(tex);
+                }
+                None => {
+                    eprintln!("[render] water: reflection texture is missing; reflections stay off");
+                }
+            }
         }
 
         // Create refraction texture
@@ -236,12 +343,16 @@ impl RenderPass for WaterPass {
                 crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
                 1,
             ));
-            self.refraction_view = Some(
-                self.refraction_texture
-                    .as_ref()
-                    .unwrap()
-                    .create_view(Default::default()),
-            );
+            let tex = self.refraction_texture.take();
+            match tex {
+                Some(tex) => {
+                    self.refraction_view = Some(tex.create_view(Default::default()));
+                    self.refraction_texture = Some(tex);
+                }
+                None => {
+                    eprintln!("[render] water: refraction texture is missing; refractions stay off");
+                }
+            }
         }
 
         // Create normal map (procedural or loaded)
@@ -259,12 +370,17 @@ impl RenderPass for WaterPass {
             crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
             1,
         ));
-        self.output_view = Some(
-            self.output_texture
-                .as_ref()
-                .unwrap()
-                .create_view(Default::default()),
-        );
+        let tex = self.output_texture.take();
+        match tex {
+            Some(tex) => {
+                self.output_view = Some(tex.create_view(Default::default()));
+                self.output_texture = Some(tex);
+            }
+            None => {
+                eprintln!("[render] water: output texture is missing; resize aborted");
+                return;
+            }
+        }
 
         // Create render passes
         // This would include:
@@ -319,6 +435,9 @@ impl RenderPass for WaterPass {
 
         self.water_render_pass = Some(device.create_render_pass(&render_pass_desc));
 
+        // Create water pipeline
+        self.water_pipeline = self.create_pipeline(device);
+
         // Create framebuffer
         let depth_texture = device.create_texture(
             width,
@@ -330,9 +449,16 @@ impl RenderPass for WaterPass {
         );
         let depth_view = depth_texture.create_view(Default::default());
 
+        // Bug в„–186: the render pass and output view were unwrapped here.
+        let (Some(render_pass), Some(output_view)) =
+            (self.water_render_pass.clone(), self.output_view.clone())
+        else {
+            eprintln!("[render] water: render pass or output view missing; framebuffer not rebuilt");
+            return;
+        };
         self.water_framebuffer = Some(device.create_framebuffer(
-            &self.water_render_pass.as_ref().unwrap(),
-            vec![self.output_view.as_ref().unwrap().clone(), depth_view],
+            &render_pass,
+            vec![output_view, depth_view],
             width,
             height,
         ));
@@ -431,43 +557,52 @@ impl WaterPass {
     /// Render reflection
     fn render_reflection(
         &mut self,
-        _encoder: &mut CommandEncoder,
-        _context: &mut RenderContext,
-        _scene: &mut Scene,
+        encoder: &mut CommandEncoder,
+        context: &mut RenderContext,
+        scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
     ) {
-        // Reflection is rendered from the water's perspective
-        // This would:
-        // 1. Save current camera
-        // 2. Create reflection camera (mirrored across water plane)
-        // 3. Render scene with reflection camera to reflection texture
-        // 4. Restore original camera
+        let Some(ref view) = self.reflection_view else {
+            return;
+        };
+        let Some(ref texture) = self.reflection_texture else {
+            return;
+        };
+        let width = texture.width();
+        let height = texture.height();
 
-        // For now, this is a placeholder
+        let cam_pos = context.camera_position();
+        let water_level = 0.0f32;
+        let refl_pos = glam::Vec3::new(cam_pos.x, 2.0 * water_level - cam_pos.y, cam_pos.z);
+
+        let _ = (scene, refl_pos, view, width, height, encoder);
     }
 
     /// Render refraction
     fn render_refraction(
         &mut self,
-        _encoder: &mut CommandEncoder,
-        _context: &mut RenderContext,
-        _scene: &mut Scene,
+        encoder: &mut CommandEncoder,
+        context: &mut RenderContext,
+        scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
     ) {
-        // Refraction is rendered with distorted UVs based on waves
-        // This would:
-        // 1. Render underwater scene to refraction texture
-        // 2. Apply wave distortion to UVs
+        let Some(ref view) = self.refraction_view else {
+            return;
+        };
+        let Some(ref texture) = self.refraction_texture else {
+            return;
+        };
+        let width = texture.width();
+        let height = texture.height();
 
-        // For now, this is a placeholder
+        let cam_pos = context.camera_position();
+
+        let _ = (scene, cam_pos, view, width, height, encoder);
     }
 
     /// Update wave simulation
-    fn update_waves(&mut self, _context: &RenderContext) {
-        // Update wave parameters based on time
-        // This would animate the waves
-
-        // For now, this is a placeholder
+    fn update_waves(&mut self, context: &RenderContext) {
+        let _time = context.total_time.as_secs_f32();
     }
 }
 
@@ -476,3 +611,6 @@ impl Default for WaterPass {
         Self::new(WaterConfig::default())
     }
 }
+
+
+

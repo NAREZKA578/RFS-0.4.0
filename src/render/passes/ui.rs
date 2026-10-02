@@ -1,4 +1,4 @@
-//! UI Render Pass
+﻿//! UI Render Pass
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
@@ -12,6 +12,7 @@ use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
+use crate::rhi::pipeline::graphics::PrimitiveTopology;
 use crate::rhi::{
     AttachmentDescription, CommandEncoder, LoadOp, Pipeline, PipelineBindPoint, Rect2D, StoreOp,
     SubpassDescription, TextureLayout, TextureView,
@@ -103,6 +104,94 @@ impl UIPass {
     pub fn camera_mut(&mut self) -> &mut crate::render::camera::OrthographicCamera {
         &mut self.ui_camera
     }
+
+    fn create_pipeline(&self, device: &Device) -> Option<Pipeline> {
+        let spirv = include_bytes!("../../../Tool/client_tests/assets/shaders/ui.spv");
+        let vs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
+            code: spirv.to_vec(),
+            format: crate::rhi::ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("ui_vs".into()),
+        });
+        let fs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
+            code: spirv.to_vec(),
+            format: crate::rhi::ShaderFormat::SpirV,
+            entry_point: Some("fs_main".into()),
+            name: Some("ui_fs".into()),
+        });
+
+        let render_pass = self.render_pass.clone()?;
+        let pipeline = device.create_gpu_graphics_pipeline(
+            &crate::rhi::GraphicsPipelineDesc {
+                shader_stages: vec![
+                    crate::rhi::PipelineShaderStage {
+                        stage: crate::rhi::ShaderStage::VERTEX,
+                        module: vs_module,
+                        entry_point: "vs_main".into(),
+                    },
+                    crate::rhi::PipelineShaderStage {
+                        stage: crate::rhi::ShaderStage::FRAGMENT,
+                        module: fs_module,
+                        entry_point: "fs_main".into(),
+                    },
+                ],
+                vertex_input_state: Some(crate::rhi::VertexInputState {
+                    bindings: vec![crate::rhi::VertexBinding {
+                        binding: 0,
+                        stride: 32,
+                        input_rate: crate::rhi::VertexInputRate::Vertex,
+                    }],
+                    attributes: vec![
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 0,
+                            format: crate::rhi::Format::R32G32_SFLOAT,
+                            offset: 0,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 1,
+                            format: crate::rhi::Format::R32G32_SFLOAT,
+                            offset: 8,
+                        },
+                        crate::rhi::VertexAttribute {
+                            binding: 0,
+                            location: 2,
+                            format: crate::rhi::Format::RGBA32_SFLOAT,
+                            offset: 16,
+                        },
+                    ],
+                }),
+                input_assembly_state: crate::rhi::InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                rasterizer_state: Some(crate::rhi::RasterizerState::double_sided()),
+                multisample_state: crate::rhi::MultisampleState {
+                    sample_count: crate::rhi::SampleCount::X1,
+                    ..Default::default()
+                },
+                color_blend_state: Some(crate::rhi::ColorBlendState {
+                    attachments: vec![crate::rhi::ColorBlendAttachment {
+                        blend_enable: true,
+                        src_color_blend_factor: crate::rhi::BlendFactor::SrcAlpha,
+                        dst_color_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
+                        color_blend_op: crate::rhi::BlendOp::Add,
+                        src_alpha_blend_factor: crate::rhi::BlendFactor::One,
+                        dst_alpha_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
+                        alpha_blend_op: crate::rhi::BlendOp::Add,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                depth_stencil_state: None,
+                ..Default::default()
+            },
+            &render_pass,
+            &[],
+        );
+        pipeline.ok()
+    }
 }
 
 impl UIPass {
@@ -165,7 +254,7 @@ impl RenderPass for UIPass {
         self.base.outputs()
     }
 
-    fn initialize(&mut self, _device: &Device, context: &RenderContext) {
+    fn initialize(&mut self, device: &Device, context: &RenderContext) {
         let width = context.resolution.width;
         let height = context.resolution.height;
 
@@ -173,15 +262,28 @@ impl RenderPass for UIPass {
         self.ui_camera
             .set_viewport(0.0, width as f32, height as f32, 0.0);
 
-        // Get swapchain view
-        self.output_view = Some(
-            context
-                .swapchain
-                .images()
-                .first()
-                .map(|image| image.view.clone())
-                .unwrap_or_default(),
-        );
+        // Get the swapchain view for the image acquired for THIS frame.
+        //
+        // Bug в„–186: this took `images().first()`, i.e. always image 0, and
+        // `unwrap_or_default()` silently produced a default (invalid) view when
+        // the swapchain had no images. Both are fixed: the acquired index comes
+        // from the context, and a missing image aborts the pass instead of
+        // attaching a bogus view to the framebuffer.
+        let images = context.swapchain.images();
+        match images.get(context.swapchain_image_index as usize) {
+            Some(image) => {
+                self.output_view = Some(image.view.clone());
+            }
+            None => {
+                eprintln!(
+                    "[render] ui: swapchain image {} not available (have {}); pass skipped",
+                    context.swapchain_image_index,
+                    images.len()
+                );
+                self.output_view = None;
+                return;
+            }
+        }
 
         // Create render pass (simple color pass with blending)
         let attachments = vec![
@@ -215,6 +317,9 @@ impl RenderPass for UIPass {
         };
 
         self.render_pass = Some(crate::rhi::RenderPass::new(render_pass_desc));
+
+        // Create UI pipeline
+        self.ui_pipeline = self.create_pipeline(device);
 
         // Create framebuffer with swapchain image
         if let Some(ref view) = self.output_view {
@@ -326,3 +431,5 @@ impl Default for UIPass {
         Self::new(UIConfig::default())
     }
 }
+
+

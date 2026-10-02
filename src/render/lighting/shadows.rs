@@ -32,19 +32,16 @@ impl Default for ShadowConfig {
 
 /// Shadow quality
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum ShadowQuality {
     Off,
     Low,
+    #[default]
     Medium,
     High,
     Ultra,
 }
 
-impl Default for ShadowQuality {
-    fn default() -> Self {
-        Self::Medium
-    }
-}
 
 /// Cascaded shadow configuration
 #[derive(Debug, Clone)]
@@ -63,6 +60,95 @@ impl Default for CascadedShadowConfig {
             cascade_resolutions: vec![2048; 4],
             transition_factor: 0.1,
         }
+    }
+}
+
+/// Smallest cascade half-extent. A cascade whose depth range is degenerate
+/// would otherwise produce a zero-sized box, and an orthographic projection
+/// with left == right yields a singular matrix.
+pub const MIN_CASCADE_RADIUS: f32 = 0.5;
+/// Largest cascade half-extent, so a bad `cascade_distances` cannot ask for a
+/// shadow map covering the whole world and destroy shadow-map resolution.
+pub const MAX_CASCADE_RADIUS: f32 = 10_000.0;
+
+/// An up-vector that is never parallel to `direction`.
+///
+/// Bug №184: `look_at` builds its basis from `forward.cross(up)`. If `up` is
+/// parallel to `forward` that cross product is zero, the normalisation divides
+/// by zero, and the resulting matrix is all NaN — which propagates into every
+/// shaded pixel. This picks the least-aligned world axis instead.
+pub fn safe_up(direction: Vec3) -> Vec3 {
+    let d = direction.normalize();
+    // Absolute components tell us how close we are to each axis.
+    let ax = d.x.abs();
+    let ay = d.y.abs();
+    let az = d.z.abs();
+    // Choose the axis we are *least* aligned with.
+    if ax <= ay && ax <= az {
+        Vec3::X
+    } else if ay <= az {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    }
+}
+
+/// True when every element of the matrix is finite.
+fn is_finite_mat4(m: &Mat4) -> bool {
+    m.as_ref().iter().all(|v| v.is_finite())
+}
+
+/// Camera world position and forward axis, recovered from a view matrix.
+///
+/// A view matrix maps world space into view space, where the camera sits at the
+/// origin looking down -Z. Inverting that by hand avoids needing the general
+/// matrix inverse: for a rigid view matrix the camera position is
+/// `-(R^T * t)`, and the forward axis is the third basis column of `R`.
+pub fn camera_basis(view: Mat4) -> (Vec3, Vec3) {
+    // A view matrix maps world into view space, where the camera sits at the
+    // origin looking down -Z. The inverse of that mapping therefore has the
+    // camera position in its translation and the world-space axes in its
+    // columns. Going through the inverse avoids depending on the memory
+    // layout of the matrix, which is exactly the mistake an earlier hand-rolled
+    // version of this made.
+    // glam's `inverse` returns a plain Mat4 (it yields NaNs for a singular
+    // matrix rather than an Option), so the finiteness check below is the guard.
+    let inv = view.inverse();
+    if !inv.is_finite() {
+        return (Vec3::ZERO, Vec3::NEG_Z);
+    }
+
+    // glam exposes the columns; the 4th one is the translation.
+    let pos = inv.w_axis.truncate();
+    // The camera looks down its own -Z, i.e. against the inverse's Z column.
+    let mut forward = -inv.z_axis.truncate().normalize();
+    if !forward.is_finite() || forward.length_squared() <= f32::EPSILON {
+        forward = Vec3::NEG_Z;
+    }
+    if !pos.is_finite() {
+        return (Vec3::ZERO, forward);
+    }
+    (pos, forward)
+}
+
+/// Aspect ratio (width / height) encoded in a projection matrix.
+///
+/// For a standard right-handed perspective matrix, `m[0] = 1/(aspect * tan(fovy/2))`
+/// and `m[5] = 1/tan(fovy/2)`, so the ratio `m[5] / m[0]` is the aspect. Returns
+/// 1.0 for a degenerate or non-finite matrix rather than propagating a bad
+/// value into the cascade box.
+fn projection_aspect(proj: Mat4) -> f32 {
+    let m = proj.to_cols_array();
+    let x = m[0];
+    let y = m[5];
+    if x.abs() <= f32::EPSILON || !x.is_finite() || !y.is_finite() {
+        return 1.0;
+    }
+    let aspect = y / x;
+    if !aspect.is_finite() || aspect <= 0.0 {
+        1.0
+    } else {
+        aspect.clamp(0.1, 10.0)
     }
 }
 
@@ -106,35 +192,81 @@ impl CascadedShadowMap {
         }
     }
 
-    pub fn update(&mut self, _camera_view: Mat4, _camera_proj: Mat4, cascade_distances: &[f32]) {
-        // Update cascade matrices
-        // This is a simplified version - actual implementation would:
-        // 1. Calculate frustum corners in world space
-        // 2. For each cascade, calculate a bounding box
-        // 3. Calculate view and projection matrices for each cascade
+    pub fn update(&mut self, camera_view: Mat4, camera_proj: Mat4, cascade_distances: &[f32]) {
+        // Guard short/unsorted slices (index OOB panic, degenerate near>=far).
+        if cascade_distances.len() < self.config.cascade_count {
+            return;
+        }
+
+        // Bug №184: the cascades were built around a hardcoded origin with a
+        // fixed +/-100 box and never looked at the camera, so a shadow map only
+        // covered the 200 m around world zero. Move the ship and its shadows
+        // simply stopped existing. Each cascade is now centred on the point the
+        // camera frustum reaches halfway through that slice, sized to the
+        // slice's radius, so the maps follow the view.
+        let (camera_pos, camera_forward) = camera_basis(camera_view);
+        // The cascade box follows the view shape, not a square: a 16:9 frustum
+        // fitted into a square box wastes shadow-map resolution on the sides.
+        let aspect = projection_aspect(camera_proj);
 
         for i in 0..self.config.cascade_count {
-            // Calculate light view matrix for this cascade
-            // This would position the light to cover the cascade's area
-
-            // For now, just use a simple orthographic projection
             let near = if i == 0 {
                 0.1
             } else {
                 cascade_distances[i - 1]
             };
-            let far = cascade_distances[i];
+            let mut far = cascade_distances[i];
+            if !near.is_finite() || !far.is_finite() || far <= near {
+                far = near + 1.0;
+            }
 
-            // Create orthographic projection
-            let proj = Mat4::orthographic_rh_gl(-100.0, 100.0, -100.0, 100.0, near, far);
+            // Centre of this slice, halfway along the camera's forward axis.
+            let mid_depth = (near + far) * 0.5;
+            let slice_centre = camera_pos + camera_forward * mid_depth;
 
-            // Create view matrix (looking in light direction)
-            let light_pos = Vec3::ZERO; // Would be calculated based on cascade
-            let view = Mat4::look_at_rh(light_pos, light_pos + self.light_direction, Vec3::Y);
+            // Radius that covers the slice: half its depth, clamped so a
+            // pathological cascade range cannot produce a huge or zero box.
+            let half = ((far - near) * 0.5).clamp(MIN_CASCADE_RADIUS, MAX_CASCADE_RADIUS);
+            let half_x = (half * aspect).clamp(MIN_CASCADE_RADIUS, MAX_CASCADE_RADIUS);
+            let half_y = half;
+
+            // Create orthographic projection around the slice.
+            // The near/far range is derived from the box rather than from the
+            // cascade's own depth slice: an orthographic light has no frustum
+            // corner to fit, so the box itself defines the covered depth, and
+            // it must reach past the slice on both sides.
+            let proj = Mat4::orthographic_rh_gl(
+                -half_x,
+                half_x,
+                -half_y,
+                half_y,
+                -half * 2.0,
+                half * 4.0,
+            );
+
+            // Create view matrix (looking in light direction).
+            //
+            // Bug №184: the view was always `look_at(ZERO, ZERO + dir, Y)`.
+            // If the light direction is parallel to Y the forward and up
+            // vectors are parallel, the cross product is zero, and the basis
+            // collapses to NaN — which silently poisons every cascade matrix
+            // and therefore the whole lighting result. `safe_up` picks a vector
+            // that is never parallel to the light direction.
+            let light_pos = slice_centre - self.light_direction * half * 2.0;
+            let target = slice_centre;
+            let up = safe_up(self.light_direction);
+            let view = Mat4::look_at_rh(light_pos, target, up);
+
+            let vp = proj * view;
+            if !is_finite_mat4(&vp) {
+                // A non-finite matrix is worse than a stale one: it propagates
+                // NaN into every shaded pixel. Keep the previous value.
+                continue;
+            }
 
             self.light_view_matrices[i] = view;
             self.light_proj_matrices[i] = proj;
-            self.light_view_proj_matrices[i] = proj * view;
+            self.light_view_proj_matrices[i] = vp;
         }
     }
 

@@ -31,12 +31,17 @@ impl MeshLibrary {
     pub fn set_device(&mut self, device: Arc<crate::rhi::Device>) {
         self.loader.set_device(device.clone());
 
-        // Recreate buffers for all loaded meshes
-        for mesh in self.meshes.values() {
-            let mut mesh_clone = (**mesh).clone();
-            mesh_clone.create_buffers(&device);
-            // Note: We can't replace the Arc here easily
-            // In actual implementation, we would need to handle this better
+        // Recreate buffers for all loaded meshes and keep them (old code
+        // built buffers on a dropped clone — a no-op leaving meshes
+        // buffer-less and panicking on vertex_buffer().unwrap()).
+        for mesh in self.meshes.values_mut() {
+            let mut rebuilt = (**mesh).clone();
+            if rebuilt.create_buffers(&device).is_ok() {
+                *mesh = Arc::new(rebuilt);
+            }
+            // On failure the previous entry is kept: it is a mesh with no
+            // buffers, which is still better than one that claims buffers it
+            // never received.
         }
     }
 

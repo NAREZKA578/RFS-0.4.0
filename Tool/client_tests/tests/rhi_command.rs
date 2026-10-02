@@ -73,15 +73,15 @@ fn command_buffer_starts_initial() {
 #[test]
 fn command_buffer_begin_records() {
     let mut buf = make_buffer(make_pool(0));
-    buf.begin();
+    buf.begin().expect("begin");
     assert_eq!(buf.state(), CommandBufferState::Recording);
 }
 
 #[test]
 fn command_buffer_end_makes_executable() {
     let mut buf = make_buffer(make_pool(0));
-    buf.begin();
-    buf.end();
+    buf.begin().expect("begin");
+    buf.end().expect("end");
     assert_eq!(buf.state(), CommandBufferState::Executable);
 }
 
@@ -99,7 +99,7 @@ fn command_buffer_desc_and_pool_accessors() {
 fn command_encoder_wraps_command_buffer() {
     let pool = make_pool(0);
     let mut buf = make_buffer(pool);
-    buf.begin();
+    buf.begin().expect("begin");
     let mut enc = CommandEncoder::new(buf);
     assert_eq!(enc.command_buffer().state(), CommandBufferState::Recording);
     enc.set_viewport(0.0, 0.0, 640.0, 480.0, 0.0, 1.0);
@@ -256,21 +256,72 @@ fn command_pool_allocate_primary_and_secondary() {
 #[test]
 fn command_buffer_reset_returns_to_initial() {
     let mut buf = make_buffer(make_pool(0));
-    buf.begin();
+    buf.begin().expect("begin");
     assert!(buf.is_recording());
-    buf.end();
+    buf.end().expect("end");
     assert!(buf.is_executable());
-    buf.reset();
+    buf.reset().expect("reset");
     assert_eq!(buf.state(), CommandBufferState::Initial);
     assert!(!buf.is_recording());
     assert!(!buf.is_executable());
 }
 
 #[test]
-#[should_panic(expected = "cannot end a command buffer that is not recording")]
-fn command_buffer_end_without_begin_panics() {
+fn command_buffer_end_without_begin_reports_an_error() {
+    // Bug №181: this used to be `#[should_panic]` — a misuse of the command
+    // buffer aborted the process instead of being reportable.
     let mut buf = make_buffer(make_pool(0));
-    buf.end();
+    assert!(
+        buf.end().is_err(),
+        "ending a buffer that is not recording must be refused"
+    );
+    // Bug №181: a buffer left in an inconsistent state is now marked invalid
+    // rather than silently continuing to look healthy.
+    assert_eq!(buf.state(), CommandBufferState::Invalid);
+}
+
+#[test]
+fn command_buffer_cannot_begin_twice() {
+    // Bug №181: `begin` used to be a silent no-op while recording, and the
+    // encoder's `begin` cleared the recorded commands regardless — so a stray
+    // second begin silently discarded a frame's work.
+    let mut buf = make_buffer(make_pool(0));
+    buf.begin().expect("first begin");
+    assert!(buf.begin().is_err(), "a second begin must be refused");
+    assert_eq!(buf.state(), CommandBufferState::Recording);
+}
+
+#[test]
+fn command_buffer_submit_and_complete() {
+    // Bug №233: `Pending` was declared but unreachable, so "in flight" and
+    // "ready" were indistinguishable.
+    let mut buf = make_buffer(make_pool(0));
+    buf.begin().expect("begin");
+    buf.end().expect("end");
+    assert!(buf.is_executable());
+
+    buf.submit().expect("submit");
+    assert!(buf.is_pending());
+    assert!(!buf.is_executable());
+
+    // Re-recording while the GPU reads it is now refused.
+    assert!(buf.begin().is_err(), "a pending buffer must not be re-recorded");
+    // And so is resetting it out from under the queue.
+    assert!(buf.reset().is_err(), "a pending buffer must not be reset");
+
+    buf.complete().expect("complete");
+    assert!(buf.is_executable());
+    assert!(!buf.is_pending());
+}
+
+#[test]
+fn command_buffer_invalidate_is_sticky() {
+    // Bug №233: `Invalid` was declared but never set.
+    let mut buf = make_buffer(make_pool(0));
+    buf.invalidate("simulated submit failure");
+    assert_eq!(buf.state(), CommandBufferState::Invalid);
+    assert!(buf.begin().is_err());
+    assert!(buf.submit().is_err());
 }
 
 #[test]
@@ -298,7 +349,7 @@ fn command_encoder_full_render_flow() {
     });
 
     let mut enc = CommandEncoder::new(buf);
-    enc.begin();
+    enc.begin().expect("begin");
     assert!(enc.is_recording());
 
     enc.begin_render_pass(&rp, &fb, Rect2D::default(), &[ClearValue::color(0.1, 0.2, 0.3, 1.0)], 1.0, 0);
@@ -312,7 +363,7 @@ fn command_encoder_full_render_flow() {
     assert!(matches!(enc.commands()[2], Command::SetScissor(_)));
     assert!(matches!(enc.commands()[3], Command::EndRenderPass));
 
-    let finished = enc.finish();
+    let finished = enc.finish().expect("finish");
     assert_eq!(finished.state(), CommandBufferState::Executable);
 }
 
@@ -320,7 +371,7 @@ fn command_encoder_full_render_flow() {
 fn command_encoder_records_viewport_bindings_and_draw() {
     let pool = make_pool(0);
     let mut enc = CommandEncoder::new(make_buffer(pool));
-    enc.begin();
+    enc.begin().expect("begin");
 
     enc.set_viewport(0.0, 0.0, 800.0, 600.0, 0.0, 1.0);
     enc.draw_indexed_instanced(36, 1, 0, 0, 0);
@@ -349,4 +400,74 @@ fn command_encoder_finish_requires_recording() {
     let pool = make_pool(0);
     let buf = make_buffer(pool);
     assert!(!buf.is_recording());
+}
+
+/// Bug №203: `finish()` used to drop the recorded commands on the floor. The
+/// encoder's `Vec<Command>` was never moved into the buffer, so a finished
+/// buffer always reported zero commands and no backend could replay the frame.
+/// Nothing failed — the commands simply vanished.
+#[test]
+fn finishing_an_encoder_moves_the_commands_into_the_buffer() {
+    let pool = make_pool(0);
+    let mut buf = make_buffer(pool);
+    buf.begin().expect("begin");
+    let mut enc = CommandEncoder::new(buf);
+
+    enc.set_viewport(0.0, 0.0, 64.0, 64.0, 0.0, 1.0);
+    enc.set_scissor(0, 0, 64, 64);
+    enc.end_render_pass();
+    assert_eq!(enc.command_count(), 3, "encoder should have recorded three");
+
+    let finished = enc.finish().expect("finish");
+    assert_eq!(
+        finished.commands().len(),
+        3,
+        "bug №203: finish() discarded the recorded commands"
+    );
+    assert!(matches!(
+        finished.commands()[0],
+        Command::SetViewport(_)
+    ));
+    assert!(matches!(finished.commands()[2], Command::EndRenderPass));
+}
+
+/// A second recording must not inherit the previous one, or a stale half of the
+/// frame would be replayed on top of the new one.
+#[test]
+fn re_recording_replaces_the_previous_command_list() {
+    let pool = make_pool(0);
+    let mut buf = make_buffer(pool);
+
+    buf.begin().expect("first begin");
+    let mut first = CommandEncoder::new(buf);
+    first.set_scissor(0, 0, 10, 10);
+    first.set_scissor(0, 0, 20, 20);
+    first.set_scissor(0, 0, 30, 30);
+    let mut buf = first.finish().expect("first finish");
+    assert_eq!(buf.commands().len(), 3);
+
+    buf.begin().expect("second begin");
+    let mut second = CommandEncoder::new(buf);
+    second.set_scissor(0, 0, 99, 99);
+    let buf = second.finish().expect("second finish");
+    assert_eq!(
+        buf.commands().len(),
+        1,
+        "the earlier recording must not leak into the next one"
+    );
+}
+
+/// Bug №203: the buffer is the thing a backend replays, so an empty list is a
+/// broken frame. `submit_commands` refuses it rather than submitting nothing.
+#[test]
+fn an_empty_recording_is_rejected_rather_than_silently_submitted() {
+    let pool = make_pool(0);
+    let mut buf = make_buffer(pool);
+    buf.begin().expect("begin");
+    let enc = CommandEncoder::new(buf);
+    let finished = enc.finish().expect("finish");
+    assert!(
+        finished.commands().is_empty(),
+        "a recording with no commands should stay empty and be rejected at submit"
+    );
 }

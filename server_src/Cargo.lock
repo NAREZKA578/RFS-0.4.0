@@ -450,6 +450,7 @@ dependencies = [
  "bytes",
  "crossbeam",
  "parking_lot",
+ "rayon",
  "rfs_core",
  "serde",
  "smallvec",

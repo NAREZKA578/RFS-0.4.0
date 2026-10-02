@@ -160,14 +160,14 @@ fn swap_chain_desc_is_valid() {
     };
     assert!(!invalid.is_valid());
 
-    let undefined = SwapChainDesc {
+    let no_buffers = SwapChainDesc {
         width: 640,
         height: 480,
-        buffer_count: 2,
-        format: rhi::Format::Undefined,
+        buffer_count: 0,
+        format: rhi::Format::RGBA8_UNORM,
         ..Default::default()
     };
-    assert!(!undefined.is_valid());
+    assert!(!no_buffers.is_valid());
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn swap_chain_images_are_textures() {
         width: 400,
         height: 300,
         buffer_count: 2,
-        format: rhi::Format::B8G8R8_UNORM,
+        format: rhi::Format::RGBA8_UNORM,
         usage: TextureUsage::COLOR_ATTACHMENT,
         ..Default::default()
     });
@@ -225,5 +225,5 @@ fn swap_chain_images_are_textures() {
     let img = &sc.images()[0];
     assert_eq!(img.texture.width(), 400);
     assert_eq!(img.texture.height(), 300);
-    assert_eq!(img.texture.format(), rhi::Format::B8G8R8_UNORM);
+    assert_eq!(img.texture.format(), rhi::Format::RGBA8_UNORM);
 }

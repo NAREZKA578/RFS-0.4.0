@@ -143,7 +143,7 @@ impl Station {
         // tick — no latch. Pump the water out / quench the fire and the
         // station comes back by itself.
         let compartment_dead = compartment_state
-            .map_or(false, |c| c.is_flooded() || c.fire_intensity > 0.5);
+            .is_some_and(|c| c.is_flooded() || c.fire_intensity > 0.5);
         state.is_operational = !compartment_dead;
         if !state.is_operational {
             return;
@@ -160,18 +160,65 @@ impl Station {
         state.yaw += yaw_diff.clamp(-max_step, max_step);
         state.pitch += pitch_diff.clamp(-max_step, max_step);
         
-        state.yaw = state.yaw.clamp(self.config.yaw_range.0, self.config.yaw_range.1);
-        state.pitch = state.pitch.clamp(self.config.pitch_range.0, self.config.pitch_range.1);
+        // Safe clamp: inverted (min>max) or non-finite ranges from JSON must
+        // not panic (f32::clamp panics on min>max). Fall back to current value.
+        fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
+            if !v.is_finite() {
+                return 0.0;
+            }
+            if !lo.is_finite() || !hi.is_finite() || lo > hi {
+                return v;
+            }
+            v.clamp(lo, hi)
+        }
+        state.yaw = safe_clamp(state.yaw, self.config.yaw_range.0, self.config.yaw_range.1);
+        state.pitch = safe_clamp(
+            state.pitch,
+            self.config.pitch_range.0,
+            self.config.pitch_range.1,
+        );
 
         if state.reload_progress < 1.0 {
             state.reload_progress += dt / self.config.reload_time;
-            state.reload_progress = state.reload_progress.min(1.0);
+            if state.reload_progress >= 1.0 {
+                state.reload_progress = 1.0;
+                // Bug №158: auto-reload — a completed cycle loads one round
+                // without a manual Reload command, so a fired gun re-arms
+                // itself. The cycle repeats until the magazine is full.
+                //
+                // Bug №158 (regression): the reset to 0.0 was unconditional, so
+                // even the cycle that *filled* the magazine immediately started
+                // another one. The station therefore only became "ready" a full
+                // reload_time after its magazine was already full — `can_fire`
+                // requires `reload_progress >= 1.0`, so a gun fired once stayed
+                // dead for twice the reload window. Reset only while the
+                // magazine still has room; otherwise stay loaded and ready.
+                if state.ammo_count < state.max_ammo {
+                    state.ammo_count += 1;
+                    if state.ammo_count < state.max_ammo {
+                        state.reload_progress = 0.0;
+                    }
+                }
+            }
         }
     }
 
     pub fn set_target_angles(&self, state: &mut StationState, yaw: f32, pitch: f32) {
-        state.target_yaw = yaw.clamp(self.config.yaw_range.0, self.config.yaw_range.1);
-        state.target_pitch = pitch.clamp(self.config.pitch_range.0, self.config.pitch_range.1);
+        fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
+            if !v.is_finite() {
+                return 0.0;
+            }
+            if !lo.is_finite() || !hi.is_finite() || lo > hi {
+                return v;
+            }
+            v.clamp(lo, hi)
+        }
+        state.target_yaw = safe_clamp(yaw, self.config.yaw_range.0, self.config.yaw_range.1);
+        state.target_pitch = safe_clamp(
+            pitch,
+            self.config.pitch_range.0,
+            self.config.pitch_range.1,
+        );
     }
 
     pub fn get_angles(&self, state: &StationState) -> (f32, f32) {

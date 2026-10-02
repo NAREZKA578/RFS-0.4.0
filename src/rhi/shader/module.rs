@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::resource::GpuResource;
+
 /// Shader format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ShaderFormat {
@@ -30,11 +32,29 @@ pub struct ShaderModuleDesc {
 #[derive(Debug, Clone, Default)]
 pub struct ShaderModule {
     desc: ShaderModuleDesc,
+    pub(crate) backend: Option<GpuResource>,
 }
 
 impl ShaderModule {
     pub fn new(desc: ShaderModuleDesc) -> Self {
-        Self { desc }
+        Self {
+            desc,
+            backend: None,
+        }
+    }
+
+    /// Attaches a native handle produced by the active backend.
+    pub(crate) fn set_backend(&mut self, backend: GpuResource) {
+        self.backend = Some(backend);
+    }
+
+    /// Returns `true` when the module has a compiled native shader handle.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    pub(crate) fn backend(&self) -> Option<GpuResource> {
+        self.backend
     }
 
     pub fn desc(&self) -> &ShaderModuleDesc {

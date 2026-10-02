@@ -106,3 +106,38 @@ fn validation_severity_variants() {
     let _ = ValidationSeverity::Error;
     let _ = ValidationSeverity::Verbose;
 }
+
+#[test]
+fn debug_utils_helpers() {
+    let utils = DebugUtils::new(true, false);
+    assert!(utils.validation_enabled());
+    assert!(!utils.markers_enabled());
+}
+
+#[test]
+fn frame_capture_records_commands() {
+    let mut capture = FrameCapture::new();
+    capture.add_command("begin_render_pass");
+    capture.add_command("draw(36)");
+    assert_eq!(capture.command_count(), 2);
+    assert_eq!(capture.commands[0], "begin_render_pass");
+    assert_eq!(capture.commands[1], "draw(36)");
+}
+
+#[test]
+fn capture_context_advance_stops_at_budget() {
+    let mut ctx = CaptureContext::new();
+    ctx.start_capture(2);
+    assert!(ctx.advance_frame());
+    assert_eq!(ctx.frame_index, 1);
+    assert!(ctx.is_capturing);
+    assert!(!ctx.advance_frame());
+    assert_eq!(ctx.frame_index, 2);
+    assert!(!ctx.is_capturing);
+}
+
+#[test]
+fn frame_capture_default_impl() {
+    let capture = FrameCapture::default();
+    assert_eq!(capture.command_count(), 0);
+}

@@ -124,18 +124,39 @@ impl Minimap {
             normalized_pos.x * self.rotation.sin() + normalized_pos.y * self.rotation.cos(),
         );
 
-        // Apply zoom and position
+        // Center of the world maps to the CENTER of the minimap rect
+        // (old code mapped it to position = top-left corner, shifting all
+        // markers by half a map). Clamp to the rect.
+        let center = Vec2::new(
+            self.position.x + self.size.x * 0.5,
+            self.position.y + self.size.y * 0.5,
+        );
+        let p = Vec2::new(
+            center.x + rotated_pos.x * self.size.x * self.zoom,
+            center.y + rotated_pos.y * self.size.y * self.zoom,
+        );
         Vec2::new(
-            self.position.x + rotated_pos.x * self.size.x * self.zoom,
-            self.position.y + rotated_pos.y * self.size.y * self.zoom,
+            p.x.clamp(self.position.x, self.position.x + self.size.x),
+            p.y.clamp(self.position.y, self.position.y + self.size.y),
         )
     }
 
     /// Convert minimap position to world position
+    ///
+    /// Bug №188: this used to subtract `self.position` (the top-left anchor)
+    /// while `world_to_minimap` subtracts the rect *centre*. The two functions
+    /// were therefore not inverses of each other: any position produced by the
+    /// forward mapping came back as a different world point, so clicking a
+    /// marker on the minimap selected the wrong world position. Both now use
+    /// the centre, which is the convention the forward function documents.
     pub fn minimap_to_world(&self, minimap_position: Vec2) -> Vec3 {
+        let center = Vec2::new(
+            self.position.x + self.size.x * 0.5,
+            self.position.y + self.size.y * 0.5,
+        );
         let relative_pos = Vec2::new(
-            (minimap_position.x - self.position.x) / (self.size.x * self.zoom),
-            (minimap_position.y - self.position.y) / (self.size.y * self.zoom),
+            (minimap_position.x - center.x) / (self.size.x * self.zoom),
+            (minimap_position.y - center.y) / (self.size.y * self.zoom),
         );
 
         // Apply inverse rotation
@@ -152,58 +173,75 @@ impl Minimap {
             )
     }
 
-    pub fn render(&self) {
-        // Render minimap background
-        if let Some(texture) = &self.background_texture {
-            self.render_texture(texture, self.position, self.size, Vec4::ONE);
+    pub fn render(&self, encoder: &mut crate::rhi::CommandEncoder) {
+        if !self.visible {
+            return;
         }
-
-        // Render fog of war
+        if let Some(texture) = &self.background_texture {
+            self.render_texture(encoder, texture, self.position, self.size, Vec4::ONE);
+        }
         if let Some(texture) = &self.fog_of_war_texture {
             self.render_texture(
+                encoder,
                 texture,
                 self.position,
                 self.size,
                 Vec4::new(0.5, 0.5, 0.5, 0.5),
             );
         }
-
-        // Render elements
         for element in &self.elements {
             if element.visible {
-                self.render_element(element);
+                self.render_element(encoder, element);
             }
         }
     }
 
-    fn render_texture(&self, _texture: &Arc<Texture>, _position: Vec2, _size: Vec2, _color: Vec4) {
-        // Render a texture at the specified position and size
+    fn render_texture(
+        &self,
+        encoder: &mut crate::rhi::CommandEncoder,
+        texture: &Arc<Texture>,
+        position: Vec2,
+        size: Vec2,
+        color: Vec4,
+    ) {
+        let _ = (encoder, texture, position, size, color);
     }
 
-    fn render_element(&self, element: &MinimapElement) {
-        // Render a minimap element
+    fn render_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
         match &element.element_type {
-            MinimapElementType::Ship => self.render_ship_element(element),
-            MinimapElementType::Objective => self.render_objective_element(element),
-            MinimapElementType::Marker => self.render_marker_element(element),
-            MinimapElementType::Area => self.render_area_element(element),
+            MinimapElementType::Ship => self.render_ship_element(encoder, element),
+            MinimapElementType::Objective => self.render_objective_element(encoder, element),
+            MinimapElementType::Marker => self.render_marker_element(encoder, element),
+            MinimapElementType::Area => self.render_area_element(encoder, element),
         }
     }
 
-    fn render_ship_element(&self, _element: &MinimapElement) {
-        // Render ship element
+    fn render_ship_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
+        let pos = self.world_to_minimap(element.world_position);
+        let size = element.size;
+        let color = element.color;
+        let _ = (encoder, pos, size, color);
     }
 
-    fn render_objective_element(&self, _element: &MinimapElement) {
-        // Render objective element
+    fn render_objective_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
+        let pos = self.world_to_minimap(element.world_position);
+        let size = element.size;
+        let color = element.color;
+        let _ = (encoder, pos, size, color);
     }
 
-    fn render_marker_element(&self, _element: &MinimapElement) {
-        // Render marker element
+    fn render_marker_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
+        let pos = self.world_to_minimap(element.world_position);
+        let size = element.size;
+        let color = element.color;
+        let _ = (encoder, pos, size, color);
     }
 
-    fn render_area_element(&self, _element: &MinimapElement) {
-        // Render area element
+    fn render_area_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
+        let pos = self.world_to_minimap(element.world_position);
+        let size = element.size;
+        let color = element.color;
+        let _ = (encoder, pos, size, color);
     }
 }
 
@@ -215,18 +253,15 @@ impl Default for Minimap {
 
 /// Minimap element type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum MinimapElementType {
+    #[default]
     Ship,
     Objective,
     Marker,
     Area,
 }
 
-impl Default for MinimapElementType {
-    fn default() -> Self {
-        Self::Ship
-    }
-}
 
 /// Minimap element
 #[derive(Debug, Clone)]

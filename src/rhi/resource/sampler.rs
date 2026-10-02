@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::GpuResource;
+
 /// Filter mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum FilterMode {
@@ -148,11 +150,12 @@ impl SamplerDesc {
 #[derive(Debug, Clone)]
 pub struct Sampler {
     desc: SamplerDesc,
+    pub(crate) backend: Option<GpuResource>,
 }
 
 impl Sampler {
     pub fn new(desc: SamplerDesc) -> Self {
-        Self { desc }
+        Self { desc, backend: None }
     }
     pub fn from_desc(desc: SamplerDesc) -> Self {
         Self::new(desc)
@@ -177,5 +180,20 @@ impl Sampler {
     /// Returns `true` when the sampler is anisotropic.
     pub fn is_anisotropic(&self) -> bool {
         self.desc.max_anisotropy > 0.0
+    }
+
+    /// Returns the native backend handle attached by the active backend, if any.
+    pub(crate) fn backend(&self) -> Option<GpuResource> {
+        self.backend
+    }
+
+    /// Attaches a native backend handle to this sampler.
+    pub(crate) fn set_backend(&mut self, resource: GpuResource) {
+        self.backend = Some(resource);
+    }
+
+    /// Returns `true` when this sampler is backed by a native GPU sampler.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
     }
 }

@@ -4,6 +4,8 @@
 
 use crate::types::*;
 
+use super::GpuResource;
+
 /// Texture description
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextureDesc {
@@ -28,7 +30,7 @@ impl TextureDesc {
             return 1;
         }
         let max_dim = width.max(height);
-        (32 - max_dim.leading_zeros()) as u32
+        32 - max_dim.leading_zeros()
     }
 
     /// Returns `true` when every mip level reduces the dimensions to at
@@ -51,11 +53,61 @@ impl TextureDesc {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Texture {
     desc: TextureDesc,
+    pub(crate) backend: Option<GpuResource>,
 }
 
 impl Texture {
     pub fn new(desc: TextureDesc) -> Self {
-        Self { desc }
+        Self { desc, backend: None }
+    }
+
+    /// Adopt an image the backend already owns.
+    ///
+    /// A swapchain image is created by `vkCreateSwapchainKHR`, not by the RHI,
+    /// so it arrives here as a raw handle. There is no descriptor to validate
+    /// and no memory to own — the swapchain owns both — so this exists purely to
+    /// let a presentation image be used wherever a `Texture` is expected, which
+    /// is what building a render pass on a swapchain image needs.
+    pub(crate) fn adopt_backend_image(
+        width: u32,
+        height: u32,
+        format: Format,
+        image: u64,
+        image_view: u64,
+    ) -> (Self, TextureView) {
+        let texture = Texture {
+            desc: TextureDesc {
+                width,
+                height,
+                depth: 1,
+                mip_levels: 1,
+                array_layers: 1,
+                format,
+                usage: TextureUsage::COLOR_ATTACHMENT,
+                sample_count: crate::types::SampleCount::X1,
+                ..Default::default()
+            },
+            backend: Some(GpuResource { handle: image, memory: image_view, mapped: 0 }),
+        };
+        let view = TextureView {
+            texture: texture.clone(),
+            desc: TextureViewDesc {
+                texture: texture.clone(),
+                format: Some(format),
+                view_type: TextureViewType::D2,
+                aspects: TextureAspectFlags::COLOR,
+                base_mip_level: 0,
+                mip_level_count: 1,
+                base_array_layer: 0,
+                array_layer_count: 1,
+            },
+            backend: Some(GpuResource { handle: image_view, memory: 0, mapped: 0 }),
+        };
+        (texture, view)
+    }
+
+    pub fn from_desc(desc: TextureDesc) -> Self {
+        Self::new(desc)
     }
 
     pub fn desc(&self) -> &TextureDesc {
@@ -120,11 +172,27 @@ impl Texture {
         self.desc.sample_count.as_count() > 1
     }
 
+    /// Returns the native backend handle attached by the active backend, if any.
+    pub(crate) fn backend(&self) -> Option<GpuResource> {
+        self.backend
+    }
+
+    /// Attaches a native backend handle to this texture.
+    pub(crate) fn set_backend(&mut self, resource: GpuResource) {
+        self.backend = Some(resource);
+    }
+
+    /// Returns `true` when this texture is backed by native GPU memory.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
+    }
+
     /// Create a texture view from this texture.
     pub fn create_view(&self, desc: TextureViewDesc) -> TextureView {
         TextureView {
             texture: self.clone(),
             desc,
+            backend: None,
         }
     }
 
@@ -197,9 +265,32 @@ pub enum TextureViewType {
 pub struct TextureView {
     texture: Texture,
     desc: TextureViewDesc,
+    pub(crate) backend: Option<GpuResource>,
 }
 
 impl TextureView {
+    pub fn from_parts(texture: Texture, desc: TextureViewDesc) -> Self {
+        Self {
+            texture,
+            desc,
+            backend: None,
+        }
+    }
+
+    /// Returns the native backend handle attached by the active backend, if any.
+    pub(crate) fn backend(&self) -> Option<GpuResource> {
+        self.backend
+    }
+
+    /// Attaches a native backend handle to this view.
+    pub(crate) fn set_backend(&mut self, resource: GpuResource) {
+        self.backend = Some(resource);
+    }
+
+    /// Returns `true` when this view is backed by a native GPU image view.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
+    }
     pub fn texture(&self) -> &Texture {
         &self.texture
     }

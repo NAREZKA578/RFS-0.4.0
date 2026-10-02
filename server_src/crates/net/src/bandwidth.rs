@@ -12,6 +12,12 @@ pub struct BandwidthTracker {
     received_packets: Mutex<u64>,
 }
 
+impl Default for BandwidthTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BandwidthTracker {
     pub fn new() -> Self {
         Self {
@@ -26,6 +32,12 @@ impl BandwidthTracker {
     }
 
     pub fn with_window(window: Duration) -> Self {
+        // Zero window would divide by zero in sent_bps/received_bps (inf).
+        let window = if window.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            window
+        };
         Self {
             sent_history: Mutex::new(VecDeque::new()),
             received_history: Mutex::new(VecDeque::new()),
@@ -191,11 +203,18 @@ struct TokenBucket {
 
 impl BandwidthLimiter {
     pub fn new(max_bps: f64) -> Self {
+        // NaN/negative/zero would blackhole everything (NaN >= cost is false)
+        // or divide by zero in wait_for — sanitize to a sane default.
+        let sane = if max_bps.is_finite() && max_bps > 0.0 {
+            max_bps
+        } else {
+            1_000_000.0
+        };
         Self {
             bucket: Mutex::new(TokenBucket {
-                tokens: max_bps,
-                max_tokens: max_bps,
-                max_bps,
+                tokens: sane,
+                max_tokens: sane,
+                max_bps: sane,
                 last_update: Instant::now(),
             }),
         }
@@ -236,15 +255,141 @@ impl BandwidthLimiter {
     }
 
     pub fn set_max_bps(&self, max_bps: f64) {
-        let max_bps = max_bps.max(0.0);
+        // Bug №176: `max_bps.max(0.0)` still let 0 through, and a zero rate
+        // makes `wait_for` compute `needed / 0` = inf, which
+        // `Duration::from_secs_f64` panics on — turning a rate change into a
+        // crash of the send path. NaN compares false against everything, so
+        // the same guard as the constructor is required here.
+        let sane = if max_bps.is_finite() && max_bps > 0.0 {
+            max_bps
+        } else {
+            1_000_000.0
+        };
         // Bug №39: bumping max_tokens alone left the bucket refill rate at
         // the OLD tempo, so the "new" limit silently did nothing. Update the
         // rate too.
         let mut bucket = self.bucket.lock();
-        bucket.max_bps = max_bps;
-        bucket.max_tokens = max_bps;
-        if bucket.tokens > max_bps {
-            bucket.tokens = max_bps;
+        bucket.max_bps = sane;
+        bucket.max_tokens = sane;
+        if bucket.tokens > sane {
+            bucket.tokens = sane;
+        }
+    }
+}
+
+/// What the limiter says about putting a packet on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Tokens available — send it now.
+    Send,
+    /// Out of tokens, and the packet is unreliable. Dropping it is correct:
+    /// the next state/update supersedes it anyway.
+    Drop,
+    /// Out of tokens, but the packet is reliable. It must be retried, never
+    /// discarded — the Channel layer has no retransmit queue yet, so a drop
+    /// here loses the message for good (bug №171). The payload is how long to
+    /// wait before tokens should have accrued.
+    Retry(Duration),
+}
+
+impl BandwidthLimiter {
+    /// Ask for permission to send `bytes`.
+    ///
+    /// `reliable` must reflect the packet's channel: a reliable packet that
+    /// gets `Retry` is the caller's responsibility to resend, an unreliable
+    /// one may be dropped without consequence.
+    pub fn admit(&self, bytes: usize, reliable: bool) -> Admission {
+        if self.try_consume(bytes) {
+            Admission::Send
+        } else if reliable {
+            Admission::Retry(self.wait_for(bytes))
+        } else {
+            Admission::Drop
+        }
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    fn limiter(bps: f64) -> BandwidthLimiter {
+        BandwidthLimiter::new(bps)
+    }
+
+    #[test]
+    fn an_unreliable_packet_may_be_dropped() {
+        // Bug №171: this is the old behaviour and it is fine for unreliable
+        // traffic — a newer packet supersedes it.
+        let l = limiter(1_000.0);
+        assert_eq!(l.admit(1_000, false), Admission::Send);
+        assert_eq!(l.admit(1_000, false), Admission::Drop);
+    }
+
+    #[test]
+    fn a_reliable_packet_is_never_advised_to_drop() {
+        let l = limiter(1_000.0);
+        assert_eq!(l.admit(1_000, true), Admission::Send);
+        match l.admit(1_000, true) {
+            Admission::Retry(wait) => {
+                assert!(wait > Duration::ZERO, "a retry must carry a real wait");
+            }
+            other => panic!("a reliable packet must never be dropped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_retry_wait_matches_the_refill_rate() {
+        // 1 000 B/s budget, bucket drained, 500 B packet -> ~0.5 s.
+        let l = limiter(1_000.0);
+        assert!(l.try_consume(1_000));
+        let Admission::Retry(wait) = l.admit(500, true) else {
+            panic!("expected a retry");
+        };
+        let secs = wait.as_secs_f64();
+        assert!(
+            (0.4..0.6).contains(&secs),
+            "expected roughly half a second, got {secs}"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_limit_never_deadlocks_reliable_traffic() {
+        // set_max_bps(0) used to leave max_bps at 0, and `wait_for` then
+        // computed `needed / 0` = inf, which `Duration::from_secs_f64` panics
+        // on (bug №176). It must instead sanitise to a usable rate.
+        //
+        // `wait_for` reads the rate straight out of the bucket rather than
+        // re-sanitising, so it is the direct expression of the invariant:
+        // whatever the caller set, a full bucket must never divide by zero,
+        // produce a non-finite duration, or deadlock reliable traffic.
+        for degenerate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let l = limiter(1_000.0);
+            assert!(l.try_consume(1_000), "drain the bucket first");
+            l.set_max_bps(degenerate);
+
+            // A full bucket at a sanitised rate => zero wait, and `admit`
+            // accepts the reliable packet instead of retrying forever.
+            assert_eq!(l.wait_for(0), Duration::ZERO, "{degenerate}");
+
+            // The rate itself must be usable: positive, finite and non-zero,
+            // otherwise `wait_for` would panic or return a silly wait.
+            let rate = l.bucket.lock().max_bps;
+            assert!(
+                rate.is_finite() && rate > 0.0,
+                "{degenerate}: sanitised to an unusable rate {rate}"
+            );
+
+            // A packet far larger than the bucket cannot be admitted, and the
+            // resulting retry must be a real, finite, non-zero wait rather
+            // than a panic or an infinite stall.
+            let Admission::Retry(wait) = l.admit(rate.ceil() as usize * 2 + 1_000_000, true) else {
+                panic!("{degenerate}: expected a retry, not an immediate send");
+            };
+            assert!(
+                wait > Duration::ZERO && wait < Duration::from_secs(60),
+                "{degenerate}: a sanitised rate must give a bounded wait, got {wait:?}"
+            );
         }
     }
 }

@@ -9,6 +9,12 @@ pub struct ComputePass {
     // In OpenGL this may be a separate pass
 }
 
+impl Default for ComputePass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ComputePass {
     pub fn new() -> Self {
         Self {}

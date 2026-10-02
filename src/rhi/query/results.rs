@@ -4,7 +4,7 @@
 //! **TODO: Full implementation required**
 
 /// Query result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
     Occlusion(bool),
     Timestamp(u64),
@@ -13,7 +13,7 @@ pub enum QueryResult {
 }
 
 /// Pipeline statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PipelineStatistics {
     pub input_assembly_vertices: u64,
     pub input_assembly_primitives: u64,

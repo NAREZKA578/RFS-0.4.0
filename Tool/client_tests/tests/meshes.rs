@@ -8,6 +8,65 @@ use glam::{Vec2, Vec3, Vec4};
 use rfs_client::render::meshes::mesh::MeshBuilder;
 use rfs_client::render::meshes::{IndexType, Mesh, MeshFlags, MeshLibrary, PrimitiveType, Vertex};
 
+/// Mesh buffers must be real GPU buffers with the geometry actually in them.
+///
+/// `create_vertex_buffer`/`create_index_buffer` used to take the device as
+/// `_device`, ignore it, and build a CPU-only `Buffer` that reported the right
+/// size while having no GPU backing. A draw would then have bound handle 0.
+/// This drives the real Vulkan device and checks the backing, the size and the
+/// bytes read back.
+#[test]
+fn mesh_buffers_reach_the_gpu_with_their_geometry() {
+    use rhi::backend::create_backend;
+    use rhi::config::RhiConfig;
+    use rhi::core::device::DeviceDesc;
+    use rhi::types::Features;
+
+    let backend = create_backend(&RhiConfig::default()).expect("create backend");
+    let devices = backend.enumerate_physical_devices().expect("enumerate");
+    if devices.is_empty() {
+        panic!("no Vulkan device available");
+    }
+    let device = backend
+        .create_device(&devices[0], &DeviceDesc { features: Features::default(), ..Default::default() })
+        .expect("create device");
+
+    let mut mesh = Mesh::cube("cube", 1.0);
+    let vertex_count = mesh.vertices.len();
+    let index_count = mesh.indices.len();
+    assert!(vertex_count > 0 && index_count > 0, "the primitive should have geometry");
+
+    mesh.create_buffers(&device);
+
+    let vertex_buffer = mesh.vertex_buffer().expect("vertex buffer");
+    let index_buffer = mesh.index_buffer().expect("index buffer");
+    assert!(vertex_buffer.has_gpu_backing(), "vertex buffer has no GPU backing");
+    assert!(index_buffer.has_gpu_backing(), "index buffer has no GPU backing");
+
+    // Sizes must match the data actually submitted, not a guess.
+    assert_eq!(
+        vertex_buffer.size() as usize,
+        std::mem::size_of::<Vertex>() * vertex_count,
+        "vertex buffer size does not match the geometry"
+    );
+    assert_eq!(
+        index_buffer.size() as usize,
+        4 * index_count,
+        "index buffer size does not match the geometry"
+    );
+
+    // The bytes have to be there, not just a handle. A buffer that was created
+    // but never uploaded reads back as zeros.
+    let read_back = device
+        .download_buffer(index_buffer, 0, index_buffer.size())
+        .expect("read back the index buffer");
+    assert_eq!(read_back.len(), 4 * index_count);
+    assert!(
+        read_back.iter().any(|b| *b != 0),
+        "the index buffer is all zeros: the upload never happened"
+    );
+}
+
 const EPSILON: f32 = 1e-4;
 const SQRT_3: f32 = 1.73205;
 
@@ -97,6 +156,47 @@ fn plane_counts_and_bounds() {
     assert!((bounds.max.z - 10.0).abs() < EPSILON);
     assert!((bounds.min.y).abs() < EPSILON);
     assert!((bounds.max.y).abs() < EPSILON);
+}
+
+/// Bug №186: the plane's triangle winding produced a geometric normal of -Y
+/// while the vertex normals claimed +Y, so back-face culling made the plane
+/// invisible from above. The counts-and-bounds test above passed regardless —
+/// it never looked at the winding — so the defect went unnoticed.
+#[test]
+fn plane_triangles_face_the_same_way_as_their_vertex_normals() {
+    let plane = Mesh::plane("plane", 10.0, 20.0);
+    let verts = &plane.vertices;
+    let idx = &plane.indices;
+
+    for tri in idx.chunks(3) {
+        let v0 = verts[tri[0] as usize].position;
+        let v1 = verts[tri[1] as usize].position;
+        let v2 = verts[tri[2] as usize].position;
+
+        // Geometric normal from the winding: (v1 - v0) x (v2 - v0).
+        let a = v1 - v0;
+        let b = v2 - v0;
+        let n = a.cross(b);
+        assert!(
+            n.length() > EPSILON,
+            "triangle {tri:?} is degenerate, its winding defines no facing"
+        );
+        let n = n.normalize();
+
+        // Must point the same way as the shading normal, otherwise back-face
+        // culling discards the surface even though it is lit as front-facing.
+        let shading = verts[tri[0] as usize].normal;
+        assert!(
+            n.dot(shading) > 0.0,
+            "triangle {tri:?} has geometric normal {n:?} but shading normal {shading:?} \
+             — back-face culling would discard it"
+        );
+        // And the plane's shading normal is +Y, so it must be visible from above.
+        assert!(
+            n.y > 0.0,
+            "the plane must face up, got {n:?}"
+        );
+    }
 }
 
 #[test]

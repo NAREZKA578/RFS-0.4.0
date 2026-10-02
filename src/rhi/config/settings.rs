@@ -96,15 +96,12 @@ impl Default for ValidationConfig {
 
 /// Validation severity levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ValidationSeverity {
     Info,
     Warning,
+    #[default]
     Error,
     Verbose,
 }
 
-impl Default for ValidationSeverity {
-    fn default() -> Self {
-        Self::Error
-    }
-}

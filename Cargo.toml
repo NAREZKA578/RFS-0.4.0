@@ -13,9 +13,17 @@ rhi = { path = "src/rhi" }
 # Math
 glam = "0.26"
 
-# Windowing (for testing)
-# winit = "0.29"
-# raw-window-handle = "0.5"
+# Windowing
+#
+# Accepted decision (plan, part G): the window comes from a ready-made library,
+# not hand-rolled. `default-features = false` because the project is Windows
+# only, so the Wayland and X11 backends are dead weight; `rwh_06` selects the
+# raw-window-handle version that `Renderer` uses to obtain the Win32 handles
+# `ash` needs for a VkSurfaceKHR.
+winit = { version = "0.29", default-features = false, features = ["rwh_06"] }
+raw-window-handle = "0.6"
+
+
 
 # Image loading (for texture loading)
 # image = "0.24"

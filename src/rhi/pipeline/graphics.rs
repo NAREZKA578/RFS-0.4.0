@@ -78,22 +78,101 @@ impl VertexInputState {
     }
 }
 
-/// Returns the size in bytes of a single texel of the given format.
+/// Block footprint of a compressed format: how many texels one block covers
+/// and how many bytes it occupies.
+///
+/// Bug №221: a single "size in bytes" cannot describe a compressed format —
+/// the byte count depends on the mip extents (rounded up to whole blocks).
+/// Anything sizing a compressed image has to use these dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatBlock {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u32,
+}
+
+/// Bug №221: block dimensions for a compressed format, `None` for uncompressed.
+pub fn format_block(format: Format) -> Option<FormatBlock> {
+    use Format::*;
+    let (width, height, bytes) = match format {
+        BC1_RGB_UNORM | BC1_RGB_SRGB | BC1_RGBA_UNORM | BC1_RGBA_SRGB => (4, 4, 8),
+        BC2_UNORM | BC2_SRGB | BC3_UNORM | BC3_SRGB => (4, 4, 16),
+        BC4_UNORM | BC4_SNORM | BC5_UNORM | BC5_SNORM => (4, 4, 8),
+        BC6H_UFLOAT | BC6H_SFLOAT => (4, 4, 16),
+        BC7_UNORM | BC7_SRGB => (4, 4, 16),
+        ASTC_4x4_UNORM | ASTC_4x4_SRGB => (4, 4, 16),
+        ASTC_5x4_UNORM | ASTC_5x4_SRGB => (5, 4, 16),
+        ASTC_5x5_UNORM | ASTC_5x5_SRGB => (5, 5, 16),
+        ASTC_6x5_UNORM | ASTC_6x5_SRGB => (6, 5, 16),
+        ASTC_6x6_UNORM | ASTC_6x6_SRGB => (6, 6, 16),
+        ASTC_8x5_UNORM | ASTC_8x5_SRGB => (8, 5, 16),
+        ASTC_8x6_UNORM | ASTC_8x6_SRGB => (8, 6, 16),
+        ASTC_8x8_UNORM | ASTC_8x8_SRGB => (8, 8, 16),
+        // Every ETC2/EAC variant is a 4x4 block of 8 or 16 bytes.
+        ETC2_R8G8B8_UNORM | ETC2_R8G8B8_SRGB | ETC2_R8G8B8A1_UNORM | ETC2_R8G8B8A1_SRGB
+        | EAC_R11_UNORM | EAC_R11_SNORM => (4, 4, 8),
+        ETC2_R8G8B8A8_UNORM
+        | ETC2_R8G8B8A8_SRGB
+        | EAC_R11G11_UNORM
+        | EAC_R11G11_SNORM => (4, 4, 16),
+        // Uncompressed formats have no block footprint.
+        _ => return None,
+    };
+    Some(FormatBlock { width, height, bytes })
+}
+
+/// Bug №221: is this a block-compressed format?
+pub fn is_compressed_format(format: Format) -> bool {
+    format_block(format).is_some()
+}
+
+/// Returns the size in bytes of a single texel of the given format, or — for a
+/// block-compressed format — the size of one *block* (see [`format_block`] for
+/// the extents a block covers).
+///
+/// Bug №221: the previous table placed the depth formats by "4 bytes per
+/// component", which gave D16_UNORM = 8, D24_UNORM_S8_UINT = 8, D32_SFLOAT = 12
+/// and D32_SFLOAT_S8_UINT = 12. The correct texel sizes are 2, 4, 4 and 8. It
+/// also returned 0 for every BC/ASTC/ETC2 format, which is not a size at all;
+/// those now report their block size instead of 0.
 pub fn format_size(format: Format) -> u32 {
     use Format::*;
+    if let Some(block) = format_block(format) {
+        return block.bytes;
+    }
     match format {
         R8_UNORM | R8_SNORM | R8_UINT | R8_SINT | S8_UINT | A8_UNORM => 1,
         R16_UNORM | R16_SNORM | R16_UINT | R16_SINT | R16_SFLOAT | RG8_UNORM | RG8_SNORM
-        | RG8_UINT | RG8_SINT => 2,
+        | RG8_UINT | RG8_SINT | D16_UNORM => 2,
         R32_UINT | R32_SINT | R32_SFLOAT | RG16_UNORM | RG16_SNORM | RG16_UINT | RG16_SINT
         | RG16_SFLOAT | RGBA8_UNORM | RGBA8_SNORM | RGBA8_UINT | RGBA8_SINT
-        | B10G11R11_UFLOAT | E5B9G9R9_UFLOAT => 4,
+        | B10G11R11_UFLOAT | E5B9G9R9_UFLOAT | D24_UNORM | D32_SFLOAT
+        | D24_UNORM_S8_UINT => 4,
         R32G32_UINT | R32G32_SINT | R32G32_SFLOAT | RGBA16_UNORM | RGBA16_SFLOAT
-        | D16_UNORM | D24_UNORM_S8_UINT => 8,
-        R32G32B32_UINT | R32G32B32_SINT | R32G32B32_SFLOAT | D32_SFLOAT
-        | D32_SFLOAT_S8_UINT => 12,
+        | D32_SFLOAT_S8_UINT => 8,
+        R32G32B32_UINT | R32G32B32_SINT | R32G32B32_SFLOAT => 12,
         RGBA32_UINT | RGBA32_SINT | RGBA32_SFLOAT => 16,
+        // Only reachable for a value the enum does not contain.
         _ => 0,
+    }
+}
+
+/// Bytes one mip level of a `width x height` image occupies.
+///
+/// Bug №221: the old call sites multiplied the raw extents by a texel size,
+/// which is wrong for block-compressed formats — a 5x5 BC1 image is one 4x4
+/// block (8 bytes), not 25 texels. Round the extents up to whole blocks first.
+pub fn mip_level_size(format: Format, width: u32, height: u32, depth: u32) -> u64 {
+    match format_block(format) {
+        Some(block) => {
+            let bw = width.div_ceil(block.width);
+            let bh = height.div_ceil(block.height);
+            bw as u64 * bh as u64 * depth.max(1) as u64 * block.bytes as u64
+        }
+        None => {
+            let texel = format_size(format) as u64;
+            width as u64 * height as u64 * depth.max(1) as u64 * texel
+        }
     }
 }
 
@@ -482,11 +561,30 @@ pub struct GraphicsPipelineDesc {
 #[derive(Debug, Clone)]
 pub struct GraphicsPipeline {
     desc: GraphicsPipelineDesc,
+    pub(crate) backend: Option<crate::resource::GpuResource>,
 }
 
 impl GraphicsPipeline {
     pub fn new(desc: GraphicsPipelineDesc) -> Self {
-        Self { desc }
+        Self {
+            desc,
+            backend: None,
+        }
+    }
+
+    /// Attaches a native handle produced by the active backend. The `memory`
+    /// field of the attachment carries the pipeline layout handle.
+    pub(crate) fn set_backend(&mut self, backend: crate::resource::GpuResource) {
+        self.backend = Some(backend);
+    }
+
+    /// Returns `true` when the pipeline has a native backend handle.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    pub(crate) fn backend(&self) -> Option<crate::resource::GpuResource> {
+        self.backend
     }
 
     pub fn desc(&self) -> &GraphicsPipelineDesc {

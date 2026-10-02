@@ -98,7 +98,6 @@ impl BloodEffect {
     /// Renders the blood effect
     pub fn render(&self, _renderer: &mut crate::render::core::Renderer) {
         if !self.enabled {
-            return;
         }
     }
 

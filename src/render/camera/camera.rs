@@ -28,9 +28,14 @@ pub trait Camera: Send + Sync + Debug {
     /// Get up direction
     fn up(&self) -> Vec3;
 
-    /// Get right direction
+    /// Get right direction (NaN-safe: parallel forward/up yields fallback axis).
     fn right(&self) -> Vec3 {
-        self.forward().cross(self.up()).normalize()
+        let c = self.forward().cross(self.up());
+        if c.length_squared() < 1e-12 || !c.is_finite() {
+            Vec3::X
+        } else {
+            c.normalize()
+        }
     }
 
     /// Cast to `Any` (for downcasting)
@@ -90,14 +95,34 @@ impl PerspectiveCamera {
     pub fn look_at(
         position: Vec3,
         target: Vec3,
-        _up: Vec3,
+        up: Vec3,
         fov: f32,
         aspect_ratio: f32,
         near: f32,
         far: f32,
     ) -> Self {
-        let forward = (target - position).normalize();
+        let dir = target - position;
+        let forward = if dir.length_squared() < 1e-12 {
+            Vec3::NEG_Z
+        } else {
+            dir.normalize()
+        };
+        let up_n = if up.length_squared() < 1e-12 {
+            Vec3::Y
+        } else {
+            up.normalize()
+        };
+        let up_safe = if forward.cross(up_n).length_squared() < 1e-12 {
+            if forward.y.abs() < 0.99 {
+                Vec3::Y
+            } else {
+                Vec3::X
+            }
+        } else {
+            up_n
+        };
         let rotation = Quat::from_rotation_arc(Vec3::Z, forward);
+        let rotation = Quat::from_rotation_arc(Vec3::Y, up_safe) * rotation;
         Self::new(position, fov, aspect_ratio, near, far).with_rotation(rotation)
     }
 
@@ -133,7 +158,12 @@ impl PerspectiveCamera {
 
     pub fn with_viewport(mut self, x: f32, y: f32, width: f32, height: f32) -> Self {
         self.viewport = (x, y, width, height);
-        self.aspect_ratio = width / height;
+        // Guard divide-by-zero: degenerate height must not produce inf aspect.
+        self.aspect_ratio = if height.abs() > 1e-6 && width.is_finite() && height.is_finite() {
+            (width / height).clamp(0.1, 10.0)
+        } else {
+            16.0 / 9.0
+        };
         self
     }
 }
@@ -186,9 +216,24 @@ impl Camera for PerspectiveCamera {
     }
 
     fn frustum_planes(&self) -> [Mat4; 6] {
-        // This is a placeholder - in actual implementation, we would
-        // calculate the frustum planes from the view-projection matrix
-        [Mat4::IDENTITY; 6]
+        let vp = self.view_projection_matrix();
+        let planes = [
+            vp.row(3) + vp.row(0),
+            vp.row(3) - vp.row(0),
+            vp.row(3) + vp.row(1),
+            vp.row(3) - vp.row(1),
+            vp.row(3) + vp.row(2),
+            vp.row(3) - vp.row(2),
+        ];
+        let mut result = [Mat4::IDENTITY; 6];
+        for (i, plane) in planes.iter().enumerate() {
+            let len = plane.truncate().length();
+            if len > 1e-6 {
+                let n = *plane / len;
+                result[i] = Mat4::from_cols(n, n, n, n);
+            }
+        }
+        result
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -269,12 +314,12 @@ impl OrthographicCamera {
         self
     }
 
-    pub fn set_viewport(&mut self, x: f32, width: f32, height: f32, _y: f32) {
+    pub fn set_viewport(&mut self, x: f32, width: f32, height: f32, y: f32) {
         self.left = x;
         self.right = x + width;
-        self.bottom = 0.0;
-        self.top = height;
-        self.viewport = (x, 0.0, width, height);
+        self.bottom = y;
+        self.top = y + height;
+        self.viewport = (x, y, width, height);
     }
 }
 
@@ -333,7 +378,24 @@ impl Camera for OrthographicCamera {
     }
 
     fn frustum_planes(&self) -> [Mat4; 6] {
-        [Mat4::IDENTITY; 6]
+        let vp = self.view_projection_matrix();
+        let planes = [
+            vp.row(3) + vp.row(0),
+            vp.row(3) - vp.row(0),
+            vp.row(3) + vp.row(1),
+            vp.row(3) - vp.row(1),
+            vp.row(3) + vp.row(2),
+            vp.row(3) - vp.row(2),
+        ];
+        let mut result = [Mat4::IDENTITY; 6];
+        for (i, plane) in planes.iter().enumerate() {
+            let len = plane.truncate().length();
+            if len > 1e-6 {
+                let n = *plane / len;
+                result[i] = Mat4::from_cols(n, n, n, n);
+            }
+        }
+        result
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -371,6 +433,15 @@ pub struct CameraBuilder {
 pub enum CameraType {
     Perspective,
     Orthographic,
+}
+
+/// Camera control mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CameraMode {
+    #[default]
+    FirstPerson,
+    ThirdPerson,
+    Orbital,
 }
 
 impl CameraBuilder {

@@ -69,6 +69,37 @@ pub struct ShipState {
     /// Bug №57: one-shot "the ship went under" flag — it lets the sim remove
     /// the ship instead of sinking forever.
     pub has_sunk: bool,
+    /// Bug №272: the most recent hit taken, replicated in layer 0.
+    ///
+    /// Set by `apply_damage` and cleared by the replication layer once it has
+    /// been published. It exists because the `ShipHit` event became unreliable
+    /// (events carry no state, and the client's world lives in the layers), and
+    /// the impact normal plus the struck compartment were the only parts of an
+    /// event that no layer carried — so without this, losing the event packet
+    /// would lose the hit effect and the survivability feedback.
+    ///
+    /// `None` means "nothing new to publish". The replication side consumes it,
+    /// so it is a one-shot marker rather than history.
+    pub last_hit: Option<HitMark>,
+}
+
+/// Bug №272: durable record of one hit, carried in the ship layer so the client
+/// can draw the impact without relying on an event packet.
+///
+/// Separate from the `ShipHit` event on purpose: the event is a notification
+/// that may be lost, this is state that is diffed and eventually consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HitMark {
+    /// Simulation tick the hit landed on.
+    pub tick: u64,
+    /// Impact point in the WORLD frame (plan §8.1: ship state is local, this is
+    /// the one-time transform to world).
+    pub position: Vec3f,
+    /// Surface normal in the world frame.
+    pub normal: Vec3f,
+    /// Compartment that took the hit, when the point resolved to one.
+    pub compartment: Option<EntityId>,
+    pub damage: f32,
 }
 
 impl Default for ShipState {
@@ -88,6 +119,7 @@ impl Default for ShipState {
             is_sinking: false,
             sink_timer: 0.0,
             has_sunk: false,
+            last_hit: None,
         }
     }
 }
@@ -157,6 +189,11 @@ impl Ship {
     }
 
     fn initialize_compartments(&mut self) {
+        // Bug №152: compartment/station/bulkhead regions are carved from the
+        // ship's id stride (+1000, +2000, +3000). More than 1000 compartments
+        // would spill into the station region and collide with another ship's
+        // or this ship's other entities. Cap so every id stays unique.
+        const MAX_COMPARTMENTS: usize = 900;
         // Ship-local names resolve to ids once here so the state copy is
         // born complete (bug №52 id scheme + bug №54 empty bulkheads).
         let name_to_id: HashMap<String, EntityId> = self
@@ -164,11 +201,12 @@ impl Ship {
             .compartments
             .iter()
             .enumerate()
+            .take(MAX_COMPARTMENTS)
             .map(|(i, t)| (t.name.clone(), EntityId::new(self.entity_id.0 + 1000 + i as u64)))
             .collect();
 
         let mut states = self.state.write();
-        for (i, template) in self.config.compartments.iter().enumerate() {
+        for (i, template) in self.config.compartments.iter().enumerate().take(MAX_COMPARTMENTS) {
             let comp_id = EntityId::new(self.entity_id.0 + 1000 + i as u64);
 
             let connected: Vec<EntityId> = template
@@ -179,10 +217,13 @@ impl Ship {
 
             // bug №52: bulkheads live in their own region (3000 + comp_rank*8 + bh_rank)
             // so they can never collide with another ship's compartments/stations.
+            // Guard: more than 8 bulkheads per compartment would spill into the
+            // next compartment region (0*8+8 == 1*8+0) — cap at 8.
             let bulkheads: Vec<crate::compartment::BulkheadState> = template
                 .bulkheads
                 .iter()
                 .enumerate()
+                .take(8)
                 .map(|(bi, bt)| crate::compartment::BulkheadState {
                     entity_id: EntityId::new(self.entity_id.0 + 3000 + i as u64 * 8 + bi as u64),
                     connects_to: name_to_id
@@ -235,7 +276,10 @@ impl Ship {
             .map(|(i, t)| (t.name.clone(), EntityId::new(self.entity_id.0 + 1000 + i as u64)))
             .collect();
 
-        for (i, template) in self.config.stations.iter().enumerate() {
+        // Guard station region spill: compartments use +1000+i, stations
+        // +2000+i — cap stations so they never reach bulkhead region (+3000).
+        const MAX_STATIONS: usize = 900;
+        for (i, template) in self.config.stations.iter().enumerate().take(MAX_STATIONS) {
             let station_id = EntityId::new(self.entity_id.0 + 2000 + i as u64);
             let compartment_id = name_to_comp
                 .get(&template.compartment_name)
@@ -259,6 +303,24 @@ impl Ship {
                 },
             );
             self.stations.insert(station_id, station);
+        }
+
+        // Backfill compartment.config.stations: Compartment::new only knew
+        // template station NAMES (mapped to EntityId(0) placeholder). Resolve
+        // them now that station ids exist (station template -> compartment).
+        {
+            let station_by_comp: HashMap<EntityId, Vec<EntityId>> = {
+                let mut map: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+                for (sid, st) in &self.stations {
+                    map.entry(st.compartment_id()).or_default().push(*sid);
+                }
+                map
+            };
+            for (cid, comp) in &mut self.compartments {
+                if let Some(list) = station_by_comp.get(cid) {
+                    comp.config_mut().stations = list.clone();
+                }
+            }
         }
     }
 
@@ -355,9 +417,12 @@ impl Ship {
         
         state.speed = state.velocity.length();
         
-        let turn_torque = rudder * self.config.turn_rate * state.speed;
+        // turn_rate sign must not invert steering; damping must be
+        // dt-dependent (pow), not per-tick constant.
+        let turn_torque = rudder * turn_limit * state.speed;
         state.angular_velocity.y += turn_torque * dt;
-        state.angular_velocity *= 0.98;
+        let damping = 0.98f32.powf(dt * 60.0);
+        state.angular_velocity *= damping;
         
         let yaw_change = state.angular_velocity.y * dt;
         state.heading += yaw_change;
@@ -392,13 +457,25 @@ impl Ship {
             let from = transfer.from;
             let to = transfer.to;
             let amount = transfer.amount;
+            if amount <= 0.0 || !amount.is_finite() {
+                continue;
+            }
+            // Compute room first; only move what fits — excess stays at the
+            // source (fan-in safe, volume conserved, no destruction).
+            let room = match state.compartment_states.get(&to) {
+                Some(dst) => (dst.max_water_level - dst.water_level).max(0.0),
+                None => continue,
+            };
             let Some(src) = state.compartment_states.get_mut(&from) else {
                 continue;
             };
-            if amount <= 0.0 || src.water_level <= 0.0 {
+            if src.water_level <= 0.0 {
                 continue;
             }
-            let moved = amount.min(src.water_level);
+            let moved = amount.min(src.water_level).min(room);
+            if moved <= 0.0 {
+                continue;
+            }
             src.water_level -= moved;
             if let Some(dst) = state.compartment_states.get_mut(&to) {
                 dst.water_level = (dst.water_level + moved).min(dst.max_water_level);
@@ -406,7 +483,14 @@ impl Ship {
         }
 
         for (id, amount) in fire_spreads {
+            if !amount.is_finite() || amount <= 0.0 {
+                continue;
+            }
             if let Some(cs) = state.compartment_states.get_mut(&id) {
+                // Flooded compartments cannot burn (matches graph gate).
+                if cs.water_level > cs.max_water_level * 0.9 {
+                    continue;
+                }
                 cs.fire_intensity = (cs.fire_intensity + amount).min(1.0);
             }
         }
@@ -443,11 +527,27 @@ impl Ship {
     }
 
     pub fn set_throttle(&self, throttle: f32) {
-        self.state.write().throttle = throttle.clamp(-1.0, 1.0);
+        // Bug №150: f32::clamp passes NaN through — a non-finite throttle
+        // poisoned physics. Non-finite inputs are treated as 0.
+        let mut state = self.state.write();
+        state.throttle = if throttle.is_finite() {
+            throttle.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
     }
 
     pub fn set_rudder(&self, angle: f32) {
-        let turn_limit = self.config.turn_rate.abs();
+        // Bug №150: same NaN guard. A non-finite turn_rate must not turn the
+        // clamp into a panic (min > max) or into NaN output.
+        if !angle.is_finite() {
+            return;
+        }
+        let turn_limit = if self.config.turn_rate.is_finite() {
+            self.config.turn_rate.abs()
+        } else {
+            1.0
+        };
         self.state.write().rudder_angle = angle.clamp(-turn_limit, turn_limit);
     }
 
@@ -456,7 +556,25 @@ impl Ship {
             let state = self.state.read();
             state.transform.inverse().transform_point(position)
         };
-        self.damage_system.apply_damage_to_ship(self, local_pos, damage);
+        // Bug №151: the damage graph accumulates per-compartment damage in its
+        // parallel world and marks breaches there — but nothing ever copied that
+        // back into the ship's own compartment states, so battle damage never
+        // made a ship flood. The graph now returns every compartment that just
+        // breached; mirror it into the real state so Compartment::update starts
+        // the water intake.
+        let breached = self.damage_system.apply_damage_to_ship(self, local_pos, damage);
+        if breached.is_empty() {
+            return;
+        }
+        let mut state = self.state.write();
+        for comp_id in breached {
+            if let (Some(compartment), Some(cs)) = (
+                self.compartments.get(&comp_id),
+                state.compartment_states.get_mut(&comp_id),
+            ) {
+                compartment.breach(cs);
+            }
+        }
     }
 
     pub fn get_compartment(&self, comp_id: EntityId) -> Option<&Compartment> {
@@ -480,6 +598,15 @@ impl Ship {
             return false;
         };
         let mut state = self.state.write();
+        // Invariant: one player — one station. Reject if the player already
+        // occupies any station (prevents N-station hold + ghost states).
+        if state
+            .station_states
+            .values()
+            .any(|s| s.occupant == Some(player_id))
+        {
+            return false;
+        }
         let Some(station_state) = state.station_states.get_mut(&station_id) else {
             return false;
         };
@@ -533,10 +660,87 @@ impl Ship {
             // Operational state is decided by health/flooding in update(),
             // so vacating must NOT flip is_operational off — that would
             // permanently block re-occupation.
-            let occupant = station_state.occupant.take();
-            occupant
+            station_state.occupant.take()
         } else {
             None
+        }
+    }
+
+    // Bug №157: engineering controls previously had no Ship API — the
+    // Pump/Repair/Extinguish/Open/Seal commands and station interactions fell
+    // into `_ => {}` and did nothing. These are the real implementations.
+
+    pub fn set_compartment_pump(&self, compartment_id: EntityId, active: bool) {
+        let mut state = self.state.write();
+        if let Some(cs) = state.compartment_states.get_mut(&compartment_id) {
+            cs.pump_active = active;
+        }
+    }
+
+    pub fn toggle_compartment_pump(&self, compartment_id: EntityId) -> bool {
+        let mut state = self.state.write();
+        if let Some(cs) = state.compartment_states.get_mut(&compartment_id) {
+            cs.pump_active = !cs.pump_active;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Resolve a pump station id to the compartment it sits in and toggle the
+    /// pump of that compartment.
+    pub fn toggle_station_pump(&self, station_id: EntityId) -> bool {
+        let Some(station) = self.stations.get(&station_id) else {
+            return false;
+        };
+        self.toggle_compartment_pump(station.compartment_id())
+    }
+
+    /// Resolve a pump station id to its compartment and set the pump on/off.
+    pub fn set_station_pump(&self, station_id: EntityId, active: bool) -> bool {
+        let Some(station) = self.stations.get(&station_id) else {
+            return false;
+        };
+        self.set_compartment_pump(station.compartment_id(), active);
+        true
+    }
+
+    pub fn set_bulkhead_seal(&self, bulkhead_id: EntityId, sealed: bool) -> bool {
+        let mut state = self.state.write();
+        for cs in state.compartment_states.values_mut() {
+            for b in cs.bulkhead_states.iter_mut() {
+                if b.entity_id == bulkhead_id {
+                    b.is_sealed = sealed;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn repair_station(&self, station_id: EntityId, amount: f32) -> bool {
+        let Some(station) = self.stations.get(&station_id) else {
+            return false;
+        };
+        let mut state = self.state.write();
+        if let Some(s) = state.station_states.get_mut(&station_id) {
+            station.repair(s, amount);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn extinguish_compartment(&self, compartment_id: EntityId) -> bool {
+        let Some(compartment) = self.compartments.get(&compartment_id) else {
+            return false;
+        };
+        let mut state = self.state.write();
+        if let Some(cs) = state.compartment_states.get_mut(&compartment_id) {
+            compartment.extinguish_fire(cs);
+            true
+        } else {
+            false
         }
     }
 
@@ -563,6 +767,43 @@ impl Ship {
             }
         }
         None
+    }
+
+    /// Bug №272: record a hit for replication in the ship layer.
+    ///
+    /// The `ShipHit` event is unreliable by design now (events carry no
+    /// state), so the durable copy of "this hull was struck here, along this
+    /// normal, in this compartment" has to live in the layer instead. The
+    /// simulation calls this where it already knows the world-frame normal and
+    /// the compartment, so nothing is recomputed here.
+    ///
+    /// One entry per ship, overwritten by each new hit: a layer delta is built
+    /// by diffing two snapshots, so a per-tick list would need to accumulate
+    /// history to stay correct, and the client only needs the latest to draw
+    /// the effect.
+    pub fn note_hit(&self, tick: u64, position: Vec3f, normal: Vec3f, compartment: Option<EntityId>, damage: f32) {
+        self.state.write().last_hit = Some(HitMark {
+            tick,
+            position,
+            normal,
+            compartment,
+            damage,
+        });
+    }
+
+    /// Bug №272: take the pending hit marker, clearing it.
+    ///
+    /// Called by the replication path once the mark has been put into a layer.
+    /// Consuming it is what makes this a one-shot publish rather than state
+    /// that would be re-sent forever: a client that already has the mark does
+    /// not need it again, and a client that misses it gets the next hit.
+    pub fn take_last_hit(&self) -> Option<HitMark> {
+        self.state.write().last_hit.take()
+    }
+
+    /// Bug №272: read the pending hit without consuming it.
+    pub fn last_hit(&self) -> Option<HitMark> {
+        self.state.read().last_hit
     }
 
     pub fn get_station_at(&self, local_pos: Vec3f) -> Option<EntityId> {
@@ -603,8 +844,21 @@ impl DamageTarget for Ship {
     }
 
     fn apply_health_damage(&self, amount: f32) {
+        // NaN/negative guards: NaN damage must not poison health, negative
+        // max_health must not panic clamp (min>max).
+        if !amount.is_finite() {
+            return;
+        }
+        let max = if self.config.max_health.is_finite() && self.config.max_health > 0.0 {
+            self.config.max_health
+        } else {
+            1.0
+        };
         let mut state = self.state.write();
-        state.health = (state.health - amount).clamp(0.0, self.config.max_health);
+        if !state.health.is_finite() {
+            state.health = max;
+        }
+        state.health = (state.health - amount).clamp(0.0, max);
         if state.health <= 0.0 {
             state.is_sinking = true;
             state.sink_timer = 30.0;

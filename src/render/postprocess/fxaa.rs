@@ -58,21 +58,17 @@ impl FXAAEffect {
     pub fn apply(
         &mut self,
         encoder: &mut CommandEncoder,
-        context: &RenderContext,
+        _context: &RenderContext,
         input: &TextureView,
-        _output: &TextureView,
+        output: &TextureView,
     ) {
         if !self.enabled {
             return;
         }
-
-        let _ = (encoder, context, input);
-
-        // Apply FXAA
-        // This would use the FXAA algorithm to smooth edges
-
-        // For now, this is a placeholder
-        let _ = self.output_view.as_ref();
+        // Placeholder pass-through until the real FXAA pipeline exists.
+        if !std::ptr::eq(input, output) {
+            encoder.copy_texture(input, output);
+        }
     }
 
     pub fn resize(&mut self, device: &Arc<Device>, context: &RenderContext, input_format: Format) {

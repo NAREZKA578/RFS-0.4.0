@@ -3,7 +3,7 @@
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //! **TODO: Full implementation required**
 
-use crate::resource::{TextureLayout, TextureView};
+use crate::resource::{GpuResource, TextureLayout, TextureView};
 use crate::types::*;
 use bitflags::bitflags;
 
@@ -106,11 +106,29 @@ pub struct RenderPassDesc {
 #[derive(Debug, Clone, Default)]
 pub struct RenderPass {
     desc: RenderPassDesc,
+    pub(crate) backend: Option<GpuResource>,
 }
 
 impl RenderPass {
     pub fn new(desc: RenderPassDesc) -> Self {
-        Self { desc }
+        Self {
+            desc,
+            backend: None,
+        }
+    }
+
+    /// Attaches a native handle produced by the active backend.
+    pub(crate) fn set_backend(&mut self, backend: GpuResource) {
+        self.backend = Some(backend);
+    }
+
+    /// Returns `true` when the render pass has a native backend handle.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    pub(crate) fn backend(&self) -> Option<GpuResource> {
+        self.backend
     }
 
     pub fn desc(&self) -> &RenderPassDesc {
@@ -140,11 +158,33 @@ pub struct FramebufferAttachment {
 #[derive(Debug, Clone, Default)]
 pub struct Framebuffer {
     desc: FramebufferDesc,
+    pub(crate) backend: Option<GpuResource>,
 }
 
 impl Framebuffer {
     pub fn new(desc: FramebufferDesc) -> Self {
-        Self { desc }
+        Self {
+            desc,
+            backend: None,
+        }
+    }
+
+    /// Attaches a native handle produced by the active backend.
+    pub(crate) fn set_backend(&mut self, backend: GpuResource) {
+        self.backend = Some(backend);
+    }
+
+    /// Returns `true` when the framebuffer has a native backend handle.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    pub(crate) fn backend(&self) -> Option<GpuResource> {
+        self.backend
+    }
+
+    pub fn desc(&self) -> &FramebufferDesc {
+        &self.desc
     }
 }
 

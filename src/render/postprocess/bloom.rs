@@ -129,7 +129,7 @@ impl BloomEffect {
         encoder: &mut CommandEncoder,
         context: &RenderContext,
         input: &TextureView,
-        _output: &TextureView,
+        output: &TextureView,
     ) {
         if !self.enabled {
             return;
@@ -141,13 +141,28 @@ impl BloomEffect {
         // Step 1: Bright pass
         self.bright_pass(encoder, input, width, height);
 
-        // Step 2: Blur (multiple passes)
+        // Step 2: seed blur chain from the bright-pass output (not from a
+        // stale blur target), then blur.
+        self.seed_blur_from_bright(encoder);
         for _ in 0..self.config.blur_passes {
             self.blur_pass(encoder, width, height);
         }
 
-        // Step 3: Composite
+        // Step 3: Composite (placeholder still forwards the image).
         self.composite_pass(encoder, input, width, height);
+        if !std::ptr::eq(input, output) {
+            encoder.copy_texture(input, output);
+        }
+    }
+
+    /// Seed blur chain from the bright-pass output so the first blur reads
+    /// thresholded pixels (not a stale blur target).
+    fn seed_blur_from_bright(&mut self, encoder: &mut CommandEncoder) {
+        if let (Some(src), Some(dst)) = (&self.bright_pass_view, &self.blur_views[0]) {
+            if !std::ptr::eq(src, dst) {
+                encoder.copy_texture(src, dst);
+            }
+        }
     }
 
     /// Bright pass: extract bright pixels
@@ -228,8 +243,13 @@ impl BloomEffect {
         _width: u32,
         _height: u32,
     ) {
-        if let (Some(bright_view), Some(_output_view)) = (&self.bright_pass_view, &self.output_view)
-        {
+        // Prefer the blurred result; fall back to bright-pass only when blur
+        // targets are missing.
+        let bloom_view = self.blur_views[1]
+            .as_ref()
+            .or(self.blur_views[0].as_ref())
+            .or(self.bright_pass_view.as_ref());
+        if let (Some(bloomed), Some(_output_view)) = (bloom_view, &self.output_view) {
             // Bind composite pipeline
             if let Some(pipeline) = &self.composite_pipeline {
                 encoder.bind_pipeline(pipeline);
@@ -237,7 +257,7 @@ impl BloomEffect {
 
             // Bind textures
             encoder.bind_texture(input_texture, 0); // Original
-            encoder.bind_texture(bright_view, 1); // Bloomed
+            encoder.bind_texture(bloomed, 1); // Blurred bloom
 
             // Set intensity uniform
             // This would set the bloom intensity in the shader
@@ -278,6 +298,12 @@ impl Default for BloomEffect {
 /// Bloom effect builder
 pub struct BloomEffectBuilder {
     effect: BloomEffect,
+}
+
+impl Default for BloomEffectBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BloomEffectBuilder {

@@ -181,7 +181,7 @@ fn descriptor_pool_allocates_until_exhausted() {
 
 #[test]
 fn descriptor_pool_respects_descriptor_budget() {
-    let layout = descriptor_layout(0, 8);
+    let layout = descriptor_layout(0, 9);
     let mut pool = DescriptorPool::new(DescriptorPoolDesc {
         max_sets: 16,
         pool_sizes: vec![DescriptorPoolSize {
@@ -189,7 +189,7 @@ fn descriptor_pool_respects_descriptor_budget() {
             count: 8,
         }],
     });
-    assert!(!pool.can_allocate(8));
+    assert!(!pool.can_allocate(9));
     assert!(pool.allocate(&layout).is_none());
 }
 

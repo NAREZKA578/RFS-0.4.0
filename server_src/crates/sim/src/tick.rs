@@ -2,7 +2,7 @@ use rfs_core::entity::EntityId;
 use rfs_core::math::{Vec3f, Transform};
 use rfs_core::packet::ProjectileType;
 use rfs_core::time::{Tick, FIXED_DT};
-use rfs_ship::ship::Ship;
+use rfs_ship::ship::{Ship, ShipState};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -65,6 +65,12 @@ pub struct CollisionEvent {
     pub velocity: Vec3f,
 }
 
+impl Default for TickSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TickSystem {
     pub fn new() -> Self {
         Self {
@@ -100,19 +106,23 @@ impl TickSystem {
 
     fn update_ships_parallel(&self, result: &mut TickResult) {
         let ships = self.ships.read();
-        
+
+        // Bug №153: the pre-tick state is captured so flooding/occupancy
+        // transitions are detected edge-triggered — the old code never emitted
+        // CompartmentFlooded/StationOccupied/StationVacated at all.
         let updates: Vec<_> = ships.par_iter()
             .map(|(id, ship)| {
-                let mut ship_state = ship.get_state();
+                let prev = ship.get_state();
+                let mut ship_state = prev.clone();
                 ship.update(FIXED_DT, &mut ship_state);
-                (*id, ship_state)
+                (*id, prev, ship_state)
             })
             .collect();
 
         drop(ships);
 
         let mut ships = self.ships.write();
-        for (id, state) in updates {
+        for (id, prev, state) in updates {
             // Bug №57: a ship that finished sinking leaves the simulation —
             // the old code kept it around forever with an empty sink-timer
             // body.
@@ -125,6 +135,7 @@ impl TickSystem {
                 continue;
             }
             if let Some(ship) = ships.get(&id) {
+                Self::emit_state_transitions(&prev, &state, &mut result.events);
                 ship.apply_state(state);
                 result.ship_updates.push(ShipUpdate {
                     entity_id: id,
@@ -138,6 +149,39 @@ impl TickSystem {
                     rudder_angle: ship.rudder_angle(),
                     throttle: ship.throttle(),
                 });
+            }
+        }
+    }
+
+    /// Bug №153: fire each CompartmentFlooded/StationOccupied/StationVacated
+    /// exactly once, on the crossing edge, never on every tick.
+    fn emit_state_transitions(prev: &ShipState, next: &ShipState, out: &mut Vec<GameEvent>) {
+        let prev_flooded: HashMap<EntityId, bool> = prev
+            .compartment_states
+            .iter()
+            .map(|(id, c)| (*id, c.is_flooded()))
+            .collect();
+        for (cid, c) in &next.compartment_states {
+            let was_flooded = prev_flooded.get(cid).copied().unwrap_or(false);
+            if !was_flooded && c.is_flooded() {
+                out.push(GameEvent::CompartmentFlooded {
+                    compartment: *cid,
+                    water_level: c.water_level,
+                });
+            }
+        }
+        for (sid, s) in &next.station_states {
+            let prev_occ = prev.station_states.get(sid).and_then(|x| x.occupant);
+            match (prev_occ, s.occupant) {
+                (None, Some(p)) => out.push(GameEvent::StationOccupied {
+                    station: *sid,
+                    player: p,
+                }),
+                (Some(p), None) => out.push(GameEvent::StationVacated {
+                    station: *sid,
+                    player: p,
+                }),
+                _ => {}
             }
         }
     }
@@ -286,6 +330,50 @@ impl TickSystem {
                 });
             }
         }
+
+        // Bug №155: explosive shells splash into NEIGHBOURING ships. The hit
+        // ship takes the full blast via the direct entry above; everyone else
+        // inside explosion_radius takes falling damage from the burst point.
+        let has_splash = collisions.iter().any(|c| {
+            projectiles
+                .iter()
+                .any(|p| p.entity_id == c.projectile && p.explosion_radius.is_finite())
+        });
+        if has_splash {
+            let ships: Vec<Arc<Ship>> = self.ships.read().values().cloned().collect();
+            for collision in collisions.iter() {
+                let Some(proj) = projectiles
+                    .iter()
+                    .find(|p| p.entity_id == collision.projectile)
+                else {
+                    continue;
+                };
+                if proj.explosion_radius.is_nan() || proj.explosion_radius <= 0.0 {
+                    continue;
+                }
+                for ship in &ships {
+                    if ship.entity_id() == collision.target || ship.entity_id() == proj.owner {
+                        continue;
+                    }
+                    let dist = distance_point_to_bounds(collision.position, &ship.bounds());
+                    if !dist.is_finite() || dist > proj.explosion_radius {
+                        continue;
+                    }
+                    let factor = (1.0 - dist / proj.explosion_radius).clamp(0.0, 1.0);
+                    let splash = proj.damage * factor * 0.5;
+                    if splash > 0.0 && splash.is_finite() {
+                        pending.push(PendingDamage {
+                            target: ship.entity_id(),
+                            projectile: collision.projectile,
+                            damage: splash,
+                            penetration: 0.0,
+                            position: collision.position,
+                            normal: collision.normal,
+                        });
+                    }
+                }
+            }
+        }
         drop(projectiles);
 
         if pending.is_empty() {
@@ -316,6 +404,28 @@ impl TickSystem {
             if let Some(ship) = ships.get(&hit.target) {
                 ship.apply_damage(hit.damage, hit.position);
 
+                // Bug №161: hit_compartment was always None — the shell hit a
+                // ship but the event never told the client which compartment.
+                let hit_compartment = ship
+                    .get_compartment_at(ship.world_to_local(hit.position))
+                    .or_else(|| ship.get_compartment_at(hit.position));
+
+                // Bug №272: the same information, but into the ship LAYER, so
+                // it survives a lost event packet. Events went unreliable
+                // because they carry no state — but this normal and this
+                // compartment were the only parts of a hit that no layer
+                // carried, so without this the impact effect and the
+                // survivability feedback would depend on a packet that can be
+                // dropped. Everything else the event reports is already in a
+                // layer and needed no change.
+                ship.note_hit(
+                    self.current_tick.value(),
+                    hit.position,
+                    hit.normal,
+                    hit_compartment,
+                    hit.damage,
+                );
+
                 result.events.push(GameEvent::ShipHit {
                     target: hit.target,
                     projectile: hit.projectile,
@@ -323,7 +433,7 @@ impl TickSystem {
                     normal: hit.normal,
                     damage: hit.damage,
                     penetration: hit.penetration,
-                    hit_compartment: None,
+                    hit_compartment,
                 });
             }
         }
@@ -342,7 +452,21 @@ impl TickSystem {
     }
 
     pub fn fire_projectile(&self, projectile: Projectile) {
-        self.projectiles.write().push(projectile);
+        // Cap: unbounded spawn is a DoS/OOM (256 clients x 30Hz x 12s).
+        // Drop with a counter instead of growing forever; also reject
+        // non-finite ballistics that would create immortal shells.
+        if !projectile.position.is_finite()
+            || !projectile.velocity.is_finite()
+            || !projectile.lifetime.is_finite()
+        {
+            return;
+        }
+        const MAX_PROJECTILES: usize = 8192;
+        let mut guard = self.projectiles.write();
+        if guard.len() >= MAX_PROJECTILES {
+            return;
+        }
+        guard.push(projectile);
     }
 
     pub fn current_tick(&self) -> Tick {
@@ -398,6 +522,25 @@ pub fn segment_intersects_bounds(prev: Vec3f, curr: Vec3f, bounds: &rfs_core::ma
     axis!(prev.y, dir.y, bounds.min.y, bounds.max.y);
     axis!(prev.z, dir.z, bounds.min.z, bounds.max.z);
     true
+}
+
+/// Distance from a point to the nearest point of an axis-aligned box
+/// (0 when inside). NaN-safe: a non-finite input returns f32::INFINITY.
+fn distance_point_to_bounds(point: Vec3f, bounds: &rfs_core::math::Bounds) -> f32 {
+    if !point.is_finite()
+        || !bounds.min.x.is_finite()
+        || !bounds.min.y.is_finite()
+        || !bounds.min.z.is_finite()
+        || !bounds.max.x.is_finite()
+        || !bounds.max.y.is_finite()
+        || !bounds.max.z.is_finite()
+    {
+        return f32::INFINITY;
+    }
+    let dx = point.x.clamp(bounds.min.x, bounds.max.x) - point.x;
+    let dy = point.y.clamp(bounds.min.y, bounds.max.y) - point.y;
+    let dz = point.z.clamp(bounds.min.z, bounds.max.z) - point.z;
+    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 #[derive(Debug, Clone)]

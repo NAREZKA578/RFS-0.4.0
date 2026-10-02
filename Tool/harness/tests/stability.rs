@@ -61,7 +61,15 @@ fn heading_rotates_around_y_not_pitch() {
 
 #[test]
 fn unknown_projectile_type_does_not_panic() {
-    // №44: GrapeShot has no config entry; the old unwrap blew up.
+    // №44: GrapeShot had no config entry and the old unwrap blew up. It also
+    // asserted an empty trajectory, which locked in the *absence* of a config as
+    // acceptable behaviour — the projectile then silently fell back to
+    // fabricated gravity/max_range/damage values in the integrator.
+    //
+    // №161 added a real `grape_shot()` config, so GrapeShot now produces an
+    // actual trajectory. This test now asserts that: no panic, a bounded
+    // non-empty arc, and a solvable launch solution. The regression it guards
+    // is still the panic, which is covered by the absence of any unwrap.
     let calc = BallisticsCalculator::new(BallisticsConfig::default());
     let traj = calc.calculate_trajectory(
         Vec3f::ZERO,
@@ -70,10 +78,31 @@ fn unknown_projectile_type_does_not_panic() {
         5.0,
         0.1,
     );
-    assert!(traj.is_empty());
-    assert!(calc
-        .solve_ballistic_arc(Vec3f::ZERO, Vec3f::new(100.0, 0.0, 0.0), ProjectileType::GrapeShot)
-        .is_none());
+    assert!(
+        !traj.is_empty(),
+        "GrapeShot now has a config and must produce a trajectory"
+    );
+    assert!(traj.len() < 10_000, "the integration must terminate: {}", traj.len());
+
+    // A solution for a 100 m shot should now exist.
+    let arc = calc.solve_ballistic_arc(Vec3f::ZERO, Vec3f::new(100.0, 0.0, 0.0), ProjectileType::GrapeShot);
+    assert!(arc.is_some(), "GrapeShot must have a launch solution");
+
+    // Every configured projectile type must be present and usable.
+    for t in [
+        ProjectileType::Cannonball,
+        ProjectileType::ExplosiveShell,
+        ProjectileType::ArmorPiercing,
+        ProjectileType::ChainShot,
+        ProjectileType::Torpedo,
+        ProjectileType::GrapeShot,
+        ProjectileType::DepthCharge,
+    ] {
+        assert!(
+            calc.get_config(t).is_some(),
+            "{t:?} has no ballistics config"
+        );
+    }
 }
 
 #[test]

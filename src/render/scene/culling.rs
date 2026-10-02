@@ -77,9 +77,18 @@ pub struct FrustumPlane {
 
 impl FrustumPlane {
     pub fn new(normal: Vec3, distance: f32) -> Self {
+        // Normalize the full plane equation: scaling normal without scaling
+        // distance shifts the plane. Guard degenerate normals.
+        let len = normal.length();
+        if len < 1e-9 || !len.is_finite() || !distance.is_finite() {
+            return Self {
+                normal: Vec3::X,
+                distance: 0.0,
+            };
+        }
         Self {
-            normal: normal.normalize(),
-            distance,
+            normal: normal / len,
+            distance: distance / len,
         }
     }
 
@@ -92,6 +101,12 @@ impl FrustumPlane {
 #[derive(Debug, Clone)]
 pub struct Frustum {
     pub planes: [FrustumPlane; 6], // Near, Far, Left, Right, Top, Bottom
+}
+
+impl Default for Frustum {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Frustum {
@@ -146,36 +161,11 @@ impl Frustum {
 
     pub fn is_visible(&self, aabb: &Aabb) -> bool {
         for plane in &self.planes {
-            // Calculate the distance from the plane to the AABB
-            let mut distance = plane.distance_to_point(aabb.min);
-
-            // Find the maximum distance (the point farthest in the plane's normal direction)
-            if plane.normal.x >= 0.0 {
-                distance = distance
-                    .max(plane.distance_to_point(Vec3::new(aabb.max.x, aabb.min.y, aabb.min.z)));
-            } else {
-                distance = distance
-                    .max(plane.distance_to_point(Vec3::new(aabb.min.x, aabb.min.y, aabb.min.z)));
-            }
-
-            if plane.normal.y >= 0.0 {
-                distance = distance
-                    .max(plane.distance_to_point(Vec3::new(aabb.min.x, aabb.max.y, aabb.min.z)));
-            } else {
-                distance = distance
-                    .max(plane.distance_to_point(Vec3::new(aabb.min.x, aabb.min.y, aabb.min.z)));
-            }
-
-            if plane.normal.z >= 0.0 {
-                distance = distance
-                    .max(plane.distance_to_point(Vec3::new(aabb.min.x, aabb.min.y, aabb.max.z)));
-            } else {
-                distance = distance
-                    .max(plane.distance_to_point(Vec3::new(aabb.min.x, aabb.min.y, aabb.min.z)));
-            }
-
-            // If the entire AABB is on the outside of the plane, it's not visible
-            if distance < 0.0 {
+            // True p-vertex: pick max/min per axis by normal sign.
+            let px = if plane.normal.x >= 0.0 { aabb.max.x } else { aabb.min.x };
+            let py = if plane.normal.y >= 0.0 { aabb.max.y } else { aabb.min.y };
+            let pz = if plane.normal.z >= 0.0 { aabb.max.z } else { aabb.min.z };
+            if plane.distance_to_point(Vec3::new(px, py, pz)) < 0.0 {
                 return false;
             }
         }

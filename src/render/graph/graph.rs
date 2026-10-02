@@ -234,7 +234,7 @@ impl RenderGraph {
     /// Execute the render graph
     pub fn execute(
         &mut self,
-        _device: &Arc<Device>,
+        device: &Arc<Device>,
         context: &mut RenderContext,
         scene: &mut Scene,
     ) {
@@ -245,10 +245,20 @@ impl RenderGraph {
         let pool = crate::rhi::command::pool::CommandPool::new(
             crate::rhi::command::pool::CommandPoolDesc::default(),
         );
-        let buffer = crate::rhi::command::buffer::CommandBuffer::new(
+        let mut buffer = crate::rhi::command::buffer::CommandBuffer::new(
             pool,
             crate::rhi::command::buffer::CommandBufferDesc::default(),
         );
+
+        // Bug №209: this created the encoder, ran the passes and then dropped
+        // it on the floor — no `begin`, no `finish`, no submit. Everything the
+        // passes recorded was discarded, so the graph could never produce a
+        // pixel no matter how correct the passes were. It is now a real
+        // record-and-submit.
+        if let Err(e) = buffer.begin() {
+            crate::error!("graph", "command buffer begin failed: {e}");
+            return;
+        }
         let mut encoder = crate::rhi::command::encoder::CommandEncoder::new(buffer);
 
         // Execute passes in order
@@ -262,6 +272,76 @@ impl RenderGraph {
 
             // Execute the pass
             node.execute(&mut encoder, context, scene, &self.resources);
+        }
+
+        let recorded = encoder.command_count();
+        let finished = match encoder.finish() {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                crate::error!("graph", "command buffer finish failed: {e}");
+                return;
+            }
+        };
+
+        // An empty list is not submitted: `submit_commands` refuses it, and
+        // reporting "nothing was recorded" is more useful than a backend error
+        // about an empty recording. With every pass still a stub (#186) this is
+        // the normal case, and it is what told us the graph was inert.
+        if recorded == 0 {
+            crate::warn!("graph", "recorded no commands; nothing submitted");
+            return;
+        }
+
+        if let Err(e) = device.submit_recorded(finished.commands()) {
+            crate::error!("graph", "command submission failed: {e}");
+        }
+    }
+
+    /// Record the graph's passes and hand back the commands, without
+    /// submitting them.
+    ///
+    /// Exists so the recording can be asserted on directly. `execute` submits,
+    /// which needs a real swapchain and produces no observable value, so the
+    /// command list was previously untestable — and an untestable list is how a
+    /// graph that records nothing passes every test.
+    pub fn record(
+        &mut self,
+        context: &mut RenderContext,
+        scene: &mut Scene,
+    ) -> Vec<crate::rhi::command::commands::Command> {
+        if self.dirty {
+            self.sort();
+        }
+
+        let pool = crate::rhi::command::pool::CommandPool::new(
+            crate::rhi::command::pool::CommandPoolDesc::default(),
+        );
+        let mut buffer = crate::rhi::command::buffer::CommandBuffer::new(
+            pool,
+            crate::rhi::command::buffer::CommandBufferDesc::default(),
+        );
+        if let Err(e) = buffer.begin() {
+            crate::error!("graph", "command buffer begin failed: {e}");
+            return Vec::new();
+        }
+        let mut encoder = crate::rhi::command::encoder::CommandEncoder::new(buffer);
+
+        for &node_index in &self.execution_order {
+            let node = &mut self.nodes[node_index];
+            if !node.enabled {
+                continue;
+            }
+            node.execute(&mut encoder, context, scene, &self.resources);
+        }
+
+        // `finish` moves the commands into the buffer; cloning them out is what
+        // makes the list inspectable without a GPU round trip.
+        match encoder.finish() {
+            Ok(buffer) => buffer.commands().to_vec(),
+            Err(e) => {
+                crate::error!("graph", "command buffer finish failed: {e}");
+                Vec::new()
+            }
         }
     }
 

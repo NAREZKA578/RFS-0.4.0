@@ -30,6 +30,16 @@ pub enum RhiError {
     #[error("Device lost")]
     DeviceLost,
 
+    /// The swapchain no longer matches its surface — the window was resized or
+    /// moved to a different monitor.
+    ///
+    /// Its own variant rather than a `BackendError` string because the required
+    /// response is specific and common: rebuild the chain and skip this frame.
+    /// It is not a failure, and treating it as one makes the renderer exit on
+    /// the first window drag.
+    #[error("Swapchain is out of date and must be recreated")]
+    SwapchainOutOfDate,
+
     // Resources
     #[error("Buffer creation failed: {0}")]
     BufferCreationError(String),

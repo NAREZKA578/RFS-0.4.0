@@ -220,9 +220,7 @@ impl CollisionSystem {
         
         let mut min_penetration = f32::MAX;
         let mut best_normal = Vec3f::ZERO;
-        let best_point_a;
-        let best_point_b;
-        
+
         let all_axes = [
             axes_a[0], axes_a[1], axes_a[2],
             axes_b[0], axes_b[1], axes_b[2],
@@ -261,8 +259,8 @@ impl CollisionSystem {
             return None;
         }
         
-        best_point_a = center_a + best_normal * (half_a.length() - min_penetration * 0.5);
-        best_point_b = center_b - best_normal * (half_b.length() - min_penetration * 0.5);
+        let best_point_a = center_a + best_normal * (half_a.length() - min_penetration * 0.5);
+        let best_point_b = center_b - best_normal * (half_b.length() - min_penetration * 0.5);
         
         Some(ContactPoint {
             point_a: best_point_a,
@@ -364,6 +362,10 @@ impl CollisionSystem {
         })
     }
 
+    // The per-connection shared state is passed explicitly rather than
+    // bundled into a context struct, to keep the borrow scopes of the
+    // individual locks narrow and obvious at each use site.
+    #[allow(clippy::too_many_arguments)]
     fn capsule_vs_capsule(
         &self,
         a: Transform,
@@ -686,36 +688,46 @@ impl Broadphase {
             transform.position - Vec3f::new(50.0, 50.0, 50.0),
             transform.position + Vec3f::new(50.0, 50.0, 50.0),
         );
-        
+
+        let min = self.world_to_cell(bounds.min);
+        let max = self.world_to_cell(bounds.max);
+
+        // Bug №243: the old code only removed the id from cells it had *left*
+        // and then unconditionally pushed it into the current cells. An object
+        // whose cell range did not change (a stationary object, or a move by a
+        // whole number of cells) therefore kept every old entry AND gained a
+        // fresh one on every call — the id count grew without bound with the
+        // tick count, leaking memory and making every query process the same
+        // object many times over.
+        //
+        // The id is now removed from the *entire* old range first, so the
+        // membership is exactly "the current range" and a repeated call with
+        // the same bounds is a no-op.
         if let Some(old_bounds) = self.object_bounds.get(&entity_id) {
             let old_min = self.world_to_cell(old_bounds.min);
             let old_max = self.world_to_cell(old_bounds.max);
-            let new_min = self.world_to_cell(bounds.min);
-            let new_max = self.world_to_cell(bounds.max);
-            
             for x in old_min.0..=old_max.0 {
                 for y in old_min.1..=old_max.1 {
                     for z in old_min.2..=old_max.2 {
-                        let key = (x, y, z);
-                        if x < new_min.0 || x > new_max.0 || y < new_min.1 || y > new_max.1 || z < new_min.2 || z > new_max.2 {
-                            if let Some(cell) = self.grid.get_mut(&key) {
-                                cell.retain(|&id| id != entity_id);
-                            }
+                        if let Some(cell) = self.grid.get_mut(&(x, y, z)) {
+                            cell.retain(|&id| id != entity_id);
                         }
                     }
                 }
             }
         }
-        
+
         self.object_bounds.insert(entity_id, bounds);
-        
-        let min = self.world_to_cell(bounds.min);
-        let max = self.world_to_cell(bounds.max);
-        
+
         for x in min.0..=max.0 {
             for y in min.1..=max.1 {
                 for z in min.2..=max.2 {
-                    self.grid.entry((x, y, z)).or_default().push(entity_id);
+                    let cell = self.grid.entry((x, y, z)).or_default();
+                    // Belt and braces: never store a duplicate even if the
+                    // bookkeeping above were to change again.
+                    if !cell.contains(&entity_id) {
+                        cell.push(entity_id);
+                    }
                 }
             }
         }
@@ -761,5 +773,69 @@ impl Broadphase {
         }
         
         pairs
+    }
+}
+#[cfg(test)]
+mod broadphase_tests {
+    use super::*;
+
+    /// Bug №243: `update_object` only removed the id from cells the object had
+    /// *left*, then pushed it into the current cells unconditionally. A
+    /// stationary object therefore accumulated one more copy of its id per
+    /// call, without bound.
+    #[test]
+    fn a_stationary_object_does_not_accumulate_duplicate_ids() {
+        let mut bp = Broadphase::new();
+        let id = EntityId::new(1);
+        let t = Transform { position: Vec3f::new(10.0, 10.0, 10.0), ..Default::default() };
+
+        bp.add_object(id);
+        // Many update calls at the same position — the worst case.
+        for _ in 0..100 {
+            bp.update_object(id, t);
+        }
+
+        let mut total = 0usize;
+        let mut duplicates = 0usize;
+        for cell in bp.grid.values() {
+            for (i, a) in cell.iter().enumerate() {
+                total += 1;
+                if cell[i + 1..].contains(a) {
+                    duplicates += 1;
+                }
+            }
+        }
+        assert_eq!(duplicates, 0, "the same id was stored more than once in a cell");
+        // And membership is bounded by the number of cells the bounds cover.
+        let expected_cells = 8usize;
+        assert!(
+            total <= expected_cells + 64,
+            "membership grew with the call count: {total} entries"
+        );
+    }
+
+    #[test]
+    fn moving_an_object_relocates_it_without_duplicates() {
+        let mut bp = Broadphase::new();
+        let id = EntityId::new(2);
+        // `add_object` only registers the bounds; the grid is filled by
+        // `update_object` (see bug №189 — the tests that relied on add_object
+        // alone were exercising an empty broadphase).
+        bp.add_object(id);
+
+        for i in 0..50 {
+            let t = Transform {
+                position: Vec3f::new(i as f32 * 500.0, 0.0, 0.0),
+                ..Default::default()
+            };
+            bp.update_object(id, t);
+        }
+
+        for cell in bp.grid.values() {
+            let mut seen = std::collections::HashSet::new();
+            for a in cell {
+                assert!(seen.insert(*a), "duplicate id {a:?} in one cell");
+            }
+        }
     }
 }

@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 /// HUD element alignment
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum HUDAlignment {
     TopLeft,
     TopCenter,
     TopRight,
     CenterLeft,
+    #[default]
     Center,
     CenterRight,
     BottomLeft,
@@ -21,11 +23,6 @@ pub enum HUDAlignment {
     BottomRight,
 }
 
-impl Default for HUDAlignment {
-    fn default() -> Self {
-        Self::Center
-    }
-}
 
 /// HUD element
 #[derive(Debug, Clone)]

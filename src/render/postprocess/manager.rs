@@ -93,8 +93,7 @@ impl PostProcessManager {
         // Apply FXAA last
         if self.fxaa.enabled() {
             self.fxaa.apply(encoder, context, current, output);
-        } else if current != output {
-            // Copy final result to output
+        } else if !std::ptr::eq(current, output) {
             encoder.copy_texture(current, output);
         }
     }

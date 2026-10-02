@@ -121,7 +121,6 @@ impl DustEffect {
     /// Renders the dust effect
     pub fn render(&self, _renderer: &mut crate::render::core::Renderer) {
         if !self.enabled || !self.active {
-            return;
         }
     }
 

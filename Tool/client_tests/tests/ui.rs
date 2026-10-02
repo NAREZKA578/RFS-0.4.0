@@ -172,7 +172,7 @@ fn minimap_world_minimap_roundtrip() {
 }
 
 #[test]
-fn minimap_world_origin_maps_to_anchor_and_scales() {
+fn minimap_world_origin_maps_to_the_rect_centre_and_scales() {
     let mut minimap = Minimap::new();
     minimap.set_position(Vec2::new(10.0, 20.0));
     minimap.set_size(Vec2::new(200.0, 200.0));
@@ -180,14 +180,28 @@ fn minimap_world_origin_maps_to_anchor_and_scales() {
     minimap.set_world_center(Vec3::ZERO);
     assert!(minimap.visible);
 
-    // The world center maps to the minimap anchor (top-left) position.
-    let origin = minimap.world_to_minimap(Vec3::ZERO);
-    assert_eq!(origin, Vec2::new(10.0, 20.0));
+    // Bug №188: the world centre maps to the CENTRE of the minimap rect, not
+    // the top-left anchor. The anchor convention is what made the roundtrip
+    // non-invertible, because `minimap_to_world` used the anchor while the
+    // forward mapping used the centre. The forward function documents the
+    // centre as the deliberate choice, so the test follows it.
+    let centre = Vec2::new(10.0 + 100.0, 20.0 + 100.0);
+    assert_eq!(minimap.world_to_minimap(Vec3::ZERO), centre);
 
-    // +Z world moves +y on screen, scaled by size / world_size (200/100 = 2).
+    // +Z world moves +y on screen, scaled by size / world_size (200/100 = 2):
+    // z = 50 is half the world extent, so half the rect.
     let north = minimap.world_to_minimap(Vec3::new(0.0, 0.0, 50.0));
-    assert!((north.x - 10.0).abs() < 0.5, "north.x = {}", north.x);
-    assert!((north.y - (20.0 + 100.0)).abs() < 0.5, "north.y = {}", north.y);
+    assert!((north.x - centre.x).abs() < 0.5, "north.x = {}", north.x);
+    assert!(
+        (north.y - (centre.y + 100.0)).abs() < 0.5,
+        "north.y = {}",
+        north.y
+    );
+
+    // +X world moves +x on screen.
+    let east = minimap.world_to_minimap(Vec3::new(25.0, 0.0, 0.0));
+    assert!((east.x - (centre.x + 50.0)).abs() < 0.5, "east.x = {}", east.x);
+    assert!((east.y - centre.y).abs() < 0.5, "east.y = {}", east.y);
 }
 
 #[test]

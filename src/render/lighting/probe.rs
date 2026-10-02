@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 /// Light probe type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum LightProbeType {
     /// Spherical harmonic probe (for diffuse lighting)
+    #[default]
     SphericalHarmonics,
     /// Cube map probe (for reflections)
     CubeMap,
@@ -19,11 +21,6 @@ pub enum LightProbeType {
     Combined,
 }
 
-impl Default for LightProbeType {
-    fn default() -> Self {
-        Self::SphericalHarmonics
-    }
-}
 
 /// Light probe
 pub struct LightProbe {
@@ -147,33 +144,72 @@ impl Default for LightProbeConfig {
 
 /// Light probe update frequency
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum LightProbeUpdateFrequency {
     /// Update every frame
     EveryFrame,
     /// Update when static objects change
     OnStaticChange,
     /// Update on demand
+    #[default]
     OnDemand,
     /// Never update (baked at level load)
     Never,
 }
 
-impl Default for LightProbeUpdateFrequency {
-    fn default() -> Self {
-        Self::OnDemand
-    }
-}
+
+/// Bug №183: an upper bound on the probe count. The grid allocates
+/// `grid_size.x * y * z` probes, so a large or nonsensical grid is an
+/// allocation bomb rather than an error.
+pub const MAX_PROBE_COUNT: usize = 1 << 20;
 
 /// Light probe grid (for large environments)
-pub struct LightProbeGrid {
-    pub config: LightProbeConfig,
+pub struct LightProbeGrid {    pub config: LightProbeConfig,
     pub probes: Vec<LightProbe>,
     pub grid_size: Vec3,
     pub cell_size: Vec3,
 }
 
 impl LightProbeGrid {
-    pub fn new(config: LightProbeConfig, grid_size: Vec3, cell_size: Vec3) -> Self {
+    /// Bug №183: `grid_size` with a zero or negative component made the
+    /// constructor's `0..grid_size.x as usize` loop either empty or enormous,
+    /// and `cell_size` with a zero component made `get_probe` divide by zero
+    /// on every call. Both are now rejected at construction, where the mistake
+    /// is still attributable, instead of surfacing as a panic or a silent
+    /// empty grid much later.
+    pub fn try_new(
+        config: LightProbeConfig,
+        grid_size: Vec3,
+        cell_size: Vec3,
+    ) -> Option<Self> {
+        if !(grid_size.x.is_finite()
+            && grid_size.y.is_finite()
+            && grid_size.z.is_finite()
+            && grid_size.x >= 1.0
+            && grid_size.y >= 1.0
+            && grid_size.z >= 1.0)
+        {
+            return None;
+        }
+        if !(cell_size.x.is_finite()
+            && cell_size.y.is_finite()
+            && cell_size.z.is_finite()
+            && cell_size.x > 0.0
+            && cell_size.y > 0.0
+            && cell_size.z > 0.0)
+        {
+            return None;
+        }
+        // The probe count is a product of three usizes; an absurd grid would
+        // try to allocate a huge vector. Bound it rather than OOM.
+        let total = grid_size.x as usize * grid_size.y as usize * grid_size.z as usize;
+        if total > MAX_PROBE_COUNT {
+            return None;
+        }
+        Some(Self::new_unchecked(config, grid_size, cell_size))
+    }
+
+    fn new_unchecked(config: LightProbeConfig, grid_size: Vec3, cell_size: Vec3) -> Self {
         let mut probes = Vec::new();
 
         // Create probes for each cell
@@ -199,15 +235,55 @@ impl LightProbeGrid {
         }
     }
 
-    /// Get the probe at a position
-    pub fn get_probe(&self, position: Vec3) -> Option<&LightProbe> {
-        // Calculate grid cell
-        let x = (position.x / self.cell_size.x).floor() as usize;
-        let y = (position.y / self.cell_size.y).floor() as usize;
-        let z = (position.z / self.cell_size.z).floor() as usize;
+    pub fn new(config: LightProbeConfig, grid_size: Vec3, cell_size: Vec3) -> Self {
+        Self::try_new(config, grid_size, cell_size)
+            .expect("light probe grid needs a positive integer grid_size, a positive cell_size and a bounded probe count")
+    }
 
-        let index =
-            x + y * self.grid_size.x as usize + z * (self.grid_size.x * self.grid_size.y) as usize;
+    /// Get the probe at a position.
+    ///
+    /// Bug №183: the cell index used to be `(position.x / cell_size.x).floor()
+    /// as usize`. A negative coordinate makes `floor()` negative, and `as usize`
+    /// on a negative float wraps to an enormous index (saturating in Rust, so
+    /// `usize::MAX`), so the lookup silently returned `None` for the entire
+    /// negative half-space. The `x/y/z` values were also never clamped to
+    /// `grid_size`, so a position past the last cell produced an index that
+    /// happened to alias a different cell or, after the wrap, a wildly out of
+    /// range one.
+    ///
+    /// The cell is now derived with explicit bounds, and an out-of-grid
+    /// position returns `None` instead of aliasing.
+    pub fn get_probe(&self, position: Vec3) -> Option<&LightProbe> {
+        // A non-finite position has no cell.
+        if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
+            return None;
+        }
+        if !(self.cell_size.x > 0.0 && self.cell_size.y > 0.0 && self.cell_size.z > 0.0) {
+            return None;
+        }
+
+        let coord = |value: f32, cell: f32, size: f32| -> Option<usize> {
+            // Negative positions are outside the grid: the grid starts at the
+            // origin and only spans +x/+y/+z.
+            if value < 0.0 {
+                return None;
+            }
+            let cell_index = (value / cell).floor();
+            if cell_index < 0.0 {
+                return None;
+            }
+            let index = cell_index as usize;
+            if index >= size as usize {
+                return None;
+            }
+            Some(index)
+        };
+
+        let x = coord(position.x, self.cell_size.x, self.grid_size.x)?;
+        let y = coord(position.y, self.cell_size.y, self.grid_size.y)?;
+        let z = coord(position.z, self.cell_size.z, self.grid_size.z)?;
+
+        let index = x + y * self.grid_size.x as usize + z * (self.grid_size.x * self.grid_size.y) as usize;
         self.probes.get(index)
     }
 

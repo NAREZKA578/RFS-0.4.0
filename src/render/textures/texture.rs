@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 /// Texture type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum TextureType {
+    #[default]
     Texture2D,
     Texture3D,
     TextureCube,
@@ -19,15 +21,12 @@ pub enum TextureType {
     RenderTarget,
 }
 
-impl Default for TextureType {
-    fn default() -> Self {
-        Self::Texture2D
-    }
-}
 
 /// Texture format (maps to RHI format)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum TextureFormat {
+    #[default]
     RGBA8,
     RGBA16,
     RGBA32,
@@ -50,10 +49,10 @@ impl From<TextureFormat> for Format {
     fn from(format: TextureFormat) -> Self {
         match format {
             TextureFormat::RGBA8 => Format::RGBA8_UNORM,
-            TextureFormat::RGBA16 => Format::RG16_UNORM,
+            TextureFormat::RGBA16 => Format::RGBA16_UNORM,
             TextureFormat::RGBA32 => Format::RGBA32_SFLOAT,
             TextureFormat::RGB8 => Format::RGBA8_UNORM,
-            TextureFormat::RGB16 => Format::RG16_UNORM,
+            TextureFormat::RGB16 => Format::RGBA16_UNORM,
             TextureFormat::RGB32 => Format::R32G32B32_SFLOAT,
             TextureFormat::RG8 => Format::RG8_UNORM,
             TextureFormat::RG16 => Format::RG16_UNORM,
@@ -69,11 +68,6 @@ impl From<TextureFormat> for Format {
     }
 }
 
-impl Default for TextureFormat {
-    fn default() -> Self {
-        Self::RGBA8
-    }
-}
 
 /// Texture usage
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,23 +112,22 @@ impl From<TextureUsage> for RhiTextureUsage {
 
 /// Texture wrap mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum TextureWrapMode {
+    #[default]
     Repeat,
     MirroredRepeat,
     ClampToEdge,
     ClampToBorder,
 }
 
-impl Default for TextureWrapMode {
-    fn default() -> Self {
-        Self::Repeat
-    }
-}
 
 /// Texture filter mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum TextureFilterMode {
     Nearest,
+    #[default]
     Linear,
     NearestMipmapNearest,
     NearestMipmapLinear,
@@ -143,11 +136,6 @@ pub enum TextureFilterMode {
     Anisotropic,
 }
 
-impl Default for TextureFilterMode {
-    fn default() -> Self {
-        Self::Linear
-    }
-}
 
 /// Sampler description
 #[derive(Debug, Clone)]
@@ -413,8 +401,12 @@ impl Texture {
     }
 
     /// Upload data to the texture
-    pub fn upload_data(&self, data: &[u8], device: &Arc<crate::rhi::Device>) {
-        device.upload_texture(&self.rhi_texture, data);
+    ///
+    /// Returns whether the texture now holds `data`. The failure used to be
+    /// dropped, leaving a texture that sampled as whatever it held before.
+    #[must_use]
+    pub fn upload_data(&self, data: &[u8], device: &Arc<crate::rhi::Device>) -> bool {
+        device.upload_texture(&self.rhi_texture, data).is_ok()
     }
 }
 

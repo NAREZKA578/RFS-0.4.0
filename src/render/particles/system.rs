@@ -119,39 +119,54 @@ impl ParticleSystem {
             self.particle_count += emitter.particle_count();
         }
 
-        // Update particle buffer
-        self.update_particle_buffer();
+        // Update particle buffer. If the upload failed the GPU holds the previous
+        // frame's particles, so the count is forced to zero rather than letting
+        // the pass draw a stale frame under a fresh count.
+        if !self.update_particle_buffer() {
+            self.particle_count = 0;
+        }
     }
 
     /// Update particle buffer with current particle data
-    fn update_particle_buffer(&mut self) {
-        // Collect all particles from all emitters
+    ///
+    /// Returns whether the GPU now holds this frame's particles. A failed
+    /// upload used to be invisible: the count kept rising while the buffer kept
+    /// the previous frame's contents, so the pass drew stale particles.
+    fn update_particle_buffer(&mut self) -> bool {
+        // Upload only LIVE particles (dead pool entries must not reach GPU).
         let mut particles: Vec<Particle> = Vec::new();
 
         for emitter in &self.emitters {
-            particles.extend_from_slice(&emitter.particles());
+            particles.extend(emitter.live_particles());
         }
+
+        let mut uploaded = true;
 
         // Upload to GPU
         if let Some(buffer) = &self.particle_buffer {
-            self.device.upload_buffer(buffer, &particles);
+            uploaded &= self.device.upload_buffer(buffer, &particles).is_ok();
         }
 
         // Update particle count
         if let Some(buffer) = &self.particle_count_buffer {
             let count = particles.len() as u32;
-            self.device.upload_buffer(buffer, &[count]);
+            uploaded &= self.device.upload_buffer(buffer, &[count]).is_ok();
         }
+
+        uploaded
     }
 
     /// Render all particles
     pub fn render(&self, encoder: &mut CommandEncoder, _context: &RenderContext) {
-        if self.particle_count == 0 || self.pipeline.is_none() {
+        if self.particle_count == 0 {
             return;
         }
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return;
+        };
 
         // Bind pipeline
-        encoder.bind_pipeline(self.pipeline.as_ref().unwrap());
+        encoder.bind_pipeline(pipeline);
 
         // Bind particle buffer
         if let Some(buffer) = &self.particle_buffer {
@@ -171,15 +186,18 @@ impl ParticleSystem {
         // Set camera matrices
         // This would set the view and projection matrices
 
-        // Draw particles
+        // Draw particles (no unwrap in frame path; U8 indices unsupported).
         if let Some(mesh) = &self.particle_mesh {
-            encoder.bind_vertex_buffer(mesh.vertex_buffer().unwrap());
+            let (Some(vb), Some(ib)) = (mesh.vertex_buffer(), mesh.index_buffer()) else {
+                return;
+            };
             let index_type = match mesh.index_type() {
-                crate::render::meshes::IndexType::U8 => crate::rhi::IndexType::U16,
                 crate::render::meshes::IndexType::U16 => crate::rhi::IndexType::U16,
                 crate::render::meshes::IndexType::U32 => crate::rhi::IndexType::U32,
+                crate::render::meshes::IndexType::U8 => return,
             };
-            encoder.bind_index_buffer(mesh.index_buffer().unwrap(), index_type);
+            encoder.bind_vertex_buffer(vb);
+            encoder.bind_index_buffer(ib, index_type);
             encoder.draw_indexed_instanced(mesh.index_count(), self.particle_count, 0, 0, 0);
         }
     }

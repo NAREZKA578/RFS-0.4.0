@@ -41,4 +41,14 @@ impl DebugUtils {
             enable_debug_markers,
         }
     }
+
+    /// Returns `true` when markers should be submitted to the backend.
+    pub fn markers_enabled(&self) -> bool {
+        self.enable_debug_markers
+    }
+
+    /// Returns `true` when validation layers are enabled.
+    pub fn validation_enabled(&self) -> bool {
+        self.enable_validation
+    }
 }

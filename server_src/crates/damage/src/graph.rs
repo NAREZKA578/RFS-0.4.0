@@ -72,7 +72,21 @@ impl CompartmentNode {
 }
 
 impl BulkheadEdge {
-    pub fn new(entity_id: EntityId, connects_a: EntityId, connects_b: EntityId, seal_strength: f32) -> Self {
+    /// Creates an intact bulkhead in the CLOSED (sealed) state.
+    ///
+    /// Bug №241: `damage.rs` builds synthetic bulkheads with this constructor
+    /// specifically so a flooded compartment has somewhere to flow, and then
+    /// comments that this is what lets the water propagate. They did not: the
+    /// old body set `is_sealed: true`, and `is_passable()` is
+    /// `!is_sealed || is_destroyed`, so every synthetic edge was permanently
+    /// impassable and the water never moved. The fix belongs at the synthetic
+    /// call site, which now uses `open` below.
+    pub fn new(
+        entity_id: EntityId,
+        connects_a: EntityId,
+        connects_b: EntityId,
+        seal_strength: f32,
+    ) -> Self {
         Self {
             entity_id,
             connects_a,
@@ -84,6 +98,22 @@ impl BulkheadEdge {
             health: seal_strength * 10.0,
             max_health: seal_strength * 10.0,
         }
+    }
+
+    /// Creates a bulkhead in the OPEN state, ready to be closed explicitly.
+    ///
+    /// This is what the synthetic water-flow edges in `damage.rs` must use: a
+    /// bulkhead is only a barrier if it is sealed, and a freshly wired
+    /// structural edge is not.
+    pub fn open(
+        entity_id: EntityId,
+        connects_a: EntityId,
+        connects_b: EntityId,
+        seal_strength: f32,
+    ) -> Self {
+        let mut edge = Self::new(entity_id, connects_a, connects_b, seal_strength);
+        edge.is_sealed = false;
+        edge
     }
 
     pub fn is_passable(&self) -> bool {
@@ -107,6 +137,12 @@ pub struct DamageGraph {
     edge_map: HashMap<EntityId, EdgeIndex>,
 }
 
+impl Default for DamageGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DamageGraph {
     pub fn new() -> Self {
         Self {
@@ -117,10 +153,32 @@ impl DamageGraph {
     }
 
     pub fn add_compartment(&mut self, node: CompartmentNode) -> NodeIndex {
-        // Bug №64: a duplicate id used to add a second (orphan) node — the
-        // graph weight and node_map then disagreed. Update in place instead.
+        // Bug №240: this used to preserve only `current_level` and
+        // `fire_intensity`, despite the comment promising that a duplicate
+        // "must not wipe live flooding/fire". Everything else in the incoming
+        // node came from the ship's state with fresh defaults, so every
+        // repeated call reset `is_breached`, `is_sealed`, `damage` and
+        // `pump_active` to "intact / unsealed / undamaged / off" — and because
+        // `node_map` still pointed at the same index, the node looked
+        // preserved while its properties were gone.
+        //
+        // The full live state is now carried over, and the node is marked
+        // damaged if it is already breached, so a rebuild cannot quietly
+        // un-breach a compartment.
         if let Some(&idx) = self.node_map.get(&node.entity_id) {
-            self.graph[idx] = node;
+            let live = self.graph[idx].clone();
+            let mut merged = node;
+            merged.current_level = live.current_level;
+            merged.fire_intensity = live.fire_intensity;
+            merged.is_breached = live.is_breached || merged.is_breached;
+            merged.is_sealed = live.is_sealed;
+            merged.damage = live.damage.max(merged.damage);
+            merged.pump_active = live.pump_active;
+            if merged.is_breached {
+                // A breached compartment cannot also be a sealed, sound one.
+                merged.is_sealed = false;
+            }
+            self.graph[idx] = merged;
             return idx;
         }
         let idx = self.graph.add_node(node.clone());
@@ -144,7 +202,11 @@ impl DamageGraph {
     pub fn add_bulkhead(&mut self, edge: BulkheadEdge) -> Option<EdgeIndex> {
         let idx_a = self.node_map.get(&edge.connects_a)?;
         let idx_b = self.node_map.get(&edge.connects_b)?;
-        
+        // Duplicate id must not orphan the old edge: remove it first.
+        if let Some(old) = self.edge_map.remove(&edge.entity_id) {
+            self.graph.remove_edge(old);
+        }
+
         let edge_idx = self.graph.add_edge(*idx_a, *idx_b, edge.clone());
         self.edge_map.insert(edge.entity_id, edge_idx);
         Some(edge_idx)
@@ -204,9 +266,13 @@ impl DamageGraph {
 
     pub fn get_bulkhead_between(&self, a: EntityId, b: EntityId) -> Option<EntityId> {
         if let (Some(idx_a), Some(idx_b)) = (self.node_map.get(&a), self.node_map.get(&b)) {
-            for edge in self.graph.edges_connecting(*idx_a, *idx_b) {
-                return Some(edge.weight().entity_id);
-            }
+            // Any connecting edge is the bulkhead between the two compartments;
+            // only one is ever created per pair, so the first one is the answer.
+            return self
+                .graph
+                .edges_connecting(*idx_a, *idx_b)
+                .next()
+                .map(|edge| edge.weight().entity_id);
         }
         None
     }
@@ -365,5 +431,91 @@ impl DamageGraph {
 
     pub fn iter_edges(&self) -> impl Iterator<Item = (EntityId, &BulkheadEdge)> {
         self.graph.edge_references().map(|edge| (edge.weight().entity_id, edge.weight()))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compartment(id: u64) -> CompartmentNode {
+        CompartmentNode {
+            entity_id: EntityId::new(id),
+            name: format!("c{id}"),
+            max_capacity: 100.0,
+            current_level: 0.0,
+            is_sealed: false,
+            is_breached: false,
+            pump_capacity: 10.0,
+            pump_active: false,
+            fire_intensity: 0.0,
+            damage: 0.0,
+            max_damage: 100.0,
+        }
+    }
+
+    /// Bug №240: a repeated add_compartment used to keep only the water level
+    /// and the fire, and reset every other live field to the incoming
+    /// defaults — so a breached, damaged, pumping compartment silently became
+    /// intact, sound and switched off while still being "found" in the map.
+    #[test]
+    fn re_adding_a_compartment_preserves_its_live_state() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+
+        // Put the node into a damaged, breached, pumping, sealed, burning state.
+        {
+            let idx = *g.node_map.get(&EntityId::new(1)).unwrap();
+            let n = &mut g.graph[idx];
+            n.is_breached = true;
+            n.damage = 42.0;
+            n.pump_active = true;
+            n.is_sealed = true;
+            n.fire_intensity = 0.75;
+            n.current_level = 55.0;
+        }
+
+        // Re-add it from a freshly built node (all defaults).
+        g.add_compartment(compartment(1));
+
+        let idx = *g.node_map.get(&EntityId::new(1)).unwrap();
+        let n = &g.graph[idx];
+        assert!((n.current_level - 55.0).abs() < 1e-5, "water level was reset");
+        assert!((n.fire_intensity - 0.75).abs() < 1e-5, "fire was reset");
+        assert!(n.is_breached, "a breach was silently undone");
+        assert!((n.damage - 42.0).abs() < 1e-5, "damage was reset");
+        assert!(n.pump_active, "the pump was switched off");
+    }
+
+    /// A breached compartment must not come back as a sealed, sound one.
+    #[test]
+    fn a_breached_compartment_cannot_be_resealed_by_a_rebuild() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+        let idx = *g.node_map.get(&EntityId::new(1)).unwrap();
+        g.graph[idx].is_breached = true;
+
+        g.add_compartment(compartment(1));
+        let n = &g.graph[*g.node_map.get(&EntityId::new(1)).unwrap()];
+        assert!(n.is_breached);
+        assert!(!n.is_sealed, "a breached compartment must not report as sealed");
+    }
+
+    /// Bug №241: a synthetic bulkhead built for the water path was sealed, and
+    /// `is_passable()` is `!is_sealed || is_destroyed` — so it could never let
+    /// water through, the exact opposite of what the caller's comment claimed.
+    #[test]
+    fn a_synthetic_bulkhead_is_passable_so_water_can_flow() {
+        let open = BulkheadEdge::open(EntityId::new(1), EntityId::new(2), EntityId::new(3), 100.0);
+        assert!(
+            open.is_passable(),
+            "a synthetic edge exists to provide a route and must start passable"
+        );
+        // A real, intact bulkhead is still sealed by default.
+        let sealed = BulkheadEdge::new(EntityId::new(4), EntityId::new(2), EntityId::new(3), 100.0);
+        assert!(!sealed.is_passable(), "an intact bulkhead stays sealed");
+        // And a destroyed one opens regardless.
+        let mut destroyed = sealed.clone();
+        destroyed.is_destroyed = true;
+        assert!(destroyed.is_passable());
     }
 }

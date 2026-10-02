@@ -1,4 +1,4 @@
-use rfs_core::entity::{ShipEntity, PlayerEntity, StationEntity, CompartmentEntity, ProjectileEntity};
+use rfs_core::entity::{HitMark, ShipEntity, PlayerEntity, StationEntity, CompartmentEntity, ProjectileEntity};
 use rfs_core::packet::*;
 use rfs_core::math::{Vec3f, Transform};
 use rfs_core::time::Tick;
@@ -30,7 +30,7 @@ pub struct Snapshot {
     pub events: Vec<GameEvent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EntitySnapshot {
     pub entity_id: EntityId,
     pub entity_type: EntityType,
@@ -57,6 +57,21 @@ pub struct ShipSnapshotData {
     pub heading: f32,
     pub rudder_angle: f32,
     pub throttle: f32,
+    /// Bug №272: the most recent hit this ship took, so the hit effect does
+    /// not depend on the `ShipHit` EVENT arriving.
+    ///
+    /// This exists because variant A of bug №272 makes events unreliable, and
+    /// the impact normal plus the struck compartment were the ONLY parts of an
+    /// event that no layer carried. Everything else an event reports — health,
+    /// flooding, occupancy, projectile position — was already in a layer, so
+    /// the loss was cosmetic. This makes the last one recoverable too.
+    ///
+    /// Deliberately "most recent", not "this tick": two shells can strike in
+    /// one tick, and a layer delta is built by diffing two snapshots, so a
+    /// per-tick hit list would have to accumulate a list to stay correct.
+    /// Carrying one entry per ship keeps the layer a true diffable state and
+    /// still guarantees the effect has something to draw.
+    pub last_hit: Option<HitMark>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,12 +111,20 @@ pub struct PlayerSnapshotData {
     pub name: String,
     pub team: u8,
     pub current_station: Option<EntityId>,
+    /// Bug №274: which ship this player is on.
+    ///
+    /// The player's position is derived from the ship's transform
+    /// (`local_to_world`), so without this a client cannot tell which ship it
+    /// is riding — it has to guess by matching station lists. A bot that wants
+    /// to occupy a gun or aim at an enemy needs it directly, and so does any
+    /// real client drawing a HUD.
+    pub current_ship: Option<EntityId>,
     pub posture: PlayerPosture,
     pub health: f32,
     pub stamina: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectileSnapshot {
     pub entity_id: EntityId,
     pub projectile_type: ProjectileType,
@@ -127,7 +150,7 @@ pub const LAYER_COUNT: usize = 4;
 pub const LAYER_INTERVAL_TICKS: [u64; LAYER_COUNT] = [2, u64::MAX, 1, 1];
 /// Force a full layer state this often (repairs state lost on the unreliable
 /// channel). Layer 1 resyncs more often per the plan ("full check every few seconds").
-pub const LAYER_RESYNC_TICKS: [u64; LAYER_COUNT] = [150, 90, 150, 150];
+pub const LAYER_RESYNC_TICKS: [u64; LAYER_COUNT] = [15, 10, 15, 15];
 
 pub fn entity_layer(entity_type: EntityType) -> u8 {
     match entity_type {
@@ -311,6 +334,12 @@ pub struct DeltaCompressor {
     last_snapshots: RwLock<HashMap<(u32, u8), Tick>>,
 }
 
+impl Default for DeltaCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeltaCompressor {
     pub fn new() -> Self {
         Self {
@@ -372,7 +401,7 @@ impl DeltaCompressor {
             }
         }
 
-        for (id, _) in &base_entities {
+        for id in base_entities.keys() {
             if !target_entities.contains_key(id) {
                 destroyed.push(*id);
             }
@@ -400,26 +429,38 @@ impl DeltaCompressor {
             }
         }
 
-        for (id, _) in &base_projectiles {
+        for id in base_projectiles.keys() {
             if !target_projectiles.contains_key(id) {
                 projectile_destroyed.push(*id);
             }
         }
 
         // Bug №24: bound the delta even if the world explodes in one tick.
+        //
+        // Bug №271: bounding is only safe as long as the client's base is NOT
+        // advanced past what it received. Everything cut here would otherwise
+        // be dropped on the floor for good: the delta still goes out, the base
+        // still moves to `target_snapshot.tick`, and the entities behind the cut
+        // are then diffed against a base the client never saw — which either
+        // stalls the layer on a base mismatch (№267) or applies on top of wrong
+        // state. There is no client-side trace of the loss: the warn below is
+        // the only record. So a truncated delta is not sent at all, and the
+        // next tick re-diffs from the same base and carries the full content.
+        let mut truncated = false;
         if created.len() > MAX_DELTA_CREATED {
-            warn!("create_delta: truncating {} created to {}", created.len(), MAX_DELTA_CREATED);
-            created.truncate(MAX_DELTA_CREATED);
+            warn!("create_delta: {} created exceeds {}; withholding the delta for this tick", created.len(), MAX_DELTA_CREATED);
+            truncated = true;
         }
         if updated.len() > MAX_DELTA_UPDATED {
-            warn!("create_delta: truncating {} updated to {}", updated.len(), MAX_DELTA_UPDATED);
-            updated.truncate(MAX_DELTA_UPDATED);
+            warn!("create_delta: {} updated exceeds {}; withholding the delta for this tick", updated.len(), MAX_DELTA_UPDATED);
+            truncated = true;
         }
         if projectile_created.len() + projectile_updated.len() > MAX_DELTA_PROJECTILES {
-            warn!("create_delta: truncating projectile updates to {}", MAX_DELTA_PROJECTILES);
-            let keep_created = projectile_created.len().min(MAX_DELTA_PROJECTILES);
-            projectile_created.truncate(keep_created);
-            projectile_updated.truncate(MAX_DELTA_PROJECTILES.saturating_sub(keep_created));
+            warn!("create_delta: {} projectile changes exceed {}; withholding the delta for this tick", projectile_created.len() + projectile_updated.len(), MAX_DELTA_PROJECTILES);
+            truncated = true;
+        }
+        if truncated {
+            return Self::withheld_delta(layer, base_tick, target_snapshot);
         }
 
         let is_empty = created.is_empty()
@@ -461,6 +502,51 @@ impl DeltaCompressor {
             projectile_updated,
             projectile_destroyed,
         }
+    }
+
+    /// An empty delta that is deliberately not sent, leaving the client's base
+    /// where it is.
+    ///
+    /// Bug №271: the caller sends nothing and the ring is not advanced, so the
+    /// next tick diffs the same base again and the withheld content goes out in
+    /// full. `base_tick` is the client's real base — using the target tick here
+    /// (as the early return in `create_delta` does) would declare a base the
+    /// client never applied, which is the same class of error this exists to
+    /// avoid. It is never observed on the wire: the send path drops empty
+    /// deltas, so the value exists only to be unambiguous if that changes.
+    fn withheld_delta(layer: u8, base_tick: Tick, target: &Snapshot) -> DeltaSnapshot {
+        DeltaSnapshot {
+            layer,
+            base_tick,
+            target_tick: target.tick,
+            target_time: target.time,
+            created: Vec::new(),
+            updated: Vec::new(),
+            destroyed: Vec::new(),
+            projectile_created: Vec::new(),
+            projectile_updated: Vec::new(),
+            projectile_destroyed: Vec::new(),
+        }
+    }
+
+    /// Move a client's per-layer base tick forward without building a delta.
+    ///
+    /// The caller is about to send a delta that was serialized for a different
+    /// client (identical layer content, identical base tick, identical target
+    /// tick — that is exactly what the payload cache key guarantees), so the
+    /// diff itself is not needed, but this client's base tick still has to move
+    /// to the tick that was just sent.
+    ///
+    /// Skipping this is what the payload cache used to do, and it silently broke
+    /// replication: the ring stayed behind while the server's own
+    /// `LayerBase.last_sent_tick` moved on, so the next real diff declared a
+    /// base tick the client had already applied and the client rejected it as a
+    /// base mismatch — for the ship layer, whose content is identical for every
+    /// client, that is almost every client, every tick.
+    pub fn advance_base(&self, client_id: u32, layer: u8, target_tick: u64) {
+        self.last_snapshots
+            .write()
+            .insert((client_id, layer), Tick(target_tick));
     }
 
     fn compute_entity_update(&self, base: &EntitySnapshot, target: &EntitySnapshot) -> EntityUpdate {
@@ -643,11 +729,10 @@ impl SnapshotInterpolator {
         let after_entities: HashMap<_, _> = after.entities.iter().map(|e| (e.entity_id, e)).collect();
 
         result.entities = before_entities.iter()
-            .filter_map(|(id, b_entity)| {
-                if let Some(a_entity) = after_entities.get(id) {
-                    Some(self.interpolate_entity(b_entity, a_entity, alpha))
-                } else {
-                    Some((*b_entity).clone())
+            .map(|(id, b_entity)| {
+                match after_entities.get(id) {
+                    Some(a_entity) => self.interpolate_entity(b_entity, a_entity, alpha),
+                    None => (*b_entity).clone(),
                 }
             })
             .chain(
@@ -663,11 +748,10 @@ impl SnapshotInterpolator {
         let after_projs: HashMap<_, _> = after.projectiles.iter().map(|p| (p.entity_id, p)).collect();
 
         result.projectiles = before_projs.iter()
-            .filter_map(|(id, b_proj)| {
-                if let Some(a_proj) = after_projs.get(id) {
-                    Some(self.interpolate_projectile(b_proj, a_proj, alpha))
-                } else {
-                    Some((*b_proj).clone())
+            .map(|(id, b_proj)| {
+                match after_projs.get(id) {
+                    Some(a_proj) => self.interpolate_projectile(b_proj, a_proj, alpha),
+                    None => (*b_proj).clone(),
                 }
             })
             .chain(
@@ -760,6 +844,7 @@ impl From<&ShipEntity> for EntitySnapshot {
                 heading: ship.heading,
                 rudder_angle: ship.rudder_angle,
                 throttle: ship.throttle,
+                last_hit: ship.last_hit,
             }),
             station_data: None,
             player_data: None,
@@ -785,6 +870,9 @@ impl From<&PlayerEntity> for EntitySnapshot {
                 name: player.name.clone(),
                 team: player.team,
                 current_station: player.current_station,
+                // Bug №274: the ship this player rides, so a client can tell
+                // which ship it is on without reverse-engineering station lists.
+                current_ship: player.current_ship,
                 posture: player.posture,
                 health: player.health,
                 stamina: player.stamina,
@@ -888,9 +976,17 @@ impl From<&ShipStateData> for ShipSnapshotData {
             max_fuel: s.max_fuel,
             speed: s.speed,
             max_speed: s.max_speed,
-            heading: s.heading,
+heading: s.heading,
             rudder_angle: s.rudder_angle,
             throttle: s.throttle,
+            // Bug §272: the wire type carries the hit, so it MUST survive the
+            // conversion in both directions. Dropping it here broke the
+            // `updated` path: `apply_state_update` rebuilds `ShipSnapshotData`
+            // through this `From`, so a hit arriving in an update was silently
+            // erased before the client could see it — which is the exact loss
+            // the field exists to prevent. The regression test that caught it
+            // is `a_client_recovers_the_hit_from_the_layer_alone`.
+last_hit: s.last_hit,
         }
     }
 }
@@ -937,6 +1033,8 @@ impl From<&PlayerStateData> for PlayerSnapshotData {
             name: s.name.clone(),
             team: s.team,
             current_station: s.current_station,
+            // Bug №274: symmetric with `From<&PlayerEntity>`.
+            current_ship: s.current_ship,
             posture: s.posture,
             health: s.health,
             stamina: s.stamina,
@@ -1040,6 +1138,7 @@ impl ShipSnapshotData {
             heading: self.heading,
             rudder_angle: self.rudder_angle,
             throttle: self.throttle,
+            last_hit: self.last_hit,
         }
     }
 }
@@ -1086,6 +1185,9 @@ impl PlayerSnapshotData {
             name: self.name.clone(),
             team: self.team,
             current_station: self.current_station,
+            // Bug №274: symmetric with `From<&PlayerEntity>` — a field dropped
+            // here would silently vanish on a full-state rebuild.
+            current_ship: self.current_ship,
             posture: self.posture,
             health: self.health,
             stamina: self.stamina,

@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 /// Menu type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum MenuType {
+    #[default]
     Main,
     Settings,
     ShipSelection,
@@ -18,11 +20,6 @@ pub enum MenuType {
     Scoreboard,
 }
 
-impl Default for MenuType {
-    fn default() -> Self {
-        Self::Main
-    }
-}
 
 /// Menu
 pub struct Menu {
@@ -334,7 +331,9 @@ impl Default for Menu {
 
 /// Menu item type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum MenuItemType {
+    #[default]
     Button,
     Label,
     Slider,
@@ -343,11 +342,6 @@ pub enum MenuItemType {
     TextInput,
 }
 
-impl Default for MenuItemType {
-    fn default() -> Self {
-        Self::Button
-    }
-}
 
 /// Menu item
 #[derive(Debug, Clone)]

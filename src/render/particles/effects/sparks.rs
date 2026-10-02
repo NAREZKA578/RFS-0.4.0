@@ -100,7 +100,6 @@ impl SparksEffect {
     /// Renders the sparks effect
     pub fn render(&self, _renderer: &mut crate::render::core::Renderer) {
         if !self.enabled {
-            return;
         }
     }
 

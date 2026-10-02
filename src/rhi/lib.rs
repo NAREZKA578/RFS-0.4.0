@@ -29,6 +29,12 @@ pub mod config;
 pub mod core;
 pub mod debug;
 pub mod descriptor;
+
+// The backend hands native handles (image views, present modes, extents) to
+// callers as part of its public API, so `ash` has to be nameable outside the
+// crate. Re-exported rather than redeclared, so there is one `ash` in the
+// dependency graph.
+pub use ash;
 pub mod error;
 pub mod memory;
 pub mod pipeline;
@@ -38,6 +44,7 @@ pub mod shader;
 pub mod swapchain;
 pub mod sync;
 pub mod types;
+pub mod ui;
 pub mod utils;
 
 #[allow(ambiguous_glob_reexports)]
@@ -68,3 +75,5 @@ pub use shader::*;
 pub use swapchain::*;
 #[allow(ambiguous_glob_reexports)]
 pub use sync::*;
+#[allow(ambiguous_glob_reexports)]
+pub use ui::*;

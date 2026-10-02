@@ -8,7 +8,9 @@ use std::time::Duration;
 
 /// Emitter shape
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum EmitterShape {
+    #[default]
     Point,
     Sphere,
     Box,
@@ -18,11 +20,6 @@ pub enum EmitterShape {
     Circle,
 }
 
-impl Default for EmitterShape {
-    fn default() -> Self {
-        Self::Point
-    }
-}
 
 /// Particle emitter configuration
 #[derive(Debug, Clone)]
@@ -95,6 +92,7 @@ pub struct ParticleEmitter {
     active: bool,
     emitting: bool,
     particles_emitted: u32,
+    emission_accumulator: f32,
 }
 
 impl ParticleEmitter {
@@ -121,6 +119,7 @@ impl ParticleEmitter {
             active: true,
             emitting: true,
             particles_emitted: 0,
+            emission_accumulator: 0.0,
         }
     }
 
@@ -180,6 +179,14 @@ impl ParticleEmitter {
         &self.particles
     }
 
+    /// Only live particles, in draw order (fixes GPU upload of dead pool entries).
+    pub fn live_particles(&self) -> Vec<Particle> {
+        self.active_particles
+            .iter()
+            .map(|&i| self.particles[i])
+            .collect()
+    }
+
     pub fn update(&mut self, delta_time: Duration) {
         if !self.active {
             return;
@@ -195,7 +202,15 @@ impl ParticleEmitter {
 
             // Apply gravity and drag
             particle.velocity += self.config.gravity * delta_seconds;
-            particle.velocity *= 1.0 - self.config.drag * delta_seconds;
+            // Bug №185: this was `velocity *= 1.0 - drag * dt`. Drag is
+            // applied per *second*, so a hitch (or a low frame rate) easily
+            // pushed `drag * dt` past 1, the factor went negative, and the
+            // velocity flipped sign and grew without bound — particles
+            // accelerated away instead of settling. Clamping the factor to
+            // [0, 1] makes drag monotone: a frame can at most remove all
+            // velocity, never reverse it.
+            let drag_factor = (1.0 - self.config.drag * delta_seconds).clamp(0.0, 1.0);
+            particle.velocity *= drag_factor;
 
             // If particle is dead, move it to free list
             if !particle.is_alive() {
@@ -204,18 +219,30 @@ impl ParticleEmitter {
             }
         }
 
-        // Remove dead particles
+        // Remove dead particles and return them to the free list (the pool
+        // must recycle, otherwise the emitter dies after max_particles).
+        let mut died = Vec::new();
         self.active_particles
-            .retain(|&index| self.particles[index].is_alive());
+            .retain(|&index| {
+                if self.particles[index].is_alive() {
+                    true
+                } else {
+                    died.push(index);
+                    false
+                }
+            });
+        self.free_particles.extend(died);
 
-        // Add free particles back to the free list
-        // (This is simplified - in actual implementation, we'd track which particles died)
-
-        // Emit new particles
+        // Emit new particles with fractional accumulator (small rates like
+        // 10/s at 60 FPS emit 0.16/frame — truncation without accumulator
+        // would never spawn).
         if self.emitting && (self.config.loop_emission || self.time < self.config.duration) {
-            let particles_to_emit = (self.config.emission_rate * delta_seconds) as u32;
+            self.emission_accumulator += self.config.emission_rate * delta_seconds;
+            let mut particles_to_emit = self.emission_accumulator as u32;
+            self.emission_accumulator -= particles_to_emit as f32;
+            particles_to_emit = particles_to_emit.min(self.free_particles.len() as u32);
 
-            for _ in 0..particles_to_emit.min(self.free_particles.len() as u32) {
+            for _ in 0..particles_to_emit {
                 self.emit_particle();
             }
         }
@@ -284,78 +311,85 @@ impl ParticleEmitter {
                     rng.gen_range(-self.config.emitter_size.z..self.config.emitter_size.z),
                 )
             }
-            _ => Vec3::ZERO,
+            EmitterShape::Cone => {
+                // Cone along +Y with base radius emitter_size.x, height emitter_size.y.
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                let h: f32 = rng.gen_range(0.0..self.config.emitter_size.y.max(0.001));
+                let r = self.config.emitter_size.x * (h / self.config.emitter_size.y.max(0.001));
+                let theta: f32 = rng.gen_range(0.0..2.0 * std::f32::consts::PI);
+                let rr: f32 = rng.gen_range(0.0..r.max(0.001));
+                Vec3::new(rr * theta.cos(), h, rr * theta.sin())
+            }
+            EmitterShape::Cylinder => {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                let theta: f32 = rng.gen_range(0.0..2.0 * std::f32::consts::PI);
+                let rr: f32 = rng.gen_range(0.0..self.config.emitter_size.x.max(0.001));
+                let h: f32 = rng.gen_range(-self.config.emitter_size.y..self.config.emitter_size.y);
+                Vec3::new(rr * theta.cos(), h, rr * theta.sin())
+            }
+            EmitterShape::Line => {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                let t: f32 = rng.gen_range(-1.0..1.0);
+                self.config.emitter_size * t
+            }
+            EmitterShape::Circle => {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                let theta: f32 = rng.gen_range(0.0..2.0 * std::f32::consts::PI);
+                let rr: f32 = rng.gen_range(0.0..self.config.emitter_size.x.max(0.001));
+                Vec3::new(rr * theta.cos(), 0.0, rr * theta.sin())
+            }
         }
     }
 
     fn get_random_velocity(&self) -> Vec3 {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
 
-        Vec3::new(
-            rng.gen_range(
-                -self.config.particle_velocity_variation.x
-                    ..self.config.particle_velocity_variation.x,
-            ),
-            rng.gen_range(
-                -self.config.particle_velocity_variation.y
-                    ..self.config.particle_velocity_variation.y,
-            ),
-            rng.gen_range(
-                -self.config.particle_velocity_variation.z
-                    ..self.config.particle_velocity_variation.z,
-            ),
-        )
+        let vx = Self::safe_range(&mut rng, self.config.particle_velocity_variation.x);
+        let vy = Self::safe_range(&mut rng, self.config.particle_velocity_variation.y);
+        let vz = Self::safe_range(&mut rng, self.config.particle_velocity_variation.z);
+        Vec3::new(vx, vy, vz)
     }
 
     fn get_random_size(&self) -> Vec2 {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
 
-        Vec2::new(
-            rng.gen_range(
-                -self.config.particle_size_variation.x..self.config.particle_size_variation.x,
-            ),
-            rng.gen_range(
-                -self.config.particle_size_variation.y..self.config.particle_size_variation.y,
-            ),
-        )
+        let sx = Self::safe_range(&mut rng, self.config.particle_size_variation.x);
+        let sy = Self::safe_range(&mut rng, self.config.particle_size_variation.y);
+        Vec2::new(sx, sy)
     }
 
     fn get_random_color(&self) -> Vec4 {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
 
-        Vec4::new(
-            rng.gen_range(
-                -self.config.particle_color_variation.x..self.config.particle_color_variation.x,
-            ),
-            rng.gen_range(
-                -self.config.particle_color_variation.y..self.config.particle_color_variation.y,
-            ),
-            rng.gen_range(
-                -self.config.particle_color_variation.z..self.config.particle_color_variation.z,
-            ),
-            rng.gen_range(
-                -self.config.particle_color_variation.w..self.config.particle_color_variation.w,
-            ),
-        )
+        let cx = Self::safe_range(&mut rng, self.config.particle_color_variation.x);
+        let cy = Self::safe_range(&mut rng, self.config.particle_color_variation.y);
+        let cz = Self::safe_range(&mut rng, self.config.particle_color_variation.z);
+        let cw = Self::safe_range(&mut rng, self.config.particle_color_variation.w);
+        Vec4::new(cx, cy, cz, cw)
     }
 
     fn get_random_lifetime(&self) -> f32 {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
 
-        rng.gen_range(
-            -self.config.particle_lifetime_variation..self.config.particle_lifetime_variation,
-        )
+        Self::safe_range(&mut rng, self.config.particle_lifetime_variation)
     }
 
     fn get_random_rotation_speed(&self) -> f32 {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
 
-        rng.gen_range(-self.config.rotation_speed_variation..self.config.rotation_speed_variation)
+        Self::safe_range(&mut rng, self.config.rotation_speed_variation)
+    }
+
+    fn safe_range(rng: &mut impl rand::Rng, variation: f32) -> f32 {
+        if variation <= 0.0 {
+            0.0
+        } else {
+            rng.gen_range(-variation..variation)
+        }
     }
 
     /// Reset the emitter

@@ -4,7 +4,7 @@
 //!
 //! Handles interaction between water and other objects (ships, projectiles, etc.)
 
-use glam::{Vec2, Vec3};
+use glam::Vec3;
 use std::collections::HashMap;
 
 /// Water interaction
@@ -108,18 +108,21 @@ impl WaterInteraction {
     }
 
     fn get_object_displacement(&self, position: Vec3, obj: &WaterInteractionObject) -> Vec3 {
-        let obj_pos = Vec2::new(obj.position.x, obj.position.z);
-        let dist = position.distance(obj_pos.extend(0.0));
-        if dist > obj.size.x + obj.size.z {
+        // XZ-only distance (Y must not leak into the horizontal radius).
+        let dx = position.x - obj.position.x;
+        let dz = position.z - obj.position.z;
+        let dist = (dx * dx + dz * dz).sqrt();
+        let radius = (obj.size.x + obj.size.z).max(1e-6);
+        if dist > radius {
             return Vec3::ZERO;
         }
 
-        let ratio = 1.0 - dist / (obj.size.x + obj.size.z);
+        let ratio = (1.0 - dist / radius).clamp(0.0, 1.0);
         Vec3::new(0.0, obj.submerge_depth * ratio.powi(2), 0.0)
     }
 
     /// Get foam amount at a position
-    pub fn get_foam(&self, position: Vec3, water_height: f32, foam_threshold: f32) -> f32 {
+    pub fn get_foam(&self, position: Vec3, _water_height: f32, foam_threshold: f32) -> f32 {
         let mut foam = 0.0;
 
         // Add foam from splashes
@@ -127,12 +130,14 @@ impl WaterInteraction {
             foam += splash.get_foam(position);
         }
 
-        // Add foam from objects
+        // Add foam from objects (XZ-only distance).
         for obj in self.objects.values() {
             if obj.submerged && obj.velocity.y > foam_threshold {
-                let obj_pos = Vec2::new(obj.position.x, obj.position.z);
-                let dist = position.distance(obj_pos.extend(water_height));
-                foam += (1.0 - dist / (obj.size.x + obj.size.z)).max(0.0);
+                let dx = position.x - obj.position.x;
+                let dz = position.z - obj.position.z;
+                let dist = (dx * dx + dz * dz).sqrt();
+                let radius = (obj.size.x + obj.size.z).max(1e-6);
+                foam += (1.0 - dist / radius).max(0.0);
             }
         }
 
@@ -189,12 +194,16 @@ impl Ripple {
     }
 
     pub fn get_displacement(&self, position: Vec3) -> Vec3 {
+        // Guard radius==0 in the first frame after add_ripple (div/0 -> inf/NaN).
+        if self.radius <= 1e-6 {
+            return Vec3::ZERO;
+        }
         let dist = position.distance(self.position);
         if dist > self.radius {
             return Vec3::ZERO;
         }
 
-        let ratio = 1.0 - dist / self.radius;
+        let ratio = (1.0 - dist / self.radius).clamp(0.0, 1.0);
         Vec3::new(0.0, self.strength * ratio.powi(2), 0.0)
     }
 }
@@ -232,12 +241,15 @@ impl Splash {
     }
 
     pub fn get_foam(&self, position: Vec3) -> f32 {
+        if self.size <= 1e-6 {
+            return 0.0;
+        }
         let dist = position.distance(self.position);
         if dist > self.size {
             return 0.0;
         }
 
-        let ratio = 1.0 - dist / self.size;
+        let ratio = (1.0 - dist / self.size).clamp(0.0, 1.0);
         self.strength * ratio
     }
 }

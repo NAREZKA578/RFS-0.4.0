@@ -28,10 +28,16 @@ impl CellCoord {
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
+                    // Bug №237: `self.x + dx` on an i32 near the bounds
+                    // overflows — a panic in debug, a silent wrap in release
+                    // that puts the "neighbour" in a cell on the far side of
+                    // the grid. Saturation keeps the coordinate extreme rather
+                    // than wrapping it, so a saturated cell still returns its
+                    // own (extreme) neighbours instead of unrelated ones.
                     result.push(CellCoord {
-                        x: self.x + dx,
-                        y: self.y + dy,
-                        z: self.z + dz,
+                        x: self.x.saturating_add(dx),
+                        y: self.y.saturating_add(dy),
+                        z: self.z.saturating_add(dz),
                     });
                 }
             }
@@ -43,10 +49,11 @@ impl CellCoord {
         let mut result = SmallVec::new();
         for dx in -1..=1 {
             for dz in -1..=1 {
+                // Bug №237: saturating, as in `neighbors`.
                 result.push(CellCoord {
-                    x: self.x + dx,
+                    x: self.x.saturating_add(dx),
                     y: self.y,
-                    z: self.z + dz,
+                    z: self.z.saturating_add(dz),
                 });
             }
         }
@@ -80,6 +87,21 @@ impl Default for EntityId {
 #[derive(Debug, Default)]
 pub struct SpatialGrid<T: SpatialEntity> {
     cells: HashMap<CellCoord, SmallVec<[T; MAX_ENTITIES_PER_CELL]>>,
+    /// Entities whose own cell was already full.
+    ///
+    /// Bug №201: these used to be parked in a *neighbouring* cell to keep the
+    /// per-cell `SmallVec` on the stack. A query only walks the cells its own
+    /// range covers, so an entity parked one cell over is invisible to every
+    /// query whose range does not happen to include that neighbour — including
+    /// a query centred exactly on the entity. The claim that the spill was
+    /// "invisible to queries" because they filter by true position was wrong:
+    /// that filter runs only for entities the cell walk has already found.
+    ///
+    /// Parking them here instead keeps the memory bound that motivated the cap
+    /// (a cell never grows past `MAX_ENTITIES_PER_CELL` on the stack) without
+    /// moving an entity away from the cell its position maps to. Every query
+    /// scans this list in addition to its cells.
+    spilled: Vec<T>,
     entity_cells: HashMap<EntityId, CellCoord>,
 }
 
@@ -87,13 +109,20 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
     pub fn new() -> Self {
         Self {
             cells: HashMap::new(),
+            spilled: Vec::new(),
             entity_cells: HashMap::new(),
         }
     }
 
     pub fn insert(&mut self, entity: T) {
         let id = entity.entity_id();
-        let cell = CellCoord::from_position(entity.position());
+        let position = entity.position();
+        // Bug №161: a non-finite position used to cast into a garbage cell
+        // and linger in the grid forever (nothing could ever find or remove it).
+        if !position.x.is_finite() || !position.y.is_finite() || !position.z.is_finite() {
+            return;
+        }
+        let cell = CellCoord::from_position(position);
         
         if let Some(old_cell) = self.entity_cells.get(&id) {
             if *old_cell == cell {
@@ -103,18 +132,39 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
                         return;
                     }
                 }
+                // The id is tracked against this cell but is not in it, so it
+                // must be in the spill list. Replacing it in place used to be
+                // missing: the lookup above missed, the code fell through, and a
+                // fresh copy was pushed onto `spilled` on every single update.
+                // `update_player`/`update_station` run per tick, so with more
+                // than `MAX_ENTITIES_PER_CELL` entities sharing a cell (all
+                // players on one ship, say) the spill list grew without bound
+                // and every `query_radius` scanned all of it — quadratic, and
+                // it silently dominated the tick budget under load.
+                if let Some(idx) = self.spilled.iter().position(|e| e.entity_id() == id) {
+                    self.spilled[idx] = entity;
+                    return;
+                }
             } else {
                 self.remove(id);
             }
         }
 
         // Bug №62: MAX_ENTITIES_PER_CELL was never enforced — the SmallVec
-        // grew on the heap without limit. Overflow parks in a spare
-        // neighbouring cell; queries still filter by true position/bounds,
-        // so the spill is invisible to them.
-        let cell = self.spill_cell(cell);
+        // grew on the heap without limit. Bug №201: overflow is parked in a
+        // spill list rather than a neighbouring cell, because a neighbouring
+        // cell falls outside the range a query walks.
+        let cell = CellCoord::from_position(position);
+        // `entry`, not `get_mut`: a cell that does not exist yet has to be
+        // created here, or the first insert of every cell misses the map and
+        // lands in the spill list instead.
+        let cell_entities = self.cells.entry(cell).or_default();
+        if cell_entities.len() < MAX_ENTITIES_PER_CELL {
+            cell_entities.push(entity);
+        } else {
+            self.spilled.push(entity);
+        }
         self.entity_cells.insert(id, cell);
-        self.cells.entry(cell).or_default().push(entity);
     }
 
     /// Pick the closest cell with room left for `MAX_ENTITIES_PER_CELL`.
@@ -140,6 +190,13 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
                     }
                     return Some(entity);
                 }
+            }
+            // Bug №201: an entity parked in the spill list shares its cell
+            // coordinate with the cell it overflowed, so the lookup above finds
+            // nothing and the entity would survive its own removal — and keep
+            // being returned by every query.
+            if let Some(idx) = self.spilled.iter().position(|e| e.entity_id() == id) {
+                return Some(self.spilled.swap_remove(idx));
             }
         }
         None
@@ -180,6 +237,19 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
         true
     }
 
+    /// Every entity held in the spill list, for a query to consider.
+    fn spilled_matching<'a>(
+        &'a self,
+        result: &mut SmallVec<[&'a T; 32]>,
+        keep: impl Fn(&T) -> bool,
+    ) {
+        for entity in &self.spilled {
+            if keep(entity) {
+                result.push(entity);
+            }
+        }
+    }
+
     pub fn query_radius(&self, center: Vec3f, radius: f32) -> SmallVec<[&T; 32]> {
         let mut result = SmallVec::new();
         // Bug №62: a non-finite center used to collapse into cell (0,0,0)
@@ -210,6 +280,7 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
                     }
                 }
             }
+            self.spilled_matching(&mut result, |e| e.position().distance(center) <= radius);
             return result;
         }
 
@@ -227,6 +298,9 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
                 }
             }
         }
+        // Bug №201: same as in `query_bounds` — the entity that overflowed a
+        // full cell is not in any cell, so the walk above cannot reach it.
+        self.spilled_matching(&mut result, |e| e.position().distance(center) <= radius);
         result
     }
 
@@ -255,6 +329,9 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
                 }
             }
         }
+        // Bug №201: entities whose cell was full live in the spill list, not in
+        // a neighbouring cell, so they have to be considered here explicitly.
+        self.spilled_matching(&mut result, |e| e.bounds().intersects(bounds));
         result
     }
 
@@ -359,5 +436,234 @@ pub fn calculate_interest_mask(
         }
         InterestLayer::ALL => true,
         _ => false,
+    }
+}
+#[cfg(test)]
+mod neighbour_tests {
+    use super::*;
+
+    /// Bug №237: `self.x + dx` on a saturated i32 wrapped in release (and
+    /// panicked in debug), so a cell at the extreme produced "neighbours" on
+    /// the far side of the grid.
+    #[test]
+    fn neighbours_do_not_overflow_at_the_coordinate_bounds() {
+        for coord in [
+            CellCoord { x: i32::MAX, y: i32::MAX, z: i32::MAX },
+            CellCoord { x: i32::MIN, y: i32::MIN, z: i32::MIN },
+            CellCoord { x: i32::MAX, y: 0, z: i32::MIN },
+        ] {
+            let n = coord.neighbors();
+            assert_eq!(n.len(), 27, "neighbour count must stay 27 for {coord:?}");
+            for c in &n {
+                // Saturation keeps the value at the bound instead of wrapping.
+                assert!(
+                    c.x == i32::MAX || c.x == i32::MIN || c.x == coord.x
+                        || c.x == coord.x.saturating_add(1)
+                        || c.x == coord.x.saturating_sub(1),
+                    "x wrapped for {coord:?}: {c:?}"
+                );
+            }
+            let n2 = coord.neighbors_2d();
+            assert_eq!(n2.len(), 9);
+            for c in &n2 {
+                assert_eq!(c.y, coord.y, "2d neighbours must not move y");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_neighbours_are_unchanged() {
+        let c = CellCoord { x: 5, y: 6, z: 7 };
+        let n = c.neighbors();
+        assert_eq!(n.len(), 27);
+        assert!(n.contains(&c), "a cell is its own neighbour");
+        assert!(n.contains(&CellCoord { x: 6, y: 6, z: 7 }));
+        assert!(n.contains(&CellCoord { x: 4, y: 5, z: 6 }));
+    }
+}
+#[cfg(test)]
+mod spill_tests {
+    use super::{Bounds, SpatialEntity, SpatialGrid, MAX_ENTITIES_PER_CELL};
+    use crate::math::Vec3f;
+    use crate::spatial::EntityId;
+
+    /// Minimal entity: the grid only needs an id, a position and bounds.
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestEntity {
+        id: u64,
+        pos: Vec3f,
+        half: f32,
+    }
+
+    impl SpatialEntity for TestEntity {
+        fn entity_id(&self) -> EntityId {
+            EntityId::new(self.id)
+        }
+        fn entity_type(&self) -> crate::packet::EntityType {
+            crate::packet::EntityType::Ship
+        }
+        fn position(&self) -> Vec3f {
+            self.pos
+        }
+        fn bounds(&self) -> Bounds {
+            Bounds::new(
+                self.pos - Vec3f::new(self.half, self.half, self.half),
+                self.pos + Vec3f::new(self.half, self.half, self.half),
+            )
+        }
+    }
+
+    fn entity(id: u64, x: f32, y: f32, z: f32) -> TestEntity {
+        TestEntity { id, pos: Vec3f::new(x, y, z), half: 1.0 }
+    }
+
+    /// Bug №201: an entity that overflowed a full cell was parked in a
+    /// neighbouring cell, so a query whose cell range covered only the entity's
+    /// own cell never saw it. The query was centred exactly on the entity, so
+    /// "filtering by true position" could not help — the entity was never
+    /// reached to be filtered.
+    #[test]
+    fn an_entity_pushed_out_of_a_full_cell_is_still_found() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+
+        // Fill one cell to the cap, all at the same position so they share a
+        // cell and cannot spill away from each other.
+        let home = Vec3f::new(100.0, 100.0, 100.0);
+        for i in 0..MAX_ENTITIES_PER_CELL as u64 {
+            grid.insert(entity(i, home.x, home.y, home.z));
+        }
+        // This one has to go somewhere else.
+        let lost = MAX_ENTITIES_PER_CELL as u64;
+        grid.insert(entity(lost, home.x, home.y, home.z));
+
+        // A query centred exactly on the entity, with a radius far smaller than
+        // the cell size, so its cell range is a single cell.
+        let found = grid.query_radius(home, 1.0);
+        assert!(
+            found.iter().any(|e| e.entity_id() == EntityId::new(lost)),
+            "the overflowing entity is invisible to a query centred on it: \
+             {} of {} entities found",
+            found.len(),
+            MAX_ENTITIES_PER_CELL + 1
+        );
+        // And the ones that fitted are all there too.
+        assert_eq!(
+            found.len(),
+            MAX_ENTITIES_PER_CELL + 1,
+            "every entity is at the same position, so all must be returned"
+        );
+    }
+
+    /// The cap still has to bound a cell, or the memory bound it was introduced
+    /// for is gone.
+    #[test]
+    fn a_cell_never_grows_past_the_cap() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        for i in 0..(MAX_ENTITIES_PER_CELL as u64) * 3 {
+            grid.insert(entity(i, 0.0, 0.0, 0.0));
+        }
+        let biggest = grid.cells.values().map(|c| c.len()).max().unwrap_or(0);
+        assert!(
+            biggest <= MAX_ENTITIES_PER_CELL,
+            "a cell holds {biggest}, past the cap of {MAX_ENTITIES_PER_CELL}"
+        );
+    }
+
+    /// A bounds query has to consider the spill list too.
+    #[test]
+    fn a_bounds_query_finds_an_overflowing_entity() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        for i in 0..(MAX_ENTITIES_PER_CELL as u64) + 1 {
+            grid.insert(entity(i, 50.0, 50.0, 50.0));
+        }
+        let bounds = Bounds::new(Vec3f::new(49.0, 49.0, 49.0), Vec3f::new(51.0, 51.0, 51.0));
+        let found = grid.query_bounds(&bounds);
+        assert_eq!(
+            found.len(),
+            MAX_ENTITIES_PER_CELL + 1,
+            "the overflowing entity is missing from the bounds query"
+        );
+    }
+
+    /// An entity removed from the spill list must actually disappear, or it
+    /// keeps being returned forever.
+    #[test]
+    fn removing_an_overflowing_entity_really_removes_it() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        for i in 0..(MAX_ENTITIES_PER_CELL as u64) + 1 {
+            grid.insert(entity(i, 10.0, 10.0, 10.0));
+        }
+        let victim = EntityId::new(MAX_ENTITIES_PER_CELL as u64);
+        assert!(grid.remove(victim).is_some(), "the overflowing entity must be removable");
+        let found = grid.query_radius(Vec3f::new(10.0, 10.0, 10.0), 1.0);
+        assert!(
+            !found.iter().any(|e| e.entity_id() == victim),
+            "a removed entity is still being returned by queries"
+        );
+        assert_eq!(found.len(), MAX_ENTITIES_PER_CELL);
+    }
+
+    /// Re-inserting an entity that lives in the spill list must replace it, not
+    /// append a second copy.
+    ///
+    /// Every server tick re-inserts each tracked entity, so an entity parked in
+    /// the spill list is re-inserted 30 times a second. When the in-place
+    /// replacement was missing, each of those updates appended another copy, so
+    /// the spill list grew without bound and every radius query scanned all of
+    /// it — quadratic cost that showed up only under load, as a server that
+    /// missed its tick budget with 200 players on one ship.
+    #[test]
+    fn updating_a_spilled_entity_does_not_grow_the_spill_list() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        let overflow = MAX_ENTITIES_PER_CELL as u64;
+        for i in 0..=overflow {
+            grid.insert(entity(i, 10.0, 10.0, 10.0));
+        }
+        let before = grid.spilled.len();
+        assert_eq!(before, 1, "exactly one entity should have overflowed");
+
+        // Same cell, same id, moved a little: the replace-in-place path.
+        for step in 1..=10u32 {
+            grid.insert(entity(overflow, 10.0 + step as f32, 10.0, 10.0));
+        }
+        assert_eq!(
+            grid.spilled.len(),
+            before,
+            "re-inserting a spilled entity grew the spill list"
+        );
+
+        let found = grid.query_radius(Vec3f::new(20.0, 10.0, 10.0), 1000.0);
+        let copies = found.iter().filter(|e| e.entity_id().0 == overflow).count();
+        assert_eq!(copies, 1, "the spilled entity was duplicated: {copies} copies");
+    }
+
+    /// The same leak, driven through the real per-tick pattern that exposed it:
+    /// many entities sharing one cell, re-inserted every tick.
+    #[test]
+    fn per_tick_reinsertion_of_a_crowded_cell_stays_bounded() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        let total = MAX_ENTITIES_PER_CELL as u64 * 3;
+        for i in 0..total {
+            grid.insert(entity(i, 10.0, 10.0, 10.0));
+        }
+        let expected_spilled = total - MAX_ENTITIES_PER_CELL as u64;
+        assert_eq!(grid.spilled.len() as u64, expected_spilled);
+
+        for _ in 0..50 {
+            for i in 0..total {
+                grid.insert(entity(i, 10.0, 10.0, 10.0));
+            }
+        }
+        assert_eq!(
+            grid.spilled.len() as u64,
+            expected_spilled,
+            "50 ticks of re-insertion grew the spill list from {expected_spilled} to {}",
+            grid.spilled.len()
+        );
+        assert_eq!(
+            grid.entity_cells.len() as u64,
+            total,
+            "re-insertion lost track of an entity"
+        );
     }
 }

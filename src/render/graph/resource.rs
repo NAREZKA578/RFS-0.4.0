@@ -146,13 +146,23 @@ impl GraphResource {
                 }));
 
                 // Create view if needed
+                //
+                // Bug №186: a RenderTarget deliberately gets no view, and the
+                // `!=` guard above honours that — but for every other usage the
+                // texture was unwrapped, so a failed `create_texture` aborted
+                // the process. Build the view from the value we hold.
                 if self.usage != ResourceUsage::RenderTarget {
-                    self.view = Some(
-                        self.texture
-                            .as_ref()
-                            .unwrap()
-                            .create_view(crate::rhi::TextureViewDesc::default()),
-                    );
+                    let tex = self.texture.take();
+                    match tex {
+                        Some(tex) => {
+                            self.view =
+                                Some(tex.create_view(crate::rhi::TextureViewDesc::default()));
+                            self.texture = Some(tex);
+                        }
+                        None => {
+                            eprintln!("[render] graph: texture creation failed; resource has no view");
+                        }
+                    }
                 }
             }
             ResourceType::Buffer => {
@@ -165,7 +175,7 @@ impl GraphResource {
                 };
 
                 self.buffer = Some(Buffer::new(BufferDesc {
-                    size: self.size as u64,
+                    size: self.size,
                     usage: rhi_usage,
                     ..Default::default()
                 }));

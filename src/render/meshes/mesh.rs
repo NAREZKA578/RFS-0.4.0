@@ -77,9 +77,11 @@ impl Default for Vertex {
 
 /// Index type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum IndexType {
     U8,
     U16,
+    #[default]
     U32,
 }
 
@@ -93,28 +95,20 @@ impl IndexType {
     }
 }
 
-impl Default for IndexType {
-    fn default() -> Self {
-        Self::U32
-    }
-}
 
 /// Primitive type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum PrimitiveType {
     Points,
     Lines,
     LineStrip,
+    #[default]
     Triangles,
     TriangleStrip,
     TriangleFan,
 }
 
-impl Default for PrimitiveType {
-    fn default() -> Self {
-        Self::Triangles
-    }
-}
 
 /// Mesh flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -225,42 +219,99 @@ impl Mesh {
         self.bounding_sphere_radius = (max - min).length() / 2.0;
     }
 
-    /// Create vertex buffer
-    pub fn create_vertex_buffer(&mut self, _device: &crate::rhi::Device) {
+    /// Create the GPU vertex buffer and upload the geometry.
+    ///
+    /// This used to take the device as `_device` and ignore it, building a
+    /// CPU-only `Buffer` that had no GPU backing and never received the vertex
+    /// data. The result looked like a live buffer — it reported the right size
+    /// — while `has_gpu_backing()` was false and any `BindVertexBuffers` would
+    /// have bound handle 0. Geometry therefore never reached the GPU at all.
+    pub fn create_vertex_buffer(&mut self, device: &crate::rhi::Device) -> crate::rhi::RhiResult<()> {
         if self.vertices.is_empty() {
-            return;
+            return Ok(());
         }
 
         let size = (std::mem::size_of::<Vertex>() * self.vertices.len()) as u64;
-        let buffer = crate::rhi::Buffer::new(crate::rhi::BufferDesc {
+        let buffer = device.create_buffer(
             size,
-            usage: BufferUsage::VERTEX | BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        });
+            BufferUsage::VERTEX | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+            false,
+        );
+        // Vertex data is written once, so a one-shot staging upload is enough;
+        // a persistently mapped buffer would only add a flush to maintain.
+        // A failed upload must not leave a buffer installed: the draw would then
+        // bind a buffer holding nothing and the mesh would look loaded.
+        device.upload_buffer(&buffer, &self.vertices)?;
+        debug_assert!(
+            buffer.has_gpu_backing(),
+            "vertex buffer must have GPU backing, otherwise a draw binds handle 0"
+        );
 
         self.vertex_buffer = Some(Arc::new(buffer));
+        Ok(())
     }
 
-    /// Create index buffer
-    pub fn create_index_buffer(&mut self, _device: &crate::rhi::Device) {
+    /// Create the GPU index buffer and upload the indices.
+    ///
+    /// Same defect as `create_vertex_buffer`: the device was ignored and no
+    /// data was uploaded, so an indexed draw had nothing to read.
+    ///
+    /// The declared index type is widened to `U32` when the mesh does not fit
+    /// it. Narrowing used to be done with `as`, so a mesh with more than 65536
+    /// vertices carrying `U16` indices was uploaded with wrapped indices: the
+    /// buffer was the right size, the draw succeeded, and the geometry was
+    /// wrong with nothing to report it.
+    pub fn create_index_buffer(&mut self, device: &crate::rhi::Device) -> crate::rhi::RhiResult<()> {
         if self.indices.is_empty() {
-            return;
+            return Ok(());
+        }
+
+        let largest = self.indices.iter().copied().max().unwrap_or(0);
+        let needed = if largest <= u8::MAX as u32 {
+            IndexType::U8
+        } else if largest <= u16::MAX as u32 {
+            IndexType::U16
+        } else {
+            IndexType::U32
+        };
+        if needed.size() > self.index_type.size() {
+            self.index_type = needed;
         }
 
         let size = self.index_type.size() as u64 * self.indices.len() as u64;
-        let buffer = crate::rhi::Buffer::new(crate::rhi::BufferDesc {
+        let buffer = device.create_buffer(
             size,
-            usage: BufferUsage::INDEX | BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        });
+            BufferUsage::INDEX | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+            false,
+        );
+        match self.index_type {
+            IndexType::U16 => {
+                // The pool stores `u32` indices; narrow them to what the
+                // format actually holds rather than uploading 4 bytes each.
+                // Safe only because the widening check above proved every
+                // index fits.
+                let narrow: Vec<u16> = self.indices.iter().map(|i| *i as u16).collect();
+                device.upload_buffer(&buffer, &narrow)?;
+            }
+            IndexType::U8 => {
+                let narrow: Vec<u8> = self.indices.iter().map(|i| *i as u8).collect();
+                device.upload_buffer(&buffer, &narrow)?;
+            }
+            IndexType::U32 => device.upload_buffer(&buffer, &self.indices)?,
+        }
+        debug_assert!(
+            buffer.has_gpu_backing(),
+            "index buffer must have GPU backing, otherwise an indexed draw binds handle 0"
+        );
 
         self.index_buffer = Some(Arc::new(buffer));
+        Ok(())
     }
 
     /// Create buffers (vertex and index)
-    pub fn create_buffers(&mut self, device: &crate::rhi::Device) {
-        self.create_vertex_buffer(device);
-        self.create_index_buffer(device);
+    pub fn create_buffers(&mut self, device: &crate::rhi::Device) -> crate::rhi::RhiResult<()> {
+        self.create_vertex_buffer(device)?;
+        self.create_index_buffer(device)
     }
 
     /// Get vertex buffer
@@ -529,7 +580,13 @@ impl Mesh {
                 .with_tex_coord(Vec2::new(0.0, 1.0)),
         ];
 
-        let indices = vec![0, 1, 2, 0, 2, 3];
+        // Bug №186: the winding was 0-1-2 / 0-2-3, whose geometric normal is
+        // (v1-v0) x (v2-v0) = -Y — the triangles faced *down* while the vertex
+        // normals claimed +Y. With back-face culling the plane was therefore
+        // invisible from above, which is the only side anyone looks at it
+        // from. The winding is reversed so the geometric normal agrees with the
+        // shading normal.
+        let indices = vec![0, 2, 1, 0, 3, 2];
 
         MeshBuilder::new(name)
             .with_vertices(vertices)

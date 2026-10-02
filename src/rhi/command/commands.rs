@@ -20,7 +20,13 @@ pub enum Command {
     BindComputePipeline(ComputePipeline),
 
     // Descriptor Sets
+    //
+    // The pipeline is carried alongside the sets because the `vk::PipelineLayout`
+    // lives on the pipeline handle. Recording only the sets left the translator
+    // with nowhere to read the layout from, and substituting a null layout is
+    // a driver-level crash rather than a diagnosable error.
     BindDescriptorSets {
+        pipeline: GraphicsPipeline,
         first_set: u32,
         sets: Vec<DescriptorSet>,
     },

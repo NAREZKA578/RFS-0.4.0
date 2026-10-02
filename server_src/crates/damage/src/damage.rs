@@ -65,11 +65,16 @@ impl DamageSystem {
         &self.config
     }
 
-    pub fn apply_damage_to_ship(&self, target: &impl DamageTarget, position: Vec3f, damage: f32) {
+    /// Apply damage and report which compartments breached for the first time
+    /// (Bug №151: the caller mirrors the breach into the ship's own state so
+    /// battle damage actually floods it).
+    pub fn apply_damage_to_ship(&self, target: &impl DamageTarget, position: Vec3f, damage: f32) -> Vec<EntityId> {
         // Bug №65: NaN/negative "damage" must never reach the hull or the
         // compartments — a negative blast used to heal the ship.
-        if !(damage > 0.0) {
-            return;
+        // Spelled out rather than `!(damage > 0.0)`: the NaN case has to stay
+        // rejected, and `<=` alone would let NaN through.
+        if damage.is_nan() || damage <= 0.0 {
+            return Vec::new();
         }
 
         let hits = target.compartment_hits();
@@ -91,6 +96,7 @@ impl DamageSystem {
             inflicted.push((hit.entity_id, damage_dealt));
         }
 
+        let mut newly_breached: Vec<EntityId> = Vec::new();
         {
             let mut graph = self.graph.lock();
             for (entity_id, amount) in &inflicted {
@@ -121,14 +127,26 @@ impl DamageSystem {
                             {
                                 continue;
                             }
-                            // Synthetic, deterministic id. Real bulkheads live in
-                            // the ship_id+3000 region; this hash sits elsewhere.
+                            // Synthetic deterministic id outside ship regions.
+                            // Guard: hash may collide with a real compartment or
+                            // bulkhead id — never reuse such an id.
                             let edge_id = EntityId::new(
                                 hit.entity_id.0.wrapping_mul(0x9E37_79B9)
                                     ^ other.entity_id.0.wrapping_add(0x517C_C1B7),
                             );
-                            if graph.get_bulkhead(edge_id).is_none() {
-                                graph.add_bulkhead(BulkheadEdge::new(
+                            if graph.get_bulkhead(edge_id).is_none()
+                                && graph.get_compartment(edge_id).is_none()
+                            {
+                                // Bug №241: this used to be `BulkheadEdge::new`,
+                                // which sets `is_sealed: true`, and
+                                // `is_passable()` is `!is_sealed || is_destroyed`
+                                // — so every synthetic edge was permanently
+                                // impassable and the water never flowed, which
+                                // is the exact opposite of what the comment
+                                // above this block claims. A synthetic edge
+                                // exists to provide a route, so it is built
+                                // open.
+                                graph.add_bulkhead(BulkheadEdge::open(
                                     edge_id,
                                     hit.entity_id,
                                     other.entity_id,
@@ -138,7 +156,21 @@ impl DamageSystem {
                         }
                     }
                 }
+                let was_breached = graph
+                    .get_compartment(*entity_id)
+                    .map(|c| c.is_breached)
+                    .unwrap_or(false);
                 graph.apply_damage(*entity_id, *amount);
+                // Bug №151: only the edge TRUE is reported — an already-sunk
+                // compartment must not re-fire the breach.
+                if !was_breached
+                    && graph
+                        .get_compartment(*entity_id)
+                        .map(|c| c.is_breached)
+                        .unwrap_or(false)
+                {
+                    newly_breached.push(*entity_id);
+                }
             }
         }
 
@@ -152,6 +184,7 @@ impl DamageSystem {
         }
         let hull_factor = if hits.is_empty() { 1.0 } else { max_factor };
         target.apply_health_damage(damage * self.config.hull_damage_multiplier * hull_factor);
+        newly_breached
     }
 
     /// Register the ship's compartment/bulkhead topology so the production
@@ -179,14 +212,34 @@ impl DamageSystem {
     }
 
     fn falloff(&self, distance: f32) -> f32 {
-        if distance <= self.config.falloff_distance {
+        // Validated falloff: non-finite/inverted configs must not invert damage
+        // (negative power = farther hurts more) or NaN-poison.
+        if !distance.is_finite() || distance < 0.0 {
+            return 1.0;
+        }
+        let falloff = if self.config.falloff_distance.is_finite() && self.config.falloff_distance >= 0.0 {
+            self.config.falloff_distance
+        } else {
+            0.0
+        };
+        let max_r = if self.config.max_damage_radius.is_finite() && self.config.max_damage_radius > falloff {
+            self.config.max_damage_radius
+        } else {
+            falloff + 1.0
+        };
+        if distance <= falloff {
             1.0
-        } else if distance >= self.config.max_damage_radius {
+        } else if distance >= max_r {
             0.0
         } else {
-            let range = self.config.max_damage_radius - self.config.falloff_distance;
-            let t = 1.0 - (distance - self.config.falloff_distance) / range.max(0.01);
-            t.powf(self.config.falloff_power).clamp(0.0, 1.0)
+            let range = (max_r - falloff).max(0.01);
+            let t = (1.0 - (distance - falloff) / range).clamp(0.0, 1.0);
+            let power = if self.config.falloff_power.is_finite() && self.config.falloff_power >= 0.0 {
+                self.config.falloff_power
+            } else {
+                1.0
+            };
+            t.powf(power).clamp(0.0, 1.0)
         }
     }
 }
@@ -194,10 +247,20 @@ impl DamageSystem {
 /// Distance from a point to the nearest point of an axis-aligned box
 /// (Bug №65). If the point is inside the box the distance is 0.
 fn distance_to_bounds(point: Vec3f, bounds: &Bounds) -> f32 {
+    // Safe clamp: inverted Bounds (min>max) from bad templates must not panic.
+    fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
+        if !v.is_finite() {
+            return 0.0;
+        }
+        if !lo.is_finite() || !hi.is_finite() || lo > hi {
+            return v;
+        }
+        v.clamp(lo, hi)
+    }
     let clamped = Vec3f::new(
-        point.x.clamp(bounds.min.x, bounds.max.x),
-        point.y.clamp(bounds.min.y, bounds.max.y),
-        point.z.clamp(bounds.min.z, bounds.max.z),
+        safe_clamp(point.x, bounds.min.x, bounds.max.x),
+        safe_clamp(point.y, bounds.min.y, bounds.max.y),
+        safe_clamp(point.z, bounds.min.z, bounds.max.z),
     );
     clamped.distance(point)
 }

@@ -1,7 +1,7 @@
 use crate::graph::{DamageGraph, CompartmentNode};
 use rfs_core::entity::EntityId;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubstanceType {
@@ -87,9 +87,20 @@ impl PropagationSystem {
         self.propagate_fire(graph, dt, &mut events);
         self.process_pumps(graph, dt, &mut events);
         self.check_critical_states(graph, &mut events);
+
+        // Bug №161: compartments that were removed or scrapped left stale
+        // entries in the edge-trigger maps — a re-add then suppressed the
+        // first Flooded/Critical event forever.
+        self.prune_known_states(graph);
         
         events.append(&mut self.event_queue.drain(..).collect());
         events
+    }
+
+    fn prune_known_states(&mut self, graph: &DamageGraph) {
+        let alive: HashSet<EntityId> = graph.iter_nodes().map(|(id, _)| id).collect();
+        self.flooded_known.retain(|id, _| alive.contains(id));
+        self.critical_known.retain(|id, _| alive.contains(id));
     }
 
     fn propagate_water(&self, graph: &mut DamageGraph, dt: f32, events: &mut Vec<PropagationEvent>) {
@@ -174,19 +185,28 @@ impl PropagationSystem {
                         / resistance;
                     let actual_flow = flow.min(source.current_level).min(room);
 
-                    if actual_flow > 0.0 {
-                        graph.pump_water(*comp_id, actual_flow);
-                        graph.add_water(target_id, actual_flow);
+                    if actual_flow > 0.0 && actual_flow.is_finite() {
+                        // Respect add_water capacity: only pump what fits,
+                        // otherwise volume is destroyed on fan-in.
+                        let room = graph
+                            .get_compartment(target_id)
+                            .map(|n| (n.max_capacity - n.current_level).max(0.0))
+                            .unwrap_or(0.0);
+                        let move_amt = actual_flow.min(room);
+                        if move_amt > 0.0 {
+                            graph.pump_water(*comp_id, move_amt);
+                            graph.add_water(target_id, move_amt);
 
-                        events.push(PropagationEvent {
-                            event_type: PropagationEventType::WaterFlow,
-                            source: *comp_id,
-                            target: Some(target_id),
-                            amount: actual_flow,
-                            substance: SubstanceType::Water,
-                        });
+                            events.push(PropagationEvent {
+                                event_type: PropagationEventType::WaterFlow,
+                                source: *comp_id,
+                                target: Some(target_id),
+                                amount: move_amt,
+                                substance: SubstanceType::Water,
+                            });
 
-                        any_flow = true;
+                            any_flow = true;
+                        }
                     }
                 }
             }
@@ -309,8 +329,10 @@ impl PropagationSystem {
             }
             self.flooded_known.insert(comp_id, flooded);
 
-            let critical = comp.is_critical();
-            if critical && !flooded && !self.critical_known.get(&comp_id).copied().unwrap_or(false) {
+            // Edge-triggered Critical excluding Flooded: store (critical && !flooded)
+            // so Flooded->Critical->Flooded->Critical re-fires after pump-out.
+            let critical_active = comp.is_critical() && !flooded;
+            if critical_active && !self.critical_known.get(&comp_id).copied().unwrap_or(false) {
                 events.push(PropagationEvent {
                     event_type: PropagationEventType::CompartmentCritical,
                     source: comp_id,
@@ -319,7 +341,7 @@ impl PropagationSystem {
                     substance: SubstanceType::Water,
                 });
             }
-            self.critical_known.insert(comp_id, critical);
+            self.critical_known.insert(comp_id, critical_active);
         }
     }
 
@@ -357,13 +379,9 @@ impl PropagationSystem {
 
     pub fn breach_compartment(&mut self, graph: &mut DamageGraph, compartment_id: EntityId) -> bool {
         if graph.breach_compartment(compartment_id) {
-            self.event_queue.push_back(PropagationEvent {
-                event_type: PropagationEventType::CompartmentFlooded,
-                source: compartment_id,
-                target: None,
-                amount: 1.0,
-                substance: SubstanceType::Water,
-            });
+            // Do NOT emit CompartmentFlooded here: breach starts at water 0,
+            // the edge detector below emits Flooded when fill_ratio actually
+            // crosses the threshold.
             true
         } else {
             false

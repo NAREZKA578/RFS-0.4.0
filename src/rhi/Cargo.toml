@@ -17,6 +17,20 @@ thiserror = "1.0"
 # Bit manipulation
 bitflags = { version = "2.0", features = ["serde"] }
 
+# Vulkan bindings (dynamic loading, no SDK required at compile time)
+ash = { version = "0.38", default-features = true }
+
+# Windows API bindings for Direct3D
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+], optional = true }
+
 [lib]
 name = "rhi"
 path = "lib.rs"
@@ -24,8 +38,8 @@ path = "lib.rs"
 [features]
 default = ["vulkan", "d3d12", "d3d11", "opengl"]
 vulkan = []
-d3d12 = []
-d3d11 = []
+d3d12 = ["windows"]
+d3d11 = ["windows"]
 opengl = []
 ray_tracing = []
 

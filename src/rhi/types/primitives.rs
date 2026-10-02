@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Texture and buffer formats
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum Format {
     // 8-bit
     R8_UNORM,
@@ -34,10 +35,20 @@ pub enum Format {
     RG16_SFLOAT,
     RGBA16_UNORM,
     RGBA16_SFLOAT,
+    #[default]
     RGBA8_UNORM,
     RGBA8_SNORM,
     RGBA8_UINT,
     RGBA8_SINT,
+    // BGR order, and sRGB.
+    //
+    // A window surface almost always offers `B8G8R8A8_SRGB` — it is what the
+    // desktop compositor wants, so nothing has to be converted on the way out.
+    // Without these two, a swapchain format could not be described by the RHI
+    // at all, which is why presentation could not be finished: the render pass
+    // has to be built for the format the *surface* chose.
+    B8G8R8A8_UNORM,
+    B8G8R8A8_SRGB,
     // 64-bit
     R32G32_UINT,
     R32G32_SINT,
@@ -109,11 +120,6 @@ pub enum Format {
     A8_UNORM,
 }
 
-impl Default for Format {
-    fn default() -> Self {
-        Format::RGBA8_UNORM
-    }
-}
 
 impl Format {
     pub const fn is_depth(&self) -> bool {
@@ -279,6 +285,15 @@ pub enum ClearValue {
 impl ClearValue {
     pub const fn color(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self::Color { r, g, b, a }
+    }
+
+    /// A depth/stencil clear.
+    ///
+    /// Present because `color` was, and a render pass with a depth attachment
+    /// needs one of these per frame: a depth attachment with a clear load
+    /// operation and no matching clear value is invalid.
+    pub const fn depth_stencil(depth: f32, stencil: u32) -> Self {
+        Self::DepthStencil { depth, stencil }
     }
 }
 

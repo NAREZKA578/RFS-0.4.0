@@ -36,12 +36,17 @@ fn texture_format_default_is_rgba8() {
 
 #[test]
 fn texture_format_maps_to_rhi_format() {
+    // `RGBA16` used to land on `RG16_UNORM`, silently dropping the blue and
+    // alpha channels: four 16-bit channels were written as two. It maps to
+    // `RGBA16_UNORM` now. `RGB16` has no three-channel 16-bit format in the
+    // RHI, so it widens to four channels the same way `RGB8` widens to
+    // `RGBA8_UNORM`; the alpha is filled in by the upload path.
     let cases = [
         (TextureFormat::RGBA8, Format::RGBA8_UNORM),
-        (TextureFormat::RGBA16, Format::RG16_UNORM),
+        (TextureFormat::RGBA16, Format::RGBA16_UNORM),
         (TextureFormat::RGBA32, Format::RGBA32_SFLOAT),
         (TextureFormat::RGB8, Format::RGBA8_UNORM),
-        (TextureFormat::RGB16, Format::RG16_UNORM),
+        (TextureFormat::RGB16, Format::RGBA16_UNORM),
         (TextureFormat::RGB32, Format::R32G32B32_SFLOAT),
         (TextureFormat::RG8, Format::RG8_UNORM),
         (TextureFormat::RG16, Format::RG16_UNORM),

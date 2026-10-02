@@ -125,14 +125,20 @@ impl ShipPhysics {
         if self.state.velocity.length() < 1.0 {
             return;
         }
-        
+
+        // The rudder acts at the stern, far behind the COG. The old code used
+        // center_of_mass.z as the lever — the COG is ~z=0, so the yaw torque
+        // was ~0 and the ship could not be steered by the rudder forces.
+        // Use a fixed stern lever arm (matches bounds half-length z=150).
+        const RUDDER_LEVER_ARM: f32 = -150.0;
+
         let speed = self.state.velocity.length();
         let rudder_force = self.state.rudder_angle * speed * speed * self.config.rudder_force_coefficient;
         let right = self.state.rotation.mul_vec3(Vec3f::RIGHT);
-        
+
         self.forces += right * rudder_force;
-        
-        let rudder_torque = self.config.center_of_mass.z * rudder_force;
+
+        let rudder_torque = RUDDER_LEVER_ARM * rudder_force;
         self.torques.y += rudder_torque;
     }
 
@@ -172,14 +178,38 @@ impl ShipPhysics {
     }
 
     fn integrate(&mut self, dt: f32) {
-        let acceleration = self.forces / self.config.mass;
+        // Guards: mass/inertia from config must be positive finite, otherwise
+        // /mass -> inf -> NaN spreads over state and network.
+        let mass = if self.config.mass.is_finite() && self.config.mass > 1e-6 {
+            self.config.mass
+        } else {
+            1.0
+        };
+        let inertia = [
+            if self.config.inertia_tensor[0].is_finite() && self.config.inertia_tensor[0] > 1e-6 {
+                self.config.inertia_tensor[0]
+            } else {
+                1.0
+            },
+            if self.config.inertia_tensor[1].is_finite() && self.config.inertia_tensor[1] > 1e-6 {
+                self.config.inertia_tensor[1]
+            } else {
+                1.0
+            },
+            if self.config.inertia_tensor[2].is_finite() && self.config.inertia_tensor[2] > 1e-6 {
+                self.config.inertia_tensor[2]
+            } else {
+                1.0
+            },
+        ];
+        let acceleration = self.forces / mass;
         self.state.velocity += acceleration * dt;
         self.state.position += self.state.velocity * dt;
-        
+
         let angular_acceleration = Vec3f::new(
-            self.torques.x / self.config.inertia_tensor[0],
-            self.torques.y / self.config.inertia_tensor[1],
-            self.torques.z / self.config.inertia_tensor[2],
+            self.torques.x / inertia[0],
+            self.torques.y / inertia[1],
+            self.torques.z / inertia[2],
         );
         self.state.angular_velocity += angular_acceleration * dt;
         
@@ -207,13 +237,41 @@ impl ShipPhysics {
     }
 
     pub fn apply_impulse(&mut self, impulse: Vec3f, point: Vec3f) {
-        self.state.velocity += impulse / self.config.mass;
+        // Bug №159: non-finite impulses or degenerate mass/inertia from bad
+        // configs must not divide into inf/NaN that then spreads over the
+        // network state.
+        if !impulse.is_finite() {
+            return;
+        }
+        let mass = if self.config.mass.is_finite() && self.config.mass > 1e-6 {
+            self.config.mass
+        } else {
+            1.0
+        };
+        let inertia = [
+            if self.config.inertia_tensor[0].is_finite() && self.config.inertia_tensor[0] > 1e-6 {
+                self.config.inertia_tensor[0]
+            } else {
+                1.0
+            },
+            if self.config.inertia_tensor[1].is_finite() && self.config.inertia_tensor[1] > 1e-6 {
+                self.config.inertia_tensor[1]
+            } else {
+                1.0
+            },
+            if self.config.inertia_tensor[2].is_finite() && self.config.inertia_tensor[2] > 1e-6 {
+                self.config.inertia_tensor[2]
+            } else {
+                1.0
+            },
+        ];
+        self.state.velocity += impulse / mass;
         let r = point - (self.state.rotation.mul_vec3(self.config.center_of_mass) + self.state.position);
         let torque = r.cross(impulse);
         self.state.angular_velocity += Vec3f::new(
-            torque.x / self.config.inertia_tensor[0],
-            torque.y / self.config.inertia_tensor[1],
-            torque.z / self.config.inertia_tensor[2],
+            torque.x / inertia[0],
+            torque.y / inertia[1],
+            torque.z / inertia[2],
         );
     }
 
@@ -245,12 +303,18 @@ impl ShipPhysics {
         (self.config.waterline_height - self.state.position.y).max(0.0)
     }
 
+    // Bug №159: rotation.x/.z are QUATERNION components, not Euler angles — the
+    // old getters returned garbage. Extract real roll/pitch via the standard
+    // quaternion formulas instead.
     pub fn get_heel_angle(&self) -> f32 {
-        self.state.rotation.z
+        let q = self.state.rotation;
+        (2.0 * (q.w * q.x + q.y * q.z))
+            .atan2(1.0 - 2.0 * (q.x * q.x + q.y * q.y))
     }
 
     pub fn get_trim_angle(&self) -> f32 {
-        self.state.rotation.x
+        let q = self.state.rotation;
+        (2.0 * (q.w * q.y - q.z * q.x)).clamp(-1.0, 1.0).asin()
     }
 }
 
@@ -268,6 +332,12 @@ pub struct WaveSystem {
     time: f32,
 }
 
+impl Default for WaveSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WaveSystem {
     pub fn new() -> Self {
         Self {
@@ -277,7 +347,13 @@ impl WaveSystem {
     }
 
     pub fn add_wave(&mut self, wave: Wave) {
-        self.waves.push(wave);
+        // Bug №161: wavelength=0 made k = inf and poisoned every height with
+        // NaN. Reject degenerate waves at the door.
+        if wave.wavelength.is_finite() && wave.wavelength > 0.0
+            && wave.amplitude.is_finite() && wave.direction.is_finite()
+        {
+            self.waves.push(wave);
+        }
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -287,6 +363,9 @@ impl WaveSystem {
     pub fn get_height(&self, position: Vec3f) -> f32 {
         let mut height = 0.0;
         for wave in &self.waves {
+            if wave.wavelength.is_nan() || wave.wavelength <= 0.0 || !wave.amplitude.is_finite() {
+                continue;
+            }
             let dot = position.x * wave.direction.x + position.z * wave.direction.z;
             let k = 2.0 * std::f32::consts::PI / wave.wavelength;
             let omega = k * wave.speed;
@@ -306,6 +385,9 @@ impl WaveSystem {
     pub fn get_velocity(&self, position: Vec3f) -> Vec3f {
         let mut vel = Vec3f::ZERO;
         for wave in &self.waves {
+            if wave.wavelength.is_nan() || wave.wavelength <= 0.0 || !wave.amplitude.is_finite() {
+                continue;
+            }
             let dot = position.x * wave.direction.x + position.z * wave.direction.z;
             let k = 2.0 * std::f32::consts::PI / wave.wavelength;
             let omega = k * wave.speed;

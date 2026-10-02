@@ -22,6 +22,7 @@ fn make_ship() -> ShipEntity {
         compartments: vec![],
         stations: vec![],
         team: 0,
+        last_hit: None,
     }
 }
 

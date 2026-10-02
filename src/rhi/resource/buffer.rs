@@ -3,6 +3,9 @@
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
 use crate::types::*;
+use crate::utils::alignment::{STORAGE_BUFFER_ALIGNMENT, UNIFORM_BUFFER_ALIGNMENT};
+
+use super::GpuResource;
 
 /// Buffer description
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -32,16 +35,35 @@ impl BufferDesc {
         self.memory_flags.contains(MemoryPropertyFlags::HOST_VISIBLE)
     }
 
-    /// Returns the alignment needed for descriptors on this buffer, in bytes.
+    /// Returns the minimum byte offset alignment this buffer's bindings need.
+    ///
+    /// Bug №222: the old table was inverted relative to the constants declared
+    /// in `utils::alignment` — it answered 256 for STORAGE and 64 for UNIFORM,
+    /// while `UNIFORM_BUFFER_ALIGNMENT` is 256 and `STORAGE_BUFFER_ALIGNMENT`
+    /// is 16. A shader-written buffer therefore got *less* alignment than the
+    /// spec requires, which is undefined behaviour on the device rather than
+    /// merely conservative.
+    ///
+    /// The original `usage.contains(VERTEX | INDEX)` also required *both* bits,
+    /// so a vertex-only buffer fell through to the 4-byte default. The vertex
+    /// and index cases are now separate.
+    ///
+    /// When several usage bits apply the strictest requirement wins: a buffer
+    /// that is both a uniform and a storage buffer must satisfy the uniform
+    /// alignment.
     pub fn alignment(&self) -> u64 {
-        if self.usage.contains(BufferUsage::STORAGE) {
-            256
-        } else if self.usage.contains(BufferUsage::UNIFORM) {
-            64
-        } else if self.usage.contains(BufferUsage::VERTEX | BufferUsage::INDEX) {
-            16
-        } else {
+        // Strictest first.
+        if self.usage.contains(BufferUsage::UNIFORM) {
+            UNIFORM_BUFFER_ALIGNMENT
+        } else if self.usage.contains(BufferUsage::STORAGE) {
+            STORAGE_BUFFER_ALIGNMENT
+        } else if self.usage.contains(BufferUsage::VERTEX) || self.usage.contains(BufferUsage::INDEX)
+        {
+            // Vertex/index offsets only need natural alignment; Vulkan places
+            // no requirement beyond the format's own component size.
             4
+        } else {
+            1
         }
     }
 }
@@ -51,6 +73,7 @@ impl BufferDesc {
 pub struct Buffer {
     desc: BufferDesc,
     device_address: Option<u64>,
+    pub(crate) backend: Option<GpuResource>,
 }
 
 impl Buffer {
@@ -58,7 +81,12 @@ impl Buffer {
         Self {
             desc,
             device_address: None,
+            backend: None,
         }
+    }
+
+    pub fn from_desc(desc: BufferDesc) -> Self {
+        Self::new(desc)
     }
 
     pub fn desc(&self) -> &BufferDesc {
@@ -98,7 +126,11 @@ impl Buffer {
     pub fn supports_transfer(&self) -> bool {
         self.desc
             .usage
-            .contains(BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST)
+            .contains(BufferUsage::TRANSFER_SRC)
+            || self
+                .desc
+                .usage
+                .contains(BufferUsage::TRANSFER_DST)
     }
 
     /// Returns `true` when the buffer memory is host-visible.
@@ -114,5 +146,20 @@ impl Buffer {
     /// Assigns a device address to this buffer.
     pub fn set_device_address(&mut self, address: u64) {
         self.device_address = Some(address);
+    }
+
+    /// Returns the native backend handle attached by the active backend, if any.
+    pub(crate) fn backend(&self) -> Option<GpuResource> {
+        self.backend
+    }
+
+    /// Returns `true` when this buffer is backed by native GPU memory.
+    pub fn has_gpu_backing(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    /// Attaches a native backend handle to this buffer.
+    pub(crate) fn set_backend(&mut self, resource: GpuResource) {
+        self.backend = Some(resource);
     }
 }

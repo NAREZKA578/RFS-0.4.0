@@ -7,6 +7,7 @@ use super::commands::Command;
 use crate::command::pass::render::{Framebuffer, RenderPass, RenderPassBeginInfo};
 use crate::descriptor::set::DescriptorSet;
 use crate::pipeline::GraphicsPipeline;
+use crate::error::RhiResult;
 use crate::resource::{Buffer, TextureView};
 use crate::types::*;
 
@@ -39,20 +40,51 @@ impl CommandEncoder {
     }
 
     /// Starts recording into the wrapped command buffer.
-    pub fn begin(&mut self) {
-        self.command_buffer.begin();
+    ///
+    /// Bug №181: this used to call `begin()` and then `commands.clear()`
+    /// unconditionally. `begin()` was a silent no-op when already recording, so
+    /// a stray second `begin()` wiped the commands recorded so far and the
+    /// caller had no way to know. `begin` now refuses to re-enter.
+    pub fn begin(&mut self) -> RhiResult<()> {
+        self.command_buffer.begin()?;
         self.commands.clear();
+        Ok(())
     }
 
     /// Stops recording and returns the finished command buffer.
-    pub fn finish(mut self) -> CommandBuffer {
-        self.command_buffer.end();
-        self.command_buffer
+    ///
+    /// Bug №181: `finish` used to panic via the encoder's `end()`. It now
+    /// reports the misuse.
+    ///
+    /// Bug №203: the recorded `Command`s used to be dropped on the floor here
+    /// — they were held by the encoder and nothing was ever moved into the
+    /// buffer, so a finished buffer always reported zero commands and no
+    /// backend could replay the frame. They are now moved into the buffer, and
+    /// `submit_commands` on the active backend consumes them.
+    pub fn finish(mut self) -> RhiResult<CommandBuffer> {
+        self.command_buffer.end()?;
+        for command in self.commands.drain(..) {
+            self.command_buffer.push_command(command);
+        }
+        Ok(self.command_buffer)
     }
 
-    /// Records a command, if currently recording.
-    pub fn record(&mut self, command: Command) {
+    /// Records a command.
+    ///
+    /// Bug №181: this pushed unconditionally, so commands recorded outside a
+    /// `begin`/`end` pair were silently accumulated and submitted as part of
+    /// the next recording. It now returns `false` and drops the command when
+    /// the buffer is not recording.
+    pub fn record(&mut self, command: Command) -> bool {
+        if !self.command_buffer.is_recording() {
+            eprintln!(
+                "[RHI] command dropped: the buffer is not recording (state={:?})",
+                self.command_buffer.state()
+            );
+            return false;
+        }
         self.commands.push(command);
+        true
     }
 
     /// Begin a render pass.
@@ -112,8 +144,18 @@ impl CommandEncoder {
     }
 
     /// Bind a descriptor set.
-    pub fn bind_descriptor_set(&mut self, set: &DescriptorSet, index: u32) {
+    ///
+    /// The pipeline must be passed too: descriptor binding needs the bound
+    /// pipeline's `PipelineLayout`, and the recorded command has no other way
+    /// to reach it.
+    pub fn bind_descriptor_set(
+        &mut self,
+        pipeline: &GraphicsPipeline,
+        set: &DescriptorSet,
+        index: u32,
+    ) {
         self.record(Command::BindDescriptorSets {
+            pipeline: pipeline.clone(),
             first_set: index,
             sets: vec![set.clone()],
         });

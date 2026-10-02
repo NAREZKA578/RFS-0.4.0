@@ -20,6 +20,12 @@ pub struct MemoryBudgetManager {
     budget: MemoryBudget,
 }
 
+impl Default for MemoryBudgetManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryBudgetManager {
     pub fn new() -> Self {
         Self {

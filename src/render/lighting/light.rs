@@ -6,18 +6,15 @@ use glam::Vec3;
 
 /// Light type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum LightType {
+    #[default]
     Directional,
     Point,
     Spot,
     Area,
 }
 
-impl Default for LightType {
-    fn default() -> Self {
-        Self::Directional
-    }
-}
 
 /// Base light struct
 #[derive(Debug, Clone)]
@@ -69,96 +66,44 @@ impl Light {
         self
     }
 
-    /// Get light direction (for directional lights)
+    /// Direction this light points in.
+    ///
+    /// Bug №185: this used to call `as_directional()`, which reinterpreted a
+    /// `&Light` as a `&DirectionalLight`. That is undefined behaviour twice
+    /// over: it violates strict aliasing, and the two types do not even have
+    /// the same layout — `Light` starts with `name: String`, while
+    /// `DirectionalLight` starts with `base: Light`. Reading `direction` out of
+    /// it returned whatever bytes happened to follow the `Light` fields.
+    ///
+    /// A bare `Light` simply has no direction, so this reports the documented
+    /// default and callers that need the real value hold the concrete type,
+    /// which has its own accessor.
     pub fn direction(&self) -> Vec3 {
         match self.light_type {
-            LightType::Directional => {
-                if let Some(dir_light) = self.as_directional() {
-                    dir_light.direction
-                } else {
-                    Vec3::NEG_Z
-                }
-            }
-            LightType::Point => Vec3::ZERO,
-            LightType::Spot => {
-                if let Some(spot_light) = self.as_spot() {
-                    spot_light.direction
-                } else {
-                    Vec3::NEG_Z
-                }
-            }
-            LightType::Area => Vec3::ZERO,
+            LightType::Directional | LightType::Spot => Vec3::NEG_Z,
+            LightType::Point | LightType::Area => Vec3::ZERO,
         }
     }
 
-    /// Get light position (for point/spot lights)
+    /// World position of this light.
+    ///
+    /// Bug №185: same unsafe cast as `direction` — removed. A bare `Light` has
+    /// no position; the concrete `PointLight`/`SpotLight` types carry it.
     pub fn position(&self) -> Vec3 {
         match self.light_type {
-            LightType::Directional => Vec3::ZERO,
-            LightType::Point => {
-                if let Some(point_light) = self.as_point() {
-                    point_light.position
-                } else {
-                    Vec3::ZERO
-                }
-            }
-            LightType::Spot => {
-                if let Some(spot_light) = self.as_spot() {
-                    spot_light.position
-                } else {
-                    Vec3::ZERO
-                }
-            }
-            LightType::Area => Vec3::ZERO,
+            LightType::Point | LightType::Spot => Vec3::ZERO,
+            LightType::Directional | LightType::Area => Vec3::ZERO,
         }
     }
 
-    /// Get light range (for point/spot lights)
+    /// Attenuation range of this light.
+    ///
+    /// Bug №185: same unsafe cast as `direction` — removed. Only a point or
+    /// spot light has a range, and only on the concrete type.
     pub fn range(&self) -> f32 {
         match self.light_type {
             LightType::Directional => f32::INFINITY,
-            LightType::Point => {
-                if let Some(point_light) = self.as_point() {
-                    point_light.range
-                } else {
-                    10.0
-                }
-            }
-            LightType::Spot => {
-                if let Some(spot_light) = self.as_spot() {
-                    spot_light.range
-                } else {
-                    10.0
-                }
-            }
-            LightType::Area => 10.0,
-        }
-    }
-
-    /// Cast to DirectionalLight
-    pub fn as_directional(&self) -> Option<&DirectionalLight> {
-        if self.light_type == LightType::Directional {
-            Some(unsafe { &*(self as *const Light as *const DirectionalLight) })
-        } else {
-            None
-        }
-    }
-
-    /// Cast to PointLight
-    pub fn as_point(&self) -> Option<&PointLight> {
-        if self.light_type == LightType::Point {
-            Some(unsafe { &*(self as *const Light as *const PointLight) })
-        } else {
-            None
-        }
-    }
-
-    /// Cast to SpotLight
-    pub fn as_spot(&self) -> Option<&SpotLight> {
-        if self.light_type == LightType::Spot {
-            Some(unsafe { &*(self as *const Light as *const SpotLight) })
-        } else {
-            None
+            _ => 10.0,
         }
     }
 }
@@ -197,6 +142,15 @@ impl DirectionalLight {
     pub fn with_intensity(mut self, intensity: f32) -> Self {
         self.base.intensity = intensity;
         self
+    }
+
+    /// Real direction of this light.
+    ///
+    /// Bug №185: this is the accessor that `Light::direction` used to fake
+    /// through an undefined-behaviour cast. Callers holding a
+    /// `DirectionalLight` get the actual value from here.
+    pub fn direction(&self) -> Vec3 {
+        self.direction
     }
 }
 

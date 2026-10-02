@@ -76,3 +76,90 @@ fn query_result_variants() {
         _ => panic!("expected pipeline statistics"),
     }
 }
+
+#[test]
+fn query_pool_write_and_get() {
+    let mut pool = QueryPool::new(QueryPoolDesc {
+        ty: QueryType::Timestamp,
+        count: 4,
+        flags: QueryPoolFlags::NONE,
+    });
+    assert_eq!(pool.count(), 4);
+    assert!(!pool.is_available(0));
+
+    // Bug №182: a result may only be written for a query that was begun, so
+    // the test now brackets it. Previously it wrote straight into slot 0 and
+    // the pool accepted a result for a query no GPU work ever issued.
+    assert!(pool.begin(0));
+    assert!(pool.write(0, QueryResult::Timestamp(12345)));
+    assert!(pool.is_available(0));
+    assert!(pool.end(0));
+    let r = pool.get(0).unwrap();
+    match r {
+        QueryResult::Timestamp(v) => assert_eq!(*v, 12345),
+        _ => panic!("expected timestamp"),
+    }
+    assert_eq!(pool.get(3), None);
+}
+
+#[test]
+fn query_pool_take_removes_result() {
+    let mut pool = QueryPool::new(QueryPoolDesc {
+        ty: QueryType::Occlusion,
+        count: 2,
+        flags: QueryPoolFlags::NONE,
+    });
+    assert!(pool.begin(1));
+    assert!(pool.write(1, QueryResult::Occlusion(true)));
+    assert!(pool.end(1));
+    assert!(pool.take(1).is_some());
+    assert!(!pool.is_available(1));
+    assert_eq!(pool.take(1), None);
+}
+
+#[test]
+fn query_pool_write_out_of_bounds_is_refused() {
+    // Bug №182: this used to be called "..._is_ignored" and asserted nothing
+    // about the outcome. An out-of-range write is now reported, not ignored.
+    let mut pool = QueryPool::new(QueryPoolDesc {
+        ty: QueryType::Timestamp,
+        count: 2,
+        flags: QueryPoolFlags::NONE,
+    });
+    assert!(!pool.write(99, QueryResult::Timestamp(1)));
+    assert_eq!(pool.get(99), None);
+    assert_eq!(pool.rejected_writes(), 1);
+
+    assert!(!pool.write(0, QueryResult::Timestamp(1)), "no query is active");
+    assert_eq!(pool.rejected_writes(), 2);
+    assert_eq!(pool.get(0), None);
+}
+
+#[test]
+fn query_pool_reset_clears_results() {
+    let mut pool = QueryPool::new(QueryPoolDesc {
+        ty: QueryType::AccelerationStructureCompactionSize,
+        count: 8,
+        flags: QueryPoolFlags::NONE,
+    });
+    assert!(pool.begin(0));
+    assert!(pool.write(0, QueryResult::CompactionSize(4096)));
+    assert!(pool.is_available(0));
+    pool.reset();
+    assert!(!pool.is_available(0));
+    assert_eq!(pool.get(0), None);
+    // Bug №182: reset also ends every open query, so a stale run cannot
+    // contribute a result to the next one.
+    assert!(!pool.is_active(0));
+    assert!(!pool.write(0, QueryResult::CompactionSize(1)));
+}
+
+#[test]
+fn query_result_default_for_types() {
+    let ts = QueryResult::default_for(QueryType::Timestamp);
+    assert!(matches!(ts, QueryResult::Timestamp(0)));
+    let occ = QueryResult::default_for(QueryType::Occlusion);
+    assert!(matches!(occ, QueryResult::Occlusion(false)));
+    let stats = QueryResult::default_for(QueryType::PipelineStatistics);
+    assert!(matches!(stats, QueryResult::PipelineStatistics(_)));
+}

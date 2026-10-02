@@ -25,21 +25,63 @@ impl Vec3f {
     pub const LEFT: Self = Self::new(-1.0, 0.0, 0.0);
     pub const RIGHT: Self = Self::new(1.0, 0.0, 0.0);
 
+    /// The largest absolute component, used to keep the length and the
+    /// normalization from overflowing.
+    fn max_abs(self) -> f32 {
+        self.x.abs().max(self.y.abs()).max(self.z.abs())
+    }
+
     pub fn length(self) -> f32 {
-        (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
+        // Divided through by the largest component first.
+        //
+        // Squaring the components directly overflows to infinity above about
+        // 1.8e19, which made `length()` return `inf` for a vector that has a
+        // perfectly good finite length. The scaled form cannot overflow, and
+        // scaling back only overflows when the true length genuinely does not
+        // fit in an f32 — which `inf` is the honest answer for.
+        let m = self.max_abs();
+        if m == 0.0 {
+            return 0.0;
+        }
+        if !m.is_finite() {
+            return f32::INFINITY;
+        }
+        let scaled = Self::new(self.x / m, self.y / m, self.z / m);
+        m * scaled.length_squared().sqrt()
     }
 
     pub fn length_squared(self) -> f32 {
+        // Kept as the plain sum, because that is what callers that already hold
+        // a safe range (the broadphase tests, the collision code) are asking
+        // for, and a silently scaled result would not compare equal to a
+        // hand-computed one. Callers that care about the overflow use `length`.
         self.x * self.x + self.y * self.y + self.z * self.z
     }
 
     pub fn normalize(self) -> Self {
-        let len = self.length();
-        if len > 0.0 {
-            self / len
-        } else {
-            Self::ZERO
+        // Normalizing is scale invariant, so the vector is divided by its
+        // largest component and only then measured. Every component of the
+        // scaled vector is at most 1, so nothing here can overflow.
+        //
+        // The previous version divided by `length()`, and for any vector longer
+        // than about 1.8e19 that length was `inf`, so the guard `len > 0.0`
+        // passed and the result was `self / inf` — the zero vector. That is
+        // not a rounding error: a zero normal or a zero velocity direction is
+        // a physical answer, and it propagated into the projectile normal, the
+        // reflected velocity and every distance filter downstream.
+        let m = self.max_abs();
+        if m == 0.0 || !m.is_finite() {
+            // No direction can be recovered from a zero or a non-finite
+            // vector, and returning something plausible instead would invent
+            // physics.
+            return Self::ZERO;
         }
+        let scaled = Self::new(self.x / m, self.y / m, self.z / m);
+        let len = scaled.length_squared().sqrt();
+        if len == 0.0 || !len.is_finite() {
+            return Self::ZERO;
+        }
+        scaled / len
     }
 
     pub fn dot(self, other: Self) -> f32 {
@@ -60,6 +102,14 @@ impl Vec3f {
 
     pub fn lerp(self, other: Self, t: f32) -> Self {
         self + (other - self) * t
+    }
+
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+
+    pub fn is_nan(self) -> bool {
+        self.x.is_nan() || self.y.is_nan() || self.z.is_nan()
     }
 }
 
@@ -330,5 +380,82 @@ impl Bounds {
             self.min - Vec3f::new(amount, amount, amount),
             self.max + Vec3f::new(amount, amount, amount),
         )
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::Vec3f;
+
+    /// The bug: `length()` squared the components, which overflows to infinity
+    /// above about 1.8e19, so `normalize()` divided by infinity and returned the
+    /// zero vector — a direction destroyed rather than an error raised.
+    #[test]
+    fn normalizing_a_huge_vector_keeps_its_direction() {
+        let v = Vec3f::new(3e20, 0.0, 0.0);
+        let n = v.normalize();
+        assert!(
+            (n.x - 1.0).abs() < 1e-6,
+            "expected (1,0,0), got {n:?}: a huge vector must still have a direction"
+        );
+        assert!(n.y.abs() < 1e-6 && n.z.abs() < 1e-6);
+
+        // Not just the axis-aligned case.
+        let diagonal = Vec3f::new(3e20, 4e20, 0.0);
+        let d = diagonal.normalize();
+        assert!(
+            (d.x - 0.6).abs() < 1e-5 && (d.y - 0.8).abs() < 1e-5,
+            "expected (0.6,0.8,0), got {d:?}"
+        );
+
+        // Smallest and largest magnitudes that are still finite.
+        let tiny = Vec3f::new(1e-30, 0.0, 0.0).normalize();
+        assert!((tiny.x - 1.0).abs() < 1e-5, "got {tiny:?}");
+        let big = Vec3f::new(f32::MAX, 0.0, 0.0).normalize();
+        assert!((big.x - 1.0).abs() < 1e-6, "got {big:?}");
+    }
+
+    #[test]
+    fn the_result_of_normalizing_is_a_unit_vector() {
+        for v in [
+            Vec3f::new(1.0, 2.0, 3.0),
+            Vec3f::new(-1e18, 5.0, 2.0),
+            Vec3f::new(1e-25, -1e-25, 1e-25),
+            Vec3f::new(3e20, 4e20, 5e20),
+        ] {
+            let n = v.normalize();
+            let len = n.x * n.x + n.y * n.y + n.z * n.z;
+            assert!(
+                (len - 1.0).abs() < 1e-5,
+                "normalize({v:?}) gave {n:?} with length squared {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_or_non_finite_vector_has_no_direction() {
+        assert_eq!(Vec3f::ZERO.normalize(), Vec3f::ZERO);
+        assert_eq!(Vec3f::new(f32::INFINITY, 0.0, 0.0).normalize(), Vec3f::ZERO);
+        assert_eq!(Vec3f::new(f32::NAN, 1.0, 0.0).normalize(), Vec3f::ZERO);
+    }
+
+    #[test]
+    fn length_survives_the_magnitudes_normalize_survives() {
+        // 3e20 fits in an f32, so its length must too. It used to be infinity.
+        let v = Vec3f::new(3e20, 4e20, 0.0);
+        let len = v.length();
+        assert!(
+            len.is_finite() && (len - 5e20).abs() / 5e20 < 1e-5,
+            "expected about 5e20, got {len}"
+        );
+        assert_eq!(Vec3f::ZERO.length(), 0.0);
+    }
+
+    #[test]
+    fn normalizing_preserves_direction_for_ordinary_magnitudes() {
+        // The pre-existing behaviour must be untouched, or the physics callers
+        // that rely on it change meaning.
+        let v = Vec3f::new(3.0, 4.0, 0.0);
+        let n = v.normalize();
+        assert!((n.x - 0.6).abs() < 1e-6 && (n.y - 0.8).abs() < 1e-6, "got {n:?}");
     }
 }

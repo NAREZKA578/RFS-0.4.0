@@ -7,18 +7,15 @@ use std::time::Duration;
 
 /// Wave method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum WaveMethod {
     Flat,
     Simple,
+    #[default]
     Gerstner,
     FFT,
 }
 
-impl Default for WaveMethod {
-    fn default() -> Self {
-        Self::Gerstner
-    }
-}
 
 /// Wave configuration
 #[derive(Debug, Clone)]
@@ -130,13 +127,19 @@ impl WaveSystem {
     }
 
     fn get_simple_normal(&self, position: Vec3) -> Vec3 {
-        // Calculate normal from height map
-        let epsilon = 0.01;
+        // Finite-difference normal with correct Y and NaN-safe normalize
+        // (flat water gives a zero gradient — normalize would yield NaN).
+        let epsilon = 0.1;
         let h = self.get_simple_height(position);
         let hx = self.get_simple_height(position + Vec3::new(epsilon, 0.0, 0.0));
         let hz = self.get_simple_height(position + Vec3::new(0.0, 0.0, epsilon));
 
-        Vec3::new(hx - h, 0.0, hz - h).normalize()
+        let n = Vec3::new(-(hx - h) / epsilon, 1.0, -(hz - h) / epsilon);
+        if n.length_squared() < 1e-12 || !n.is_finite() {
+            Vec3::Y
+        } else {
+            n.normalize()
+        }
     }
 
     fn get_gerstner_height(&self, position: Vec3) -> f32 {

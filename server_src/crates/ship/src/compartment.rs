@@ -129,6 +129,10 @@ impl Compartment {
         &self.config
     }
 
+    pub(crate) fn config_mut(&mut self) -> &mut CompartmentConfig {
+        &mut self.config
+    }
+
     pub fn set_connected_compartments(&mut self, compartments: Vec<EntityId>) {
         self.config.connected_compartments = compartments;
     }

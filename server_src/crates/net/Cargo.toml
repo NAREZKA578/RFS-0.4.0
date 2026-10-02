@@ -16,3 +16,9 @@ smallvec = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+rayon = "1"
+
+[dev-dependencies]
+# The crate itself only needs net/sync/time; the end-to-end tests need a
+# runtime and #[tokio::test].
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -27,9 +27,7 @@ impl TextureLoader {
 
     /// Load a texture from a file
     pub fn load(&self, path: &Path) -> Option<Texture> {
-        if self.device.is_none() {
-            return None;
-        }
+        self.device.as_ref()?;
 
         let device = self.device.as_ref().unwrap();
         let ext = path
@@ -72,7 +70,7 @@ impl TextureLoader {
 
         // Upload some placeholder data (white texture)
         let data = vec![255u8; 256 * 256 * 4];
-        texture.upload_data(&data, device);
+        if !texture.upload_data(&data, device) { return None; }
 
         Some(texture)
     }
@@ -102,7 +100,7 @@ impl TextureLoader {
 
         // Upload placeholder data
         let data = vec![255u8; 256 * 256 * 4 * 6];
-        texture.upload_data(&data, device);
+        if !texture.upload_data(&data, device) { return None; }
 
         Some(texture)
     }
@@ -153,7 +151,7 @@ impl TextureLoader {
         );
 
         let data: Vec<u8> = (0..width * height).flat_map(|_| color.to_vec()).collect();
-        texture.upload_data(&data, device);
+        if !texture.upload_data(&data, device) { return None; }
 
         Some(texture)
     }
@@ -186,7 +184,7 @@ impl TextureLoader {
             }
         }
 
-        texture.upload_data(&data, device);
+        if !texture.upload_data(&data, device) { return None; }
 
         Some(texture)
     }

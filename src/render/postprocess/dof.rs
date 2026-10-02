@@ -87,22 +87,18 @@ impl DepthOfFieldEffect {
     pub fn apply(
         &mut self,
         encoder: &mut CommandEncoder,
-        context: &RenderContext,
+        _context: &RenderContext,
         input: &TextureView,
         _depth_texture: &TextureView,
-        _output: &TextureView,
+        output: &TextureView,
     ) {
         if !self.enabled {
             return;
         }
-
-        let _ = (encoder, context, input);
-
-        // Apply depth of field
-        // This would blur areas outside the focus range
-
-        // For now, this is a placeholder
-        let _ = self.output_view.as_ref();
+        // Placeholder pass-through until the real CoC blur exists.
+        if !std::ptr::eq(input, output) {
+            encoder.copy_texture(input, output);
+        }
     }
 
     pub fn resize(&mut self, device: &Arc<Device>, context: &RenderContext, input_format: Format) {

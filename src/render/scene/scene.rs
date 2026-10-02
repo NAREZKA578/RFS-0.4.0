@@ -65,7 +65,7 @@ impl Scene {
             let entity = self.entities.remove(index);
 
             // Update entity_map for entities after the removed one
-            for (_, idx) in self.entity_map.iter_mut() {
+            for idx in self.entity_map.values_mut() {
                 if *idx > index {
                     *idx -= 1;
                 }
@@ -115,7 +115,7 @@ impl Scene {
     pub fn set_active_camera(&mut self, entity_id: usize) {
         if self
             .get_entity(entity_id)
-            .map_or(false, |e| e.has_component::<CameraComponent>())
+            .is_some_and(|e| e.has_component::<CameraComponent>())
         {
             self.active_camera = Some(entity_id);
         }
@@ -217,6 +217,8 @@ impl Scene {
     /// Perform frustum culling
     pub fn cull(&self, _context: &RenderContext) -> Vec<usize> {
         let view_proj = self.camera_view_projection_matrix();
+        // Hoisted out of the hot loop: one extraction per frame, not per entity.
+        let frustum = crate::render::scene::culling::Frustum::from_matrix(view_proj);
         let mut visible_entities = Vec::new();
 
         for (entity_id, &index) in &self.entity_map {
@@ -228,7 +230,6 @@ impl Scene {
 
             // Check if entity is in frustum
             if let Some(aabb) = entity.bounding_box() {
-                let frustum = crate::render::scene::culling::Frustum::from_matrix(view_proj);
                 if frustum.is_visible(&aabb) {
                     visible_entities.push(*entity_id);
                 }

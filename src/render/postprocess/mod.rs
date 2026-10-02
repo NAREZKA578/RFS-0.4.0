@@ -128,15 +128,12 @@ impl Default for HDRConfig {
 
 /// Tone mapping methods
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum ToneMapping {
     Linear,
     Reinhard,
+    #[default]
     ACES,
     Filmic,
 }
 
-impl Default for ToneMapping {
-    fn default() -> Self {
-        Self::ACES
-    }
-}

@@ -109,22 +109,20 @@ impl UnderwaterEffect {
         let _was_underwater = self.underwater;
         self.underwater = self.depth < self.config.depth_threshold;
 
-        // Calculate underwater factor with smooth transition
-        if self.underwater {
+        // Target factor: 1 deep below the threshold, 0 clearly above.
+        // Above-water branch decays to 0 immediately (no full tint just
+        // above the surface).
+        let target = if self.underwater {
             let depth_below = self.config.depth_threshold - self.depth;
-            self.underwater_factor =
-                (depth_below / (self.config.depth_threshold.abs() + 0.1)).clamp(0.0, 1.0);
+            (depth_below / (self.config.depth_threshold.abs() + 0.1)).clamp(0.0, 1.0)
         } else {
-            let depth_above = self.depth - self.config.depth_threshold;
-            self.underwater_factor =
-                1.0 - (depth_above / (self.config.depth_threshold.abs() + 0.1)).clamp(0.0, 1.0);
-        }
+            0.0
+        };
 
-        // Smooth the transition
-        let smooth_factor = self.config.transition_smoothness;
-        let prev_factor = self.underwater_factor;
-        self.underwater_factor =
-            prev_factor + (self.underwater_factor - prev_factor) * dt * smooth_factor;
+        // Exponential smoothing towards the target (old code lerped the value
+        // towards itself — a no-op).
+        let smooth_factor = (self.config.transition_smoothness * dt).clamp(0.0, 1.0);
+        self.underwater_factor += (target - self.underwater_factor) * smooth_factor;
 
         self.prev_camera_position = camera_position;
     }

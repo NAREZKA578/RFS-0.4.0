@@ -30,6 +30,28 @@ pub struct ShipEntity {
     pub compartments: Vec<CompartmentEntity>,
     pub stations: Vec<StationEntity>,
     pub team: u8,
+    /// Bug №272: the most recent hit, so the impact effect and the
+    /// survivability feedback survive a lost `ShipHit` event. The event went
+    /// unreliable because events carry no state; this is the state half.
+    pub last_hit: Option<HitMark>,
+}
+
+/// Bug §272: durable record of one hit, replicated in layer 0 (the ship layer).
+///
+/// Distinct from the `ShipHit` event on purpose: the event is a best-effort
+/// notification, this is state that is diffed and converges.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HitMark {
+    /// Simulation tick the hit landed on — the client uses it to avoid drawing
+    /// the same impact twice.
+    pub hit_tick: u32,
+    /// Impact point, world frame.
+    pub position: Vec3f,
+    /// Surface normal, world frame.
+    pub normal: Vec3f,
+    /// Compartment that took the hit, when the point resolved to one.
+    pub compartment: Option<EntityId>,
+    pub damage: f32,
 }
 
 impl SpatialEntity for ShipEntity {

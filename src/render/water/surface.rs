@@ -83,10 +83,13 @@ impl WaterSurface {
         self.tessellation_factor = factor;
     }
 
-    /// Get the model matrix for the water surface
+    /// Get the model matrix for the water surface.
+    /// The mesh is already built at world size (create_mesh uses size.x/z),
+    /// so the matrix must be translation-only — scaling again would square
+    /// the size (128 -> 16384).
     pub fn model_matrix(&self) -> Mat4 {
         Mat4::from_scale_rotation_translation(
-            Vec3::new(self.size.x, 1.0, self.size.z),
+            Vec3::ONE,
             glam::Quat::IDENTITY,
             Vec3::new(0.0, self.size.y / 2.0, 0.0),
         )

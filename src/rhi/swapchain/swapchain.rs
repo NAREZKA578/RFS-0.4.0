@@ -5,7 +5,7 @@
 
 use super::surface::Surface;
 use crate::error::*;
-use crate::resource::{Texture, TextureView};
+use crate::resource::{Texture, TextureDesc, TextureView};
 use crate::types::*;
 
 /// Color space

@@ -156,8 +156,11 @@ impl TextureLibrary {
                 TextureUsage::Normal,
                 device,
             );
-            normal_tex.upload_data(&normal_data, device);
-            self.add("normal_flat", normal_tex);
+            // Do not publish a placeholder whose upload failed: an empty normal map is
+            // worse than no normal map, because the sampler finds something.
+            if normal_tex.upload_data(&normal_data, device) {
+                self.add("normal_flat", normal_tex);
+            }
         }
     }
 }
