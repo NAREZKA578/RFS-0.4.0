@@ -243,6 +243,21 @@ pub trait BackendResource: Send + Sync {
         ))
     }
 
+    /// Tell the backend the next submit is the one being presented.
+    ///
+    /// Bug №282: `vkQueuePresentKHR` waits on a semaphore that the frame's submit
+    /// signals. Defaulting to "nothing to arm" is the safe answer for a backend
+    /// with no presentation path — there is nothing to present to.
+    fn arm_presentation_signal(&self) {}
+
+    /// The semaphore presentation waits on, or null when there is none.
+    ///
+    /// Bug №282. Null here means `present` must not wait, which is what a backend
+    /// without presentation wants; a Vulkan backend returns a real semaphore.
+    fn render_finished_semaphore(&self) -> crate::ash::vk::Semaphore {
+        crate::ash::vk::Semaphore::null()
+    }
+
     /// Draw into a framebuffer with a single pipeline, an optional index buffer
     /// and submit the commands.
     #[allow(clippy::too_many_arguments)]

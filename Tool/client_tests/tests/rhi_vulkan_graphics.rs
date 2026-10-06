@@ -213,3 +213,140 @@ fn vulkan_offscreen_graphics_roundtrip() {
         "expected the clear color (blue) in the corner, got {corner:?}"
     );
 }
+
+/// Bug №274: the submit fence used to be created and destroyed inside
+/// `submit_recorded`, once per frame. This is the regression test for turning
+/// that into a single device-owned fence.
+///
+/// A single submit cannot tell you whether the fence is being *reset* correctly,
+/// because a freshly created fence starts unsignalled, so the wait after the
+/// first submit is a real block whether or not the reset exists. What a repeated
+/// submit can catch is the failure mode the reuse introduces: if the fence were
+/// not reset, it would still be signalled from the previous frame, the wait
+/// would return immediately, and the second frame would be recorded into a
+/// command buffer the GPU was still reading — which shows up as the second
+/// frame's pixels being wrong or the readback racing.
+///
+/// So each iteration draws a *different* colour and then checks the texture
+/// actually contains that iteration's colour. A stale or unreached frame shows up
+/// as the previous colour still being there.
+#[test]
+fn repeated_submits_do_not_reuse_a_previously_signalled_fence() {
+    let device = open_vulkan_device(Features::default());
+
+    const EXTENT: u32 = 64;
+    const FRAMES: u32 = 8;
+
+    let texture = device.create_texture(
+        EXTENT,
+        EXTENT,
+        1,
+        rhi::Format::RGBA8_UNORM,
+        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+        1,
+    );
+    let view = device
+        .create_texture_view(&texture, texture.create_default_view().desc())
+        .expect("color attachment view");
+
+    let render_pass = device
+        .create_gpu_render_pass(&RenderPassDesc {
+            attachments: vec![AttachmentDescription {
+                format: rhi::Format::RGBA8_UNORM,
+                samples: SampleCount::X1,
+                load_op: LoadOp::Clear,
+                store_op: StoreOp::Store,
+                stencil_load_op: LoadOp::DontCare,
+                stencil_store_op: StoreOp::DontCare,
+                initial_layout: TextureLayout::Undefined,
+                final_layout: TextureLayout::ColorAttachmentOptimal,
+            }],
+            subpasses: vec![SubpassDescription {
+                pipeline_bind_point: PipelineBindPoint::Graphics,
+                color_attachments: vec![AttachmentReference {
+                    attachment: 0,
+                    layout: TextureLayout::ColorAttachmentOptimal,
+                }],
+                ..Default::default()
+            }],
+            dependencies: vec![],
+        })
+        .expect("render pass");
+
+    let framebuffer = device
+        .create_gpu_framebuffer(&FramebufferDesc {
+            render_pass: render_pass.clone(),
+            attachments: vec![FramebufferAttachment {
+                texture_view: view,
+                layer: 0,
+                mip_level: 0,
+            }],
+            width: EXTENT,
+            height: EXTENT,
+            layers: 1,
+        })
+        .expect("framebuffer");
+
+    let vs = device.create_shader_module(&ShaderModuleDesc {
+        code: wgsl_to_spirv(SHADER),
+        format: ShaderFormat::SpirV,
+        entry_point: Some("vs_main".into()),
+        name: Some("repeated submit".into()),
+    });
+    let fs = device.create_shader_module(&ShaderModuleDesc {
+        code: wgsl_to_spirv(SHADER),
+        format: ShaderFormat::SpirV,
+        entry_point: Some("fs_main".into()),
+        name: Some("repeated submit".into()),
+    });
+
+    let pipeline = device
+        .create_gpu_graphics_pipeline(
+            &GraphicsPipelineDesc {
+                shader_stages: vec![
+                    PipelineShaderStage {
+                        stage: ShaderStage::VERTEX,
+                        module: vs,
+                        entry_point: "vs_main".into(),
+                    },
+                    PipelineShaderStage {
+                        stage: ShaderStage::FRAGMENT,
+                        module: fs,
+                        entry_point: "fs_main".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            &render_pass,
+            &[],
+        )
+        .expect("graphics pipeline");
+
+    // Every frame clears to its own colour and draws the same triangle over it,
+    // so the clear is the part that has to change. If a frame's submit were lost
+    // or raced, the texture would still hold an earlier frame's colour.
+    for frame in 0..FRAMES {
+        let level = (frame + 1) as f32 / FRAMES as f32;
+        let clear = rhi::ClearValue::color(level, 0.0, 0.0, 1.0);
+
+        device
+            .draw_framebuffer(&framebuffer, &pipeline, &[], None, 3, 0, &[clear])
+            .unwrap_or_else(|e| panic!("submit for frame {frame} failed: {e}"));
+
+        let bytes = device
+            .download_texture(&texture, 0, 0)
+            .unwrap_or_else(|e| panic!("readback for frame {frame} failed: {e}"));
+        assert_eq!(bytes.len(), (EXTENT * EXTENT * 4) as usize);
+
+        // A corner is outside the triangle, so it shows the clear value and not
+        // the shader output.
+        let offset = 0usize;
+        let red = bytes[offset];
+        let expected = (level * 255.0).round() as u8;
+        assert!(
+            (red as i32 - expected as i32).abs() <= 2,
+            "frame {frame} should have cleared to red ~= {expected}, found {red}; \
+             a stale fence or a lost submit would leave an earlier frame's colour"
+        );
+    }
+}

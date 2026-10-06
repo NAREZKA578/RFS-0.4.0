@@ -181,25 +181,60 @@ fn pass_dependency_creation() {
     assert_eq!(dependency.usage, ResourceUsage::Sampled);
 }
 
+/// Bug №102: `|` used to mean "pick the dominant usage" and to depend on the
+/// order the caller wrote, which meant `ColorAttachment | Sampled` silently lost
+/// the `Sampled` bit. `graph.rs` declares exactly that combination for seven
+/// resources, so those textures were created without `TextureUsage::SAMPLED` and
+/// anything sampling them read a texture never made for sampling.
+///
+/// `|` is a union now, so the test asserts union rather than dominance. The name
+/// changed with it on purpose: a test called `bitor_dominance` invites a future
+/// reader to reintroduce the old behaviour, because the old name described the
+/// defect as if it were the specification.
 #[test]
-fn resource_usage_bitor_dominance() {
-    assert_eq!(ResourceUsage::RenderTarget | ResourceUsage::ColorAttachment, ResourceUsage::RenderTarget);
+fn resource_usage_union_keeps_every_bit_in_any_order() {
+    // Order must not matter: this is what the old implementation got wrong.
     assert_eq!(
-        ResourceUsage::ColorAttachment | ResourceUsage::RenderTarget,
-        ResourceUsage::RenderTarget
+        ResourceUsage::RENDER_TARGET | ResourceUsage::COLOR_ATTACHMENT,
+        ResourceUsage::COLOR_ATTACHMENT | ResourceUsage::RENDER_TARGET
     );
+    assert_eq!(
+        ResourceUsage::COLOR_ATTACHMENT | ResourceUsage::SAMPLED,
+        ResourceUsage::SAMPLED | ResourceUsage::COLOR_ATTACHMENT
+    );
+    assert_eq!(
+        ResourceUsage::DEPTH_STENCIL | ResourceUsage::SAMPLED,
+        ResourceUsage::SAMPLED | ResourceUsage::DEPTH_STENCIL
+    );
+    assert_eq!(
+        ResourceUsage::SAMPLED | ResourceUsage::STORAGE,
+        ResourceUsage::STORAGE | ResourceUsage::SAMPLED
+    );
+
+    // The specific loss that mattered: the second usage used to disappear.
+    assert!(
+        (ResourceUsage::COLOR_ATTACHMENT | ResourceUsage::SAMPLED).contains(ResourceUsage::SAMPLED),
+        "SAMPLED must survive the union"
+    );
+    assert!(
+        (ResourceUsage::COLOR_ATTACHMENT | ResourceUsage::SAMPLED)
+            .contains(ResourceUsage::COLOR_ATTACHMENT)
+    );
+    assert!(
+        (ResourceUsage::DEPTH_STENCIL | ResourceUsage::SAMPLED).contains(ResourceUsage::SAMPLED)
+    );
+
+    // Three usages at once, which no single `match` arm could ever describe.
+    let three = ResourceUsage::RENDER_TARGET
+        | ResourceUsage::DEPTH_STENCIL
+        | ResourceUsage::STORAGE;
+    assert_eq!(three.iter().count(), 3);
+
+    // The alias spellings must still work, because the passes use them.
     assert_eq!(
         ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-        ResourceUsage::ColorAttachment
+        ResourceUsage::COLOR_ATTACHMENT | ResourceUsage::SAMPLED
     );
-    assert_eq!(
-        ResourceUsage::DepthStencil | ResourceUsage::Sampled,
-        ResourceUsage::DepthStencil
-    );
-    assert_eq!(ResourceUsage::Sampled | ResourceUsage::Storage, ResourceUsage::Sampled);
-    assert_eq!(ResourceUsage::Storage | ResourceUsage::Sampled, ResourceUsage::Storage);
-    assert_eq!(ResourceUsage::ColorAttachment | ResourceUsage::DepthStencil, ResourceUsage::ColorAttachment);
-    assert_eq!(ResourceUsage::DepthStencil | ResourceUsage::ColorAttachment, ResourceUsage::DepthStencil);
 }
 
 #[test]

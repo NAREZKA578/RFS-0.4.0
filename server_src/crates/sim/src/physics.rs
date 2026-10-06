@@ -68,6 +68,8 @@ impl ShipPhysics {
         }
     }
 
+    
+
     pub fn set_state(&mut self, state: ShipPhysicsState) {
         self.state = state;
     }
@@ -170,11 +172,13 @@ impl ShipPhysics {
         let heave_force = (wave_height - self.state.position.y) * 10000.0 - self.state.velocity.y * 5000.0;
         self.forces.y += heave_force;
         
-        let pitch_torque = -self.state.rotation.x * 50000.0 - self.state.angular_velocity.x * 10000.0;
-        self.torques.x += pitch_torque;
-        
-        let roll_torque = -self.state.rotation.z * 50000.0 - self.state.angular_velocity.z * 10000.0;
-        self.torques.z += roll_torque;
+        // Bug №195: see `roll_and_pitch` and `restoring_torque`. Angular
+        // damping stays on its own axes — `angular_velocity` components are real.
+        let restoring =
+            restoring_torque(self.state.rotation, self.state.angular_velocity, 50000.0, 10000.0);
+        self.torques.x += restoring.x;
+        self.torques.y += restoring.y;
+        self.torques.z += restoring.z;
     }
 
     fn integrate(&mut self, dt: f32) {
@@ -397,5 +401,181 @@ impl WaveSystem {
             vel.z += wave.direction.z * amplitude * phase.cos();
         }
         vel
+    }
+}
+
+/// Roll about x and pitch about y, from a quaternion.
+///
+/// Bug №195: these were read straight off `rotation.x` and `rotation.z`, which
+/// are quaternion components, not angles. A quaternion component is not a signed
+/// angle, so the "spring" was a constant pull toward q.x = 0 rather than toward
+/// upright, and its sign could push a capsized hull the wrong way. The same trap
+/// is documented in `get_heel_angle` (Bug №159); these are the same conversions.
+fn roll_and_pitch(rotation: Quatf) -> (f32, f32) {
+    let roll = (2.0 * (rotation.w * rotation.x + rotation.y * rotation.z))
+        .atan2(1.0 - 2.0 * (rotation.x * rotation.x + rotation.y * rotation.y));
+    let pitch = (2.0 * (rotation.w * rotation.y - rotation.z * rotation.x)).clamp(-1.0, 1.0).asin();
+    (roll, pitch)
+}
+
+/// The upright-restoring part of the wave response, as a pure function.
+///
+/// Split out so it can be checked on its own: inside `calculate_wave_forces` it is
+/// added to every other force in the frame, so asserting on the total would test
+/// the whole force model instead of this term.
+fn restoring_torque(
+    rotation: Quatf,
+    angular_velocity: Vec3f,
+    stiffness: f32,
+    damping: f32,
+) -> Vec3f {
+    let (roll, pitch) = roll_and_pitch(rotation);
+    Vec3f::new(
+        -roll * stiffness - angular_velocity.x * damping,
+        -pitch * stiffness - angular_velocity.y * damping,
+        -angular_velocity.z * damping,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STIFFNESS: f32 = 50000.0;
+    const DAMPING: f32 = 10000.0;
+
+    fn restoring_for(rotation: Quatf) -> Vec3f {
+        restoring_torque(rotation, Vec3f::ZERO, STIFFNESS, DAMPING)
+    }
+
+    fn rolled(angle: f32) -> Quatf {
+        Quatf::from_axis_angle(Vec3f::new(1.0, 0.0, 0.0), angle)
+    }
+
+    fn trimmed(angle: f32) -> Quatf {
+        Quatf::from_axis_angle(Vec3f::new(0.0, 1.0, 0.0), angle)
+    }
+
+    /// Bug №195: `rotation.x` and `rotation.z` are quaternion components, not
+    /// angles. These assert behaviour rather than axis names, because the old
+    /// labels were themselves wrong — the torque the old code called "pitch" was
+    /// applied to x, which is the roll axis.
+    #[test]
+    fn an_upright_ship_gets_no_restoring_torque() {
+        let t = restoring_for(Quatf::IDENTITY);
+        assert!(
+            t.x.abs() < 1e-3 && t.y.abs() < 1e-3,
+            "a level ship was given a restoring torque: {:?}",
+            t
+        );
+    }
+
+    /// A hull rolled about x must be pushed back toward level. The sign is the
+    /// whole point: a quaternion component's sign is not an angle's sign, so the
+    /// old constant pull could drive a capsized hull further over.
+    #[test]
+    fn a_rolled_ship_is_pushed_back_toward_level() {
+        let angle = 0.6_f32;
+        let t = restoring_for(rolled(angle));
+        assert!(
+            t.x < 0.0,
+            "a +{angle} rad roll produced {:?}, which does not restore it",
+            t
+        );
+    }
+
+    /// The mirror, so a sign error cannot pass unnoticed.
+    #[test]
+    fn rolling_the_other_way_torques_the_other_way() {
+        let t = restoring_for(rolled(-0.6));
+        assert!(
+            t.x > 0.0,
+            "a negative roll produced {:?}, which does not restore it",
+            t
+        );
+    }
+
+    /// Trim is pitch about y and must restore independently of roll.
+    #[test]
+    fn a_trimmed_ship_is_pushed_back_toward_level() {
+        let t = restoring_for(trimmed(0.4));
+        assert!(
+            t.y < 0.0,
+            "a +0.4 rad trim produced {:?}, which does not restore it",
+            t
+        );
+    }
+
+    /// The defect in one assertion, and the reason a ratio test cannot catch it.
+    ///
+    /// The old code multiplied a quaternion component by the stiffness, so it
+    /// produced `-sin(angle / 2) * stiffness`. A correct spring produces
+    /// `-angle * stiffness`. The *ratio* between two different angles is nearly
+    /// the same for both (sin(0.1)/sin(0.5) is 0.208, and 0.2/1.0 is 0.200), so
+    /// comparing one torque against another proves nothing. Comparing against the
+    /// analytic value separates them by a factor of two at 1 rad.
+    #[test]
+    fn the_restoring_torque_tracks_the_angle_not_the_quaternion_component() {
+        for angle in [0.2_f32, 0.6, 1.0, 2.0] {
+            let t = restoring_for(rolled(angle)).x;
+            let expected = -angle * STIFFNESS;
+            let buggy = -(angle / 2.0).sin() * STIFFNESS;
+
+            assert!(
+                (t - expected).abs() < 1.0,
+                "at {angle} rad expected about {expected}, got {t}"
+            );
+            assert!(
+                (t - buggy).abs() > 1000.0,
+                "at {angle} rad the torque {t} still matches the old sin(angle/2) form {buggy}"
+            );
+        }
+    }
+
+    /// Capsized: rolled past 90°. Quaternion component and angle disagree most
+    /// here, and the hull must still be pushed back.
+    #[test]
+    fn a_capsized_hull_is_still_restored() {
+        let t = restoring_for(rolled(2.0));
+        assert!(t.x < 0.0, "a capsized hull got no restoring torque: {:?}", t);
+    }
+
+    /// The old code also put a restoring term on z, where a quaternion component
+    /// says nothing about rotation about z. Now z carries damping only, so a pure
+    /// roll about z produces no torque at all — and that is correct, because
+    /// decomposing it lands on the roll/pitch axes.
+    #[test]
+    fn tilt_about_z_is_no_longer_mistaken_for_a_restoring_torque() {
+        let t = restoring_for(Quatf::from_axis_angle(Vec3f::new(0.0, 0.0, 1.0), 0.5));
+        assert!(
+            t.z.abs() < 1e-3,
+            "a quaternion z component is being treated as a z-axis angle: {:?}",
+            t
+        );
+    }
+
+    /// Damping must oppose angular velocity, and it is the only term that can
+    /// appear with a zero restoring angle.
+    #[test]
+    fn damping_opposes_angular_velocity() {
+        let t = restoring_torque(Quatf::IDENTITY, Vec3f::new(2.0, -3.0, 4.0), STIFFNESS, DAMPING);
+        assert!(t.x < 0.0, "damping did not oppose +x spin");
+        assert!(t.y > 0.0, "damping did not oppose -y spin");
+        assert!(t.z < 0.0, "damping did not oppose +z spin");
+    }
+
+    /// The reported angles must match the angles that were applied, which is
+    /// what `get_heel_angle` / `get_trim_angle` already promised (Bug №159).
+    #[test]
+    fn the_recovered_angles_match_what_was_applied() {
+        let q = rolled(0.6);
+        let (roll, pitch) = roll_and_pitch(q);
+        assert!((roll - 0.6).abs() < 1e-3, "roll recovered as {roll}");
+        assert!(pitch.abs() < 1e-3, "a pure roll reported pitch {pitch}");
+
+        let q = trimmed(0.4);
+        let (roll, pitch) = roll_and_pitch(q);
+        assert!((pitch - 0.4).abs() < 1e-3, "pitch recovered as {pitch}");
+        assert!(roll.abs() < 1e-3, "a pure pitch reported roll {roll}");
     }
 }

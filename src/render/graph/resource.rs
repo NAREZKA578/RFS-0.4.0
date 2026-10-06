@@ -120,16 +120,49 @@ impl GraphResource {
     pub fn create(&mut self, _device: &crate::rhi::Device) {
         match self.resource_type {
             ResourceType::Texture => {
-                let rhi_usage = match self.usage {
-                    ResourceUsage::RenderTarget | ResourceUsage::ColorAttachment => {
-                        TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED
-                    }
-                    ResourceUsage::DepthStencil => {
-                        TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::SAMPLED
-                    }
-                    ResourceUsage::Sampled => TextureUsage::SAMPLED,
-                    ResourceUsage::Storage => TextureUsage::STORAGE | TextureUsage::SAMPLED,
-                };
+                // Bug №102: this used to be a `match` over `ResourceUsage`, which only worked
+                // while the type was a single-valued enum. As a set it can hold
+                // several usages at once — and `graph.rs` really does declare
+                // `COLOR_ATTACHMENT | SAMPLED` — so the usage is accumulated bit
+                // by bit instead of selected. Matching on the whole value would
+                // miss every combination, which is the bug all over again.
+                let mut rhi_usage = TextureUsage::empty();
+                if self.usage.contains(ResourceUsage::RENDER_TARGET)
+                    || self.usage.contains(ResourceUsage::COLOR_ATTACHMENT)
+                {
+                    rhi_usage |= TextureUsage::COLOR_ATTACHMENT;
+                }
+                if self.usage.contains(ResourceUsage::DEPTH_STENCIL) {
+                    rhi_usage |= TextureUsage::DEPTH_STENCIL_ATTACHMENT;
+                }
+                if self.usage.contains(ResourceUsage::SAMPLED) {
+                    rhi_usage |= TextureUsage::SAMPLED;
+                }
+                if self.usage.contains(ResourceUsage::STORAGE) {
+                    rhi_usage |= TextureUsage::STORAGE;
+                }
+                if rhi_usage.is_empty() {
+                    // A resource nobody declared a use for cannot be created
+                    // without usage bits, and Vulkan would reject a zero-usage
+                    // image. Saying so beats a validation error about an image
+                    // that was never asked for.
+                    eprintln!(
+                        "[render] graph: resource {:?} has no usage declared; \
+                         not creating a texture",
+                        self.name
+                    );
+                    return;
+                }
+                // Sampled is implied whenever a texture is also written, because
+                // every pass that writes a target reads it back later in the
+                // chain (lighting, transparent, UI all declare a Sampled
+                // dependency on what an earlier pass produced).
+                if rhi_usage != TextureUsage::SAMPLED
+                    && (rhi_usage.contains(TextureUsage::COLOR_ATTACHMENT)
+                        || rhi_usage.contains(TextureUsage::DEPTH_STENCIL_ATTACHMENT))
+                {
+                    rhi_usage |= TextureUsage::SAMPLED;
+                }
 
                 self.texture = Some(Texture::new(TextureDesc {
                     width: self.width,
@@ -166,13 +199,42 @@ impl GraphResource {
                 }
             }
             ResourceType::Buffer => {
-                let rhi_usage = match self.usage {
-                    ResourceUsage::RenderTarget => unreachable!(),
-                    ResourceUsage::ColorAttachment => unreachable!(),
-                    ResourceUsage::DepthStencil => unreachable!(),
-                    ResourceUsage::Sampled => BufferUsage::UNIFORM | BufferUsage::STORAGE,
-                    ResourceUsage::Storage => BufferUsage::STORAGE,
-                };
+                // Bug №102: accumulated like the texture case above. A buffer that is both a
+                // storage target and something sampled needs both usage bits, and
+                // the old `match` could not express that at all.
+                let mut rhi_usage = BufferUsage::empty();
+                if self.usage.contains(ResourceUsage::SAMPLED) {
+                    // A sampled buffer is read through a descriptor, which for a
+                    // uniform is a UNIFORM buffer and for anything else is read
+                    // as storage. Keeping both matches what the old code did for
+                    // the single `Sampled` case.
+                    rhi_usage |= BufferUsage::UNIFORM | BufferUsage::STORAGE;
+                }
+                if self.usage.contains(ResourceUsage::STORAGE) {
+                    rhi_usage |= BufferUsage::STORAGE;
+                }
+                if self.usage.contains(ResourceUsage::RENDER_TARGET)
+                    || self.usage.contains(ResourceUsage::COLOR_ATTACHMENT)
+                    || self.usage.contains(ResourceUsage::DEPTH_STENCIL)
+                {
+                    // Attachments are textures, never buffers. Saying so beats the
+                    // `unreachable!()` the old code had here, which would abort
+                    // the process on a data-driven mistake rather than on a bug.
+                    eprintln!(
+                        "[render] graph: buffer {:?} declares an attachment usage \
+                         ({}) but buffers cannot be attachments; not creating it",
+                        self.name, self.usage
+                    );
+                    return;
+                }
+                if rhi_usage.is_empty() {
+                    eprintln!(
+                        "[render] graph: buffer {:?} has no usage declared; \
+                         not creating a buffer",
+                        self.name
+                    );
+                    return;
+                }
 
                 self.buffer = Some(Buffer::new(BufferDesc {
                     size: self.size,

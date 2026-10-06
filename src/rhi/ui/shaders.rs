@@ -2,87 +2,157 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
-//! Manages loading, compilation, and hot-reloading of UI shaders.
+//! Loads pre-compiled SPIR-V and turns it into real shader modules.
+//!
+//! SPIR-V arrives as bytes rather than being read from a path. `rhi` is its own
+//! crate and must not know where assets live on disk: the caller embeds the
+//! `.spv` with `include_bytes!` and hands the bytes over. That also keeps the
+//! dependency pointing one way — `render` already depends on `rhi`, not the
+//! reverse.
+//!
+//! Both entry points are named `vs_main` / `fs_main`, matching the shaders
+//! already committed under `Tool/client_tests/assets/shaders`.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::Arc;
-use crate::Device;
-use super::UiResult;
 
-/// Shader type for UI
+use crate::shader::module::{ShaderFormat, ShaderModule, ShaderModuleDesc};
+use crate::Device;
+
+use super::{UiError, UiResult};
+
+/// Which UI shader a module is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UiShaderType {
-    /// UI vertex shader
-    UiVertex,
-    /// UI fragment shader
-    UiFragment,
-    /// Text vertex shader
-    TextVertex,
-    /// Text fragment shader
-    TextFragment,
+    /// Untextured vertex-coloured geometry: panels, buttons, bars, lines.
+    Geometry,
+    /// Text glyph quads. Reserved; the font atlas is a separate task.
+    Text,
 }
 
 impl UiShaderType {
-    /// Get the default shader file name for this type
-    pub fn default_filename(&self) -> &'static str {
+    /// Entry point name every UI shader is expected to export.
+    pub const VERTEX_ENTRY: &'static str = "vs_main";
+    pub const FRAGMENT_ENTRY: &'static str = "fs_main";
+
+    /// Source file this shader type is authored in.
+    pub fn source_filename(&self) -> &'static str {
         match self {
-            UiShaderType::UiVertex => "ui.vert",
-            UiShaderType::UiFragment => "ui.frag",
-            UiShaderType::TextVertex => "text.vert",
-            UiShaderType::TextFragment => "text.frag",
-        }
-    }
-    
-    /// Get the shader stage name
-    pub fn stage_name(&self) -> &'static str {
-        match self {
-            UiShaderType::UiVertex | UiShaderType::TextVertex => "vertex",
-            UiShaderType::UiFragment | UiShaderType::TextFragment => "fragment",
+            UiShaderType::Geometry => "ui_geom.wgsl",
+            UiShaderType::Text => "ui_text.wgsl",
         }
     }
 }
 
-/// Shader source code
+/// Where a loaded module came from, kept for diagnostics.
+///
+/// A module that failed to build leaves no entry here, so an empty table is the
+/// signal that something is missing rather than that shaders are simply absent.
 #[derive(Debug, Clone)]
 pub struct UiShaderSource {
-    /// Source code
-    pub code: String,
-    /// File path (if loaded from file)
-    pub path: Option<PathBuf>,
-    /// Shader type
     pub shader_type: UiShaderType,
+    /// Length of the SPIR-V blob that was handed in.
+    pub spirv_len: usize,
 }
 
-/// UI Shader Manager
-/// 
-/// This is a simplified shader manager that doesn't actually compile shaders.
-/// In a full implementation, this would manage loading, compilation, and hot-reloading.
+/// Owns the UI shader modules and the device they were built on.
 pub struct UiShaderManager {
-    /// Device reference
-    _device: Arc<Device>,
-    /// Whether the manager is initialized
-    initialized: bool,
+    device: Arc<Device>,
+    modules: HashMap<UiShaderType, ShaderModule>,
+    sources: HashMap<UiShaderType, UiShaderSource>,
 }
 
 impl UiShaderManager {
-    /// Create a new shader manager
     pub fn new(device: Arc<Device>) -> Self {
         Self {
-            _device: device,
-            initialized: false,
+            device,
+            modules: HashMap::new(),
+            sources: HashMap::new(),
         }
     }
-    
-    /// Initialize the shader manager
-    pub fn initialize(&mut self, _device: &Arc<Device>) -> UiResult<()> {
-        self.initialized = true;
+
+    /// Build one shader module from SPIR-V, replacing any previous one.
+    ///
+    /// Reports rather than swallows a module that came back without a GPU
+    /// handle: the pipeline built from it would fail later, at draw time, with
+    /// an error pointing at the wrong place.
+    pub fn load(&mut self, shader_type: UiShaderType, spirv: &[u8]) -> UiResult<()> {
+        if spirv.is_empty() {
+            return Err(UiError::ShaderCompilationFailed(format!(
+                "{}: SPIR-V is empty",
+                shader_type.source_filename()
+            )));
+        }
+// SPIR-V is five 32-bit words: magic, version, generator, bound, schema.
+//        // A blob shorter than that cannot be a module, and handing it to the
+// driver produces an error that does not name the real problem.
+        let word_aligned = spirv.len().is_multiple_of(4);
+        if !word_aligned || spirv.len() < 20 {
+            return Err(UiError::ShaderCompilationFailed(format!(
+                "{}: SPIR-V is {} bytes, which is neither a whole number of words nor at least a header",
+                shader_type.source_filename(),
+                spirv.len()
+            )));
+        }
+
+        let module = self.device.create_shader_module(&ShaderModuleDesc {
+            code: spirv.to_vec(),
+            format: ShaderFormat::SpirV,
+            entry_point: Some(UiShaderType::VERTEX_ENTRY.to_string()),
+            name: Some(shader_type.source_filename().to_string()),
+        });
+
+        if !module.has_gpu_backing() {
+            return Err(UiError::ShaderCompilationFailed(format!(
+                "{}: the shader module was not created on the device",
+                shader_type.source_filename()
+            )));
+        }
+
+        self.sources.insert(
+            shader_type,
+            UiShaderSource {
+                shader_type,
+                spirv_len: spirv.len(),
+            },
+        );
+        self.modules.insert(shader_type, module);
         Ok(())
     }
-    
-    /// Check if the manager is initialized
-    pub fn is_initialized(&self) -> bool {
-        self.initialized
+
+    /// Load every shader the renderer needs.
+    ///
+    /// `geometry` is required. `text` is optional until the font atlas lands:
+    /// a missing text module must not stop panels and buttons from drawing, so
+    /// its absence is reported through `is_loaded` instead of failing here.
+    pub fn load_geometry(&mut self, spirv: &[u8]) -> UiResult<()> {
+        self.load(UiShaderType::Geometry, spirv)
+    }
+
+    pub fn load_text(&mut self, spirv: &[u8]) -> UiResult<()> {
+        self.load(UiShaderType::Text, spirv)
+    }
+
+    /// The module for `shader_type`, or an error naming what is missing.
+    pub fn module(&self, shader_type: UiShaderType) -> UiResult<&ShaderModule> {
+        self.modules.get(&shader_type).ok_or_else(|| {
+            UiError::ShaderCompilationFailed(format!(
+                "{} has not been loaded into the UI shader manager",
+                shader_type.source_filename()
+            ))
+        })
+    }
+
+    pub fn is_loaded(&self, shader_type: UiShaderType) -> bool {
+        self.modules.contains_key(&shader_type)
+    }
+
+    /// Provenance for a loaded shader, if it was recorded.
+    pub fn source(&self, shader_type: UiShaderType) -> Option<&UiShaderSource> {
+        self.sources.get(&shader_type)
+    }
+
+    pub fn loaded_count(&self) -> usize {
+        self.modules.len()
     }
 }
-
-

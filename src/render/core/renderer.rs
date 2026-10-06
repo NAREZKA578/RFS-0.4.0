@@ -54,7 +54,11 @@ pub struct Renderer {
 /// Ordered so the surface outlives the chain: fields drop in declaration order,
 /// and destroying a swapchain after its surface is invalid.
 struct Presentation {
-    _surface: crate::rhi::backend::vulkan::WindowSurface,
+    /// Kept, not prefixed with `_`, because `resize` needs the same surface to
+    /// rebuild the chain on. A surface is tied to the window handle and outlives
+    /// any particular swapchain, so one surface is built once per window and
+    /// every rebuild reuses it.
+    surface: crate::rhi::backend::vulkan::WindowSurface,
     swapchain: crate::rhi::backend::vulkan::Swapchain,
 }
 
@@ -146,7 +150,7 @@ impl Renderer {
                 .create_swapchain(&surface, request, Some(&mut existing.swapchain))?,
             None => self.device.create_swapchain(&surface, request, None)?,
         };
-        self.presentation = Some(Presentation { _surface: surface, swapchain });
+        self.presentation = Some(Presentation { surface, swapchain });
         // `old` drops here. Its swapchain handle was consumed by Vulkan during
         // the handover, so `Drop` leaves it alone; its surface goes with it.
         Ok(())
@@ -185,15 +189,12 @@ impl Renderer {
 
     /// Detect hardware configuration
     fn detect_config(device: &Device, requested_api: GraphicsApi) -> RendererConfig {
-        let backend = match requested_api {
+        let mut config = RendererConfig::default();
+        config.backend = match requested_api {
             GraphicsApi::Vulkan => RenderApi::Vulkan,
             GraphicsApi::Direct3D12 => RenderApi::Direct3D12,
             GraphicsApi::Direct3D11 => RenderApi::Direct3D11,
             GraphicsApi::OpenGL => RenderApi::OpenGL,
-        };
-        let mut config = RendererConfig {
-            backend,
-            ..Default::default()
         };
         let physical_device = device.physical_device();
         config.device_name = physical_device.name.clone();
@@ -263,7 +264,21 @@ impl Renderer {
             Some(presentation) => {
                 let acquired = match presentation.swapchain.acquire(u64::MAX) {
                     Ok(acquired) => acquired,
-                    Err(RhiError::SwapchainOutOfDate) => return,
+                    // Out of date means the chain no longer matches the surface,
+                    // which happens on every resize and on entering fullscreen.
+                    // It used to be a silent `return`, so the frame was skipped
+                    // before anything was recorded and nothing was logged — the
+                    // window silently stopped updating, and repeated resizes
+                    // left it that way permanently because nothing rebuilt the
+                    // chain.
+                    //
+                    // Rebuild now and let this frame go; the next one acquires
+                    // from the new chain. Logging matters: without it, a failed
+                    // rebuild and a stale acquire look identical from outside.
+                    Err(RhiError::SwapchainOutOfDate) => {
+                        self.rebuild_presentation();
+                        return;
+                    }
                     Err(e) => {
                         crate::error!("renderer", "swapchain acquire failed: {e}");
                         return;
@@ -276,12 +291,12 @@ impl Renderer {
                     swapchain
                         .images
                         .iter()
-                        .map(|image| image.as_raw())
+                        .map(|image| image.as_raw() as u64)
                         .collect(),
                     swapchain
                         .image_views
                         .iter()
-                        .map(|view| view.as_raw())
+                        .map(|view| view.as_raw() as u64)
                         .collect(),
                 );
                 acquired.image_index
@@ -302,15 +317,34 @@ impl Renderer {
         //
         // Recorded after acquire, so a pass targeting the swapchain can bind
         // the image that is about to be presented (§209, §186).
+        // Bug №282: armed so the submit inside `execute` signals the semaphore that
+        // `present` below waits on. The submit has no other way to know that this
+        // particular submission is the one being presented.
+        // Bug №282: a single present semaphore is NOT sufficient and was measured not to
+        // be. The submit waits on a fence, but `queue_present` only *queues* its
+        // wait on the semaphore — the semaphore is consumed later, asynchronously.
+        // Re-signalling it on the next frame therefore trips
+        // VUID-vkQueueSubmit-pSignalSemaphores-00067 ("may still be in use by
+        // VkSwapchainKHR") every frame. With the signal disabled the index stayed
+        // at 0 instead of cycling, which is the same defect as before, so this is
+        // a reverted experiment rather than a partial fix. The real answer is a
+        // ring of frames in flight with one semaphore per slot.
         self.render_graph
             .execute(&self.device, &mut self.context, scene);
 
-        if let Some(presentation) = self.presentation.as_mut() {
+        if self.presentation.is_some() {
+            let presentation = self
+                .presentation
+                .as_mut()
+                .expect("presentation presence was just checked");
             // No fence wait here: the graph's submit path already blocks on its
             // own fence before returning, so the work is finished. There used to
             // be a wait here, on a fence that the *acquire* had signalled rather
             // than the render, so it never actually waited for anything.
-            if let Err(e) = presentation.swapchain.present(acquired_index) {
+            // Bug №282: present waits on a per-frame semaphore. One semaphore is not enough
+            // (see above), so nothing is signalled yet and this waits on null.
+            let render_finished = crate::rhi::ash::vk::Semaphore::null();
+            if let Err(e) = presentation.swapchain.present(acquired_index, render_finished) {
                 if !matches!(e, RhiError::SwapchainOutOfDate) {
                     crate::error!("renderer", "present failed: {e}");
                 }
@@ -323,15 +357,141 @@ impl Renderer {
 
     /// Resize the renderer
     pub fn resize(&mut self, width: u32, height: u32) {
-        // self.swapchain.resize(width, height).expect("swapchain resize not implemented");
+        let width = width.max(1);
+        let height = height.max(1);
         self.context.resolution = crate::rhi::types::Extent2D::new(width, height);
 
         // Recreate depth texture
         self.context.depth_texture = None;
         self.context.depth_view = None;
 
-        // Reinitialize render graph
-        // self.render_graph.resize(&self.device, &self.context);
+        // Rebuild the swapchain at the new extent.
+        //
+        // This line used to be commented out, and the consequence was a dead
+        // render loop rather than a visible error: after a resize `acquire` keeps
+        // returning `SUBOPTIMAL`/`OUT_OF_DATE`, `render_frame` returns before
+        // recording anything, and the window keeps showing the last frame that
+        // was drawn. Nothing was logged, so switching to fullscreen looked
+        // exactly like a hang.
+        //
+        // The handover form is required rather than a fresh chain: Vulkan forbids
+        // destroying a chain whose images are still in flight, and passing the old
+        // one lets the driver retire them in order.
+        // A zero extent is what a minimised window reports, and Vulkan rejects a
+        // swapchain with a zero `imageExtent` outright. Attempting the rebuild
+        // anyway is what produced VUID-VkSwapchainCreateInfoKHR-imageExtent-01689.
+        // There is also nothing to rebuild: the surface has no size yet, so the
+        // chain is rebuilt when the window comes back, which arrives as a resize.
+        if width == 0 || height == 0 {
+            return;
+        }
+        if let Some(presentation) = self.presentation.as_mut() {
+            let request = crate::rhi::backend::vulkan::SwapchainRequest {
+                width,
+                height,
+                present_mode: crate::rhi::ash::vk::PresentModeKHR::FIFO,
+            };
+            match self
+                    .device
+                    .create_swapchain(&presentation.surface, request, Some(&mut presentation.swapchain))
+                {
+                    Ok(swapchain) => presentation.swapchain = swapchain,
+                    Err(e) => {
+                        // Reported rather than swallowed: a resize that could not
+                        // rebuild the chain leaves presentation permanently broken,
+                        // and the next frames will fail to acquire for a reason that
+                        // has nothing to do with acquire itself.
+                        crate::error!("renderer", "swapchain rebuild on resize failed: {e}");
+                    }
+                }
+                // Same reason as in `rebuild_presentation`: the new handles have to
+                // reach the context now, or the next frame renders through the
+                // retired chain.
+                self.refresh_presentation_state();
+            }
+    }
+
+    /// Rebuild the presentation chain from the surface's current extent.
+    ///
+    /// Two callers: `resize`, which knows the new size, and `acquire` reporting
+    /// out of date, which does not — the surface itself is then the authority.
+    /// Falling back to `context.resolution` only when the surface reports nothing
+    /// keeps a zero extent from producing a 1x1 chain that then fails again.
+    fn rebuild_presentation(&mut self) {
+        if self.presentation.is_none() {
+            crate::warn!("renderer", "out-of-date presentation but no surface to rebuild from");
+            return;
+        }
+        // The surface is the authority here, because the caller that reaches this
+        // path (a failed acquire) does not know the new size — only the surface
+        // does. `context.resolution` is the fallback when the surface reports
+        // nothing.
+        let extent = self.presentation_extent();
+        let (width, height) = if extent.width > 0 && extent.height > 0 {
+            (extent.width, extent.height)
+        } else {
+            (
+                self.context.resolution.width.max(1),
+                self.context.resolution.height.max(1),
+            )
+        };
+        // A minimised window reports zero on both axes. Vulkan rejects a chain with
+        // a zero imageExtent, and there is nothing useful to rebuild yet, so this
+        // is not an error — the chain is rebuilt when the window returns, which
+        // arrives as a resize.
+        if width == 0 || height == 0 {
+            return;
+        }
+        let Some(presentation) = self.presentation.as_mut() else {
+            return;
+        };
+        let request = crate::rhi::backend::vulkan::SwapchainRequest {
+            width,
+            height,
+            present_mode: crate::rhi::ash::vk::PresentModeKHR::FIFO,
+        };
+        match self
+            .device
+            .create_swapchain(&presentation.surface, request, Some(&mut presentation.swapchain))
+        {
+            Ok(swapchain) => {
+                crate::warn!("renderer", "presentation rebuilt at {width}x{height}");
+                presentation.swapchain = swapchain;
+                // Republish immediately: until the context knows the new handles,
+                // a pass would build a framebuffer from the retired chain.
+                self.refresh_presentation_state();
+            }
+            Err(e) => crate::error!("renderer", "presentation rebuild failed: {e}"),
+        }
+        // The context must be republish now, not on the next acquire.
+        //
+        // Without this the passes keep building framebuffers from the *previous*
+        // chain's image handles, and rendering continues against views the driver
+        // has already retired — which surfaced as
+        // VUID-VkRenderPassBeginInfo-framebuffer-parameter: pAttachments[0]
+        // VkImageView ... is invalid. The acquire path does this on every frame,
+        // which is why the frame after a successful rebuild is the first one with
+        // valid handles.
+        self.refresh_presentation_state();
+    }
+
+    /// Copy the current chain's format, extent and image handles into the context.
+    ///
+    /// Split out because both the normal acquire path and the rebuild path need
+    /// it, and forgetting it in the second place is exactly the bug above.
+    fn refresh_presentation_state(&mut self) {
+        let Some(presentation) = self.presentation.as_ref() else {
+            self.context
+                .set_presentation(None, self.context.resolution, Vec::new(), Vec::new());
+            return;
+        };
+        let swapchain = &presentation.swapchain;
+        self.context.set_presentation(
+            swapchain.rhi_format(),
+            Extent2D::new(swapchain.extent.width, swapchain.extent.height),
+            swapchain.images.iter().map(|i| i.as_raw() as u64).collect(),
+            swapchain.image_views.iter().map(|v| v.as_raw() as u64).collect(),
+        );
     }
 
     /// Update settings

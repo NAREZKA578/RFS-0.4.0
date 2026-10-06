@@ -211,7 +211,11 @@ impl Compartment {
         dt: f32,
     ) -> Vec<(EntityId, f32)> {
         let mut spreads = Vec::new();
-        if state.fire_intensity <= 0.0 {
+        // Bug №198: NaN made this guard false — "burning" — and
+        // `(NaN * 0.1 * dt).clamp(0.0, 1.0)` stayed NaN, so unusable
+        // intensities would have been handed to every open neighbour.
+        let intensity = rfs_damage::unit_or_zero(state.fire_intensity);
+        if intensity <= 0.0 {
             return spreads;
         }
         for &connected_id in &state.connected_compartments {
@@ -220,7 +224,7 @@ impl Compartment {
                     .find(|b| b.connects_to == connected_id);
                 if let Some(bh) = bulkhead {
                     if !bh.is_sealed || bh.is_destroyed {
-                        let amount = (state.fire_intensity * 0.1 * dt).clamp(0.0, 1.0);
+                        let amount = rfs_damage::unit_or_zero(intensity * 0.1 * dt);
                         if amount > 0.0 {
                             spreads.push((connected_id, amount));
                         }
@@ -258,6 +262,13 @@ impl Compartment {
     }
 
     pub fn set_fire(&self, state: &mut CompartmentState, intensity: f32) {
+        // Bug №198: `f32::clamp` returns NaN unchanged, so this stored a NaN
+        // intensity. Every `fire_intensity <= 0.0` guard downstream is then
+        // false and the compartment reads as burning forever. Refused rather
+        // than written as zero, so garbage cannot extinguish live fire either.
+        if !intensity.is_finite() {
+            return;
+        }
         state.fire_intensity = intensity.clamp(0.0, 1.0);
     }
 
@@ -267,6 +278,10 @@ impl Compartment {
 
     pub fn apply_damage(&self, state: &mut CompartmentState, damage: f32, position: Vec3f) {
         // Non-positive damage must not inflate bulkhead health.
+        //
+        // Bug №197: NaN also passes that guard, and `f32::max` handed back the
+        // full health instead of leaving the bulkhead alone.
+        let damage = rfs_damage::positive_or_zero(damage);
         if damage <= 0.0 {
             return;
         }

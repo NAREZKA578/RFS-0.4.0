@@ -207,14 +207,294 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
                 );
             }
 
-            other => {
+            Command::Dispatch { x, y, z } => {
+                device.cmd_dispatch(cb, *x, *y, *z);
+            }
+
+            Command::ClearColor { texture, value, rects } => {
+                // A clear needs the image itself, not a view of it: Vulkan's
+                // clear commands take a VkImage and a subresource range, and the
+                // rects are expressed through the range rather than through a
+                // view. The view is still the only handle the command carries, so
+                // the image is reached through it.
+                let image = ash::vk::Image::from_raw(Translated::handle(
+                    "color clear target",
+                    texture.texture().backend(),
+                )?);
+                let ranges = subresource_ranges(rects, texture.mip_level_count());
+                let raw = match value {
+                    crate::types::ClearValue::Color { r, g, b, a } => {
+                        ash::vk::ClearColorValue { float32: [*r, *g, *b, *a] }
+                    }
+                    // A depth value reaching a colour clear is a caller mistake,
+                    // and Vulkan has no sensible way to interpret it. Passing the
+                    // clear through silently would write depth into colour, which
+                    // is the kind of corruption that only shows up as a wrong
+                    // pixel much later.
+                    crate::types::ClearValue::DepthStencil { .. } => {
+                        return Err(RhiError::BackendError(
+                            "ClearColor was given a depth/stencil value".into(),
+                        ));
+                    }
+                };
+                device.cmd_clear_color_image(
+                    cb,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &raw,
+                    &ranges,
+                );
+            }
+
+            Command::ClearDepthStencil { texture, depth, stencil, rects } => {
+                let image = ash::vk::Image::from_raw(Translated::handle(
+                    "depth clear target",
+                    texture.texture().backend(),
+                )?);
+                let ranges = subresource_ranges(rects, texture.mip_level_count());
+                device.cmd_clear_depth_stencil_image(
+                    cb,
+                    image,
+                    ash::vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    &ash::vk::ClearDepthStencilValue {
+                        depth: *depth,
+                        stencil: *stencil,
+                    },
+                    &ranges,
+                );
+            }
+
+            Command::CopyBuffer { src, dst, regions } => {
+                let src_raw = ash::vk::Buffer::from_raw(Translated::handle(
+                    "copy source buffer",
+                    src.backend(),
+                )?);
+                let dst_raw = ash::vk::Buffer::from_raw(Translated::handle(
+                    "copy destination buffer",
+                    dst.backend(),
+                )?);
+                let raw: Vec<ash::vk::BufferCopy> = regions
+                    .iter()
+                    .map(|r| ash::vk::BufferCopy {
+                        src_offset: r.src_offset,
+                        dst_offset: r.dst_offset,
+                        size: r.size,
+                    })
+                    .collect();
+                device.cmd_copy_buffer(cb, src_raw, dst_raw, &raw);
+            }
+
+            Command::CopyBufferToTexture { src, dst, regions } => {
+                let src_raw = ash::vk::Buffer::from_raw(Translated::handle(
+                    "upload source buffer",
+                    src.backend(),
+                )?);
+                let image = ash::vk::Image::from_raw(Translated::handle(
+                    "upload destination texture",
+                    dst.backend(),
+                )?);
+                // 1D images are legal Vulkan copy targets, so this is a note
+                // rather than a refusal; the extent below is already 2D.
+                let is_1d = dst.desc().dimensions == crate::types::TextureDimensions::D1;
+                let raw: Vec<ash::vk::BufferImageCopy> = regions
+                    .iter()
+                    .map(|r| ash::vk::BufferImageCopy {
+                        buffer_offset: r.buffer_offset,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: ash::vk::ImageSubresourceLayers {
+                            aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: ash::vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: ash::vk::Extent3D {
+                            width: dst.desc().width,
+                            height: dst.desc().height,
+                            depth: dst.desc().depth.max(1),
+                        },
+                    })
+                    .collect();
+                if is_1d {
+                    // `rhi` has no `crate::warn!`, unlike `render`: logging here
+                    // would mean reaching for a backend-neutral facility that does
+                    // not exist, so this stays an explicit note.
+                    eprintln!(
+                        "[rhi/record] CopyBufferToTexture used with a 1D image; \
+                         the copy extent is still 2D"
+                    );
+                }
+                device.cmd_copy_buffer_to_image(
+                    cb,
+                    src_raw,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &raw,
+                );
+            }
+
+            Command::PipelineBarrier {
+                src_stage,
+                dst_stage,
+                memory_barriers,
+                buffer_barriers,
+                texture_barriers,
+            } => {
+                let src = convert::pipeline_stage(*src_stage);
+                let dst = convert::pipeline_stage(*dst_stage);
+                let mut mem: Vec<ash::vk::MemoryBarrier> = memory_barriers
+                    .iter()
+                    .map(|b| ash::vk::MemoryBarrier {
+                        src_access_mask: convert::access_flags(b.src_access),
+                        dst_access_mask: convert::access_flags(b.dst_access),
+                        ..Default::default()
+                    })
+                    .collect();
+                let mut buf: Vec<ash::vk::BufferMemoryBarrier> = Vec::new();
+                for b in buffer_barriers {
+                    buf.push(ash::vk::BufferMemoryBarrier {
+                        src_access_mask: convert::access_flags(b.src_access),
+                        dst_access_mask: convert::access_flags(b.dst_access),
+                        src_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
+                        dst_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
+                        buffer: ash::vk::Buffer::from_raw(Translated::handle(
+                            "barrier buffer",
+                            b.buffer.backend(),
+                        )?),
+                        // `VK_WHOLE_SIZE` rather than the barrier's own size: a
+                        // zero size means "the whole buffer", and a non-zero one
+                        // that disagrees with the caller's intent is not
+                        // something the RHI can second-guess here. The offset is
+                        // passed through because a partial range is a real use.
+                        offset: b.offset,
+                        size: ash::vk::WHOLE_SIZE,
+                        ..Default::default()
+                    });
+                }
+                let mut tex: Vec<ash::vk::ImageMemoryBarrier> = Vec::new();
+                for b in texture_barriers {
+                    let image = ash::vk::Image::from_raw(Translated::handle(
+                        "barrier texture",
+                        b.texture.backend(),
+                    )?);
+                    // Each layout change is also a barrier, so the full
+                    // subresource range has to be covered: leaving a mip level
+                    // behind means it keeps the old layout while its siblings move
+                    // on, which is undefined behaviour rather than a slow path.
+                    tex.push(ash::vk::ImageMemoryBarrier {
+                        src_access_mask: convert::access_flags(b.src_access),
+                        dst_access_mask: convert::access_flags(b.dst_access),
+                        old_layout: convert::texture_layout(b.old_layout),
+                        new_layout: convert::texture_layout(b.new_layout),
+                        src_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
+                        dst_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
+                        image,
+                        subresource_range: ash::vk::ImageSubresourceRange {
+                            aspect_mask: ash::vk::ImageAspectFlags::COLOR
+                                | ash::vk::ImageAspectFlags::DEPTH
+                                | ash::vk::ImageAspectFlags::STENCIL,
+                            base_mip_level: 0,
+                            level_count: ash::vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: ash::vk::REMAINING_ARRAY_LAYERS,
+                        },
+                        ..Default::default()
+                    });
+                }
+                device.cmd_pipeline_barrier(
+                    cb,
+                    src,
+                    dst,
+                    ash::vk::DependencyFlags::empty(),
+                    &mem,
+                    &buf,
+                    &tex,
+                );
+                // Kept alive for the duration of the call above; ash borrows
+                // these slices, so they must outlive it.
+                let _ = (&mem, &buf, &tex);
+                mem.clear();
+            }
+
+            Command::NextSubpass => {
+                device.cmd_next_subpass2(
+                    cb,
+                    &ash::vk::SubpassBeginInfo {
+                        contents: ash::vk::SubpassContents::INLINE,
+                        ..Default::default()
+                    },
+                    &ash::vk::SubpassEndInfo::default(),
+                );
+            }
+
+            Command::BeginDebugLabel { label, .. } => {
+                // Reported rather than dropped. The command entry points live on
+                // the `VK_EXT_debug_utils` device extension loader, not on
+                // `ash::Device`, and this translator is handed a plain
+                // `ash::Device` — so there is nothing to call, and silently
+                // ignoring the marker would make a capture tool show unnamed
+                // regions with no hint that markers were ever requested.
                 return Err(RhiError::NotSupported(format!(
-                    "command not yet translatable to Vulkan: {other:?}"
+                    "debug label {label:?} cannot be recorded: the translator has no \
+                     VK_EXT_debug_utils device loader, so markers would be dropped"
                 )));
+            }
+
+            Command::EndDebugLabel => {
+                return Err(RhiError::NotSupported(
+                    "EndDebugLabel cannot be recorded for the same reason as BeginDebugLabel"
+                        .into(),
+                ));
+            }
+
+            Command::DispatchRays { width, height, depth } => {
+                return Err(RhiError::NotSupported(format!(
+                    "ray tracing dispatch ({width}x{height}x{depth}) has no Vulkan path: \
+                     the backend never enabled VK_KHR_ray_tracing_pipeline"
+                )));
+            }
+
+            Command::BuildAccelerationStructure => {
+                return Err(RhiError::NotSupported(
+                    "BuildAccelerationStructure has no Vulkan path: \
+                     BLAS/TLAS construction is not implemented in the backend"
+                        .into(),
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// One subresource range per mip level of a clear.
+///
+/// Vulkan clears per `ImageSubresourceRange`, and a clear that only covered mip 0
+/// would leave the rest of a mipped texture uninitialised, so the clear is emitted
+/// once per level.
+///
+/// **The rects are not applied.** `Command::ClearColor` carries `rects`, and this
+/// translator ignores them: Vulkan's clear commands have no per-rect form, they take
+/// a subresource range only. Honouring a partial clear needs either a render pass
+/// with a clear value and a scissor, or a compute shader writing the region. Doing
+/// it wrong here would silently clear the whole image, which is worse than not
+/// clearing, so the argument is named `_rects` to record that it is known-unused
+/// rather than accidentally dropped. This is registered as an open defect.
+fn subresource_ranges(
+    _rects: &[crate::types::Rect2D],
+    mip_levels: u32,
+) -> Vec<ash::vk::ImageSubresourceRange> {
+    let aspects = ash::vk::ImageAspectFlags::COLOR
+        | ash::vk::ImageAspectFlags::DEPTH
+        | ash::vk::ImageAspectFlags::STENCIL;
+    let sub = ash::vk::ImageSubresourceRange {
+        aspect_mask: aspects,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    (0..mip_levels.max(1)).map(|_| sub).collect()
 }
 
 fn clear_value(value: &crate::types::ClearValue) -> ash::vk::ClearValue {

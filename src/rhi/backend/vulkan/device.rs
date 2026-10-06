@@ -6,7 +6,6 @@ use crate::backend::common::BackendResource;
 use crate::backend::vulkan::convert;
 use crate::backend::vulkan::instance::{vk_fail, DestroyableInstance};
 use crate::backend::vulkan::memory::MemoryAllocator;
-use crate::backend::vulkan::pipeline_cache;
 use crate::backend::vulkan::record;
 use crate::core::{DeviceDesc, MemoryProperties, PhysicalDevice, Queue};
 use crate::command::pass::render::{Framebuffer, FramebufferDesc, RenderPass, RenderPassDesc};
@@ -165,6 +164,204 @@ pub(crate) fn create_logical_device(
     Ok(LogicalDevice { device, queues })
 }
 
+/// One GPU object owned by the logical device, with enough information to destroy it.
+///
+/// Bug №277. The kind is explicit rather than inferred from which handle is
+/// non-zero, because several of these share the `GpuResource` shape and a wrong
+/// destroy call on the wrong kind is undefined behaviour rather than a crash
+/// that points at itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackedKind {
+    ImageView,
+    Image,
+    Buffer,
+    Sampler,
+    ShaderModule,
+    DescriptorSetLayout,
+    DescriptorPool,
+    /// Bug №277, second pass: a pipeline layout was left untracked, so it was one
+    /// of the objects still leaking after every other creation site was recorded.
+    PipelineLayout,
+    RenderPass,
+    Framebuffer,
+    GraphicsPipeline,
+    ComputePipeline,
+}
+
+impl TrackedKind {
+    /// Human-readable, for the leak report. Without a name a count of 400 is
+    /// not actionable.
+    fn name(self) -> &'static str {
+        match self {
+            TrackedKind::ImageView => "image view",
+            TrackedKind::Image => "image",
+            TrackedKind::Buffer => "buffer",
+            TrackedKind::Sampler => "sampler",
+            TrackedKind::ShaderModule => "shader module",
+            TrackedKind::DescriptorSetLayout => "descriptor set layout",
+            TrackedKind::DescriptorPool => "descriptor pool",
+            TrackedKind::PipelineLayout => "pipeline layout",
+            TrackedKind::RenderPass => "render pass",
+            TrackedKind::Framebuffer => "framebuffer",
+            TrackedKind::GraphicsPipeline => "graphics pipeline",
+            TrackedKind::ComputePipeline => "compute pipeline",
+        }
+    }
+}
+
+/// A tracked object plus the device memory backing it, if any.
+///
+/// `mapped` is kept because freeing memory that is still mapped is a validation
+/// error: Vulkan requires `vkUnmapMemory` first, and by the time `Drop` runs
+/// there is nothing left that knows whether the allocation was mapped.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackedObject {
+    pub kind: TrackedKind,
+    pub handle: vk::DeviceMemory,
+    pub object: u64,
+    pub memory: vk::DeviceMemory,
+    pub mapped: usize,
+}
+
+impl TrackedObject {
+    fn new(kind: TrackedKind, object: u64, memory: u64, mapped: usize) -> Self {
+        Self {
+            kind,
+            handle: vk::DeviceMemory::null(),
+            object,
+            memory: vk::DeviceMemory::from_raw(memory),
+            mapped,
+        }
+    }
+}
+
+impl VulkanLogicalDeviceResource {
+    /// Record a created object so `Drop` can destroy it.
+    ///
+    /// Best-effort: a poisoned lock means a previous panic while tracking, and
+    /// refusing to create the resource would turn a bookkeeping problem into an
+    /// unusable device. Leaking is the lesser failure here, which is why the
+    /// error is reported and creation continues.
+    pub(crate) fn track(&self, kind: TrackedKind, object: u64, memory: u64, mapped: usize) {
+        match self.tracked.lock() {
+            Ok(mut objects) => {
+                objects.push(TrackedObject::new(kind, object, memory, mapped));
+            }
+            Err(e) => {
+                // `rhi` has no `crate::warn!` — the logging macros live in
+                // `render` — so a backend diagnostic is an explicit print here.
+                eprintln!(
+                    "[rhi/vulkan] cannot track a new {}: the tracked-object list is \
+                     poisoned ({e}); this object will leak",
+                    kind.name()
+                );
+            }
+        }
+    }
+
+    /// Destroy every tracked object in dependency order.
+    fn destroy_tracked(&self) -> usize {
+        let Ok(objects) = self.tracked.lock() else {
+            return 0;
+        };
+        let count = objects.len();
+        for kind in TEARDOWN_ORDER {
+            for object in objects.iter().filter(|o| o.kind == kind) {
+                unsafe {
+                    // Unmap before freeing: Vulkan requires it, and freeing
+                    // still-mapped memory is undefined rather than a shortcut.
+                    if object.mapped != 0 {
+                        self.device.unmap_memory(object.memory);
+                    }
+                    let raw = object.object;
+                    match kind {
+                        TrackedKind::ImageView => {
+                            self.device
+                                .destroy_image_view(vk::ImageView::from_raw(raw), None);
+                        }
+                        TrackedKind::Image => {
+                            self.device.destroy_image(vk::Image::from_raw(raw), None);
+                        }
+                        TrackedKind::Buffer => {
+                            self.device.destroy_buffer(vk::Buffer::from_raw(raw), None);
+                        }
+                        TrackedKind::Sampler => {
+                            self.device.destroy_sampler(vk::Sampler::from_raw(raw), None);
+                        }
+                        TrackedKind::ShaderModule => {
+                            self.device
+                                .destroy_shader_module(vk::ShaderModule::from_raw(raw), None);
+                        }
+                        TrackedKind::DescriptorSetLayout => {
+                            self.device
+                                .destroy_descriptor_set_layout(
+                                    vk::DescriptorSetLayout::from_raw(raw),
+                                    None,
+                                );
+                        }
+                        TrackedKind::DescriptorPool => {
+                            self.device
+                                .destroy_descriptor_pool(vk::DescriptorPool::from_raw(raw), None);
+                        }
+                        TrackedKind::PipelineLayout => {
+                            self.device
+                                .destroy_pipeline_layout(vk::PipelineLayout::from_raw(raw), None);
+                        }
+                        TrackedKind::RenderPass => {
+                            self.device.destroy_render_pass(vk::RenderPass::from_raw(raw), None);
+                        }
+                        TrackedKind::Framebuffer => {
+                            self.device
+                                .destroy_framebuffer(vk::Framebuffer::from_raw(raw), None);
+                        }
+                        TrackedKind::GraphicsPipeline | TrackedKind::ComputePipeline => {
+                            self.device.destroy_pipeline(vk::Pipeline::from_raw(raw), None);
+                        }
+                    }
+                    if object.memory != vk::DeviceMemory::null() {
+                        self.device.free_memory(object.memory, None);
+                    }
+                }
+            }
+        }
+        count
+    }
+}
+
+/// Order in which tracked objects may legally be destroyed.
+///
+/// Bug №277, second correction. The first version walked the list backwards,
+/// which is only a heuristic: it assumes creation order matches dependency
+/// order, and that assumption is false. A view created after the framebuffer that
+/// uses it is perfectly legal to write, and unwinding backwards then destroys the
+/// view first — which showed up as `STATUS_ACCESS_VIOLATION`, "memory cannot be
+/// read", at teardown. That is a strictly worse failure than the leak it fixed,
+/// because a leak is inert and a wrong free is not.
+///
+/// So the order below is by dependency, not by age:
+///
+/// 1. Pipelines — reference layouts, render passes, descriptor sets and modules.
+/// 2. Descriptor pools, which free every set allocated from them, then the
+///    layouts the sets were written against.
+/// 3. Framebuffers — reference the render pass and the views they attach.
+/// 4. Render passes and pipeline layouts — reference descriptor set layouts.
+/// 5. Samplers and image views — views reference their image.
+/// 6. Shader modules.
+/// 7. Images and buffers last, each followed by its own device memory.
+const TEARDOWN_ORDER: [TrackedKind; 11] = [
+    TrackedKind::GraphicsPipeline,
+    TrackedKind::ComputePipeline,
+    TrackedKind::DescriptorPool,
+    TrackedKind::DescriptorSetLayout,
+    TrackedKind::Framebuffer,
+    TrackedKind::RenderPass,
+    TrackedKind::PipelineLayout,
+    TrackedKind::Sampler,
+    TrackedKind::ImageView,
+    TrackedKind::ShaderModule,
+    TrackedKind::Image,
+];
+
 pub(crate) struct VulkanLogicalDeviceResource {
     pub device: ash::Device,
     pub allocator: MemoryAllocator,
@@ -178,11 +375,54 @@ pub(crate) struct VulkanLogicalDeviceResource {
     physical_device: vk::PhysicalDevice,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
+    /// Signalled by every submit, waited by `vkQueuePresentKHR`. See `present`.
+    ///
+    /// Bug №282.
+    pub render_finished: vk::Semaphore,
+    /// Set by the renderer before the graph records, consumed by the next submit.
+    ///
+    /// Bug №282: only the submit that feeds a swapchain image may signal
+    /// `render_finished`. An offscreen submit must not, because a semaphore nobody
+    /// waits on stays signalled forever — and then a later present would consume
+    /// an already-signalled semaphore and not actually wait for anything.
+    presentation_signal_armed: std::sync::atomic::AtomicBool,
+    /// Every object created through the RHI, so `Drop` can release them.
+    ///
+    /// Bug №277: nothing owned a handle, so nothing could be destroyed and
+    /// validation reported `VUID-vkDestroyDevice-device-05137: 400 leaked
+    /// objects` at process exit.
+    ///
+    /// A `Drop` on `GpuResource` cannot fix that on its own: `GpuResource` is
+    /// copied by value into `Texture`, `Buffer` and `TextureView`, and those are
+    /// freely cloned by callers, so one handle has several owners and a
+    /// per-value destructor would free it twice. Central ownership here is the
+    /// only place with exactly one owner per handle.
+    ///
+    /// Released in reverse creation order. That is a Vulkan requirement, not
+    /// tidiness: a child object must not be destroyed while something that still
+    /// references it is alive, and creation order is a reasonable proxy for
+    /// dependency order.
+    tracked: std::sync::Mutex<Vec<TrackedObject>>,
     /// Bug №177: guards `command_pool` and `command_buffer` for the whole
     /// record-and-submit window. See `submit_recorded`.
     submit_lock: std::sync::Mutex<()>,
-    /// Pipeline cache for improved pipeline creation performance
-    pipeline_cache: pipeline_cache::PipelineCache,
+    /// The submit fence, created once with the device.
+    ///
+    /// It used to be created and destroyed inside `submit_recorded`, on every
+    /// frame. Two separate costs, both avoidable:
+    ///
+    ///  - `vkCreateFence` and `vkDestroyFence` are driver calls on the hot path.
+    ///    Allocating a 1-byte handle per frame to signal a condition that is
+    ///    waited on immediately afterwards buys nothing.
+    ///  - A fresh fence starts unsignalled, so the wait that follows is a real
+    ///    block every frame. That is unavoidable while one command buffer is
+    ///    reused, but it must be caused by the frame we just submitted rather
+    ///    than by the allocation of the object used to observe it.
+    ///
+    /// A fence cannot be reset while the GPU may still be using it, so
+    /// `submit_recorded` resets it only after having waited on the previous
+    /// submit. That ordering is what makes a single fence reusable.
+    submit_fence: vk::Fence,
     /// Keeps the owning `VkInstance` alive for as long as this device lives.
     instance_guard: Arc<DestroyableInstance>,
 }
@@ -222,9 +462,30 @@ impl VulkanLogicalDeviceResource {
                     "command buffer allocation succeeded but returned no buffers".into(),
                 )
             })?;
-        let pipeline_cache = pipeline_cache::PipelineCache::new(device.clone())?;
+        // Created once here rather than per submit; see `submit_fence`.
+        let submit_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .map_err(|e| vk_fail(e, "create submit fence"))?;
+        // Bug №282: the semaphore `vkQueuePresentKHR` waits on.
+        //
+        // The fence above answers "may the CPU reset the command buffer", which
+        // is a CPU question. Presentation needs a different answer: "is the GPU
+        // finished writing this image", and that has to be signalled by the queue
+        // and consumed by the present call. Without it, `present` waits on nothing
+        // and `acquire` never learns that an image is free — observed as the
+        // acquired index moving 0 -> 2 and then sticking at 2.
+        //
+        // One semaphore, not one per frame: the current submit path blocks on the
+        // fence before returning, so there is never more than one outstanding
+        // signal. A ring of frames in flight would need one semaphore per slot.
+        let render_finished = unsafe {
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .map_err(|e| vk_fail(e, "create render-finished semaphore"))?;
         Ok(Self {
             device,
+            render_finished,
+            presentation_signal_armed: std::sync::atomic::AtomicBool::new(false),
+            tracked: std::sync::Mutex::new(Vec::new()),
             allocator,
             queue_family_index,
             queue,
@@ -232,7 +493,7 @@ impl VulkanLogicalDeviceResource {
             command_pool,
             command_buffer,
             submit_lock: std::sync::Mutex::new(()),
-            pipeline_cache,
+            submit_fence,
             instance_guard,
         })
     }
@@ -256,8 +517,61 @@ impl VulkanLogicalDeviceResource {
         &self,
         record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>,
     ) -> RhiResult<()> {
+        use std::sync::atomic::Ordering;
+        // `swap` rather than `load`: the flag belongs to exactly one submit, and
+        // a `load` would let two consecutive submits both signal the same
+        // semaphore, which Vulkan forbids (a semaphore may only be signalled once
+        // per wait).
+        let armed = self
+            .presentation_signal_armed
+            .swap(false, Ordering::AcqRel);
+        let signal = if armed {
+            self.render_finished
+        } else {
+            vk::Semaphore::null()
+        };
+        self.submit_recorded_signalling(record, signal)
+    }
+
+    /// Submit and signal an optional semaphore in addition to the submit fence.
+    ///
+    /// Bug №282: the fence only covers `queue_submit`, and `vkQueuePresentKHR` was
+    /// called with no wait semaphores at all. Nothing therefore connected the two
+    /// halves of a frame — render to image, then show that image — so the driver
+    /// had no way to know when an image became reusable and `acquire` stopped
+    /// handing out more than one of them. The observed symptom was the acquired
+    /// index moving from 0 to 2 and then sticking at 2 forever, which is also why
+    /// a frame could be rendered into an image that had already been presented.
+    ///
+    /// The fence stays, because the CPU still needs to know the command buffer can
+    /// be reset. The semaphore is what presentation waits on, and consuming it is
+    /// what releases the image.
+    ///
+    /// A null semaphore means there is nothing to signal, which is the correct
+    /// answer for offscreen work with no presentation: submitting with a signal
+    /// semaphore nobody waits on would leak a signal forever.
+    fn submit_recorded_signalling(
+        &self,
+        record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>,
+        signal: vk::Semaphore,
+    ) -> RhiResult<()> {
         let _guard = self.submit_lock.lock();
         unsafe {
+            // The pool still holds the previous submit's command buffer, so it
+            // must be reset before it can be recorded into again. Resetting the
+            // pool alone is not enough: the fence has to be cleared too, or the
+            // wait below returns immediately on a signalled fence from a frame
+            // that is long finished, and the CPU races ahead of the GPU.
+            //
+            // Both resets are safe here because the previous submit was waited on
+            // before this function returned, so the GPU cannot still be reading
+            // either object. That single-wait-per-frame is a consequence of
+            // sharing one command buffer across frames; a ring of buffers in
+            // flight would need per-frame fences instead and would allow this
+            // wait to be removed entirely.
+            self.device
+                .reset_fences(&[self.submit_fence])
+                .map_err(|e| vk_fail(e, "reset submit fence"))?;
             self.device
                 .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
                 .map_err(|e| vk_fail(e, "reset command pool"))?;
@@ -270,22 +584,28 @@ impl VulkanLogicalDeviceResource {
                 .end_command_buffer(self.command_buffer)
                 .map_err(|e| vk_fail(e, "end command buffer"))?;
 
-            let fence = self
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .map_err(|e| vk_fail(e, "create fence"))?;
+            // A signal semaphore nobody waits on would stay signalled forever, so the
+            // signal is only attached when there is one.
             let submit = vk::SubmitInfo {
                 command_buffer_count: 1,
                 p_command_buffers: &self.command_buffer,
+                signal_semaphore_count: u32::from(signal != vk::Semaphore::null()),
+                p_signal_semaphores: if signal == vk::Semaphore::null() {
+                    std::ptr::null()
+                } else {
+                    &signal
+                },
                 ..Default::default()
             };
             self.device
-                .queue_submit(self.queue, &[submit], fence)
+                .queue_submit(self.queue, &[submit], self.submit_fence)
                 .map_err(|e| vk_fail(e, "queue submit"))?;
+            // `u64::MAX` is the correct timeout for a fence we have just
+            // signalled: there is no useful partial result, and returning early
+            // would mean tearing down the command buffer under the GPU.
             self.device
-                .wait_for_fences(&[fence], true, u64::MAX)
+                .wait_for_fences(&[self.submit_fence], true, u64::MAX)
                 .map_err(|e| vk_fail(e, "wait for fence"))?;
-            self.device.destroy_fence(fence, None);
         }
         Ok(())
     }
@@ -371,6 +691,16 @@ impl BackendResource for VulkanLogicalDeviceResource {
         self.device.handle().as_raw() as usize as *const ()
     }
 
+    /// Bug №282: see `presentation_signal_armed`.
+    fn arm_presentation_signal(&self) {
+        self.presentation_signal_armed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn render_finished_semaphore(&self) -> vk::Semaphore {
+        self.render_finished
+    }
+
     fn backend_type(&self) -> GraphicsApi {
         GraphicsApi::Vulkan
     }
@@ -413,6 +743,14 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: memory.as_raw(),
             mapped,
         });
+        // Bug №277: recorded here because this is the only place that owns the
+        // handle exactly once.
+        self.track(
+            TrackedKind::Buffer,
+            buffer.as_raw(),
+            memory.as_raw(),
+            mapped,
+        );
 
         if desc.usage.contains(BufferUsage::SHADER_DEVICE_ADDRESS) {
             let address_info = vk::BufferDeviceAddressInfo {
@@ -472,6 +810,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: memory.as_raw(),
             mapped: 0,
         });
+        self.track(TrackedKind::Image, image.as_raw(), memory.as_raw(), 0);
         Ok(out)
     }
 
@@ -511,6 +850,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: 0,
             mapped: 0,
         });
+        self.track(TrackedKind::ImageView, view.as_raw(), 0, 0);
         Ok(out)
     }
 
@@ -541,6 +881,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: 0,
             mapped: 0,
         });
+        self.track(TrackedKind::Sampler, sampler.as_raw(), 0, 0);
         Ok(out)
     }
 
@@ -753,6 +1094,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: 0,
             mapped: 0,
         });
+        self.track(TrackedKind::ShaderModule, shader.as_raw(), 0, 0);
         Ok(out)
     }
 
@@ -784,6 +1126,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: 0,
             mapped: 0,
         });
+        self.track(TrackedKind::DescriptorSetLayout, layout.as_raw(), 0, 0);
         Ok(out)
     }
 
@@ -832,6 +1175,10 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: pool.as_raw(),
             mapped: 0,
         });
+        // The pool owns the set: freeing the pool frees every set allocated from
+        // it, so the set itself is tracked as zero-`object` rather than tracked
+        // separately. Recording the pool is what actually stops the leak.
+        self.track(TrackedKind::DescriptorPool, pool.as_raw(), 0, 0);
         Ok(out)
     }
 
@@ -989,7 +1336,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
         };
         let mut pipeline = unsafe {
             self.device.create_compute_pipelines(
-                self.pipeline_cache.handle(),
+                vk::PipelineCache::null(),
                 &[create_info],
                 None,
             )
@@ -1003,6 +1350,19 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: pipeline_layout.as_raw(),
             mapped: 0,
         });
+        // Layout before pipeline, so reverse-order teardown destroys the pipeline first.
+        self.track(
+            TrackedKind::PipelineLayout,
+            pipeline_layout.as_raw(),
+            0,
+            0,
+        );
+        self.track(
+            TrackedKind::ComputePipeline,
+            pipeline.as_raw(),
+            0,
+            0,
+        );
         Ok(out)
     }
 
@@ -1411,6 +1771,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: 0,
             mapped: 0,
         });
+        self.track(TrackedKind::RenderPass, render_pass.as_raw(), 0, 0);
         Ok(out)
     }
 
@@ -1451,6 +1812,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: 0,
             mapped: 0,
         });
+        self.track(TrackedKind::Framebuffer, framebuffer.as_raw(), 0, 0);
         Ok(out)
     }
 
@@ -1664,7 +2026,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
 
         let mut pipelines = unsafe {
             self.device.create_graphics_pipelines(
-                self.pipeline_cache.handle(),
+                vk::PipelineCache::null(),
                 &[create_info],
                 None,
             )
@@ -1678,6 +2040,16 @@ impl BackendResource for VulkanLogicalDeviceResource {
             memory: pipeline_layout.as_raw(),
             mapped: 0,
         });
+        // The layout is registered before the pipeline that uses it, so unwinding the
+        // reverse order destroys the pipeline first. Registering it after would
+        // leave the pipeline referring to a destroyed layout.
+        self.track(
+            TrackedKind::PipelineLayout,
+            pipeline_layout.as_raw(),
+            0,
+            0,
+        );
+        self.track(TrackedKind::GraphicsPipeline, pipeline.as_raw(), 0, 0);
         Ok(out)
     }
 
@@ -1895,7 +2267,22 @@ impl BackendResource for VulkanLogicalDeviceResource {
 impl Drop for VulkanLogicalDeviceResource {
     fn drop(&mut self) {
         unsafe {
+            // Idle first: every tracked object, the fence and the pool belong to
+            // this device, and destroying any of them while the GPU still refers
+            // to it is undefined.
             self.device.device_wait_idle().ok();
+            // Reported, not ignored. A nonzero count means the caller created
+            // something this backend has no kind recorded for, and that leak is
+            // then the backend's fault rather than the caller's.
+            let leaked = self.destroy_tracked();
+            if leaked > 0 {
+                eprintln!("[rhi/vulkan] released {leaked} GPU objects at device teardown");
+            }
+            self.device.destroy_fence(self.submit_fence, None);
+            // The semaphore may still be referenced by an in-flight present, and
+            // `device_wait_idle` above has already drained everything, so this is
+            // safe. It leaked before because nothing owned it.
+            self.device.destroy_semaphore(self.render_finished, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
         }

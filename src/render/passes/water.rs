@@ -1,4 +1,4 @@
-﻿//! Water Render Pass
+//! Water Render Pass
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
@@ -15,7 +15,6 @@ use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
-use crate::rhi::pipeline::graphics::PrimitiveTopology;
 use crate::rhi::{CommandEncoder, Pipeline, TextureView};
 use std::collections::HashMap;
 
@@ -179,106 +178,6 @@ _reflection_pipeline: None,
     pub fn config_mut(&mut self) -> &mut WaterConfig {
         &mut self.config
     }
-
-    fn create_pipeline(&self, device: &crate::rhi::Device) -> Option<Pipeline> {
-        let spirv = include_bytes!("../../../Tool/client_tests/assets/shaders/water.spv");
-        let vs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: crate::rhi::ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("water_vs".into()),
-        });
-        let fs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: crate::rhi::ShaderFormat::SpirV,
-            entry_point: Some("fs_main".into()),
-            name: Some("water_fs".into()),
-        });
-
-        let render_pass = self.water_render_pass.clone()?;
-        let pipeline = device.create_gpu_graphics_pipeline(
-            &crate::rhi::GraphicsPipelineDesc {
-                shader_stages: vec![
-                    crate::rhi::PipelineShaderStage {
-                        stage: crate::rhi::ShaderStage::VERTEX,
-                        module: vs_module,
-                        entry_point: "vs_main".into(),
-                    },
-                    crate::rhi::PipelineShaderStage {
-                        stage: crate::rhi::ShaderStage::FRAGMENT,
-                        module: fs_module,
-                        entry_point: "fs_main".into(),
-                    },
-                ],
-                vertex_input_state: Some(crate::rhi::VertexInputState {
-                    bindings: vec![crate::rhi::VertexBinding {
-                        binding: 0,
-                        stride: std::mem::size_of::<crate::render::meshes::Vertex>() as u32,
-                        input_rate: crate::rhi::VertexInputRate::Vertex,
-                    }],
-                    attributes: vec![
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 0,
-                            format: crate::rhi::Format::R32G32B32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, position) as u32,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 1,
-                            format: crate::rhi::Format::R32G32B32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, normal) as u32,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 2,
-                            format: crate::rhi::Format::RGBA32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, tangent) as u32,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 3,
-                            format: crate::rhi::Format::R32G32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, tex_coord) as u32,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 4,
-                            format: crate::rhi::Format::RGBA32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, color) as u32,
-                        },
-                    ],
-                }),
-                input_assembly_state: crate::rhi::InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                rasterizer_state: Some(crate::rhi::RasterizerState::double_sided()),
-                multisample_state: crate::rhi::MultisampleState {
-                    sample_count: crate::rhi::SampleCount::X1,
-                    ..Default::default()
-                },
-                color_blend_state: Some(crate::rhi::ColorBlendState {
-                    attachments: vec![crate::rhi::ColorBlendAttachment {
-                        blend_enable: true,
-                        src_color_blend_factor: crate::rhi::BlendFactor::SrcAlpha,
-                        dst_color_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
-                        color_blend_op: crate::rhi::BlendOp::Add,
-                        src_alpha_blend_factor: crate::rhi::BlendFactor::One,
-                        dst_alpha_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
-                        alpha_blend_op: crate::rhi::BlendOp::Add,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                depth_stencil_state: Some(crate::rhi::DepthStencilState::enabled()),
-                ..Default::default()
-            },
-            &render_pass,
-            &[],
-        );
-        pipeline.ok()
-    }
 }
 
 impl RenderPass for WaterPass {
@@ -319,7 +218,7 @@ impl RenderPass for WaterPass {
                 crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
                 1,
             ));
-            // Bug в„–186: build the view from the value we hold instead of
+            // Bug №186: build the view from the value we hold instead of
             // unwrapping it back out of the Option.
             let tex = self.reflection_texture.take();
             match tex {
@@ -435,9 +334,6 @@ impl RenderPass for WaterPass {
 
         self.water_render_pass = Some(device.create_render_pass(&render_pass_desc));
 
-        // Create water pipeline
-        self.water_pipeline = self.create_pipeline(device);
-
         // Create framebuffer
         let depth_texture = device.create_texture(
             width,
@@ -449,7 +345,7 @@ impl RenderPass for WaterPass {
         );
         let depth_view = depth_texture.create_view(Default::default());
 
-        // Bug в„–186: the render pass and output view were unwrapped here.
+        // Bug №186: the render pass and output view were unwrapped here.
         let (Some(render_pass), Some(output_view)) =
             (self.water_render_pass.clone(), self.output_view.clone())
         else {
@@ -611,6 +507,3 @@ impl Default for WaterPass {
         Self::new(WaterConfig::default())
     }
 }
-
-
-

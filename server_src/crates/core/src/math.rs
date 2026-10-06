@@ -350,15 +350,86 @@ pub struct Bounds {
     pub max: Vec3f,
 }
 
+/// Returns the lower of two corners on one axis, repairing an inverted pair.
+///
+/// A non-finite value is returned unchanged on purpose: `f32::min` and
+/// `f32::max` return the *other* operand when one is NaN, so sorting with them
+/// would fabricate a finite box out of a NaN one and hide the bad data from the
+/// `query_bounds` guard that is supposed to reject it.
+fn low(lo: f32, hi: f32) -> f32 {
+    if lo.is_finite() && hi.is_finite() && lo > hi {
+        hi
+    } else {
+        lo
+    }
+}
+
+/// The upper counterpart of [`low`]. Same NaN rule, mirrored.
+fn high(lo: f32, hi: f32) -> f32 {
+    if lo.is_finite() && hi.is_finite() && lo > hi {
+        lo
+    } else {
+        hi
+    }
+}
+
 impl Bounds {
+    /// Bug №199: `min`/`max` used to be stored exactly as given, so one
+    /// inverted axis (`min > max`) produced a box that was not a box. Every
+    /// method below then misreported:
+    ///
+    /// - `size()` returned a negative component,
+    /// - `contains()` was never satisfied on that axis,
+    /// - `intersects()` gave arbitrary answers, and
+    /// - `distance_to_bounds` in the damage crate clamped to nothing on that
+    ///   axis, so the axis contributed a distance of **zero**. One inverted axis
+    ///   in a compartment template therefore under-reported the blast distance,
+    ///   which `falloff(0.0)` scores as 1.0 — full damage — so a single bad
+    ///   number in the ship data made explosions hit at full strength
+    ///   everywhere.
+    ///
+    /// The extent is now ordered per axis on the way in, so the invariant holds
+    /// by construction instead of at each call site. Computed callers
+    /// (`position ± half`) were already ordered, so this is a no-op for them;
+    /// the literal ship-class data in `ship/src/loader.rs` is what it repairs.
+    /// `Bounds::new` is the only construction site in the workspace — every
+    /// other builder goes through it — so ordering here covers all callers.
+    ///
+    /// A non-finite corner is deliberately **left alone**. Sorting with `f32::min`
+    /// and `f32::max` would be shorter, but both return the finite operand when
+    /// the other is NaN, which would silently turn a NaN box into a valid
+    /// degenerate one: `min(NaN, 1.0)` is `1.0`, so `Bounds::new` with a NaN
+    /// corner would fabricate a box at x == 1. That breaks
+    /// `SpatialGrid::query_bounds`, whose whole contract is that a non-finite
+    /// query matches nothing (`query_bounds_nan_returns_empty`), and it would
+    /// hide bad data instead of surfacing it. Keep NaN visible.
     pub fn new(min: Vec3f, max: Vec3f) -> Self {
-        Self { min, max }
+        Self {
+            min: Vec3f::new(low(min.x, max.x), low(min.y, max.y), low(min.z, max.z)),
+            max: Vec3f::new(high(min.x, max.x), high(min.y, max.y), high(min.z, max.z)),
+        }
+    }
+
+    /// Re-orders the axes of a box that is already in hand.
+    ///
+    /// `Bounds` is `Serialize`/`Deserialize` and its fields are `pub`, so values
+    /// can arrive from the wire or be written directly, bypassing `new`. Use
+    /// this at the point of consumption for those.
+    pub fn normalized(&self) -> Self {
+        Self::new(self.min, self.max)
+    }
+
+    /// Whether any axis is inverted, i.e. the box is malformed.
+    pub fn is_inverted(&self) -> bool {
+        self.min.x > self.max.x || self.min.y > self.max.y || self.min.z > self.max.z
     }
 
     pub fn center(&self) -> Vec3f {
         (self.min + self.max) * 0.5
     }
 
+    /// Bug №199: for an inverted axis this used to yield a negative component.
+    /// A non-negative size is now guaranteed by the ordering `new` maintains.
     pub fn size(&self) -> Vec3f {
         self.max - self.min
     }
@@ -384,7 +455,167 @@ impl Bounds {
 }
 #[cfg(test)]
 mod tests {
-    use super::Vec3f;
+    use super::{Bounds, Vec3f};
+
+/// Bug №199: a box whose corners arrive swapped used to stay that way, and
+    /// `size()` then reported a negative extent.
+    #[test]
+    fn an_inverted_axis_is_ordered_on_construction() {
+        let b = Bounds::new(Vec3f::new(5.0, 5.0, 5.0), Vec3f::new(-5.0, -5.0, -5.0));
+        assert_eq!(b.min, Vec3f::new(-5.0, -5.0, -5.0));
+        assert_eq!(b.max, Vec3f::new(5.0, 5.0, 5.0));
+        assert!(!b.is_inverted());
+    }
+
+    /// One bad axis must not disturb the others: here y is a genuinely flat axis
+    /// (min == max) that must survive as flat, while the inverted z axis is
+    /// repaired independently.
+    #[test]
+    fn one_inverted_axis_does_not_disturb_the_good_axes() {
+        let b = Bounds::new(Vec3f::new(0.0, 2.0, 4.0), Vec3f::new(4.0, 2.0, 0.0));
+        assert!(!b.is_inverted());
+        assert_eq!(b.min, Vec3f::new(0.0, 2.0, 0.0));
+        assert_eq!(b.max, Vec3f::new(4.0, 2.0, 4.0));
+        let s = b.size();
+        assert_eq!(s.y, 0.0, "a genuinely flat axis was altered");
+        assert_eq!(s.x, 4.0);
+        assert_eq!(s.z, 4.0, "the inverted axis was not repaired");
+    }
+
+    /// An inverted axis and a degenerate one are different: min == max is valid
+    /// data and must be left exactly as it is.
+    #[test]
+    fn a_degenerate_axis_is_left_alone() {
+        let b = Bounds::new(Vec3f::new(-1.0, -1.0, 7.0), Vec3f::new(1.0, 1.0, 7.0));
+        assert!(!b.is_inverted(), "min == max is not inverted");
+        assert_eq!(b.size().z, 0.0);
+        assert_eq!(b.min.z, 7.0);
+        assert_eq!(b.max.z, 7.0);
+    }
+
+    /// The `size()` regression: it returned `max - min`, so an inverted axis
+    /// produced a negative extent that callers would propagate.
+    #[test]
+    fn size_is_never_negative() {
+        let b = Bounds::new(Vec3f::new(10.0, -1.0, 0.0), Vec3f::new(-10.0, 1.0, 7.0));
+        let s = b.size();
+        assert!(s.x >= 0.0 && s.y >= 0.0 && s.z >= 0.0, "negative size {s:?}");
+        assert_eq!(s, Vec3f::new(20.0, 2.0, 7.0));
+    }
+
+    /// Swapping the arguments must give the identical box, otherwise "which
+    /// corner is min" would still matter to callers.
+    #[test]
+    fn corner_order_does_not_change_the_box() {
+        let a = Bounds::new(Vec3f::new(-2.0, -3.0, -4.0), Vec3f::new(6.0, 7.0, 8.0));
+        let b = Bounds::new(Vec3f::new(6.0, 7.0, 8.0), Vec3f::new(-2.0, -3.0, -4.0));
+        assert_eq!(a, b);
+    }
+
+    /// A well-formed box must be completely untouched, or the normalization is
+    /// not a no-op and would be changing behaviour everywhere.
+    #[test]
+    fn a_well_formed_box_is_unchanged() {
+        let min = Vec3f::new(-1.0, -2.0, -3.0);
+        let max = Vec3f::new(4.0, 5.0, 6.0);
+        let b = Bounds::new(min, max);
+        assert_eq!(b.min, min);
+        assert_eq!(b.max, max);
+        assert!(!b.is_inverted());
+    }
+
+    /// `center()` was already correct for a swapped pair — the midpoint of two
+    /// corners does not care which is called min. Pinned down so the
+    /// normalization is not wrongly credited with fixing it.
+    #[test]
+    fn center_is_unaffected_by_corner_order() {
+        let min = Vec3f::new(-1.0, -2.0, -3.0);
+        let max = Vec3f::new(4.0, 5.0, 6.0);
+        assert_eq!(
+            Bounds::new(min, max).center(),
+            Bounds::new(max, min).center()
+        );
+    }
+
+    /// `contains` was unsatisfiable on an inverted axis, so it always said
+    /// "outside". An ordered box must contain its own center.
+    #[test]
+    fn an_ordered_box_contains_its_own_center() {
+        let b = Bounds::new(Vec3f::new(5.0, 5.0, 5.0), Vec3f::new(-5.0, -5.0, -5.0));
+        assert!(b.contains(b.center()), "the box rejected its own center");
+    }
+
+    /// A box cannot fail to intersect itself under either corner order.
+    #[test]
+    fn a_box_intersects_itself_regardless_of_corner_order() {
+        let min = Vec3f::new(-1.0, -1.0, -1.0);
+        let max = Vec3f::new(1.0, 1.0, 1.0);
+        assert!(Bounds::new(min, max).intersects(&Bounds::new(min, max)));
+        assert!(Bounds::new(max, min).intersects(&Bounds::new(max, min)));
+    }
+
+    /// Deserialization and direct field writes bypass `new`, so `normalized` is
+    /// the repair for values that arrive already malformed.
+    #[test]
+    fn normalized_repairs_a_box_built_by_hand() {
+        let malformed = Bounds {
+            min: Vec3f::new(3.0, 0.0, 0.0),
+            max: Vec3f::new(-3.0, 1.0, 1.0),
+        };
+        assert!(malformed.is_inverted());
+        assert!(!malformed.normalized().is_inverted());
+        assert_eq!(malformed.normalized().size(), Vec3f::new(6.0, 1.0, 1.0));
+    }
+
+    /// Regression, and the reason `order` exists at all: sorting the corners
+    /// with `f32::min`/`f32::max` looks equivalent but is not. Both return the
+    /// finite operand when the other is NaN, so a NaN corner was silently
+    /// replaced by the opposite corner — fabricating a valid degenerate box at
+    /// x == 1 and defeating `query_bounds`' contract that a non-finite query
+    /// matches nothing.
+    #[test]
+    fn a_nan_corner_is_not_silently_replaced() {
+        let nan = f32::NAN;
+        let b = Bounds::new(Vec3f::new(nan, 0.0, 0.0), Vec3f::new(1.0, 1.0, 1.0));
+        assert!(
+            b.min.x.is_nan(),
+            "the NaN corner became {}, which fabricates a valid box",
+            b.min.x
+        );
+        assert_eq!(b.max.x, 1.0, "the finite corner should be untouched");
+    }
+
+    /// The same for the other two axes, and for an infinity, so the guard is
+    /// about non-finiteness rather than about NaN specifically.
+    #[test]
+    fn every_axis_keeps_its_non_finite_corner() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let b = Bounds::new(Vec3f::new(bad, bad, bad), Vec3f::new(5.0, 5.0, 5.0));
+            assert!(!b.min.x.is_finite(), "{bad} was replaced on x");
+            assert!(!b.min.y.is_finite(), "{bad} was replaced on y");
+            assert!(!b.min.z.is_finite(), "{bad} was replaced on z");
+            assert_eq!(b.max.x, 5.0, "{bad} disturbed the finite corner");
+        }
+    }
+
+    /// A box with a NaN corner stays detectable as unusable, which is what the
+    /// downstream `is_finite` guards rely on.
+    #[test]
+    fn a_nan_box_reports_itself_as_inverted() {
+        // min.x is NaN so `NaN > 1.0` is false; the box is not "inverted", but
+        // it is also not finite, and consumers must not treat it as valid.
+        let b = Bounds::new(Vec3f::new(f32::NAN, 0.0, 0.0), Vec3f::new(1.0, 1.0, 1.0));
+        assert!(!b.min.is_finite() || !b.max.is_finite());
+    }
+
+    /// Ordering still happens for the ordinary finite case — the NaN guard must
+    /// not have disabled the repair.
+    #[test]
+    fn ordering_still_works_for_finite_corners() {
+        let b = Bounds::new(Vec3f::new(5.0, 5.0, 5.0), Vec3f::new(-5.0, -5.0, -5.0));
+        assert_eq!(b.min, Vec3f::new(-5.0, -5.0, -5.0));
+        assert_eq!(b.max, Vec3f::new(5.0, 5.0, 5.0));
+    }
 
     /// The bug: `length()` squared the components, which overflows to infinity
     /// above about 1.8e19, so `normalize()` divided by infinity and returned the

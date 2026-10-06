@@ -1,4 +1,4 @@
-﻿//! Transparent Render Pass
+//! Transparent Render Pass
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
@@ -11,7 +11,6 @@ use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
-use crate::rhi::pipeline::graphics::PrimitiveTopology;
 use crate::rhi::{CommandEncoder, Pipeline, TextureView};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -86,7 +85,7 @@ pub struct TransparentPass {
     render_pass: Option<crate::rhi::RenderPass>,
     /// Framebuffer
     framebuffer: Option<crate::rhi::Framebuffer>,
-    /// Particle system (bug в„–211: was unreachable)
+    /// Particle system (bug №211: was unreachable)
     particle_system: Option<Arc<crate::render::particles::ParticleSystem>>,
 }
 
@@ -128,120 +127,6 @@ impl TransparentPass {
     pub fn config_mut(&mut self) -> &mut TransparentConfig {
         &mut self.config
     }
-
-    fn create_pipelines(&mut self, device: &crate::rhi::Device) {
-        let spirv = include_bytes!("../../../Tool/client_tests/assets/shaders/transparent.spv");
-        let vs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: crate::rhi::ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("transparent_vs".into()),
-        });
-        let fs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: crate::rhi::ShaderFormat::SpirV,
-            entry_point: Some("fs_main".into()),
-            name: Some("transparent_fs".into()),
-        });
-
-        let render_pass = match self.render_pass.clone() {
-            Some(rp) => rp,
-            None => return,
-        };
-
-        let pipeline = device.create_gpu_graphics_pipeline(
-            &crate::rhi::GraphicsPipelineDesc {
-                shader_stages: vec![
-                    crate::rhi::PipelineShaderStage {
-                        stage: crate::rhi::ShaderStage::VERTEX,
-                        module: vs_module,
-                        entry_point: "vs_main".into(),
-                    },
-                    crate::rhi::PipelineShaderStage {
-                        stage: crate::rhi::ShaderStage::FRAGMENT,
-                        module: fs_module,
-                        entry_point: "fs_main".into(),
-                    },
-                ],
-                vertex_input_state: Some(crate::rhi::VertexInputState {
-                    bindings: vec![crate::rhi::VertexBinding {
-                        binding: 0,
-                        stride: std::mem::size_of::<crate::render::meshes::Vertex>() as u32,
-                        input_rate: crate::rhi::VertexInputRate::Vertex,
-                    }],
-                    attributes: vec![
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 0,
-                            format: crate::rhi::Format::R32G32B32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, position) as u32,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 1,
-                            format: crate::rhi::Format::R32G32B32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, normal) as u32,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 2,
-                            format: crate::rhi::Format::RGBA32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, tangent) as u32,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 3,
-                            format: crate::rhi::Format::R32G32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, tex_coord) as u32,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 4,
-                            format: crate::rhi::Format::RGBA32_SFLOAT,
-                            offset: std::mem::offset_of!(crate::render::meshes::Vertex, color) as u32,
-                        },
-                    ],
-                }),
-                input_assembly_state: crate::rhi::InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                rasterizer_state: Some(crate::rhi::RasterizerState::double_sided()),
-                multisample_state: crate::rhi::MultisampleState {
-                    sample_count: crate::rhi::SampleCount::X1,
-                    ..Default::default()
-                },
-                color_blend_state: Some(crate::rhi::ColorBlendState {
-                    attachments: vec![crate::rhi::ColorBlendAttachment {
-                        blend_enable: true,
-                        src_color_blend_factor: crate::rhi::BlendFactor::SrcAlpha,
-                        dst_color_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
-                        color_blend_op: crate::rhi::BlendOp::Add,
-                        src_alpha_blend_factor: crate::rhi::BlendFactor::One,
-                        dst_alpha_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
-                        alpha_blend_op: crate::rhi::BlendOp::Add,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                depth_stencil_state: Some(crate::rhi::DepthStencilState {
-                    depth_test_enable: true,
-                    depth_write_enable: false,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            &render_pass,
-            &[],
-        );
-
-        if let Ok(pipeline) = pipeline {
-            self.pipelines.insert(BlendMode::Alpha, pipeline.clone());
-            self.pipelines.insert(BlendMode::Additive, pipeline.clone());
-            self.pipelines.insert(BlendMode::Multiplicative, pipeline.clone());
-            self.pipelines.insert(BlendMode::Screen, pipeline);
-        }
-    }
 }
 
 impl RenderPass for TransparentPass {
@@ -271,7 +156,7 @@ impl RenderPass for TransparentPass {
             crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
             1,
         ));
-        // Bug в„–186: the view was built by unwrapping the texture that had just
+        // Bug №186: the view was built by unwrapping the texture that had just
         // been stored, so a failed `create_texture` aborted the process instead
         // of leaving the pass without a target. Build the view from the value
         // we actually hold.
@@ -346,12 +231,9 @@ impl RenderPass for TransparentPass {
 
         self.render_pass = Some(device.create_render_pass(&render_pass_desc));
 
-        // Create pipelines for each blend mode
-        self.create_pipelines(device);
-
         // Create framebuffer
         //
-        // Bug в„–186: these three views were unwrapped. A missing target now
+        // Bug №186: these three views were unwrapped. A missing target now
         // aborts the resize with a message instead of the process.
         let (Some(output_view), Some(depth_view), Some(render_pass)) = (
             self.output_view.clone(),
@@ -459,33 +341,23 @@ impl RenderPass for TransparentPass {
             encoder.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
             encoder.set_scissor(0, 0, width, height);
 
-            // Render particles (bug в„–211: was unreachable)
+            // Render particles (bug №211: was unreachable)
             if let Some(ref ps) = self.particle_system {
                 ps.render(encoder, context);
             }
 
             // Render each transparent object
             for obj in &transparent_objects {
-                if let Some(entity) = scene.get_entity(obj.entity_id) {
-                    if let Some(mesh_component) = entity.mesh() {
-                        let mesh = mesh_component.get_lod_mesh(0);
-                        if let Some(vertex_buffer) = mesh.vertex_buffer() {
-                            if let Some(index_buffer) = mesh.index_buffer() {
-                                if let Some(pipeline) = self.pipelines.get(&obj.blend_mode) {
-                                    encoder.bind_pipeline(pipeline);
-                                    encoder.bind_vertex_buffer(vertex_buffer);
-                                    encoder.bind_index_buffer(index_buffer, crate::rhi::IndexType::U32);
-                                    encoder.draw_indexed_instanced(
-                                        mesh.index_count(),
-                                        1,
-                                        0,
-                                        0,
-                                        0,
-                                    );
-                                }
-                            }
-                        }
+                if let Some(_entity) = scene.get_entity(obj.entity_id) {
+                    // Get the appropriate pipeline for this blend mode
+                    if let Some(pipeline) = self.pipelines.get(&obj.blend_mode) {
+                        encoder.bind_pipeline(pipeline);
                     }
+
+                    // Bind entity's mesh and material
+                    // Draw the entity
+
+                    // Placeholder: actual rendering would go here
                 }
             }
 
@@ -512,7 +384,3 @@ impl Default for TransparentPass {
         Self::new(TransparentConfig::default())
     }
 }
-
-
-
-

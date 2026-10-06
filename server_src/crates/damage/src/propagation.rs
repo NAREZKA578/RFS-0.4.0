@@ -139,7 +139,10 @@ impl PropagationSystem {
             let mut any_flow = false;
 
             for (comp_id, comp) in &compartments {
-                if comp.current_level <= 0.0 {
+                // Bug №197: `current_level <= 0.0` is false for NaN, so a NaN
+                // level was treated as a source and drove flow arithmetic with a
+                // NaN `fill_ratio` below.
+                if !crate::finite::is_positive_finite(comp.current_level) {
                     continue;
                 }
 
@@ -224,14 +227,20 @@ impl PropagationSystem {
             .collect();
         
         for (comp_id, comp) in &compartments {
-            if comp.fire_intensity <= 0.0 {
+            // Bug №198: this guard is `fire_intensity <= 0.0`, which is false
+            // for NaN, so a NaN intensity read as "burning". Read it through
+            // `unit_or_zero` once and use the sanitized value from here down, so
+            // growth and clamping below cannot reintroduce the NaN.
+            let intensity = crate::finite::unit_or_zero(comp.fire_intensity);
+            if intensity <= 0.0 {
                 continue;
             }
             
             if comp.is_flooded() {
-                let reduction = comp.fire_intensity * 0.5 * dt;
+                let reduction = intensity * 0.5 * dt;
                 if let Some(node) = graph.get_compartment_mut(*comp_id) {
-                    node.fire_intensity = (node.fire_intensity - reduction).max(0.0);
+                    node.fire_intensity =
+                        crate::finite::unit_or_zero(node.fire_intensity - reduction);
                     if node.fire_intensity <= 0.0 {
                         events.push(PropagationEvent {
                             event_type: PropagationEventType::FireExtinguished,
@@ -267,11 +276,12 @@ impl PropagationSystem {
                         // Bug №64: growth was gated by fastrand — replays and
                         // the authoritative tick became nondeterministic. A
                         // deterministic amount is added per tick instead.
-                        let growth = comp.fire_intensity * self.config.fire_spread_rate * dt;
+                        let growth = intensity * self.config.fire_spread_rate * dt;
                         if growth <= 0.0 {
                             continue;
                         }
-                        let new_intensity = (target.fire_intensity + growth).min(1.0);
+                        let new_intensity =
+                            crate::finite::unit_or_zero(target.fire_intensity + growth);
                         if let Some(node) = graph.get_compartment_mut(target_id) {
                             node.fire_intensity = new_intensity;
 
@@ -346,6 +356,13 @@ impl PropagationSystem {
     }
 
     pub fn ignite_fire(&mut self, graph: &mut DamageGraph, compartment_id: EntityId, intensity: f32) -> bool {
+        // Bug №198: `f32::clamp` returns NaN unchanged, so an unusable
+        // intensity became a NaN `fire_intensity` that then spread at full
+        // strength. Refused outright instead of written as zero, so garbage
+        // cannot extinguish live fire either.
+        if !intensity.is_finite() {
+            return false;
+        }
         if let Some(node) = graph.get_compartment_mut(compartment_id) {
             if !node.is_flooded() {
                 node.fire_intensity = intensity.clamp(0.0, 1.0);
@@ -469,6 +486,13 @@ impl FloodingSimulator {
     }
 
     pub fn add_water_source(&mut self, compartment_id: EntityId, flow_rate: f32) {
+        // Bug №197: an unusable rate was stored as-is. It reached `add_water`,
+        // where `f32::min` handed back the full free space and filled the
+        // compartment in one tick. Reject it at the boundary instead.
+        let flow_rate = crate::finite::positive_or_zero(flow_rate);
+        if flow_rate <= 0.0 {
+            return;
+        }
         self.water_sources.push(WaterSource {
             compartment_id,
             flow_rate,

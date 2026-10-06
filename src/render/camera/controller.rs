@@ -102,8 +102,8 @@ impl CameraController {
     }
 
     /// Get the camera
-    pub fn camera(&self) -> &dyn Camera {
-        self.camera.as_ref()
+    pub fn camera(&self) -> &Box<dyn Camera> {
+        &self.camera
     }
 
     /// Get mutable camera

@@ -161,7 +161,7 @@ impl Swapchain {
         physical_device: vk::PhysicalDevice,
         queue: vk::Queue,
         request: SwapchainRequest,
-        old: Option<&mut Swapchain>,
+        mut old: Option<&mut Swapchain>,
     ) -> RhiResult<Self> {
         let swapchain_loader = SwapchainLoader::new(&instance.instance, &device);
         let surface_loader = SurfaceLoader::new(&instance.entry, &instance.instance);
@@ -213,7 +213,7 @@ impl Swapchain {
             }
         };
         // Only now, with a swapchain in hand, is the old one actually gone.
-        if let Some(old) = old {
+        if let Some(old) = old.as_deref_mut() {
             old.handed_over = true;
         }
 
@@ -367,7 +367,23 @@ impl Swapchain {
     ///
     /// No wait semaphore is passed: with one frame in flight the CPU has
     /// already blocked on the render fence, so the image is complete.
-    pub fn present(&self, image_index: u32) -> RhiResult<()> {
+    /// Show `image_index`, waiting until the render into it has completed.
+    ///
+    /// `render_finished` is the semaphore the submit signalled.
+    ///
+    /// Bug №282: this used to build `vk::PresentInfoKHR` with no wait semaphores
+    /// at all, and no submit signalled anything either. Nothing therefore linked
+    /// "rendered into this image" to "this image is being shown", and the driver's
+    /// only safe assumption was that an image stays busy. `vkAcquireNextImageKHR`
+    /// then kept handing back the same index — observed as the index moving from
+    /// 0 to 2 and sticking there — which also meant frames could be rendered into
+    /// an image that had already been presented.
+    ///
+    /// The `queue_present` below returns once the wait is *queued*, not once the
+    /// frame is on screen: presentation is asynchronous, and the wait semaphore is
+    /// consumed by it. That consumption is what releases the image for the next
+    /// acquire, which is exactly the signal that was missing.
+    pub fn present(&self, image_index: u32, render_finished: vk::Semaphore) -> RhiResult<()> {
         if image_index as usize >= self.images.len() {
             return Err(RhiError::BackendError(format!(
                 "present index {image_index} is outside the {} swapchain images",
@@ -378,6 +394,12 @@ impl Swapchain {
             swapchain_count: 1,
             p_swapchains: &self.handle,
             p_image_indices: &image_index,
+            wait_semaphore_count: u32::from(render_finished != vk::Semaphore::null()),
+            p_wait_semaphores: if render_finished == vk::Semaphore::null() {
+                std::ptr::null()
+            } else {
+                &render_finished
+            },
             ..Default::default()
         };
         match unsafe { self.loader.queue_present(self.queue, &present) } {

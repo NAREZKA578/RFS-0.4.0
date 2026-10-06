@@ -468,6 +468,33 @@ impl Device {
         backend.submit_commands(commands)
     }
 
+    /// Tell the backend that the next submit is the one being presented.
+    ///
+    /// Bug №282: `vkQueuePresentKHR` has to wait on a semaphore that the frame's
+    /// submit signals, and the submit happens deep inside the render graph, which
+    /// has no idea whether its output reaches a swapchain. The renderer arms this
+    /// before running the graph and reads the semaphore back afterwards.
+    ///
+    /// A flag rather than a parameter, because threading a "is this presented"
+    /// argument through `RenderGraph::execute` would put a presentation concern
+    /// into the graph for the sake of one caller.
+    pub fn arm_presentation_signal(&self) {
+        if let Some(backend) = &self.backend_resource {
+            backend.arm_presentation_signal();
+        }
+    }
+
+    /// The semaphore [`present`](Self::arm_presentation_signal) waits on.
+    ///
+    /// Null when the active backend is not Vulkan, which is exactly what `present`
+    /// needs to skip the wait rather than wait on nothing.
+    pub fn render_finished_semaphore(&self) -> crate::ash::vk::Semaphore {
+        self.backend_resource
+            .as_ref()
+            .map(|b| b.render_finished_semaphore())
+            .unwrap_or_else(crate::ash::vk::Semaphore::null)
+    }
+
     /// Create a window surface from raw Win32 handles (`HINSTANCE`, `HWND`),
     /// as obtained from `raw-window-handle`.
     ///

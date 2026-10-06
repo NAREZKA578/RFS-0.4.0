@@ -51,17 +51,23 @@ impl MemoryAllocator {
     /// Required before the device reads a non-coherent mapped range. A no-op for
     /// coherent memory, so it is always safe to call.
     ///
-    /// `size` is honoured rather than flushing the whole allocation: callers know
-    /// exactly how much they wrote, and flushing more than that is legal but
-    /// needlessly expensive on large resources.
-    pub(crate) fn flush(&self, memory: vk::DeviceMemory, size: u64) -> RhiResult<()> {
-        if size == 0 {
-            return Ok(());
-        }
+    /// `size` is the number of bytes the host wrote, but it is not passed through
+    /// as the range size. The spec requires a `VkMappedMemoryRange` size to be a
+    /// multiple of `nonCoherentAtomSize` (64 bytes on most desktop parts), and a
+    /// written size almost never is: the 112-byte uniform block here is a 64-byte
+    /// atom boundary violation. Leaving it unrounded made the tail of the block
+    /// invisible to the device, so the shader read a stale matrix.
+    ///
+    /// `VK_WHOLE_SIZE` is used instead of a rounded size because this allocator
+    /// gives every allocation its own dedicated `vk::DeviceMemory`. There is no
+    /// neighbouring live data to disturb, so the theoretical saving from a
+    /// narrower range does not exist, while a rounded-up range would still need
+    /// the limit plumbed in from the physical device.
+    pub(crate) fn flush(&self, memory: vk::DeviceMemory, _size: u64) -> RhiResult<()> {
         let range = vk::MappedMemoryRange {
             memory,
             offset: 0,
-            size,
+            size: vk::WHOLE_SIZE,
             ..Default::default()
         };
         unsafe { self.device.flush_mapped_memory_ranges(&[range]) }
@@ -71,15 +77,13 @@ impl MemoryAllocator {
     /// Make device writes visible to the host.
     ///
     /// The read-side counterpart of [`flush`](Self::flush): needed before reading
-    /// a non-coherent mapped range the GPU has written.
-    pub(crate) fn invalidate(&self, memory: vk::DeviceMemory, size: u64) -> RhiResult<()> {
-        if size == 0 {
-            return Ok(());
-        }
+    /// a non-coherent mapped range the GPU has written. It carries the same
+    /// `VK_WHOLE_SIZE` reasoning for the same reason.
+    pub(crate) fn invalidate(&self, memory: vk::DeviceMemory, _size: u64) -> RhiResult<()> {
         let range = vk::MappedMemoryRange {
             memory,
             offset: 0,
-            size,
+            size: vk::WHOLE_SIZE,
             ..Default::default()
         };
         unsafe { self.device.invalidate_mapped_memory_ranges(&[range]) }

@@ -2,114 +2,216 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
-//! Render pass specifically designed for UI rendering.
+//! The render pass the UI draws into, plus the screen-space projection its
+//! shaders use.
+//!
+//! # Why this is not `Device::presentation_render_pass`
+//!
+//! That helper describes a pass which *starts* a frame: it clears the colour
+//! attachment and declares `Undefined` as the initial layout, because nothing
+//! has been drawn yet. UI is the opposite — it composites over a finished 3D
+//! frame, so it must load what is already there and start from
+//! `ColorAttachmentOptimal`.
+//!
+//! Getting this wrong is not a cosmetic problem. Clearing here wipes the scene
+//! every time the UI pass runs, and a pipeline that declares
+//! `ColorAttachmentOptimal` as the initial layout of an `Undefined` image
+//! produces undefined contents, which on most drivers is a black frame.
 
-use std::sync::Arc;
-use crate::{Device, Extent3D};
-use super::{UiConfig, UiResult};
+use crate::command::pass::render::RenderPass;
+use crate::types::Format;
+use crate::Device;
 
-/// UI Render Pass
-/// 
-/// This is a marker struct for UI render pass.
-/// In a full implementation, this would manage the actual render pass,
-/// pipelines, and resources needed for UI rendering.
+use super::{UiError, UiResult};
+
+/// Screen-space orthographic projection with the origin at the top left.
+///
+/// UI positions are pixels with Y growing downwards, which is the opposite of
+/// Vulkan's clip space, so Y is negated here rather than in every caller.
+/// Z is left at zero: the UI pipeline declares no depth state, so the value is
+/// never tested.
+///
+/// A zero extent would divide by zero and put infinities in the matrix, which
+/// silently draws nothing; `max(1)` keeps it finite and the geometry simply
+/// ends up off-screen.
+///
+/// The result is column-major, matching what `std140 mat4x4<f32>` expects.
+///
+/// Free-standing so it can be checked without a device: the interesting
+/// behaviour here is arithmetic, not a GPU round trip.
+pub fn ui_ortho_projection(width: u32, height: u32) -> [f32; 16] {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+    [
+        2.0 / w, 0.0, 0.0, 0.0, // column 0
+        0.0, -2.0 / h, 0.0, 0.0, // column 1
+        0.0, 0.0, 0.0, 0.0, // column 2
+        -1.0, 1.0, 0.0, 1.0, // column 3: translation
+    ]
+}
+
+/// Render pass and projection for UI drawn over a finished frame.
 pub struct UiRenderPass {
-    /// Current configuration
-    config: UiConfig,
-    /// Orthographic projection matrix
-    projection_matrix: [f32; 16],
-    /// Whether the pass is initialized
-    initialized: bool,
+    render_pass: RenderPass,
+    /// Column-major 4x4, laid out for `std140` `mat4x4<f32>`.
+    projection: [f32; 16],
+    format: Format,
+    width: u32,
+    height: u32,
 }
 
 impl UiRenderPass {
-    /// Create a new UI render pass
-    pub fn new() -> Self {
-        Self {
-            config: UiConfig::default(),
-            projection_matrix: [0.0; 16],
-            initialized: false,
-        }
+    /// Build the UI pass for a surface format and size.
+    pub fn new(device: &Device, format: Format, width: u32, height: u32) -> UiResult<Self> {
+// Deliberately the SAME helper the geometry pass uses, with the same
+    // `LoadOp::Clear` / `initial_layout: Undefined` / no subpass dependencies.
+//
+// This is a bisect, not a considered choice. `LoadOp::Load` is the semantically
+// right operator for an overlay — it is what preserves the 3D frame underneath —
+// but the geometry pass renders correctly with `Clear` and no dependencies, so
+// until a `Load` UI pass is seen drawing, the difference in operator is the only
+// variable left worth testing. If the UI appears with `Clear`, the fault is in
+// the load path or its barrier; if it does not, the fault is in the pipeline or
+// vertex state, and the operator was never the problem.
+//
+// Known cost of `Clear` here: it wipes the 3D frame the UI is meant to sit on.
+// That has to be fixed properly — an acquire barrier plus `Load` — but only
+// after the UI is drawing at all.
+let render_pass = device.presentation_render_pass(format).map_err(|e| {
+            UiError::BackendError(format!("UI presentation render pass: {e}"))
+        })?;
+
+        let mut this = Self {
+            render_pass,
+            projection: [0.0; 16],
+            format,
+            width: width.max(1),
+            height: height.max(1),
+        };
+        this.rebuild_projection();
+        Ok(this)
     }
-    
-    /// Initialize the UI render pass
-    pub fn initialize(
-        &mut self,
-        _device: &Arc<Device>,
-        swapchain_extent: Extent3D,
-        config: UiConfig,
-    ) -> UiResult<()> {
-        self.config = config;
-        
-        // Create orthographic projection matrix
-        let width = swapchain_extent.width as f32;
-        let height = swapchain_extent.height as f32;
-        self.update_projection(width, height);
-        
-        self.initialized = true;
-        
-        Ok(())
+
+    /// Screen-space orthographic projection; see [`ui_ortho_projection`].
+    fn rebuild_projection(&mut self) {
+        self.projection = ui_ortho_projection(self.width, self.height);
     }
-    
-    /// Update the orthographic projection matrix
-    pub fn update_projection(&mut self, width: f32, height: f32) {
-        let left = 0.0;
-        let right = width;
-        let bottom = height;
-        let top = 0.0;
-        let near = -1.0;
-        let far = 1.0;
-        
-        let m00 = 2.0 / (right - left);
-        let m11 = 2.0 / (top - bottom);
-        let m22 = -2.0 / (far - near);
-        
-        let m30 = -(right + left) / (right - left);
-        let m31 = -(top + bottom) / (top - bottom);
-        let m32 = -(far + near) / (far - near);
-        
-        self.projection_matrix = [
-            m00, 0.0, 0.0, 0.0,
-            0.0, m11, 0.0, 0.0,
-            0.0, 0.0, m22, 0.0,
-            m30, m31, m32, 1.0,
-        ];
+
+    pub fn render_pass(&self) -> &RenderPass {
+        &self.render_pass
     }
-    
-    /// Get the projection matrix
-    pub fn projection_matrix(&self) -> [f32; 16] {
-        self.projection_matrix
+
+    /// The matrix to upload into the UI uniform buffer, column-major.
+    pub fn projection(&self) -> [f32; 16] {
+        self.projection
     }
-    
-    /// Check if the pass is initialized
-    pub fn is_initialized(&self) -> bool {
-        self.initialized
+
+    pub fn format(&self) -> Format {
+        self.format
     }
-    
-    /// Resize the render pass
-    pub fn resize(&mut self, _device: &Arc<Device>, width: u32, height: u32) -> UiResult<()> {
-        self.config.screen_width = width;
-        self.config.screen_height = height;
-        self.update_projection(width as f32, height as f32);
-        Ok(())
+
+    pub fn width(&self) -> u32 {
+        self.width
     }
-    
-    /// Update configuration
-    pub fn update_config(&mut self, config: UiConfig) -> UiResult<()> {
-        self.config = config;
-        if self.initialized
-            && self.config.screen_width != 0 && self.config.screen_height != 0 {
-                self.update_projection(
-                    self.config.screen_width as f32,
-                    self.config.screen_height as f32,
-                );
-            }
-        Ok(())
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Update the target size after a window resize.
+    ///
+    /// The render pass itself does not change — its attachments are described
+    /// by format and sample count, not by extent — so only the projection is
+    /// rebuilt. The framebuffer, which does depend on extent, is rebuilt by the
+    /// renderer against the new swapchain.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.rebuild_projection();
     }
 }
 
-impl Default for UiRenderPass {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod tests {
+    use super::ui_ortho_projection;
+
+    /// Applies the column-major matrix to a point the way the shader does.
+    fn project(m: &[f32; 16], x: f32, y: f32) -> [f32; 4] {
+        [
+            m[0] * x + m[4] * y + m[12],
+            m[1] * x + m[5] * y + m[13],
+            m[2] * x + m[6] * y + m[14],
+            m[3] * x + m[7] * y + m[15],
+        ]
+    }
+
+    #[test]
+    fn the_top_left_corner_maps_to_clip_minus_one_plus_one() {
+        // Vulkan's clip +1 is the top of the screen, which is where UI y = 0 is.
+        let m = ui_ortho_projection(1920, 1080);
+        let p = project(&m, 0.0, 0.0);
+        assert!((p[0] + 1.0).abs() < 1e-6, "x was {}", p[0]);
+        assert!((p[1] - 1.0).abs() < 1e-6, "y was {}", p[1]);
+    }
+
+    #[test]
+    fn the_bottom_right_corner_maps_to_clip_plus_one_minus_one() {
+        // UI Y grows downwards, so the bottom of the screen must be clip -1.
+        let m = ui_ortho_projection(1920, 1080);
+        let p = project(&m, 1920.0, 1080.0);
+        assert!((p[0] - 1.0).abs() < 1e-6, "x was {}", p[0]);
+        assert!((p[1] + 1.0).abs() < 1e-6, "y was {}", p[1]);
+    }
+
+    #[test]
+    fn the_centre_maps_to_the_clip_origin() {
+        let m = ui_ortho_projection(800, 600);
+        let p = project(&m, 400.0, 300.0);
+        assert!(p[0].abs() < 1e-6, "x was {}", p[0]);
+        assert!(p[1].abs() < 1e-6, "y was {}", p[1]);
+    }
+
+    #[test]
+    fn a_zero_extent_stays_finite_instead_of_producing_infinities() {
+        // A window that has not been sized yet must not poison the matrix:
+        // NaN there draws nothing and reports nothing.
+        for (w, h) in [(0u32, 0u32), (0, 1080), (1920, 0)] {
+            let m = ui_ortho_projection(w, h);
+            assert!(
+                m.iter().all(|v| v.is_finite()),
+                "{w}x{h} produced a non-finite matrix: {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_is_flat_because_the_pipeline_has_no_depth_state() {
+        let m = ui_ortho_projection(640, 480);
+        let p = project(&m, 10.0, 20.0);
+        assert_eq!(p[2], 0.0);
+        assert_eq!(p[3], 1.0);
+    }
+
+    #[test]
+    fn the_projection_follows_a_physical_extent_that_differs_from_the_window() {
+        // A window can be logical while the swapchain is physical: 1280x720 at
+        // 125% is a 1600x900 image. The projection has to describe the extent
+        // actually being drawn into, or the UI is scaled to the wrong size.
+        let logical = ui_ortho_projection(1280, 720);
+        let physical = ui_ortho_projection(1600, 900);
+
+        // The logical projection maps the logical width to the right edge...
+        let p = project(&logical, 1280.0, 720.0);
+        assert!((p[0] - 1.0).abs() < 1e-6);
+
+        // ...while the physical one maps the physical width, so a UI laid out
+        // in physical pixels still lands on the right edge.
+        let p = project(&physical, 1600.0, 900.0);
+        assert!((p[0] - 1.0).abs() < 1e-6);
+        assert!((p[1] + 1.0).abs() < 1e-6);
+
+        // The two differ, which is the whole reason the target extent has to win.
+        assert_ne!(logical[0], physical[0]);
+        assert_ne!(logical[5], physical[5]);
     }
 }

@@ -174,6 +174,26 @@ impl ProjectileConfig {
             turn_rate: 0.0,
         }
     }
+
+    /// The one place that answers "what does this projectile type do".
+    ///
+    /// Bug №193: these numbers existed and were correct, but nothing read them.
+    /// `Station::get_damage` returned a hardcoded 100 for any gun, so a
+    /// torpedo's declared 5000 never reached a `Projectile` — 100 damage per
+    /// shot against a 10000 hull is a hundred shots to sink a ship. The
+    /// constructor is the source of truth; this resolves a runtime type to it,
+    /// so there is exactly one answer per type rather than one per call site.
+    pub fn for_type(projectile_type: ProjectileType) -> Self {
+        match projectile_type {
+            ProjectileType::Cannonball => Self::cannonball(),
+            ProjectileType::ExplosiveShell => Self::explosive_shell(),
+            ProjectileType::ArmorPiercing => Self::armor_piercing(),
+            ProjectileType::ChainShot => Self::chain_shot(),
+            ProjectileType::GrapeShot => Self::grape_shot(),
+            ProjectileType::Torpedo => Self::torpedo(),
+            ProjectileType::DepthCharge => Self::depth_charge(),
+        }
+    }
 }
 
 pub struct BallisticsCalculator {
@@ -556,9 +576,105 @@ impl BallisticSolution {
     pub fn direction(&self) -> Vec3f {
         let cp = self.pitch.cos();
         Vec3f::new(
-            cp * self.yaw.cos(),
-            self.pitch.sin(),
             cp * self.yaw.sin(),
+            self.pitch.sin(),
+            cp * self.yaw.cos()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug №193: these configs were correct and completely unread. A torpedo's
+    /// declared 5000 damage never reached a projectile, because the station
+    /// returned a hardcoded 100 instead. `for_type` is now the answer.
+    #[test]
+    fn a_torpedo_carries_its_declared_damage() {
+        let torpedo = ProjectileConfig::for_type(ProjectileType::Torpedo);
+        assert_eq!(torpedo.damage, 5000.0, "the torpedo lost its damage");
+        assert_eq!(torpedo.max_range, 10000.0);
+        assert_eq!(torpedo.explosion_radius, 20.0);
+    }
+
+    /// The head-to-head that makes the regression visible: a torpedo must be
+    /// worth fifty times a cannonball, which is exactly what the hardcoded 100
+    /// denied. Against a 10000 hull the old path needed a hundred shots.
+    #[test]
+    fn a_torpedo_is_worth_far_more_than_a_cannonball() {
+        let cannon = ProjectileConfig::for_type(ProjectileType::Cannonball);
+        let torpedo = ProjectileConfig::for_type(ProjectileType::Torpedo);
+        assert_eq!(cannon.damage, 100.0);
+        assert_eq!(
+            torpedo.damage / cannon.damage,
+            50.0,
+            "a torpedo is no longer worth fifty cannonballs"
+        );
+    }
+
+    /// Every variant must resolve, and each to its own constructor. A missing
+    /// arm would silently fall back to a default and reintroduce the original
+    /// bug in a new place.
+    #[test]
+    fn every_projectile_type_resolves_to_its_own_config() {
+        let all = [
+            ProjectileType::Cannonball,
+            ProjectileType::ExplosiveShell,
+            ProjectileType::ArmorPiercing,
+            ProjectileType::ChainShot,
+            ProjectileType::GrapeShot,
+            ProjectileType::Torpedo,
+            ProjectileType::DepthCharge,
+        ];
+        for projectile_type in all {
+            let resolved = ProjectileConfig::for_type(projectile_type);
+            assert_eq!(
+                resolved.projectile_type, projectile_type,
+                "{projectile_type:?} resolved to a config tagged as something else"
+            );
+        }
+    }
+
+    /// The declared values are distinct per type, so a wrong arm cannot pass by
+    /// accident.
+    #[test]
+    fn distinct_types_have_distinct_damage() {
+        let cannon = ProjectileConfig::for_type(ProjectileType::Cannonball).damage;
+        let ap = ProjectileConfig::for_type(ProjectileType::ArmorPiercing).damage;
+        let torpedo = ProjectileConfig::for_type(ProjectileType::Torpedo).damage;
+        let depth = ProjectileConfig::for_type(ProjectileType::DepthCharge).damage;
+        assert!(cannon != ap && ap != torpedo && torpedo != depth);
+        assert_eq!(ap, 200.0);
+        assert_eq!(depth, 300.0);
+    }
+
+    /// `for_type` must agree with the named constructor it dispatches to, or the
+    /// lookup becomes a second, drifting source of truth.
+    #[test]
+    fn for_type_agrees_with_the_named_constructors() {
+        assert_eq!(
+            ProjectileConfig::for_type(ProjectileType::Cannonball).damage,
+            ProjectileConfig::cannonball().damage
+        );
+        assert_eq!(
+            ProjectileConfig::for_type(ProjectileType::Torpedo).penetration,
+            ProjectileConfig::torpedo().penetration
+        );
+        assert_eq!(
+            ProjectileConfig::for_type(ProjectileType::DepthCharge).explosion_radius,
+            ProjectileConfig::depth_charge().explosion_radius
+        );
+    }
+
+    /// Explosive shells and depth charges blast; solid shot does not. The old
+    /// `main.rs` hardcoded 5.0 for ExplosiveShell and 0.0 for everything else,
+    /// which disagreed with the config on both counts.
+    #[test]
+    fn blast_radius_comes_from_the_type() {
+        assert_eq!(ProjectileConfig::for_type(ProjectileType::ExplosiveShell).explosion_radius, 10.0);
+        assert_eq!(ProjectileConfig::for_type(ProjectileType::DepthCharge).explosion_radius, 25.0);
+        assert_eq!(ProjectileConfig::for_type(ProjectileType::Cannonball).explosion_radius, 0.0);
+assert_eq!(ProjectileConfig::for_type(ProjectileType::Torpedo).explosion_radius, 20.0);
     }
 }

@@ -14,6 +14,7 @@ use rfs_net::*;
 use rfs_ship::loader::create_default_frigate;
 use rfs_ship::ship::{Ship, ShipConfig, ShipState};
 use rfs_ship::station::FireResult;
+use rfs_sim::ballistics::ProjectileConfig;
 use rfs_sim::tick::{GameEvent as SimGameEvent, Projectile, TickSystem};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -349,11 +350,22 @@ fn apply_input(
     }
 
     if let Some(interaction) = &input.station_interaction {
-        handle_station_interaction(sim, ship, player_id, interaction);
+        // Bug №196: a refused shot returns a reason instead of vanishing. The
+        // input path has no command ack to carry it, so it is logged here — the
+        // point is that the drop is observable at all.
+        if let Some(reason) = handle_station_interaction(sim, ship, player_id, interaction) {
+            warn!("player {:?} station action refused: {reason}", player_id.0);
+        }
     }
 }
 
-fn handle_station_interaction(sim: &TickSystem, ship: &Ship, player_id: EntityId, interaction: &StationInteraction) {
+/// Applies a station action, returning a reason if the shot was refused.
+fn handle_station_interaction(
+    sim: &TickSystem,
+    ship: &Ship,
+    player_id: EntityId,
+    interaction: &StationInteraction,
+) -> Option<String> {
     // Bug №59: only the occupant may operate a station — the old code let
     // any crew member yaw/fire/reload any gun of their ship without ever
     // entering the station.
@@ -363,7 +375,7 @@ fn handle_station_interaction(sim: &TickSystem, ship: &Ship, player_id: EntityId
         .get(&interaction.station_id)
         .and_then(|s| s.occupant);
     if occupied_by != Some(player_id) {
-        return;
+        return None;
     }
 
     let station_compartment = || {
@@ -391,7 +403,11 @@ fn handle_station_interaction(sim: &TickSystem, ship: &Ship, player_id: EntityId
         }
         StationAction::Fire => {
             if let Some(result) = ship.try_fire_station(interaction.station_id, None) {
-                spawn_projectile(sim, ship, interaction.station_id, result);
+                // Bug №196: a refused spawn used to be dropped silently, so the
+                // shooter saw a normal frame and no shell.
+                if let Err(rejected) = spawn_projectile(sim, ship, interaction.station_id, result) {
+                    return Some(format!("shot refused: {}", rejected.as_str()));
+                }
             }
         }
         StationAction::Reload => {
@@ -446,11 +462,22 @@ fn handle_station_interaction(sim: &TickSystem, ship: &Ship, player_id: EntityId
             ship.extinguish_compartment(station_compartment());
         }
     }
+    None
 }
 
-fn spawn_projectile(sim: &TickSystem, ship: &Ship, weapon: EntityId, result: FireResult) {
+fn spawn_projectile(
+    sim: &TickSystem,
+    ship: &Ship,
+    weapon: EntityId,
+    result: FireResult,
+) -> Result<(), rfs_sim::tick::ProjectileRejected> {
     let world_pos = ship.local_to_world(result.position);
     let world_vel = ship.transform().rotation.mul_vec3(result.velocity);
+    // Bug №193: damage, penetration and blast radius now come from the
+    // projectile type's own config instead of a hardcoded 100/50 in the station
+    // and a hardcoded 5.0 here. Those two answers disagreed with the config,
+    // and with each other, and the config was the one nobody read.
+    let config = ProjectileConfig::for_type(result.projectile_type);
     sim.fire_projectile(Projectile {
         entity_id: new_projectile_id(),
         projectile_type: result.projectile_type,
@@ -463,13 +490,10 @@ fn spawn_projectile(sim: &TickSystem, ship: &Ship, weapon: EntityId, result: Fir
         distance_traveled: 0.0,
         owner: ship.entity_id(),
         weapon,
-        damage: result.damage,
-        penetration: result.penetration,
-        explosion_radius: match result.projectile_type {
-            rfs_core::entity::ProjectileType::ExplosiveShell => 5.0,
-            _ => 0.0,
-        },
-    });
+        damage: config.damage,
+        penetration: config.penetration,
+        explosion_radius: config.explosion_radius,
+    })
 }
 
 fn handle_command(
@@ -567,8 +591,16 @@ fn translate_command(sim: &TickSystem, ship: &Ship, player_id: EntityId, command
                     }
                 }
                 if let Some(result) = ship.try_fire_station(*station, None) {
-                    spawn_projectile(sim, ship, *station, result);
-                    (true, None)
+                    // Bug №196: this is the command path, so the ack can carry
+                    // the reason. The spawn used to be dropped silently, so a
+                    // shot refused by the projectile cap was acked as success
+                    // and the player saw a normal frame with no shell.
+                    match spawn_projectile(sim, ship, *station, result) {
+                        Ok(()) => (true, None),
+                        Err(rejected) => {
+                            (false, Some(format!("shot refused: {}", rejected.as_str())))
+                        }
+                    }
                 } else {
                     (false, Some("weapon not ready".into()))
                 }

@@ -44,7 +44,17 @@ pub mod shader;
 pub mod swapchain;
 pub mod sync;
 pub mod types;
+
+/// The 2D user interface: immediate and retained element trees, text layout,
+/// input handling, and the renderer that turns them into draw calls.
+///
+/// This declaration was missing, which meant the whole module was never
+/// compiled: `rhi` had 59 tests and zero UI tests, and no UI pixel could reach
+/// the screen regardless of how correct the drawing code was. Worth stating
+/// plainly, because "the pipelines are unit-tested" is exactly the kind of claim
+/// that survives a module quietly falling out of the build.
 pub mod ui;
+
 pub mod utils;
 
 #[allow(ambiguous_glob_reexports)]
@@ -75,5 +85,3 @@ pub use shader::*;
 pub use swapchain::*;
 #[allow(ambiguous_glob_reexports)]
 pub use sync::*;
-#[allow(ambiguous_glob_reexports)]
-pub use ui::*;

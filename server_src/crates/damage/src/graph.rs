@@ -347,6 +347,13 @@ impl DamageGraph {
 
     pub fn add_water(&mut self, compartment_id: EntityId, amount: f32) -> f32 {
         // Bug №64: negative amounts drained the compartment in reverse.
+        //
+        // Bug №197: NaN passed this guard too, because every comparison
+        // against NaN is false — and `f32::min` returns its *second* operand
+        // when the first is NaN, so `NaN.min(space)` yielded `space` and the
+        // compartment was filled to capacity in a single call. Nothing failed;
+        // the ship just flooded.
+        let amount = crate::finite::positive_or_zero(amount);
         if amount <= 0.0 {
             return 0.0;
         }
@@ -362,6 +369,10 @@ impl DamageGraph {
 
     pub fn pump_water(&mut self, compartment_id: EntityId, amount: f32) -> f32 {
         // Bug №64: negative amounts filled the compartment in reverse.
+        //
+        // Bug №197: as in `add_water`. `NaN.min(current_level)` returned
+        // `current_level`, draining the compartment completely in one call.
+        let amount = crate::finite::positive_or_zero(amount);
         if amount <= 0.0 {
             return 0.0;
         }
@@ -375,6 +386,18 @@ impl DamageGraph {
     }
 
     pub fn set_fire(&mut self, compartment_id: EntityId, intensity: f32) -> bool {
+        // Bug №198: `f32::clamp` returns NaN unchanged, so a NaN intensity
+        // became a NaN `fire_intensity`. Every downstream `fire_intensity <=
+        // 0.0` guard is then false — "burning" — and `(target + NaN).min(1.0)`
+        // yields 1.0, spreading full-intensity fire to every neighbour.
+        //
+        // Unusable input is refused outright rather than mapped to zero:
+        // garbage must not write authoritative state, and writing zero would
+        // let the same NaN *extinguish* a burning compartment. Call
+        // `extinguish_fire` to clear fire deliberately.
+        if !intensity.is_finite() {
+            return false;
+        }
         if let Some(node) = self.get_compartment_mut(compartment_id) {
             node.fire_intensity = intensity.clamp(0.0, 1.0);
             true
@@ -394,6 +417,10 @@ impl DamageGraph {
 
     pub fn apply_damage(&mut self, compartment_id: EntityId, damage: f32) -> bool {
         // Bug №64: negative damage healed the compartment.
+        //
+        // Bug №197: NaN slipped through and `(damage + NaN).min(max_damage)`
+        // returned `max_damage`, breaching the compartment outright.
+        let damage = crate::finite::positive_or_zero(damage);
         if damage <= 0.0 {
             return false;
         }
@@ -517,5 +544,169 @@ mod tests {
         let mut destroyed = sealed.clone();
         destroyed.is_destroyed = true;
         assert!(destroyed.is_passable());
+    }
+
+    fn level(g: &DamageGraph, id: EntityId) -> f32 {
+        g.get_compartment(id).unwrap().current_level
+    }
+
+    /// Bug №197: `add_water(NaN)` filled the compartment to capacity in one
+    /// call, because `NaN <= 0.0` is false and `f32::min(NaN, space)` returns
+    /// `space`. A NaN anywhere upstream therefore sank the ship.
+    #[test]
+    fn nan_water_does_not_flood_a_compartment() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+
+        let added = g.add_water(EntityId::new(1), f32::NAN);
+
+        assert_eq!(added, 0.0, "a NaN amount reported water entering");
+        assert_eq!(level(&g, EntityId::new(1)), 0.0, "a NaN amount filled the compartment");
+    }
+
+    /// Bug №197, the mirror image: `pump_water(NaN)` emptied the compartment,
+    /// because `f32::min(NaN, current)` returns `current`.
+    #[test]
+    fn nan_pump_does_not_drain_a_compartment() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+        g.add_water(EntityId::new(1), 40.0);
+        let before = level(&g, EntityId::new(1));
+        assert!(before > 0.0);
+
+        let pumped = g.pump_water(EntityId::new(1), f32::NAN);
+
+        assert_eq!(pumped, 0.0, "a NaN amount reported water leaving");
+        assert_eq!(level(&g, EntityId::new(1)), before, "a NaN drained the compartment");
+    }
+
+    /// Both infinities must be refused too — `min` returns them as-is, which is
+    /// just as unrepresentable as NaN.
+    #[test]
+    fn infinite_water_does_not_change_a_compartment() {
+        for bad in [f32::INFINITY, f32::NEG_INFINITY] {
+            let mut g = DamageGraph::new();
+            g.add_compartment(compartment(1));
+            assert_eq!(g.add_water(EntityId::new(1), bad), 0.0, "{bad} flooded the compartment");
+            assert_eq!(level(&g, EntityId::new(1)), 0.0, "{bad} changed the level");
+
+            g.add_water(EntityId::new(1), 10.0);
+            let before = level(&g, EntityId::new(1));
+            assert_eq!(g.pump_water(EntityId::new(1), bad), 0.0, "{bad} drained the compartment");
+            assert_eq!(level(&g, EntityId::new(1)), before, "{bad} changed the level");
+        }
+    }
+
+    /// A refused amount must not be reported as "nothing happened" while still
+    /// having moved water — the return value is what callers bill against.
+    #[test]
+    fn a_refused_amount_never_also_moves_water() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+            assert_eq!(g.add_water(EntityId::new(1), bad), 0.0);
+            assert_eq!(g.pump_water(EntityId::new(1), bad), 0.0);
+            assert_eq!(level(&g, EntityId::new(1)), 0.0);
+        }
+    }
+
+    /// Bug №198: `f32::clamp` returns NaN unchanged, so `set_fire` stored a NaN
+    /// intensity that every `fire_intensity <= 0.0` guard reads as "burning".
+    #[test]
+    fn nan_fire_intensity_is_refused() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+
+        assert!(
+            !g.set_fire(EntityId::new(1), f32::NAN),
+            "a NaN reported a successful ignite"
+        );
+
+        let intensity = g.get_compartment(EntityId::new(1)).unwrap().fire_intensity;
+        assert!(intensity.is_finite(), "a NaN intensity was stored");
+        assert_eq!(
+            intensity, 0.0,
+            "an unusable intensity must read as 'not burning', not as burning"
+        );
+    }
+
+    /// Refusing is what makes this safe. Mapping a NaN to zero instead would let
+    /// anyone who can inject a bad float put out a fire at will — on an
+    /// authoritative server that is a griefing vector, not a rounding detail.
+    #[test]
+    fn nan_fire_does_not_extinguish_a_burning_compartment() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+        g.set_fire(EntityId::new(1), 0.6);
+
+        g.set_fire(EntityId::new(1), f32::NAN);
+
+        let intensity = g.get_compartment(EntityId::new(1)).unwrap().fire_intensity;
+        assert!(
+            (intensity - 0.6).abs() < 1e-5,
+            "an unusable intensity overwrote live fire, got {intensity}"
+        );
+    }
+
+    /// Clearing fire stays possible — that is what `extinguish_fire` is for, so
+    /// refusing garbage costs nothing.
+    #[test]
+    fn fire_can_still_be_cleared_deliberately() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+        g.set_fire(EntityId::new(1), 0.6);
+
+        assert!(g.extinguish_fire(EntityId::new(1)));
+        assert_eq!(g.get_compartment(EntityId::new(1)).unwrap().fire_intensity, 0.0);
+    }
+
+    #[test]
+    fn infinite_fire_intensity_is_refused() {
+        for bad in [f32::INFINITY, f32::NEG_INFINITY] {
+            let mut g = DamageGraph::new();
+            g.add_compartment(compartment(1));
+            assert!(!g.set_fire(EntityId::new(1), bad), "{bad} reported a successful ignite");
+            assert_eq!(g.get_compartment(EntityId::new(1)).unwrap().fire_intensity, 0.0);
+        }
+    }
+
+    /// Out-of-range but finite intensities are still clamped, not refused —
+    /// refusing them would change behaviour for legitimate callers.
+    #[test]
+    fn an_out_of_range_intensity_is_clamped_not_refused() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+
+        assert!(g.set_fire(EntityId::new(1), 5.0));
+        assert_eq!(g.get_compartment(EntityId::new(1)).unwrap().fire_intensity, 1.0);
+
+        assert!(g.set_fire(EntityId::new(1), -5.0));
+        assert_eq!(g.get_compartment(EntityId::new(1)).unwrap().fire_intensity, 0.0);
+    }
+
+    /// Bug №197 again, on the damage path: `(damage + NaN).min(max_damage)`
+    /// returns `max_damage`, so a NaN blast breached the compartment outright.
+    #[test]
+    fn nan_damage_does_not_breach_a_compartment() {
+        let mut g = DamageGraph::new();
+        g.add_compartment(compartment(1));
+
+        assert!(!g.apply_damage(EntityId::new(1), f32::NAN), "a NaN reported a hit");
+
+        let node = g.get_compartment(EntityId::new(1)).unwrap();
+        assert_eq!(node.damage, 0.0, "a NaN blast dealt damage");
+        assert!(!node.is_breached, "a NaN blast breached the compartment");
+    }
+
+    #[test]
+    fn infinite_damage_does_not_breach_a_compartment() {
+        for bad in [f32::INFINITY, f32::NEG_INFINITY] {
+            let mut g = DamageGraph::new();
+            g.add_compartment(compartment(1));
+            assert!(!g.apply_damage(EntityId::new(1), bad), "{bad} reported a hit");
+            let node = g.get_compartment(EntityId::new(1)).unwrap();
+            assert_eq!(node.damage, 0.0, "{bad} dealt damage");
+            assert!(!node.is_breached, "{bad} breached the compartment");
+        }
     }
 }

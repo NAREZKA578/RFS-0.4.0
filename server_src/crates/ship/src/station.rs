@@ -255,8 +255,6 @@ impl Station {
             direction,
             velocity: direction * self.get_muzzle_velocity(),
             projectile_type: self.ammo_type_to_projectile(state.ammo_type),
-            damage: self.get_damage(),
-            penetration: self.get_penetration(),
         })
     }
 
@@ -279,20 +277,10 @@ impl Station {
         }
     }
 
-    fn get_damage(&self) -> f32 {
-        match self.config.station_type {
-            StationType::Gun => 100.0,
-            _ => 0.0,
-        }
-    }
-
-    fn get_penetration(&self) -> f32 {
-        match self.config.station_type {
-            StationType::Gun => 50.0,
-            _ => 0.0,
-        }
-    }
-
+    /// Bug №193: the old `_ => Cannonball` swallowed ammo types 5 and 6, so a
+    /// loaded torpedo and a depth charge were both fired as a cannonball —
+    /// losing their 5000 and 300 damage, their guidance and their fuse. The
+    /// numbering follows `ProjectileType`, which the shell types already used.
     fn ammo_type_to_projectile(&self, ammo_type: u8) -> rfs_core::packet::ProjectileType {
         match ammo_type {
             0 => rfs_core::packet::ProjectileType::Cannonball,
@@ -300,6 +288,8 @@ impl Station {
             2 => rfs_core::packet::ProjectileType::ArmorPiercing,
             3 => rfs_core::packet::ProjectileType::ChainShot,
             4 => rfs_core::packet::ProjectileType::GrapeShot,
+            5 => rfs_core::packet::ProjectileType::Torpedo,
+            6 => rfs_core::packet::ProjectileType::DepthCharge,
             _ => rfs_core::packet::ProjectileType::Cannonball,
         }
     }
@@ -325,8 +315,20 @@ impl Station {
     }
 
     pub fn apply_damage(&self, state: &mut StationState, damage: f32) {
+        // Bug №194: `f32::clamp` asserts min <= max, so a template with a
+        // negative `max_health` (it comes straight out of JSON) aborted the
+        // process instead of merely misbehaving. Same guard shape as
+        // `Ship::apply_health_damage`.
+        if !damage.is_finite() {
+            return;
+        }
+        let max = if state.max_health.is_finite() && state.max_health > 0.0 {
+            state.max_health
+        } else {
+            1.0
+        };
         // Clamped both ways: negative damage must not overheal above max.
-        state.health = (state.health - damage).clamp(0.0, state.max_health);
+        state.health = (state.health - damage).clamp(0.0, max);
         if state.health <= 0.0 {
             state.is_operational = false;
             state.occupant = None;
@@ -367,8 +369,10 @@ pub struct FireResult {
     pub direction: Vec3f,
     pub velocity: Vec3f,
     pub projectile_type: rfs_core::packet::ProjectileType,
-    pub damage: f32,
-    pub penetration: f32,
+    // Bug №193: `damage` and `penetration` used to be hardcoded per station
+    // type here, which is why a torpedo's declared 5000 never applied. They
+    // moved to `ProjectileConfig::for_type`, so the projectile type carries
+    // the numbers and there is a single answer per type.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,4 +380,79 @@ pub enum DefaultBehavior {
     Active,
     Passive,
     Disabled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rfs_core::entity::ProjectileType;
+
+    fn station() -> Station {
+        Station::new(
+            EntityId::new(2001),
+            EntityId::new(1),
+            StationTemplate {
+                name: "main gun".into(),
+                station_type: StationType::Gun,
+                compartment_name: "bridge".into(),
+                local_transform: Transform::from_position(Vec3f::ZERO),
+                max_health: 50.0,
+                max_ammo: 10,
+                default_ammo_type: 0,
+                cooldown: 1.0,
+                yaw_range: (-90.0, 90.0),
+                pitch_range: (-30.0, 30.0),
+            },
+        )
+    }
+
+    /// Bug №193: the old mapping had no arm for ammo 5 and 6, and its `_` arm
+    /// turned both into a cannonball. A loaded torpedo was fired as a 100
+    /// damage cannonball, losing its 5000 damage, its guidance and its fuse.
+    #[test]
+    fn torpedo_and_depth_charge_survive_the_ammo_mapping() {
+        let s = station();
+        assert_eq!(
+            s.ammo_type_to_projectile(5),
+            ProjectileType::Torpedo,
+            "ammo 5 was fired as something other than a torpedo"
+        );
+        assert_eq!(
+            s.ammo_type_to_projectile(6),
+            ProjectileType::DepthCharge,
+            "ammo 6 was fired as something other than a depth charge"
+        );
+    }
+
+    /// Every declared ammo type must map to the matching projectile, so the
+    /// type that reaches `ProjectileConfig::for_type` is the one that was
+    /// loaded.
+    #[test]
+    fn every_ammo_type_maps_to_its_own_projectile() {
+        let s = station();
+        let expected = [
+            (0u8, ProjectileType::Cannonball),
+            (1, ProjectileType::ExplosiveShell),
+            (2, ProjectileType::ArmorPiercing),
+            (3, ProjectileType::ChainShot),
+            (4, ProjectileType::GrapeShot),
+            (5, ProjectileType::Torpedo),
+            (6, ProjectileType::DepthCharge),
+        ];
+        for (ammo, projectile) in expected {
+            assert_eq!(
+                s.ammo_type_to_projectile(ammo),
+                projectile,
+                "ammo {ammo} mapped to the wrong projectile"
+            );
+        }
+    }
+
+    /// The old mapping could not represent this at all, so nothing tested it.
+    #[test]
+    fn an_explosive_shell_keeps_a_blast_radius() {
+        // ExplosiveShell is 1; its config declares a 10.0 blast. If the type is
+        // right, `for_type` will hand back a non-zero radius.
+        assert_eq!(station().ammo_type_to_projectile(1), ProjectileType::ExplosiveShell);
+    }
 }

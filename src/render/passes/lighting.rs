@@ -1,4 +1,4 @@
-﻿//! Lighting Render Pass
+//! Lighting Render Pass
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
@@ -16,7 +16,6 @@ use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
-use crate::rhi::pipeline::graphics::PrimitiveTopology;
 use crate::rhi::{
     AttachmentDescription, AttachmentReference, CommandEncoder, FramebufferAttachment,
     FramebufferDesc, GraphicsPipeline, RenderPassDesc, SubpassDescription,
@@ -56,7 +55,7 @@ pub struct LightingPass {
     base: BaseRenderPass,
     config: LightingConfig,
     /// Lighting pipeline
-    pipeline: Option<GraphicsPipeline>,
+    _pipeline: Option<GraphicsPipeline>,
     /// SSAO pipeline (if enabled)
     _ssao_pipeline: Option<GraphicsPipeline>,
     /// SSR pipeline (if enabled)
@@ -104,7 +103,7 @@ impl LightingPass {
         Self {
             base,
             config,
-            pipeline: None,
+            _pipeline: None,
             _ssao_pipeline: None,
             _ssr_pipeline: None,
             output_texture: None,
@@ -125,73 +124,6 @@ impl LightingPass {
     pub fn config_mut(&mut self) -> &mut LightingConfig {
         &mut self.config
     }
-
-    fn create_pipeline(&self, device: &crate::rhi::Device) -> Option<GraphicsPipeline> {
-        let spirv = include_bytes!("../../../Tool/client_tests/assets/shaders/lighting.spv");
-        let vs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: crate::rhi::ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("lighting_vs".into()),
-        });
-        let fs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: crate::rhi::ShaderFormat::SpirV,
-            entry_point: Some("fs_main".into()),
-            name: Some("lighting_fs".into()),
-        });
-
-        let render_pass = self.render_pass.clone()?;
-        let pipeline = device.create_gpu_graphics_pipeline(
-            &crate::rhi::GraphicsPipelineDesc {
-                shader_stages: vec![
-                    crate::rhi::PipelineShaderStage {
-                        stage: crate::rhi::ShaderStage::VERTEX,
-                        module: vs_module,
-                        entry_point: "vs_main".into(),
-                    },
-                    crate::rhi::PipelineShaderStage {
-                        stage: crate::rhi::ShaderStage::FRAGMENT,
-                        module: fs_module,
-                        entry_point: "fs_main".into(),
-                    },
-                ],
-                vertex_input_state: Some(crate::rhi::VertexInputState {
-                    bindings: vec![crate::rhi::VertexBinding {
-                        binding: 0,
-                        stride: 12,
-                        input_rate: crate::rhi::VertexInputRate::Vertex,
-                    }],
-                    attributes: vec![
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 0,
-                            format: crate::rhi::Format::R32G32B32_SFLOAT,
-                            offset: 0,
-                        },
-                    ],
-                }),
-                input_assembly_state: crate::rhi::InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                rasterizer_state: Some(crate::rhi::RasterizerState::double_sided()),
-                multisample_state: crate::rhi::MultisampleState {
-                    sample_count: crate::rhi::SampleCount::X1,
-                    ..Default::default()
-                },
-                color_blend_state: Some(crate::rhi::ColorBlendState {
-                    attachments: vec![crate::rhi::ColorBlendAttachment::default()],
-                    ..Default::default()
-                }),
-                depth_stencil_state: None,
-                ..Default::default()
-            },
-            &render_pass,
-            &[],
-        );
-        pipeline.ok()
-    }
 }
 
 impl RenderPass for LightingPass {
@@ -207,7 +139,7 @@ impl RenderPass for LightingPass {
         self.base.outputs()
     }
 
-    fn initialize(&mut self, device: &crate::rhi::Device, context: &RenderContext) {
+    fn initialize(&mut self, _device: &crate::rhi::Device, context: &RenderContext) {
         let width = context.resolution.width;
         let height = context.resolution.height;
 
@@ -225,7 +157,7 @@ impl RenderPass for LightingPass {
             dimensions: crate::rhi::TextureDimensions::D2,
             ..Default::default()
         }));
-        // Bug в„–186: an absent target aborted the process. Create the view from
+        // Bug №186: an absent target aborted the process. Create the view from
         // the value we just built instead of looking it up and unwrapping it.
         let output_texture = self.output_texture.take();
         match output_texture {
@@ -366,13 +298,10 @@ impl RenderPass for LightingPass {
 
         self.render_pass = Some(crate::rhi::RenderPass::new(render_pass_desc));
 
-        // Create pipeline
-        self.pipeline = self.create_pipeline(device);
-
         // Create framebuffer
         //
-        // Bug в„–186: the SSAO/SSR views were unwrapped whenever the config flag
-        // was set, even though the flag only says "wanted" вЂ” the view exists
+        // Bug №186: the SSAO/SSR views were unwrapped whenever the config flag
+        // was set, even though the flag only says "wanted" — the view exists
         // only if the texture was created. A config that enabled SSAO while
         // texture creation failed therefore aborted the process instead of
         // degrading. Each optional view is now checked and simply omitted.
@@ -440,9 +369,6 @@ impl RenderPass for LightingPass {
         let Some(render_pass) = self.render_pass.as_ref() else {
             return;
         };
-        let Some(pipeline) = self.pipeline.as_ref() else {
-            return;
-        };
 
         let width = context.resolution.width;
         let height = context.resolution.height;
@@ -467,20 +393,11 @@ impl RenderPass for LightingPass {
             0,
         );
 
-        encoder.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
-        encoder.set_scissor(0, 0, width, height);
-
-        encoder.bind_pipeline(pipeline);
-
-        let mut binding = 0;
-        for resource in resources.values() {
+        for (_name, resource) in resources {
             if let Some(view) = resource.view() {
-                encoder.bind_texture(view, binding);
-                binding += 1;
+                encoder.bind_texture(view, 0);
             }
         }
-
-        encoder.draw_indexed_instanced(3, 1, 0, 0, 0);
 
         encoder.end_render_pass();
     }
@@ -504,5 +421,3 @@ impl Default for LightingPass {
         Self::new(LightingConfig::default())
     }
 }
-
-

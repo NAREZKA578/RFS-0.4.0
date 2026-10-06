@@ -6,7 +6,6 @@ mod convert;
 mod device;
 mod instance;
 mod memory;
-mod pipeline_cache;
 mod present;
 mod record;
 

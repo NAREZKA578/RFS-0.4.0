@@ -78,7 +78,15 @@ fn run() -> RhiResult<()> {
     // The window argument is unused by `new`: the surface is attached afterwards
     // from the handles, because a window is not always available (tests and
     // offscreen rendering never have one).
-    let mut renderer = Renderer::new(std::ptr::null_mut(), RhiConfig::default())?;
+    let mut renderer = Renderer::new(
+        std::ptr::null_mut(),
+        RhiConfig {
+            // Validation names the exact Vulkan misuse *before* it turns into an
+            // access violation, which a bare crash report never will.
+            validation: true,
+            ..RhiConfig::default()
+        },
+    )?;
     let size = window.inner_size();
     renderer.attach_presentation(
         hinstance,
@@ -158,9 +166,25 @@ fn run() -> RhiResult<()> {
                         // and a rebuild is a Vulkan call, not a repaint.
                         renderer.resize(size.width.max(1), size.height.max(1));
                     }
+                    // Going fullscreen changes the scale factor as well as the
+                    // size, and winit delivers that separately from `Resized`.
+                    // Without this the chain is rebuilt for the new pixel size
+                    // but every coordinate in the frame is still divided by the
+                    // old scale factor, so the image is stretched or cropped.
+                    winit::event::WindowEvent::ScaleFactorChanged { .. } => {
+                        let size = window.inner_size();
+                        renderer.resize(size.width.max(1), size.height.max(1));
+                    }
                     _ => {}
                 },
                 winit::event::Event::AboutToWait => {
+                    // A minimised window reports a zero-sized swapchain. Acquiring
+                    // or presenting there is not a valid Vulkan operation, so the
+                    // frame has to be skipped until the window is restored. The
+                    // angle is recomputed from the clock below, so nothing is
+                    // "lost" while the window is hidden.
+                    let extent = renderer.presentation_extent();
+                    if extent.width != 0 && extent.height != 0 {
                     // The cube turns, so a stuck submit is visible as a frozen
                     // picture rather than passing for a static scene.
                     let angle = (start.elapsed().as_secs_f32() / TURN_SECONDS)
@@ -174,14 +198,9 @@ fn run() -> RhiResult<()> {
                         glam::Vec3::ZERO,
                         glam::Vec3::Y,
                     );
-                    let extent = renderer.presentation_extent();
                     // The aspect ratio has to come from the live extent or the
                     // cube is stretched on any window that is not 16:9.
-                    let aspect = if extent.height == 0 {
-                        16.0 / 9.0
-                    } else {
-                        extent.width as f32 / extent.height as f32
-                    };
+                    let aspect = extent.width as f32 / extent.height as f32;
                     let projection =
                         glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, aspect, 0.1, 100.0);
                     // Skip the frame rather than draw it under the previous frame's matrix.
@@ -194,6 +213,11 @@ fn run() -> RhiResult<()> {
 
                     if uniforms_ok {
                         renderer.render_frame(&mut scene);
+                    } else {
+                        eprintln!(
+                            "[cube] update_uniforms failed -> frame skipped (no render_frame)"
+                        );
+                    }
                     }
                 }
                 _ => {}

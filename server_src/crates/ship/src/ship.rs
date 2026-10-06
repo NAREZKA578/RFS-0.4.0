@@ -2,7 +2,7 @@ use rfs_core::entity::{ShipClass, CompartmentTemplate, StationTemplate, StationT
 use rfs_core::math::{Vec3f, Transform, Quatf, Bounds as CoreBounds};
 use crate::station::{FireResult, Station, StationState};
 use crate::compartment::{Compartment, CompartmentState, WaterTransfer};
-use rfs_damage::damage::{CompartmentHit, DamageSystem, DamageTarget};
+use rfs_damage::damage::{CompartmentHit, DamageSystem, DamageTarget, StationHit};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -760,13 +760,25 @@ impl Ship {
         self.transform().transform_point(local_pos)
     }
 
+    /// Bug №244: this iterated a `HashMap` and returned the first hit. Where
+    /// compartment bounds overlap, the answer then depended on hash order —
+    /// different between runs and between platforms — so a hit, a shot and a
+    /// flood could be attributed to different compartments, and a report could
+    /// not be reproduced.
+    ///
+    /// Sorting by id makes the choice deterministic. Ids are assigned in
+    /// template order (`entity_id + 1000 + index`), so the tie-break is the
+    /// first compartment in the class file, which is predictable to a player.
+    /// `EntityId` derives no `Ord`, so the sort is on its public `u64` rather
+    /// than on the wrapper.
     pub fn get_compartment_at(&self, local_pos: Vec3f) -> Option<EntityId> {
-        for (id, comp) in &self.compartments {
-            if comp.bounds().contains(local_pos) {
-                return Some(*id);
-            }
-        }
-        None
+        let mut ids: Vec<EntityId> = self.compartments.keys().copied().collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.into_iter().find(|id| {
+            self.compartments
+                .get(id)
+                .is_some_and(|comp| comp.bounds().contains(local_pos))
+        })
     }
 
     /// Bug №272: record a hit for replication in the ship layer.
@@ -806,13 +818,16 @@ impl Ship {
         self.state.read().last_hit
     }
 
+    /// Bug №244, same defect as `get_compartment_at`: station bounds can overlap,
+    /// and the first match out of a `HashMap` was not a stable choice.
     pub fn get_station_at(&self, local_pos: Vec3f) -> Option<EntityId> {
-        for (id, station) in &self.stations {
-            if station.bounds().contains(local_pos) {
-                return Some(*id);
-            }
-        }
-        None
+        let mut ids: Vec<EntityId> = self.stations.keys().copied().collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.into_iter().find(|id| {
+            self.stations
+                .get(id)
+                .is_some_and(|station| station.bounds().contains(local_pos))
+        })
     }
 
     pub fn total_water_volume(&self) -> f32 {
@@ -843,6 +858,31 @@ impl DamageTarget for Ship {
             .collect()
     }
 
+    /// Bug №194: stations are reachable by a blast now. They are reported
+    /// separately from compartments because they carry no water and no
+    /// bulkhead edges, so adding them to the flooding graph would fabricate
+    /// capacity for a gun mount.
+    fn station_hits(&self) -> Vec<StationHit> {
+        self.stations
+            .values()
+            .map(|st| StationHit {
+                entity_id: st.entity_id(),
+                name: st.config().compartment_name.clone(),
+                bounds: st.bounds(),
+            })
+            .collect()
+    }
+
+    fn apply_station_damage(&self, station_id: EntityId, damage: f32, _position: Vec3f) {
+        let Some(station) = self.stations.get(&station_id) else {
+            return;
+        };
+        let mut state = self.state.write();
+        if let Some(ss) = state.station_states.get_mut(&station_id) {
+            station.apply_damage(ss, damage);
+        }
+    }
+
     fn apply_health_damage(&self, amount: f32) {
         // NaN/negative guards: NaN damage must not poison health, negative
         // max_health must not panic clamp (min>max).
@@ -859,7 +899,13 @@ impl DamageTarget for Ship {
             state.health = max;
         }
         state.health = (state.health - amount).clamp(0.0, max);
-        if state.health <= 0.0 {
+        // Bug №191: this guard used to be absent, so every further hit on an
+        // already-sinking ship reset `sink_timer` to 30. While damage kept
+        // landing the timer could never reach zero, `has_sunk` was never set,
+        // and the wreck stayed in the simulation forever — colliding,
+        // replicating, and keeping its crew aboard. `check_sinking` already had
+        // the `!is_sinking` guard; this path did not.
+        if state.health <= 0.0 && !state.is_sinking {
             state.is_sinking = true;
             state.sink_timer = 30.0;
         }
@@ -974,5 +1020,353 @@ impl From<&Ship> for ShipSnapshot {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rfs_damage::DamageSystem;
+
+    fn ship(max_health: f32) -> Ship {
+        let cfg = ShipConfig {
+            max_health,
+            ..Default::default()
+        };
+        Ship::new(cfg, EntityId::new(1), Arc::new(DamageSystem::new()))
+    }
+
+    /// One compartment holding a single gun mount, so a blast has something
+    /// to destroy.
+    fn ship_with_station() -> (Ship, EntityId) {
+        let cfg = ShipConfig {
+            max_health: 1000.0,
+            compartments: vec![CompartmentTemplate {
+                name: "bridge".into(),
+                local_bounds: CoreBounds::new(
+                    Vec3f::new(-5.0, -5.0, -5.0),
+                    Vec3f::new(5.0, 5.0, 5.0),
+                ),
+                max_water_level: 100.0,
+                pump_capacity: 5.0,
+                connected_compartments: Vec::new(),
+                bulkheads: Vec::new(),
+                stations: vec!["main gun".into()],
+            }],
+            stations: vec![StationTemplate {
+                name: "main gun".into(),
+                station_type: StationType::Gun,
+                compartment_name: "bridge".into(),
+                local_transform: Transform::from_position(Vec3f::ZERO),
+                max_health: 50.0,
+                max_ammo: 10,
+                default_ammo_type: 0,
+                cooldown: 1.0,
+                yaw_range: (-90.0, 90.0),
+                pitch_range: (-30.0, 30.0),
+            }],
+            ..Default::default()
+        };
+        // Station ids are derived from the ship id (+2000+index).
+        let ship = Ship::new(cfg, EntityId::new(1), Arc::new(DamageSystem::new()));
+        (ship, EntityId::new(2001))
+    }
+
+    /// Bug №194: `Station::apply_damage` had no caller, so a station could
+    /// never be destroyed — `is_operational` and `occupant` never cleared and
+    /// the gun fired forever.
+    #[test]
+    fn a_blast_can_destroy_a_station() {
+        let (s, station_id) = ship_with_station();
+        let before = s.get_state();
+        let station = before.station_states.get(&station_id).expect("no station");
+        assert!(station.is_operational, "the fixture station is not operational");
+        assert!(station.health > 0.0);
+
+        s.apply_damage(10_000.0, Vec3f::new(1.0, 0.0, 0.0));
+
+        let after = s.get_state();
+        let station = after.station_states.get(&station_id).expect("station vanished");
+        assert!(
+            !station.is_operational,
+            "a direct hit left the station operational"
+        );
+        assert!(station.health <= 0.0, "the station kept health after a huge hit");
+        assert!(station.occupant.is_none(), "a destroyed station kept its crew");
+    }
+
+    /// The falloff has to apply to stations too: a blast far away must not
+    /// reach a gun that a near one destroys.
+    #[test]
+    fn station_damage_obeys_the_falloff() {
+        let (near_ship, station_id) = ship_with_station();
+        near_ship.apply_damage(60.0, Vec3f::new(1.0, 0.0, 0.0));
+        assert!(
+            !near_ship.get_state().station_states[&station_id].is_operational,
+            "a 50-health station survived 60 damage at point blank"
+        );
+
+        // Same damage, far outside max_damage_radius (12.0).
+        let (far_ship, far_station) = ship_with_station();
+        far_ship.apply_damage(60.0, Vec3f::new(900.0, 900.0, 900.0));
+        let s = far_ship.get_state().station_states[&far_station].clone();
+        assert!(s.is_operational, "a station was hit from 1500 units away");
+        assert_eq!(s.health, 50.0, "a distant blast damaged the station");
+    }
+
+    /// Bug №194 secondary: a template with a negative `max_health` used to
+    /// abort the process in `f32::clamp`, because clamp asserts min <= max.
+    #[test]
+    fn a_negative_station_max_health_does_not_panic() {
+        let cfg = ShipConfig {
+            max_health: 100.0,
+            stations: vec![StationTemplate {
+                name: "bad gun".into(),
+                station_type: StationType::Gun,
+                compartment_name: String::new(),
+                local_transform: Transform::from_position(Vec3f::ZERO),
+                max_health: -10.0,
+                max_ammo: 10,
+                default_ammo_type: 0,
+                cooldown: 1.0,
+                yaw_range: (-90.0, 90.0),
+                pitch_range: (-30.0, 30.0),
+            }],
+            ..Default::default()
+        };
+        let s = Ship::new(cfg, EntityId::new(1), Arc::new(DamageSystem::new()));
+        let station_id = EntityId::new(2001);
+
+        // Must not panic, and must not report a bogus negative health.
+        s.apply_damage(100_000.0, Vec3f::new(1.0, 0.0, 0.0));
+        let st = s.get_state().station_states[&station_id].clone();
+        assert!(st.health >= 0.0, "health went negative: {}", st.health);
+        assert!(!st.health.is_nan(), "health became NaN");
+    }
+
+    /// Stations must not leak into the flooding graph: they hold no water, so
+    /// reporting them as compartments would fabricate capacity and bulkhead
+    /// edges for a gun mount.
+    #[test]
+    fn stations_are_not_treated_as_floodable_compartments() {
+        let (s, station_id) = ship_with_station();
+        let hits = DamageTarget::compartment_hits(&s);
+        assert!(
+            !hits.iter().any(|h| h.entity_id == station_id),
+            "a station was reported as a water compartment"
+        );
+        // It must be reachable as a station, though.
+        assert!(
+            DamageTarget::station_hits(&s).iter().any(|h| h.entity_id == station_id),
+            "the station is not in the blast path either, so it is now invulnerable"
+        );
+    }
+
+    /// `apply_health_damage` is a trait method, so it is reached the same way
+    /// the damage system reaches it.
+    fn hurt(s: &Ship, amount: f32) {
+        DamageTarget::apply_health_damage(s, amount);
+    }
+
+    /// Runs `n` ticks of one second, which is what drains `sink_timer`.
+    ///
+    /// `update` takes the state as a parameter rather than mutating the ship's
+    /// own copy, so each tick is written back with `apply_state`. Without that,
+    /// damage applied between ticks would read a timer that never advanced.
+    fn tick(s: &Ship, n: usize) -> ShipState {
+        let mut state = s.get_state();
+        for _ in 0..n {
+            s.update(1.0, &mut state);
+            s.apply_state(state.clone());
+        }
+        state
+    }
+
+    /// Bug №244: compartment bounds can overlap, and the old lookup returned the
+    /// first match out of a `HashMap`, so the result varied between runs. A
+    /// point inside every compartment is the worst case, because every entry
+    /// matches.
+    #[test]
+    fn an_overlapping_point_always_resolves_to_the_same_compartment() {
+        let overlapping = CompartmentTemplate {
+            name: "bridge".into(),
+            // Every compartment covers the same box, so the point is ambiguous.
+            local_bounds: CoreBounds::new(Vec3f::new(-5.0, -5.0, -5.0), Vec3f::new(5.0, 5.0, 5.0)),
+            max_water_level: 100.0,
+            pump_capacity: 5.0,
+            connected_compartments: Vec::new(),
+            bulkheads: Vec::new(),
+            stations: Vec::new(),
+        };
+        let cfg = ShipConfig {
+            max_health: 1000.0,
+            compartments: vec![
+                overlapping.clone(),
+                overlapping.clone(),
+                overlapping.clone(),
+                overlapping.clone(),
+            ],
+            ..Default::default()
+        };
+
+        // Many independently built ships, so each gets its own hash seed and
+        // its own iteration order.
+        let mut answers = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let s = Ship::new(cfg.clone(), EntityId::new(1), Arc::new(DamageSystem::new()));
+            answers.insert(s.get_compartment_at(Vec3f::ZERO));
+        }
+
+        assert_eq!(
+            answers.len(),
+            1,
+            "an ambiguous point resolved to different compartments across runs: {:?}",
+            answers.len()
+        );
+    }
+
+    /// The tie-break is the lowest id, which is template order — so the answer is
+    /// also the one a player could predict, not merely a stable one.
+    #[test]
+    fn overlapping_compartments_resolve_to_the_first_in_template_order() {
+        let overlapping = CompartmentTemplate {
+            name: "same".into(),
+            local_bounds: CoreBounds::new(Vec3f::new(-5.0, -5.0, -5.0), Vec3f::new(5.0, 5.0, 5.0)),
+            max_water_level: 100.0,
+            pump_capacity: 5.0,
+            connected_compartments: Vec::new(),
+            bulkheads: Vec::new(),
+            stations: Vec::new(),
+        };
+        let cfg = ShipConfig {
+            max_health: 1000.0,
+            compartments: vec![overlapping.clone(), overlapping.clone(), overlapping],
+            ..Default::default()
+        };
+        let s = Ship::new(cfg, EntityId::new(1), Arc::new(DamageSystem::new()));
+
+        // Compartment ids start at ship_id + 1000 and follow template order.
+        assert_eq!(
+            s.get_compartment_at(Vec3f::ZERO),
+            Some(EntityId::new(1001)),
+            "an ambiguous point did not resolve to the first compartment"
+        );
+    }
+
+    /// Sanity check on the fix itself: a point outside every box still finds
+    /// nothing, so sorting did not turn "no match" into "some match".
+    #[test]
+    fn a_point_outside_every_compartment_still_finds_nothing() {
+        let cfg = ShipConfig {
+            max_health: 1000.0,
+            compartments: vec![CompartmentTemplate {
+                name: "bridge".into(),
+                local_bounds: CoreBounds::new(Vec3f::new(-5.0, -5.0, -5.0), Vec3f::new(5.0, 5.0, 5.0)),
+                max_water_level: 100.0,
+                pump_capacity: 5.0,
+                connected_compartments: Vec::new(),
+                bulkheads: Vec::new(),
+                stations: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let s = Ship::new(cfg, EntityId::new(1), Arc::new(DamageSystem::new()));
+        assert_eq!(s.get_compartment_at(Vec3f::new(500.0, 0.0, 0.0)), None);
+    }
+
+    /// Bug №191: every further hit on a sinking ship used to reset
+    /// `sink_timer` to 30, so a ship that kept taking fire never finished
+    /// sinking. `has_sunk` stayed false, the sim never despawned the wreck, and
+    /// it went on colliding, replicating and holding its crew.
+    #[test]
+    fn more_damage_does_not_restart_the_sinking_timer() {
+        let s = ship(100.0);
+        hurt(&s, 500.0);
+
+        let started = s.get_state();
+        assert!(started.is_sinking, "the ship did not start sinking");
+        assert!((started.sink_timer - 30.0).abs() < 1e-4, "timer {}", started.sink_timer);
+
+        // Ten seconds of sinking: ten seconds should be gone from the timer.
+        let mid = tick(&s, 10);
+        assert!(mid.is_sinking);
+        assert!(
+            (mid.sink_timer - 20.0).abs() < 1e-3,
+            "expected 20s left after 10s, got {}",
+            mid.sink_timer
+        );
+
+        // Another hit lands while it is still sinking. Health is already 0, so
+        // there is nothing left to take, and the timer must not be rearmed.
+        hurt(&s, 10.0);
+
+        let after = s.get_state();
+        assert!(
+            (after.sink_timer - 20.0).abs() < 1e-3,
+            "a hit rearmed the sinking timer to {}",
+            after.sink_timer
+        );
+    }
+
+    /// The end-to-end consequence: a sinking ship that keeps being hit must still
+    /// reach `has_sunk`, so the sim can despawn it.
+    ///
+    /// The order matters. Each round advances a real tick first, then applies a
+    /// hit, and reads the ship's own state back. An earlier version ticked a
+    /// local copy and applied damage to the ship, so the write-back overwrote
+    /// the rearm and the test passed even with the bug present — it was
+    /// asserting nothing.
+    #[test]
+    fn a_sinking_ship_still_finishes_sinking_while_under_fire() {
+        let s = ship(100.0);
+        hurt(&s, 500.0);
+
+        let mut sunk = false;
+        // 35 seconds of fire. With the bug the timer is rearmed to 30 on every
+        // hit and never reaches zero inside this window.
+        for _ in 0..35 {
+            tick(&s, 1);
+            hurt(&s, 1.0);
+            if s.get_state().has_sunk {
+                sunk = true;
+                break;
+            }
+        }
+
+        assert!(sunk, "the wreck never finished sinking under continuous fire");
+    }
+
+    /// A ship that is not sinking must be unaffected by the new guard, and a
+    /// single killing blow must still arm the timer.
+    #[test]
+    fn the_first_killing_blow_arms_the_timer() {
+        let s = ship(100.0);
+        hurt(&s, 40.0);
+        let alive = s.get_state();
+        assert!(!alive.is_sinking, "a damaged but living ship started sinking");
+        assert_eq!(alive.sink_timer, 0.0);
+
+        hurt(&s, 80.0);
+        let dead = s.get_state();
+        assert!(dead.is_sinking);
+        assert!((dead.sink_timer - 30.0).abs() < 1e-4);
+        assert!(dead.health <= 0.0);
+    }
+
+    /// Once sunk, the state must not be re-armed by later damage either.
+    #[test]
+    fn a_sunk_ship_is_not_resurrected_into_sinking() {
+        let s = ship(100.0);
+        hurt(&s, 500.0);
+        let mut state = s.get_state();
+        for _ in 0..31 {
+            s.update(1.0, &mut state);
+            s.apply_state(state.clone());
+        }
+        assert!(state.has_sunk, "the ship did not sink in 31 seconds");
+
+        hurt(&s, 50.0);
+        let after = s.get_state();
+        assert!(after.has_sunk, "a late hit cleared has_sunk");
     }
 }

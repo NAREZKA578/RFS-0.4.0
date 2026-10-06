@@ -34,11 +34,38 @@ pub struct CompartmentHit {
     pub pump_capacity: f32,
 }
 
+/// A damageable station inside a compartment (Bug №194).
+///
+/// Stations are deliberately not `CompartmentHit`: they hold no water and have
+/// no bulkhead edges, so feeding them to the flooding graph would invent
+/// capacity and edges for something that is only a gun mount.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationHit {
+    pub entity_id: EntityId,
+    pub name: String,
+    pub bounds: Bounds,
+}
+
 pub trait DamageTarget {
     fn entity_id(&self) -> EntityId;
     fn compartment_hits(&self) -> Vec<CompartmentHit>;
     fn apply_health_damage(&self, amount: f32);
     fn apply_compartment_damage(&self, compartment_id: EntityId, damage: f32, position: Vec3f);
+
+    /// Stations that a blast can reach.
+    ///
+    /// Bug №194: `Station::apply_damage` had no caller anywhere in the server,
+    /// so a station's `is_operational = false` and `occupant = None` branches
+    /// were unreachable, the early exit in `Station::update` was dead, and
+    /// guns could never be destroyed. Defaulted so existing targets keep
+    /// compiling.
+    fn station_hits(&self) -> Vec<StationHit> {
+        Vec::new()
+    }
+
+    /// Applies blast damage to one station. Defaulted to a no-op for the same
+    /// reason.
+    fn apply_station_damage(&self, _station_id: EntityId, _damage: f32, _position: Vec3f) {}
 }
 
 pub struct DamageSystem {
@@ -174,6 +201,19 @@ impl DamageSystem {
             }
         }
 
+        // Bug №194: stations used to be invisible to the blast. They are kept
+        // out of the flooding graph on purpose — no water capacity, no edges —
+        // so they get their own pass with the same falloff curve. Without this
+        // a station could never be destroyed and its gun fired forever.
+        for station in target.station_hits() {
+            let distance = distance_to_bounds(position, &station.bounds);
+            let damage_dealt = damage * self.falloff(distance) * self.config.direct_damage_multiplier;
+            if damage_dealt <= 0.0 {
+                continue;
+            }
+            target.apply_station_damage(station.entity_id, damage_dealt, position);
+        }
+
         // Bug №65: the hull took the FULL blast regardless of falloff — a
         // far-edge hit dealt 0 to every compartment and 100 to the hull.
         // Hull damage now scales with the best factor seen by any compartment.
@@ -247,22 +287,174 @@ impl DamageSystem {
 /// Distance from a point to the nearest point of an axis-aligned box
 /// (Bug №65). If the point is inside the box the distance is 0.
 fn distance_to_bounds(point: Vec3f, bounds: &Bounds) -> f32 {
-    // Safe clamp: inverted Bounds (min>max) from bad templates must not panic.
-    fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
-        if !v.is_finite() {
-            return 0.0;
-        }
-        if !lo.is_finite() || !hi.is_finite() || lo > hi {
-            return v;
-        }
-        v.clamp(lo, hi)
-    }
+    // Bug №199: an inverted axis used to clamp to nothing and so contribute a
+    // distance of zero, which made the blast distance collapse to 0 and
+    // `falloff(0.0)` to 1.0 — full damage from any point on the ship.
+    //
+    // `Bounds::new` orders the axes for every construction site, but `Bounds`
+    // is `Serialize`/`Deserialize` with public fields, so a box can still
+    // arrive from the wire. Re-order here as well: the sink does not assume
+    // the source normalized.
+    let bounds = bounds.normalized();
+    // Bug №65: inverted bounds must not panic. Lives in `finite` so every call
+    // site shares one implementation.
+    use crate::finite::safe_clamp;
     let clamped = Vec3f::new(
         safe_clamp(point.x, bounds.min.x, bounds.max.x),
         safe_clamp(point.y, bounds.min.y, bounds.max.y),
         safe_clamp(point.z, bounds.min.z, bounds.max.z),
     );
     clamped.distance(point)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Records what the blast actually did, so the assertions are made on dealt
+    /// damage rather than on the falloff helper in isolation.
+    struct RecordingShip {
+        hull_damage: RefCell<f32>,
+        compartment_damage: RefCell<Vec<(EntityId, f32)>>,
+        bounds: Bounds,
+    }
+
+    impl RecordingShip {
+        fn new(bounds: Bounds) -> Self {
+            Self {
+                hull_damage: RefCell::new(0.0),
+                compartment_damage: RefCell::new(Vec::new()),
+                bounds,
+            }
+        }
+
+        fn hull(&self) -> f32 {
+            *self.hull_damage.borrow()
+        }
+
+        fn compartment_total(&self) -> f32 {
+            self.compartment_damage.borrow().iter().map(|(_, d)| *d).sum()
+        }
+    }
+
+    impl DamageTarget for RecordingShip {
+        fn entity_id(&self) -> EntityId {
+            EntityId::new(1)
+        }
+
+        fn compartment_hits(&self) -> Vec<CompartmentHit> {
+            vec![CompartmentHit {
+                entity_id: EntityId::new(10),
+                name: "engine room".into(),
+                bounds: self.bounds,
+                max_water_level: 100.0,
+                pump_capacity: 5.0,
+            }]
+        }
+
+        fn apply_health_damage(&self, amount: f32) {
+            *self.hull_damage.borrow_mut() += amount;
+        }
+
+        fn apply_compartment_damage(&self, compartment_id: EntityId, damage: f32, _pos: Vec3f) {
+            // The trait takes `&self`, so the log sits behind a RefCell.
+            self.compartment_damage
+                .borrow_mut()
+                .push((compartment_id, damage));
+        }
+    }
+
+    /// A compartment box spanning x/y 0..10 and sitting at z 0..2.
+    fn compartment_bounds() -> Bounds {
+        Bounds::new(Vec3f::new(0.0, 0.0, 0.0), Vec3f::new(10.0, 10.0, 2.0))
+    }
+
+    /// The blast position that actually exposes Bug №199: it lies **inside** the
+    /// compartment on x and y but far away on z. With z inverted the clamp on z
+    /// does nothing, so z contributes a distance of zero, x and y contribute
+    /// zero, and the measured distance collapses to exactly 0 — which
+    /// `falloff(0.0)` scores as 1.0, full damage.
+    ///
+    /// A blast far away on *all* axes does not expose it: the two sound axes
+    /// then supply a large real distance on their own. That is why the obvious
+    /// "distant blast" version of this test passed even with the bug present.
+    fn blast_along_the_inverted_axis() -> Vec3f {
+        Vec3f::new(5.0, 5.0, 500.0)
+    }
+
+    /// A box with z corners swapped, built as a struct literal so `Bounds::new`
+    /// does not silently repair it — this stands in for data that arrived
+    /// malformed from the wire or from a direct field write.
+    fn inverted_bounds() -> Bounds {
+        let b = Bounds {
+            min: Vec3f::new(0.0, 0.0, 2.0),
+            max: Vec3f::new(10.0, 10.0, 0.0),
+        };
+        assert!(b.is_inverted(), "the fixture is not actually inverted");
+        b
+    }
+
+    /// Bug №199: an inverted axis collapsed the measured distance to 0, so a
+    /// blast from 500 units away dealt full hull damage. Asserted end to end
+    /// through the real `DamageTarget`, not on the helper alone.
+    #[test]
+    fn an_inverted_compartment_axis_does_not_make_every_blast_full_damage() {
+        let sys = DamageSystem::new();
+
+        // The well-formed box: this blast is far outside it, scaled away to none.
+        let good = RecordingShip::new(compartment_bounds());
+        sys.apply_damage_to_ship(&good, blast_along_the_inverted_axis(), 100.0);
+        let good_hull = good.hull();
+        assert_eq!(good_hull, 0.0, "a far blast reached a sound compartment box");
+
+        // The malformed box must behave identically.
+        let bad = RecordingShip::new(inverted_bounds());
+        sys.apply_damage_to_ship(&bad, blast_along_the_inverted_axis(), 100.0);
+        assert_eq!(
+            bad.hull(),
+            good_hull,
+            "an inverted axis turned a far blast into full hull damage: {}",
+            bad.hull()
+        );
+        assert_eq!(
+            bad.compartment_total(),
+            0.0,
+            "an inverted axis dealt compartment damage from 500 units away"
+        );
+    }
+
+    /// The complementary case: a blast genuinely inside the compartment must
+    /// still deal full damage. Guards against over-correcting into "malformed
+    /// boxes are simply immune".
+    #[test]
+    fn a_blast_inside_the_compartment_still_hits_full() {
+        let sys = DamageSystem::new();
+        let ship = RecordingShip::new(inverted_bounds());
+
+        sys.apply_damage_to_ship(&ship, Vec3f::new(5.0, 5.0, 1.0), 100.0);
+
+        assert!(
+            ship.hull() > 99.0,
+            "a blast at the compartment centre dealt only {}",
+            ship.hull()
+        );
+    }
+
+    /// A well-formed box is untouched by the normalization: the fix must not
+    /// quietly change the distance a sound compartment reports.
+    #[test]
+    fn a_well_formed_compartment_box_is_unaffected() {
+        let bounds = compartment_bounds();
+        assert!(!bounds.is_inverted());
+        assert_eq!(
+            distance_to_bounds(Vec3f::new(5.0, 5.0, 1.0), &bounds),
+            0.0,
+            "a point inside the box is not at distance 0"
+        );
+        let d = distance_to_bounds(Vec3f::new(13.0, 5.0, 1.0), &bounds);
+        assert!((d - 3.0).abs() < 1e-4, "expected 3.0, got {d}");
+    }
 }
 
 impl Default for DamageSystem {

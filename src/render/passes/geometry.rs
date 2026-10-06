@@ -77,8 +77,27 @@ pub struct GeometryPassState {
     /// Which swapchain image `framebuffer` was built for, so it is rebuilt when
     /// the renderer acquires a different one or resizes the chain.
     pub framebuffer_image: Option<u32>,
-    pub width: u32,
-    pub height: u32,
+    /// The extent `framebuffer` was built for.
+    ///
+    /// Part of the cache key, and the reason this field exists. Keying the
+    /// rebuild on the image index alone looks sufficient and is not: after a
+    /// resize the renderer can acquire the same image number as last frame while
+    /// the chain has different dimensions, so the cached framebuffer is returned
+    /// with attachments sized for the previous window and nothing renders.
+    pub framebuffer_extent: Option<Extent2D>,
+    // There are deliberately no cached width/height fields used as the draw size.
+    //
+    // They used to exist, initialised to 0 and never assigned again, and the pass
+    // fed them to `render_area`, the viewport and the scissor every frame. The
+    // result was a pass that never knew what it was drawing into: the render area
+    // fell back to the framebuffer's real size (so the clear covered the image)
+    // while the viewport and scissor stayed zero-sized, which rasterised only a
+    // corner of the swapchain and left the rest as undefined memory.
+    //
+    // A size captured at creation time is wrong the moment the window is resized
+    // or moved to a display with a different scale factor, so the extent is read
+    // from the live context instead. Keeping it out of the state also makes the
+    // stale-size mistake impossible to reintroduce.
 }
 
 /// Uniform block layout, matching `geometry.wgsl`:
@@ -262,8 +281,7 @@ impl GeometryPass {
             framebuffer: None,
             framebuffer_pinned: false,
             framebuffer_image: None,
-            width: 0,
-            height: 0,
+            framebuffer_extent: None,
         }))
     }
 
@@ -303,7 +321,14 @@ impl GeometryPass {
         if state.framebuffer_pinned {
             return state.framebuffer.clone();
         }
-        if state.framebuffer_image == Some(context.swapchain_image_index) {
+        // The extent is part of the cache key, not just the image index: see
+        // `framebuffer_extent`. Without it, a resize that happens to reacquire
+        // the same image number returns a framebuffer whose attachments are still
+        // sized for the previous window.
+        let current_extent = context.presentation_extent;
+        if state.framebuffer_image == Some(context.swapchain_image_index)
+            && state.framebuffer_extent == Some(current_extent)
+        {
             return state.framebuffer.clone();
         }
         // Out of range until the renderer publishes presentation state, and
@@ -385,8 +410,7 @@ impl GeometryPass {
             Ok(framebuffer) => {
                 state.framebuffer = Some(framebuffer.clone());
                 state.framebuffer_image = Some(context.swapchain_image_index);
-                state.width = width;
-                state.height = height;
+                state.framebuffer_extent = Some(current_extent);
                 Some(framebuffer)
             }
             Err(e) => {
@@ -400,23 +424,28 @@ impl GeometryPass {
         self.state.clone()
     }
 
-    /// Point the pass at a specific framebuffer, and set the viewport.
+    /// Point the pass at a specific framebuffer.
     ///
     /// This is a pin: the pass keeps this framebuffer whatever image the
     /// renderer acquires. Pass `None` to hand control back to the acquired
     /// image, which is what a windowed run wants.
+    ///
+    /// `width` and `height` are accepted for call-site compatibility but ignored.
+    /// The viewport, scissor and render area now come from the live render
+    /// context every frame, because a size handed in here goes stale the moment
+    /// the window is resized or changes scale factor. Offscreen callers pass the
+    /// size of the framebuffer they built, which is what `context.resolution`
+    /// already reports.
     pub fn set_framebuffer(
         state: &SharedState,
         framebuffer: Option<Framebuffer>,
-        width: u32,
-        height: u32,
+        _width: u32,
+        _height: u32,
     ) {
         if let Ok(mut state) = state.lock() {
             state.framebuffer = framebuffer;
             state.framebuffer_pinned = true;
             state.framebuffer_image = None;
-            state.width = width;
-            state.height = height;
         }
     }
 
@@ -456,12 +485,16 @@ impl GeometryPass {
         data[20..24].copy_from_slice(&[1.0, 0.96, 0.9, 1.0]);
         data[24..28].copy_from_slice(&[0.18, 0.2, 0.24, 1.0]);
 
-        // A failed uniform upload leaves the previous frame's MVP on the GPU, which
+// A failed uniform upload leaves the previous frame's MVP on the GPU, which
         // would draw the mesh under the old camera. Report it rather than
         // letting the frame go out with transforms nobody asked for.
-        device
-            .upload_buffer(&state.uniform_buffer, &data)
-            .is_err()
+        match device.upload_buffer(&state.uniform_buffer, &data) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("[geometry] uniform upload failed: {e}");
+                false
+            }
+        }
     }
 }
 
@@ -503,21 +536,72 @@ impl RenderPass for GeometryPass {
         // caller, and holding the lock across the graph's other passes would
         // serialise them behind this one for no reason.
         let Some(shared) = self.state.as_ref() else {
+            eprintln!("[geometry] early exit: state is None");
             return;
         };
         let Ok(mut state) = shared.lock() else {
+            eprintln!("[geometry] early exit: state lock poisoned");
             return;
         };
         if state.items.is_empty() {
+            eprintln!("[geometry] early exit: no items");
             return;
         }
         let Some(framebuffer) = Self::resolve_target(&mut state, context) else {
+            eprintln!(
+                "[geometry] early exit: resolve_target failed \
+                 (image_index={}, presentation_format={:?}, resolution={}x{})",
+                context.swapchain_image_index,
+                context.presentation_format,
+                context.resolution.width,
+                context.resolution.height
+            );
             return;
         };
         let framebuffer = framebuffer.clone();
 
-        let width = state.width;
-        let height = state.height;
+        // The target size is read from the live framebuffer every frame, never from
+        // state captured at `create`. Three reasons, all learned the hard way:
+        //
+        //  - A size fixed at creation is wrong as soon as the window resizes or
+        //    the window moves to a monitor with another scale factor. The window
+        //    is created with a *logical* size while the swapchain holds *physical*
+        //    pixels, so at 125% scaling a 1280x720 window yields a 1600x900
+        //    swapchain and a frozen 1280x720 viewport covers only the corner.
+        //  - The extent has to be the one the framebuffer was built from, or the
+        //    viewport and the attachments disagree. The framebuffer's own
+        //    descriptor is exactly that size, and it is the same value
+        //    `record.rs` falls back to when no render area was recorded, so the
+        //    two agree by construction.
+        //  - Offscreen rendering has no presentation extent and a headless
+        //    context may have no resolution either, so those cannot be the
+        //    primary source: a pass that trusted them drew nothing at all.
+        let desc = framebuffer.desc();
+        let (fb_width, fb_height) = (desc.width, desc.height);
+        let extent = context.presentation_extent;
+        let (width, height) = if fb_width != 0 && fb_height != 0 {
+            (fb_width, fb_height)
+        } else if extent.width != 0 && extent.height != 0 {
+            (extent.width, extent.height)
+        } else {
+            (context.resolution.width, context.resolution.height)
+        };
+        if width == 0 || height == 0 {
+            // Nothing to draw into. Recording a zero-sized viewport would be
+            // meaningless at best, and a framebuffer whose attachments are
+            // zero-sized cannot be created at all.
+            eprintln!(
+                "[geometry] early exit: no drawable extent (framebuffer {fb_width}x{fb_height}, \
+                 presentation {}x{}, resolution {}x{})",
+                extent.width,
+                extent.height,
+                context.resolution.width,
+                context.resolution.height
+            );
+            return;
+        }
+
+        
 
         let mut commands: Vec<Command> = Vec::with_capacity(11 + state.items.len() * 3);
         // One clear value per attachment, in attachment order. A depth

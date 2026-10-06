@@ -17,17 +17,27 @@
 
 pub mod context;
 pub mod elements;
+pub mod input;
 pub mod layout;
 pub mod pass;
 pub mod renderer;
 pub mod shaders;
+pub mod text;
 
-pub use context::{UiContext, UiState, UiModifiers};
-pub use elements::{UiElement, UiElementType, UiElementId, UiVisualStyle, UiElementData, SliderOrientation, UiElementBuilder};
-pub use layout::{UiLayout, UiConstraints, UiAnchor, UiLayoutResult};
-pub use pass::UiRenderPass;
-pub use renderer::{UiRenderer, UiRendererConfig, UiRenderStats, UiVertex, UiGeometryBatch, UiFont, UiFontCharacter};
-pub use shaders::{UiShaderManager, UiShaderType, UiShaderSource};
+pub use context::{UiContext, UiModifiers, UiState};
+pub use elements::{
+    SliderOrientation, UiElement, UiElementBuilder, UiElementData, UiElementId, UiElementType,
+    UiVisualStyle,
+};
+pub use input::{
+    draw_order, hit_test, next_focusable, update as update_input, UiClick, UiInputEvent,
+    UiInputState, UiInteraction, UiKey,
+};
+pub use layout::{UiAnchor, UiConstraints, UiLayout, UiLayoutResult};
+pub use pass::{ui_ortho_projection, UiRenderPass};
+pub use renderer::{UiRenderStats, UiRenderTarget, UiRenderer, UiRendererConfig, UiVertex};
+pub use shaders::{UiShaderManager, UiShaderSource, UiShaderType};
+pub use text::{UiBlockFont, UiFont, UiGlyph, UiPlacedGlyph, UiTextLayout, UiTextLine, UiTextStyle};
 
 /// UI command for immediate mode rendering
 #[derive(Debug, Clone, PartialEq)]

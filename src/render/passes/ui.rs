@@ -1,34 +1,66 @@
-﻿//! UI Render Pass
+//! The UI pass, driven by `rhi::ui::UiRenderer`.
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
-//! This pass renders the 2D user interface (HUD, menus, etc.)
-//! Uses orthographic projection and alpha blending.
+//! This used to be a self-contained pass with a hand-written pipeline, and it
+//! never touched `rhi::ui` at all: two independent implementations of the same
+//! idea, only one of which was exercised. It now wraps `UiRenderer` and hands it
+//! the acquired swapchain image, so the drawing code that ships is the same code
+//! the unit tests cover.
+//!
+//! The size rule is the one the geometry pass arrived at (Bug №272), and it is
+//! load-bearing rather than cosmetic:
+//!
+//!  - The window is created with a *logical* size while the swapchain holds
+//!    *physical* pixels, so at 125% scaling a 1280x720 window yields a 1600x900
+//!    swapchain. A target sized from `context.resolution` covers a corner.
+//!  - `context.resolution` is the wrong primary source. It is also not always
+//!    populated: a headless context has neither it nor a presentation extent,
+//!    and a pass that trusted it drew nothing at all.
+//!  - So the physical presentation extent leads, and resolution is only the last
+//!    resort for an offscreen target.
+//!
+//! The projection is built from the same extent, so the viewport, the scissor
+//! and the NDC mapping agree by construction rather than by coincidence.
 
-use crate::render::camera::Camera;
 use crate::render::core::RenderContext;
 use crate::render::graph::node::{PassDependency, RenderPass};
 use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
-use crate::rhi::pipeline::graphics::PrimitiveTopology;
-use crate::rhi::{
-    AttachmentDescription, CommandEncoder, LoadOp, Pipeline, PipelineBindPoint, Rect2D, StoreOp,
-    SubpassDescription, TextureLayout, TextureView,
-};
-use crate::rhi::command::pass::render::{AttachmentReference, RenderPassDesc};
-use crate::rhi::core::Device;
-use crate::rhi::types::{Extent2D, Offset2D, SampleCount};
+use crate::rhi::command::encoder::CommandEncoder;
+use crate::rhi::ui::{UiCommand, UiRenderStats, UiRenderTarget, UiRenderer, UiRendererConfig};
 use std::collections::HashMap;
 
-/// UI configuration
+/// Compiled from `assets/shaders/ui_geom.wgsl`. The RHI takes SPIR-V as bytes
+/// rather than reading a path, so it does not need to know where assets live.
+///
+/// The path reaches into `Tool/client_tests`, which is the convention
+/// `examples/cube.rs` already uses and the only place the compiled `.spv`
+/// currently exist. It couples the render crate to another workspace and will
+/// break if the layout moves, so it is worth moving the compiled output next to
+/// the source rather than spreading a third path convention.
+const UI_GEOM_SPV: &[u8] =
+    include_bytes!("../../../Tool/client_tests/assets/shaders/ui_geom.spv");
+
+/// The textured pipeline, used for glyphs and images. Optional: if it is missing
+/// the renderer still draws solid geometry and reports text as skipped, which
+/// beats refusing to start.
+const UI_TEX_SPV: &[u8] =
+    include_bytes!("../../../Tool/client_tests/assets/shaders/ui_tex.spv");
+
+/// UI configuration.
 #[derive(Debug, Clone)]
 pub struct UIConfig {
     pub resolution_scale: f32,
     pub enable_hud: bool,
     pub enable_menu: bool,
     pub enable_minimap: bool,
+    /// Draw a single green rectangle in the corner. Deliberately crude: the
+    /// point of it is to answer "does any UI pixel reach the screen at all",
+    /// which nothing else in the stack can answer.
+    pub debug_marker: bool,
 }
 
 impl Default for UIConfig {
@@ -38,212 +70,127 @@ impl Default for UIConfig {
             enable_hud: true,
             enable_menu: true,
             enable_minimap: true,
+            debug_marker: true,
         }
     }
 }
 
-/// UI pass
+/// The UI pass.
 pub struct UIPass {
     base: BaseRenderPass,
+    /// `BaseRenderPass::name` is private, and `RenderPass::name` has to hand out
+    /// a borrow that outlives the call, so the name is kept here too.
+    name: String,
     config: UIConfig,
-    /// Orthographic camera for UI
-    ui_camera: crate::render::camera::OrthographicCamera,
-    /// UI pipeline
-    ui_pipeline: Option<Pipeline>,
-    /// Output texture (swapchain target)
-    output_view: Option<TextureView>,
-    /// Render pass
-    render_pass: Option<crate::rhi::RenderPass>,
-    /// Framebuffer
-    framebuffer: Option<crate::rhi::Framebuffer>,
+    /// Built once the surface format is known, so it cannot be built in `new`.
+    ui: Option<UiRenderer>,
+    /// The extent the renderer was initialized for, so a resize is noticed.
+    built_for: Option<(u32, u32)>,
+    /// Reported once per change rather than every frame, which would drown the
+    /// log at 60 Hz.
+    reported_init: bool,
+    reported_resize: bool,
+    /// Frames that actually recorded a draw. Drives the heartbeat log.
+    frames: u64,
 }
 
 impl UIPass {
     pub fn new(config: UIConfig) -> Self {
         let mut base = BaseRenderPass::new("ui");
-
-        // UI pass depends on all previous passes
+        // The UI samples what the 3D passes produced, so it runs after them.
         base.add_dependency("water", "water", ResourceUsage::Sampled);
         base.add_dependency("transparent", "final", ResourceUsage::Sampled);
-
-        // UI pass outputs to swapchain
+        // Load, not clear: the UI is an overlay, and clearing here would erase
+        // the 3D scene underneath it.
         base.add_output("swapchain");
-
-        // Create orthographic camera for UI
-        let ui_camera = crate::render::camera::OrthographicCamera::new(
-            0.0, 1920.0, // left, right
-            1080.0, 0.0, // bottom, top (inverted for screen space)
-            -1.0, 1.0, // near, far
-        );
 
         Self {
             base,
+            name: "ui".to_string(),
             config,
-            ui_camera,
-            ui_pipeline: None,
-            output_view: None,
-            render_pass: None,
-            framebuffer: None,
+            ui: None,
+            built_for: None,
+            reported_init: false,
+            reported_resize: false,
+            frames: 0,
         }
     }
-}
 
-impl UIPass {
     pub fn config(&self) -> &UIConfig {
         &self.config
     }
 
-    pub fn config_mut(&mut self) -> &mut UIConfig {
-        &mut self.config
+    /// Per-frame counters. The caller needs this because `UiRenderer` reports
+    /// anything it refused to draw through `stats().skipped` rather than by
+    /// failing — silence would otherwise look like success.
+    pub fn stats(&self) -> UiRenderStats {
+        self.ui.as_ref().map_or_default(UiRenderer::stats)
     }
 
-    pub fn camera(&self) -> &crate::render::camera::OrthographicCamera {
-        &self.ui_camera
+    pub fn is_initialized(&self) -> bool {
+        self.ui.as_ref().is_some_and(UiRenderer::is_initialized)
     }
 
-    pub fn camera_mut(&mut self) -> &mut crate::render::camera::OrthographicCamera {
-        &mut self.ui_camera
-    }
+    /// Builds (or rebuilds) the renderer for `width` x `height`.
+    ///
+    /// A resize invalidates the projection, so the renderer is rebuilt rather
+    /// than only told about the new size: `UiRenderPass` bakes the extent into
+    /// the viewport it records.
+    fn ensure_built(
+        &mut self,
+        device: &std::sync::Arc<crate::rhi::core::Device>,
+        format: crate::rhi::Format,
+        width: u32,
+        height: u32,
+    ) {
+        let needs_build = self
+            .ui
+            .as_ref()
+            .map_or(true, |ui| !ui.is_initialized() || self.built_for != Some((width, height)));
 
-    fn create_pipeline(&self, device: &Device) -> Option<Pipeline> {
-        let spirv = include_bytes!("../../../Tool/client_tests/assets/shaders/ui.spv");
-        let vs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: crate::rhi::ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("ui_vs".into()),
-        });
-        let fs_module = device.create_shader_module(&crate::rhi::ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: crate::rhi::ShaderFormat::SpirV,
-            entry_point: Some("fs_main".into()),
-            name: Some("ui_fs".into()),
-        });
+        if !needs_build {
+            return;
+        }
 
-        let render_pass = self.render_pass.clone()?;
-        let pipeline = device.create_gpu_graphics_pipeline(
-            &crate::rhi::GraphicsPipelineDesc {
-                shader_stages: vec![
-                    crate::rhi::PipelineShaderStage {
-                        stage: crate::rhi::ShaderStage::VERTEX,
-                        module: vs_module,
-                        entry_point: "vs_main".into(),
-                    },
-                    crate::rhi::PipelineShaderStage {
-                        stage: crate::rhi::ShaderStage::FRAGMENT,
-                        module: fs_module,
-                        entry_point: "fs_main".into(),
-                    },
-                ],
-                vertex_input_state: Some(crate::rhi::VertexInputState {
-                    bindings: vec![crate::rhi::VertexBinding {
-                        binding: 0,
-                        stride: 32,
-                        input_rate: crate::rhi::VertexInputRate::Vertex,
-                    }],
-                    attributes: vec![
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 0,
-                            format: crate::rhi::Format::R32G32_SFLOAT,
-                            offset: 0,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 1,
-                            format: crate::rhi::Format::R32G32_SFLOAT,
-                            offset: 8,
-                        },
-                        crate::rhi::VertexAttribute {
-                            binding: 0,
-                            location: 2,
-                            format: crate::rhi::Format::RGBA32_SFLOAT,
-                            offset: 16,
-                        },
-                    ],
-                }),
-                input_assembly_state: crate::rhi::InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                rasterizer_state: Some(crate::rhi::RasterizerState::double_sided()),
-                multisample_state: crate::rhi::MultisampleState {
-                    sample_count: crate::rhi::SampleCount::X1,
-                    ..Default::default()
-                },
-                color_blend_state: Some(crate::rhi::ColorBlendState {
-                    attachments: vec![crate::rhi::ColorBlendAttachment {
-                        blend_enable: true,
-                        src_color_blend_factor: crate::rhi::BlendFactor::SrcAlpha,
-                        dst_color_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
-                        color_blend_op: crate::rhi::BlendOp::Add,
-                        src_alpha_blend_factor: crate::rhi::BlendFactor::One,
-                        dst_alpha_blend_factor: crate::rhi::BlendFactor::OneMinusSrcAlpha,
-                        alpha_blend_op: crate::rhi::BlendOp::Add,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                depth_stencil_state: None,
-                ..Default::default()
+        let mut ui = UiRenderer::new(
+            std::sync::Arc::clone(device),
+            UiRendererConfig {
+                // Enough for a HUD on the first frame; the buffers grow.
+                initial_vertex_capacity: 4096,
+                initial_index_capacity: 6144,
+                debug_label: false,
             },
-            &render_pass,
-            &[],
         );
-        pipeline.ok()
-    }
-}
 
-impl UIPass {
-    /// Render HUD elements
-    fn render_hud(&mut self, _encoder: &mut CommandEncoder, _context: &RenderContext, _scene: &Scene) {
-        // HUD elements:
-        // - Crosshair
-        // - Ship information (HP, speed, fuel)
-        // - Weapon information (ammo, cooldown)
-        // - Player information (health, role)
-        // - Objectives
-        // - Compass
-
-        // For now, this is a placeholder
-    }
-
-    /// Render menu
-    fn render_menu(
-        &mut self,
-        _encoder: &mut CommandEncoder,
-        _context: &RenderContext,
-        _scene: &Scene,
-    ) {
-        // Menu elements:
-        // - Main menu
-        // - Settings menu
-        // - Ship selection
-        // - Loadout selection
-
-        // For now, this is a placeholder
-    }
-
-    /// Render minimap
-    fn render_minimap(
-        &mut self,
-        _encoder: &mut CommandEncoder,
-        _context: &RenderContext,
-        _scene: &Scene,
-    ) {
-        // Minimap rendering:
-        // - Top-down view of the battlefield
-        // - Ship positions
-        // - Objectives
-        // - Fog of war
-
-        // For now, this is a placeholder
+        match ui.initialize(format, width, height, UI_GEOM_SPV, Some(UI_TEX_SPV)) {
+            Ok(()) => {
+                if !self.reported_init {
+                    eprintln!(
+                        "[ui] renderer ready for {width}x{height} as {format:?} \
+                         (projection follows this extent)"
+                    );
+                    self.reported_init = true;
+                }
+                self.reported_resize = false;
+                self.built_for = Some((width, height));
+                self.ui = Some(ui);
+            }
+            Err(e) => {
+                // Reported once: a per-frame message here would spam the log and
+                // hide the one fact that matters, which is that nothing drew.
+                if !self.reported_init {
+                    eprintln!("[ui] renderer failed to initialize: {e}");
+                    self.reported_init = true;
+                }
+                self.ui = None;
+            }
+        }
     }
 }
 
 impl RenderPass for UIPass {
     fn name(&self) -> &str {
-        self.base.name()
+        &self.name
     }
 
     fn dependencies(&self) -> &[PassDependency] {
@@ -254,182 +201,154 @@ impl RenderPass for UIPass {
         self.base.outputs()
     }
 
-    fn initialize(&mut self, device: &Device, context: &RenderContext) {
-        let width = context.resolution.width;
-        let height = context.resolution.height;
-
-        // Update camera to match resolution
-        self.ui_camera
-            .set_viewport(0.0, width as f32, height as f32, 0.0);
-
-        // Get the swapchain view for the image acquired for THIS frame.
-        //
-        // Bug в„–186: this took `images().first()`, i.e. always image 0, and
-        // `unwrap_or_default()` silently produced a default (invalid) view when
-        // the swapchain had no images. Both are fixed: the acquired index comes
-        // from the context, and a missing image aborts the pass instead of
-        // attaching a bogus view to the framebuffer.
-        let images = context.swapchain.images();
-        match images.get(context.swapchain_image_index as usize) {
-            Some(image) => {
-                self.output_view = Some(image.view.clone());
-            }
-            None => {
-                eprintln!(
-                    "[render] ui: swapchain image {} not available (have {}); pass skipped",
-                    context.swapchain_image_index,
-                    images.len()
-                );
-                self.output_view = None;
-                return;
-            }
-        }
-
-        // Create render pass (simple color pass with blending)
-        let attachments = vec![
-            // Output (swapchain)
-            AttachmentDescription {
-                format: context.swapchain.desc().format,
-                samples: SampleCount::X1,
-                load_op: LoadOp::Load, // Load from previous pass
-                store_op: StoreOp::Store,
-                stencil_load_op: LoadOp::DontCare,
-                stencil_store_op: StoreOp::DontCare,
-                initial_layout: TextureLayout::TransferDstOptimal,
-                final_layout: TextureLayout::TransferSrcOptimal,
-            },
-        ];
-
-        let subpass = SubpassDescription {
-            pipeline_bind_point: PipelineBindPoint::Graphics,
-            color_attachments: vec![AttachmentReference {
-                attachment: 0,
-                layout: TextureLayout::ColorAttachmentOptimal,
-            }],
-            depth_stencil_attachment: None,
-            ..Default::default()
-        };
-
-        let render_pass_desc = RenderPassDesc {
-            attachments,
-            subpasses: vec![subpass],
-            dependencies: vec![],
-        };
-
-        self.render_pass = Some(crate::rhi::RenderPass::new(render_pass_desc));
-
-        // Create UI pipeline
-        self.ui_pipeline = self.create_pipeline(device);
-
-        // Create framebuffer with swapchain image
-        if let Some(ref view) = self.output_view {
-            let render_pass = self.render_pass.clone().unwrap_or_default();
-            self.framebuffer = Some(crate::rhi::Framebuffer::new(
-                crate::rhi::FramebufferDesc {
-                    render_pass,
-                    attachments: vec![crate::rhi::FramebufferAttachment {
-                        texture_view: view.clone(),
-                        layer: 0,
-                        mip_level: 0,
-                    }],
-                    width,
-                    height,
-                    layers: 1,
-                },
-            ));
-        }
+    fn initialize(&mut self, _device: &crate::rhi::core::Device, _context: &RenderContext) {
+        // Nothing is built here on purpose. The surface format is only known once
+        // presentation is attached, and `UiRenderer` wants an `Arc<Device>` while
+        // this hook is handed a `&Device` — so the renderer is built on the first
+        // drawable frame in `execute`, which already has the `Arc`.
     }
 
     fn execute(
         &mut self,
         encoder: &mut CommandEncoder,
         context: &mut RenderContext,
-        scene: &mut Scene,
+        _scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
     ) {
-        if !self.base.is_enabled() {
+        let Some((width, height)) = Self::drawable_extent(context) else {
+            // A minimised window reports a zero-sized swapchain; drawing into it
+            // is not a valid operation, so the frame is skipped rather than
+            // recorded against a zero-sized viewport.
+            return;
+        };
+        if width == 0 || height == 0 {
             return;
         }
 
-        let width = context.resolution.width;
-        let height = context.resolution.height;
+        let Some(format) = context.presentation_format else {
+            return;
+        };
 
-        // Get the scene's UI elements
-        // In the actual implementation, the scene would have UI elements
-        // For now, we'll just render a simple HUD
+        self.ensure_built(context.device(), format, width, height);
 
-        // Begin render pass
-        if let (Some(render_pass), Some(framebuffer), Some(_output_view)) =
-            (&self.render_pass, &self.framebuffer, &self.output_view)
-        {
-            // Clear color is not used because we're loading the existing content
-            encoder.begin_render_pass(
-                render_pass,
-                framebuffer,
-                Rect2D {
-                    offset: Offset2D { x: 0, y: 0 },
-                    extent: Extent2D { width, height },
-                },
-                &[], // No color clears
-                1.0,
-                0,
-            );
+        let Some(ui) = self.ui.as_mut() else {
+            return;
+        };
 
-            // Set viewport
-            encoder.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
-            encoder.set_scissor(0, 0, width, height);
+        // The acquired image, not a pinned one: pinning leaves every frame
+        // drawing into whichever image happened to be acquired first, and the
+        // other swapchain images are then presented having never been written.
+        let Some((image, view)) = context.acquired_image() else {
+            return;
+        };
 
-            // Bind UI pipeline
-            if let Some(pipeline) = &self.ui_pipeline {
-                encoder.bind_pipeline(pipeline);
+        // What is actually drawn this frame. Kept minimal on purpose — see
+        // `UIConfig::debug_marker`.
+        if self.config.debug_marker {
+            // Two rectangles, and the point is to tell them apart on screen:
+            //
+            //  - the small corner one is the real test of the pixel mapping. If it
+            //    is missing while the big one shows, the mapping is wrong and the
+            //    problem is coordinates, not the pass.
+            //  - the full-screen one is deliberately unmistakable. If *neither*
+            //    appears, the recorded draw is not reaching the image at all, and
+            //    the projection is not the place to look.
+            //
+            // A single small rectangle cannot distinguish these two, which is
+            // exactly the ambiguity that let this sit unresolved.
+            let corner = UiCommand::Rectangle {
+                x: 32.0,
+                y: 32.0,
+                width: 160.0,
+                height: 90.0,
+                color: [0.76, 0.95, 0.13, 1.0],
+                corner_radius: 0.0,
+            };
+            let full = UiCommand::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+                // Blue, so it cannot be confused with the green corner marker.
+                color: [0.15, 0.35, 0.95, 1.0],
+                corner_radius: 0.0,
+            };
+            if let Err(e) = ui.submit_commands(vec![corner, full]) {
+                eprintln!("[ui] submit_commands failed: {e}");
             }
+        }
 
-            // Update camera matrices
-            let _view_matrix = self.ui_camera.view_matrix();
-            let _proj_matrix = self.ui_camera.projection_matrix();
+        let target = UiRenderTarget {
+            image,
+            view,
+            format,
+            width,
+            height,
+        };
 
-            // Render HUD elements
-            if self.config.enable_hud {
-                self.render_hud(encoder, context, scene);
+        match ui.record(encoder, Some(&target)) {
+            // `false` means there was nothing to draw, which is normal on a frame
+            // where every UI element was culled.
+            Ok(true) => {
+                let stats = ui.stats();
+                if !self.reported_resize {
+                    self.reported_resize = true;
+                    eprintln!(
+                        "[ui] first frame recorded at {width}x{height}: {} verts, \
+                         {} batches, {} draw calls, {} skipped",
+                        stats.vertices, stats.batches, stats.draw_calls, stats.skipped
+                    );
+                }
+                // A heartbeat, because "the rectangle appears and then goes away"
+                // is a claim about time and a single frame cannot refute it. This
+                // is what shows whether recording keeps happening, whether the
+                // acquired image index keeps cycling, and whether the two ever
+                // disagree — the three things that could make a correct draw
+                // invisible after a while.
+                self.frames += 1;
+                if self.frames % 120 == 0 {
+                    eprintln!(
+                        "[ui:hb] frame {} images={} image_index={} draw_calls={} skipped={}",
+                        self.frames,
+                        context.presentation_images.len(),
+                        context.swapchain_image_index,
+                        stats.draw_calls,
+                        stats.skipped
+                    );
+                }
             }
-
-            // Render menu (if active)
-            if self.config.enable_menu {
-                self.render_menu(encoder, context, scene);
-            }
-
-            // Render minimap
-            if self.config.enable_minimap {
-                self.render_minimap(encoder, context, scene);
-            }
-
-            // End render pass
-            encoder.end_render_pass();
+            Ok(false) => {}
+            Err(e) => eprintln!("[ui] record failed: {e}"),
         }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
-        // Update camera
-        self.ui_camera
-            .set_viewport(0.0, width as f32, height as f32, 0.0);
-
-        // Note: We need to recreate the framebuffer with the new swapchain image
-        // This is handled by the swapchain resize
+        if let Some(ui) = self.ui.as_mut() {
+            ui.resize(width, height);
+        }
+        // Force a rebuild: the baked extent inside `UiRenderPass` is stale now.
+        self.built_for = Some((width, height));
     }
 
     fn is_enabled(&self) -> bool {
-        self.base.is_enabled()
-    }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        self.base.set_enabled(enabled);
+        true
     }
 }
 
-impl Default for UIPass {
-    fn default() -> Self {
-        Self::new(UIConfig::default())
+impl UIPass {
+    /// The size to draw at, in physical pixels.
+    ///
+    /// Physical extent first. See the module comment: `context.resolution` is the
+    /// window's *logical* size and disagrees with the swapchain at any scale
+    /// factor other than 100%, and it is absent entirely on a headless context.
+    fn drawable_extent(context: &RenderContext) -> Option<(u32, u32)> {
+        let extent = context.presentation_extent;
+        if extent.width != 0 && extent.height != 0 {
+            return Some((extent.width, extent.height));
+        }
+        if context.resolution.width != 0 && context.resolution.height != 0 {
+            return Some((context.resolution.width, context.resolution.height));
+        }
+        None
     }
 }
-
-

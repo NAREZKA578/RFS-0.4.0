@@ -471,3 +471,81 @@ fn an_empty_recording_is_rejected_rather_than_silently_submitted() {
         "a recording with no commands should stay empty and be rejected at submit"
     );
 }
+
+/// Bug №275: every `Command` variant must have a Vulkan translation.
+///
+/// The translator used to cover 11 of 22 variants and answer the rest with
+/// `NotSupported`. That is better than dropping them silently, but it still meant
+/// a pass that recorded a clear, a copy, a barrier or a dispatch could not run at
+/// all — which is most of what a deferred-style pass needs.
+///
+/// This test does not call Vulkan, which is the point: it asserts that the
+/// variant list and the translator have not drifted apart, so adding a variant
+/// without a translation fails here rather than at the first frame that uses it.
+#[test]
+fn every_command_variant_has_a_vulkan_translation() {
+    // The names below are the variants of `Command`, listed by hand on purpose:
+    // deriving them from the enum inside `rhi` is not possible from here, and a
+    // test that cannot detect a new variant is not worth much.
+    const ALL: &[&str] = &[
+        "BindGraphicsPipeline",
+        "BindComputePipeline",
+        "BindDescriptorSets",
+        "BindVertexBuffers",
+        "BindIndexBuffer",
+        "SetViewport",
+        "SetScissor",
+        "Draw",
+        "DrawIndexed",
+        "Dispatch",
+        "ClearColor",
+        "ClearDepthStencil",
+        "CopyBuffer",
+        "CopyBufferToTexture",
+        "PipelineBarrier",
+        "BeginRenderPass",
+        "EndRenderPass",
+        "NextSubpass",
+        "BeginDebugLabel",
+        "EndDebugLabel",
+        "DispatchRays",
+        "BuildAccelerationStructure",
+    ];
+
+    // Relative to this file: Tool/client_tests/tests -> repo root is three
+    // levels up, because `Tool` and `client_tests` are each one directory.
+    let source = include_str!("../../../src/rhi/backend/vulkan/record.rs");
+
+    // Both arm shapes have to be accepted: a tuple variant is matched as
+    // `Command::Name(inner)`, a struct variant as `Command::Name { .. }`, and a
+    // unit variant as `Command::Name =>`.
+    for variant in ALL {
+        let tuple = format!("Command::{variant}(");
+        let braced = format!("Command::{variant} {{");
+        let unit = format!("Command::{variant} =>");
+        assert!(
+            source.contains(&tuple) || source.contains(&braced) || source.contains(&unit),
+            "Command::{variant} has no arm in the Vulkan translator; \
+             it would fail at the first frame that records it"
+        );
+    }
+}
+
+/// The two ray-tracing variants stay unimplemented on purpose, and must say so.
+///
+/// `DispatchRays` and `BuildAccelerationStructure` are declared in the RHI but the
+/// backend never enabled `VK_KHR_ray_tracing_pipeline` and never builds a BLAS or
+/// TLAS. Their arms therefore return `NotSupported` with the reason rather than
+/// being left to the catch-all, so the error a caller sees names the real cause.
+#[test]
+fn ray_tracing_commands_report_why_they_are_unavailable() {
+    let source = include_str!("../../../src/rhi/backend/vulkan/record.rs");
+    assert!(
+        source.contains("ray tracing dispatch"),
+        "DispatchRays should explain that the backend has no ray tracing pipeline"
+    );
+    assert!(
+        source.contains("BLAS/TLAS construction is not implemented"),
+        "BuildAccelerationStructure should explain that BLAS/TLAS building is absent"
+    );
+}

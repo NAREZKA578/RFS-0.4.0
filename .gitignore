@@ -1,6 +1,12 @@
 # Rust build output (workspace target dir and any crate-level target dirs)
 target/
+target-*/
 **/*.rs.bk
+
+# Downloaded toolchains and SDKs. `UPl/` holds a full Vulkan SDK (~1.7 GB
+# installed plus the installer); it is a machine-local dependency, not source,
+# and would otherwise be committed by anyone who followed the setup step.
+UPl/
 
 # Editor / OS artefacts
 .vscode/

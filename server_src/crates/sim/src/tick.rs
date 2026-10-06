@@ -6,6 +6,7 @@ use rfs_ship::ship::{Ship, ShipState};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -21,6 +22,32 @@ pub struct TickSystem {
     /// boundary (plan §5.1: stage-2 results never touch half-computed state).
     pending_damage: RwLock<Vec<PendingDamage>>,
     ballistics: BallisticsCalculator,
+    /// Bug №196: projectiles refused by `fire_projectile`. The old comment
+    /// claimed a counter existed; it did not, so a dropped shot was invisible.
+    dropped_projectiles: std::sync::atomic::AtomicU64,
+}
+
+/// Why a projectile was not accepted.
+///
+/// Bug №196: `fire_projectile` returned `()` and dropped silently, so a client
+/// whose shot hit the cap got no reply and the command looked successful. The
+/// caller now has something to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectileRejected {
+    /// Position, velocity or lifetime was not finite, which would create a shell
+    /// that can never be culled.
+    NonFiniteBallistics,
+    /// The server already holds `MAX_PROJECTILES`.
+    AtCapacity,
+}
+
+impl ProjectileRejected {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectileRejected::NonFiniteBallistics => "non-finite ballistics",
+            ProjectileRejected::AtCapacity => "projectile limit reached",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +107,7 @@ impl TickSystem {
             collisions: RwLock::new(Vec::new()),
             pending_damage: RwLock::new(Vec::new()),
             ballistics: BallisticsCalculator::new(BallisticsConfig::default()),
+            dropped_projectiles: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -451,23 +479,38 @@ impl TickSystem {
         self.ships.read().get(&entity_id).cloned()
     }
 
-    pub fn fire_projectile(&self, projectile: Projectile) {
-        // Cap: unbounded spawn is a DoS/OOM (256 clients x 30Hz x 12s).
-        // Drop with a counter instead of growing forever; also reject
-        // non-finite ballistics that would create immortal shells.
+    /// Spawns a projectile, or reports why it was refused.
+    pub fn fire_projectile(&self, projectile: Projectile) -> Result<(), ProjectileRejected> {
+        // Unbounded spawn is a DoS/OOM (256 clients x 30Hz x 12s), so the count is
+        // capped. Reject non-finite ballistics too: they would create immortal shells.
         if !projectile.position.is_finite()
             || !projectile.velocity.is_finite()
             || !projectile.lifetime.is_finite()
         {
-            return;
+            self.dropped_projectiles.fetch_add(1, Ordering::Relaxed);
+            return Err(ProjectileRejected::NonFiniteBallistics);
         }
         const MAX_PROJECTILES: usize = 8192;
         let mut guard = self.projectiles.write();
         if guard.len() >= MAX_PROJECTILES {
-            return;
+            drop(guard);
+            // Bug №196: this counter is what the old comment claimed existed. It is
+            // now real, so a rejection is observable in a log or a stat instead of
+            // looking like a successful shot.
+            self.dropped_projectiles.fetch_add(1, Ordering::Relaxed);
+            return Err(ProjectileRejected::AtCapacity);
         }
         guard.push(projectile);
+        Ok(())
     }
+
+/// How many projectiles have been refused since start-up.
+///
+/// Bug №196: the old comment described exactly this counter, but no such value
+/// was kept — the drop was unobservable.
+pub fn dropped_projectiles(&self) -> u64 {
+    self.dropped_projectiles.load(Ordering::Relaxed)
+}
 
     pub fn current_tick(&self) -> Tick {
         self.current_tick
@@ -601,4 +644,197 @@ pub enum GameEvent {
         station: EntityId,
         player: EntityId,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell(id: u64) -> Projectile {
+        Projectile {
+            entity_id: EntityId::new(id),
+            projectile_type: ProjectileType::Cannonball,
+            position: Vec3f::ZERO,
+            prev_position: Vec3f::ZERO,
+            velocity: Vec3f::new(400.0, 0.0, 0.0),
+            spawn_tick: Tick(0),
+            lifetime: 0.0,
+            max_lifetime: 12.0,
+            distance_traveled: 0.0,
+            owner: EntityId::new(1),
+            weapon: EntityId::new(2001),
+            damage: 100.0,
+            penetration: 50.0,
+            explosion_radius: 0.0,
+        }
+    }
+
+    /// Bug №196: the old comment on this function promised "drop with a counter",
+    /// and no counter existed. A refused shot was therefore unobservable, which
+    /// is the whole of the defect — the drop itself was correct, its silence was
+    /// not.
+    #[test]
+    fn a_refused_shell_is_counted() {
+        let sim = TickSystem::new();
+        assert_eq!(sim.dropped_projectiles(), 0);
+
+        let bad = Projectile {
+            position: Vec3f::new(f32::NAN, 0.0, 0.0),
+            ..shell(1)
+        };
+        assert_eq!(
+            sim.fire_projectile(bad),
+            Err(ProjectileRejected::NonFiniteBallistics)
+        );
+        assert_eq!(
+            sim.dropped_projectiles(),
+            1,
+            "the refusal was not counted"
+        );
+    }
+
+    /// An accepted shell must not be counted, or the number means nothing.
+    #[test]
+    fn an_accepted_shell_is_not_counted() {
+        let sim = TickSystem::new();
+        assert_eq!(sim.fire_projectile(shell(1)), Ok(()));
+        assert_eq!(sim.get_active_projectiles().len(), 1);
+        assert_eq!(sim.dropped_projectiles(), 0);
+    }
+
+    /// The DoS cap has to actually refuse, and refuse with the reason that
+    /// distinguishes it from a bad-geometry refusal.
+    #[test]
+    fn the_projectile_cap_refuses_and_is_visible() {
+        let sim = TickSystem::new();
+        const MAX: usize = 8192;
+        for i in 0..MAX {
+            assert_eq!(sim.fire_projectile(shell(i as u64 + 1)), Ok(()), "refused early at {i}");
+        }
+
+        assert_eq!(
+            sim.fire_projectile(shell(99999)),
+            Err(ProjectileRejected::AtCapacity),
+            "the cap did not refuse the shell past its limit"
+        );
+        assert_eq!(sim.dropped_projectiles(), 1);
+        assert_eq!(
+            sim.get_active_projectiles().len(),
+            MAX,
+            "a refused shell was stored anyway"
+        );
+    }
+
+    /// Both reasons must be distinguishable, since the caller reports one of
+    /// them to the player.
+    #[test]
+    fn the_two_rejections_are_distinguishable() {
+        assert_ne!(
+            ProjectileRejected::NonFiniteBallistics,
+            ProjectileRejected::AtCapacity
+        );
+        assert!(!ProjectileRejected::AtCapacity.as_str().is_empty());
+        assert!(!ProjectileRejected::NonFiniteBallistics.as_str().is_empty());
+        assert_ne!(
+            ProjectileRejected::AtCapacity.as_str(),
+            ProjectileRejected::NonFiniteBallistics.as_str()
+        );
+    }
+
+    /// Each non-finite field is rejected on its own, so a NaN cannot sneak in
+    /// through the one the guard forgets.
+    #[test]
+    fn every_non_finite_field_is_rejected() {
+        let cases = [
+            Projectile { position: Vec3f::new(f32::NAN, 0.0, 0.0), ..shell(1) },
+            Projectile { position: Vec3f::new(f32::INFINITY, 0.0, 0.0), ..shell(2) },
+            Projectile { velocity: Vec3f::new(f32::NAN, 0.0, 0.0), ..shell(3) },
+            Projectile { velocity: Vec3f::new(0.0, f32::NEG_INFINITY, 0.0), ..shell(4) },
+            Projectile { lifetime: f32::NAN, ..shell(5) },
+        ];
+        for (i, bad) in cases.into_iter().enumerate() {
+            let sim = TickSystem::new();
+            assert_eq!(
+                sim.fire_projectile(bad),
+                Err(ProjectileRejected::NonFiniteBallistics),
+                "case {i} was accepted"
+            );
+            assert!(sim.get_active_projectiles().is_empty(), "case {i} was stored");
+        }
+    }
+
+    /// Bug №43 was still listed as open, but the tick pipeline already deferred
+    /// damage: `collect_damage` at the end of a tick queues into `pending_damage`,
+    /// and `apply_pending_damage` runs first on the next tick's settled state
+    /// (plan §5.1). This pins the ordering so it cannot regress into damaging a
+    /// ship inside the same tick its collision was detected in — which is what
+    /// made a client see one tick's update and its event disagree about health.
+    #[test]
+    fn damage_from_a_collision_lands_on_the_next_tick_not_the_same_one() {
+        let mut sim = TickSystem::new();
+        let start_health = {
+            let ship = rfs_ship::ship::Ship::new(
+                rfs_ship::ship::ShipConfig {
+                    max_health: 1000.0,
+                    // A ship with no compartments has no bounds, so nothing could
+                    // ever hit it. One compartment centred on the origin gives
+                    // the collision pass something to find.
+                    compartments: vec![rfs_core::entity::CompartmentTemplate {
+                        name: "hull".into(),
+                        local_bounds: rfs_core::math::Bounds::new(
+                            Vec3f::new(-20.0, -20.0, -20.0),
+                            Vec3f::new(20.0, 20.0, 20.0),
+                        ),
+                        max_water_level: 100.0,
+                        pump_capacity: 5.0,
+                        connected_compartments: Vec::new(),
+                        bulkheads: Vec::new(),
+                        stations: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+                EntityId::new(1),
+                std::sync::Arc::new(rfs_damage::DamageSystem::new()),
+            );
+            let health = ship.health();
+            sim.add_ship(ship);
+            health
+        };
+        let ship = sim
+            .get_ship(EntityId::new(1))
+            .expect("the ship was not registered");
+
+        // A shell flying along +x straight through the hull, so the swept
+        // segment crosses the compartment rather than starting inside it.
+        sim.fire_projectile(Projectile {
+            entity_id: EntityId::new(500),
+            // A different owner: `check_collisions` skips a projectile whose
+            // owner is the ship it would hit, so reusing the fixture's default
+            // owner would silently test nothing.
+            owner: EntityId::new(999),
+            position: Vec3f::ZERO,
+            prev_position: Vec3f::new(-30.0, 0.0, 0.0),
+            velocity: Vec3f::new(400.0, 0.0, 0.0),
+            damage: 250.0,
+            ..shell(500)
+        })
+        .expect("the shell was accepted");
+
+        // First tick: the collision is detected and queued.
+        sim.tick();
+        assert_eq!(
+            ship.health(),
+            start_health,
+            "damage was applied in the same tick as the collision"
+        );
+
+        // Second tick: the queued damage lands.
+        sim.tick();
+        assert!(
+            ship.health() < start_health,
+            "the queued damage never landed: health {} vs {}",
+            ship.health(),
+            start_health
+        );
+    }
 }

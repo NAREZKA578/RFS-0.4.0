@@ -235,8 +235,16 @@ fn the_geometry_pass_records_a_full_draw_sequence() {
         framebuffer: Some(framebuffer),
         framebuffer_pinned: true,
         framebuffer_image: Some(0),
-        width: EXTENT,
-        height: EXTENT,
+        // Replaces the old `width`/`height` fields, which the pass used as its
+        // draw size. They were initialised to 0 and only refreshed when the
+        // framebuffer was rebuilt, so the viewport and scissor could disagree
+        // with the attachments. The pass now takes its size from the live render
+        // context; this field is only part of the framebuffer cache key and is
+        // irrelevant while the framebuffer is pinned.
+        framebuffer_extent: Some(rhi::types::Extent2D {
+            width: EXTENT,
+            height: EXTENT,
+        }),
     });
 
     // Give the pass a real MVP so the uniform upload is exercised too.
