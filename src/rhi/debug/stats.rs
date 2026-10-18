@@ -1,7 +1,6 @@
 //! Statistics
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 /// GPU statistics
 #[derive(Debug, Clone, Default)]

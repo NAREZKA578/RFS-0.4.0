@@ -1,7 +1,6 @@
 //! Acceleration Structure Build Operations
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use super::blas::Blas;
 use super::tlas::Tlas;

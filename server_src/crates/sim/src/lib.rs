@@ -1,5 +1,6 @@
 pub mod tick;
 pub mod ballistics;
+pub mod map;
 pub mod physics;
 pub mod collision;
 

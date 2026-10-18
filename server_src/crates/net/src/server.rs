@@ -9,7 +9,6 @@ use rfs_core::time::{Tick, TICK_RATE, TICK_DURATION};
 use bytes::BytesMut;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn, error};
 use rayon::prelude::*;
+use smallvec::SmallVec;
 use uuid::Uuid;
 
 /// Wire cap for a single bincode message (DoS: Vec len prefix could OOM).
@@ -74,8 +74,13 @@ pub struct NetServer {
     running: Arc<Mutex<bool>>,
     send_handle: Mutex<Option<JoinHandle<()>>>,
     recv_handle: Mutex<Option<JoinHandle<()>>>,
-    event_sender: mpsc::UnboundedSender<ServerEvent>,
-    event_receiver: Mutex<Option<mpsc::UnboundedReceiver<ServerEvent>>>,
+    /// Bug №613: both channels were `unbounded_channel`. An unbounded queue is
+    /// an OOM waiting for a producer that outruns the consumer: every inbound
+    /// datagram is turned into at least one event, and a client that floods can
+    /// outpace the tick loop indefinitely. Both are bounded now, and the dropped
+    /// counters say so out loud instead of the memory simply growing.
+    event_sender: mpsc::Sender<ServerEvent>,
+    event_receiver: Mutex<Option<mpsc::Receiver<ServerEvent>>>,
     match_id: Uuid,
     /// Per-address Connect token buckets (bug №27).
     connect_limits: Arc<Mutex<HashMap<SocketAddr, ConnectLimit>>>,
@@ -83,16 +88,36 @@ pub struct NetServer {
     /// spawn one task each, so the executor queue grew without bound and the
     /// UDP order between concurrently spawned tasks was never guaranteed.
     /// Everything now queues here and a single writer task drains it in order.
-    outbox: mpsc::UnboundedSender<OutboxItem>,
+    outbox: mpsc::Sender<OutboxItem>,
     outbox_handle: Mutex<Option<JoinHandle<()>>>,
     /// Held until the server starts, then moved into the writer task.
-    outbox_rx: Mutex<Option<mpsc::UnboundedReceiver<OutboxItem>>>,
+    outbox_rx: Mutex<Option<mpsc::Receiver<OutboxItem>>>,
+    /// Events dropped because the consumer fell behind (Bug №613).
+    dropped_events: Arc<AtomicU64>,
+    /// Outbox entries dropped for the same reason (Bug №613).
+    dropped_outbox: Arc<AtomicU64>,
 }
 
 /// One queued datagram awaiting the writer task.
 struct OutboxItem {
     conn: Arc<Connection>,
     packet: OutgoingPacket,
+}
+
+/// Bug №613: the event queue is bounded, so "the channel is full" is a real
+/// outcome and not a hypothetical. Every send therefore goes through here: a
+/// full queue drops the event and says so, instead of `let _ = …send()` which
+/// made a dropped event look exactly like a delivered one. A closed channel is
+/// not counted — nothing is waiting to read it any more, so the number would
+/// only ever grow for a server that is already going down.
+fn emit_event(tx: &mpsc::Sender<ServerEvent>, dropped: &AtomicU64, event: ServerEvent) {
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
 }
 
 /// Token bucket for inbound Connects from one source address (bug №27).
@@ -158,10 +183,15 @@ pub enum ServerEvent {
 impl NetServer {
     pub async fn new(config: ServerConfig) -> Result<Self, std::io::Error> {
         let socket = Arc::new(UdpSocket::bind(config.bind_addr).await?);
-        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        // Bug №613: bounded, with a measured cap. 4096 events is far more than a
+        // healthy tick loop ever has in flight, and small enough that a flood is
+        // dropped rather than buffered until the process dies.
+        const EVENT_QUEUE_LIMIT: usize = 4096;
+        const OUTBOX_QUEUE_LIMIT: usize = 8192;
+        let (event_sender, event_receiver) = mpsc::channel(EVENT_QUEUE_LIMIT);
         // Bug №172: the outbox and the channel holding its receiving end. The
         // receiver is moved into the writer task when the server starts.
-        let (outbox, outbox_rx) = mpsc::unbounded_channel();
+        let (outbox, outbox_rx) = mpsc::channel(OUTBOX_QUEUE_LIMIT);
         let match_id = Uuid::new_v4();
         
         let server = Self {
@@ -194,6 +224,8 @@ impl NetServer {
             outbox,
             outbox_handle: Mutex::new(None),
             outbox_rx: Mutex::new(Some(outbox_rx)),
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            dropped_outbox: Arc::new(AtomicU64::new(0)),
         };
 
         Ok(server)
@@ -253,8 +285,35 @@ impl NetServer {
     }
 
     pub fn stop(&self) {
+        // Bug №610: the farewells have to be queued BEFORE the task that sends
+        // them is aborted. The outbox has exactly one writer, and it was
+        // aborted first, so every `Disconnect(ServerShutdown)` that
+        // `disconnect_all` queued afterwards went into a channel with nobody
+        // left reading it — the shutdown notice was dropped on the floor and
+        // clients learned about the match ending from a silent socket.
+        self.disconnect_all(DisconnectReason::ServerShutdown);
         *self.running.lock() = false;
+        self.abort_tasks();
+        info!("NetServer stopped");
+    }
 
+    /// `stop()`, but the outbox gets a bounded window to deliver the farewells.
+    ///
+    /// Bug №610: ordering alone is not enough — the farewell is queued, then the
+    /// only task that can send it is aborted in the same breath. On a real
+    /// socket that is a lost packet, which is exactly the case this path exists
+    /// for. The pause is the drain window; it is short and it is paid once, at
+    /// the end of a match.
+    pub async fn stop_gracefully(&self) {
+        const FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+        self.disconnect_all(DisconnectReason::ServerShutdown);
+        *self.running.lock() = false;
+        tokio::time::sleep(FLUSH_WINDOW).await;
+        self.abort_tasks();
+        info!("NetServer stopped");
+    }
+
+    fn abort_tasks(&self) {
         if let Some(handle) = self.send_handle.lock().take() {
             handle.abort();
         }
@@ -264,9 +323,6 @@ impl NetServer {
         if let Some(handle) = self.outbox_handle.lock().take() {
             handle.abort();
         }
-
-        self.disconnect_all(DisconnectReason::ServerShutdown);
-        info!("NetServer stopped");
     }
 
     /// Bug №172: the single writer for every queued datagram.
@@ -300,11 +356,23 @@ impl NetServer {
 
     /// Bug №172: queue instead of spawning. Returns false only if the server
     /// has been dropped, which is the one case where a send is truly lost.
+    ///
+    /// Bug №613: the channel is bounded now, so `send` can also fail because it
+    /// is FULL — a consumer that fell behind. That is a dropped packet, and it
+    /// is counted: a silently dropped farewell or ack is the kind of failure
+    /// that looks like a network problem for an hour.
     fn enqueue(&self, conn: Arc<Connection>, packets: Vec<OutgoingPacket>) {
         for packet in packets {
-            if self.outbox.send(OutboxItem { conn: conn.clone(), packet }).is_err() {
-                warn!("outbox closed; dropping packet for connection {}", conn.id);
-                return;
+            match self.outbox.try_send(OutboxItem { conn: conn.clone(), packet }) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.dropped_outbox.fetch_add(1, Ordering::Relaxed);
+                    warn!("outbox full; dropping a packet for connection {}", conn.id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("outbox closed; dropping packet for connection {}", conn.id);
+                    return;
+                }
             }
         }
     }
@@ -320,6 +388,9 @@ impl NetServer {
         let connect_limits = self.connect_limits.clone();
         let running = self.running.clone();
         let event_sender = self.event_sender.clone();
+        // Bug №613: the drop counter travels with the sender into the task, or a
+        // bounded queue would drop events with nothing left to report it.
+        let dropped_events = self.dropped_events.clone();
         let current_tick = self.current_tick.clone();
         let server_time = self.server_time.clone();
         let match_id = self.match_id;
@@ -345,6 +416,7 @@ impl NetServer {
                             limit_enabled,
                             &connect_limits,
                             &event_sender,
+                            &dropped_events,
                             &current_tick,
                             &server_time,
                             match_id,
@@ -354,10 +426,14 @@ impl NetServer {
                             data,
                         ).await {
                             warn!("Error handling packet from {}: {}", addr, e);
-                            let _ = event_sender.send(ServerEvent::Error {
-                                connection_id: None,
-                                error: e.to_string(),
-                            });
+                            emit_event(
+                                &event_sender,
+                                &dropped_events,
+                                ServerEvent::Error {
+                                    connection_id: None,
+                                    error: e.to_string(),
+                                },
+                            );
                         }
                     }
                     Err(e) => {
@@ -413,7 +489,10 @@ impl NetServer {
         bandwidth: &BandwidthTracker,
         limit_enabled: bool,
         connect_limits: &Arc<Mutex<HashMap<SocketAddr, ConnectLimit>>>,
-        event_sender: &mpsc::UnboundedSender<ServerEvent>,
+        event_sender: &mpsc::Sender<ServerEvent>,
+        // Bug №613: the bounded event queue drops what it cannot hold, and
+        // this is where that drop is counted.
+        dropped_events: &AtomicU64,
         current_tick: &Arc<Mutex<Tick>>,
         server_time: &Arc<Mutex<f64>>,
         match_id: Uuid,
@@ -539,7 +618,11 @@ impl NetServer {
                     conn_arc.send_connect_accept(tick, time, match_id)
                 };
 
-                let _ = event_sender.send(ServerEvent::ClientConnected { connection_id: id, addr });
+                emit_event(
+            event_sender,
+            dropped_events,
+            ServerEvent::ClientConnected { connection_id: id, addr },
+        );
 
                 if let Some(accept) = accept {
                     Self::send_packet(socket, &conn_arc, &accept, bandwidth, limit_enabled).await.map(|_| ())?;
@@ -561,12 +644,12 @@ impl NetServer {
             match PacketType::from_u8(header.packet_type) {
                 Some(PacketType::Input) => {
                     if let Ok(input) = deserialize_limited::<InputPacket>(payload) {
-                        let _ = event_sender.send(ServerEvent::ClientInput { connection_id, input });
+                        emit_event(event_sender, dropped_events, ServerEvent::ClientInput { connection_id, input });
                     }
                 }
                 Some(PacketType::Command) => {
                     if let Ok(command) = deserialize_limited::<CommandPacket>(payload) {
-                        let _ = event_sender.send(ServerEvent::ClientCommand { connection_id, command });
+                        emit_event(event_sender, dropped_events, ServerEvent::ClientCommand { connection_id, command });
                     }
                 }
                 Some(PacketType::Connect) => {
@@ -605,12 +688,12 @@ impl NetServer {
                         match orig_type {
                             PacketType::Input => {
                                 if let Ok(input) = deserialize_limited::<InputPacket>(&bytes) {
-                                    let _ = event_sender.send(ServerEvent::ClientInput { connection_id, input });
+                emit_event(event_sender, dropped_events, ServerEvent::ClientInput { connection_id, input });
                                 }
                             }
                             PacketType::Command => {
                                 if let Ok(command) = deserialize_limited::<CommandPacket>(&bytes) {
-                                    let _ = event_sender.send(ServerEvent::ClientCommand { connection_id, command });
+        emit_event(event_sender, dropped_events, ServerEvent::ClientCommand { connection_id, command });
                                 }
                             }
                             _ => {}
@@ -633,10 +716,14 @@ impl NetServer {
                         connection_id,
                         addr,
                     ) {
-                        let _ = event_sender.send(ServerEvent::ClientDisconnected {
-                            connection_id,
-                            reason,
-                        });
+                        emit_event(
+                            event_sender,
+                            dropped_events,
+                            ServerEvent::ClientDisconnected {
+                                connection_id,
+                                reason,
+                            },
+                        );
                     }
                 }
                 _ => {}
@@ -714,6 +801,9 @@ impl NetServer {
         let limit_enabled = self.config.enable_bandwidth_limit;
         let event_sender = self.event_sender.clone();
         let running = self.running.clone();
+        // Bug №613: as in the receive loop, the drop counter goes with the
+        // sender into the task.
+        let dropped_events = self.dropped_events.clone();
         let current_tick = self.current_tick.clone();
         let server_time = self.server_time.clone();
         let tick_rate = self.tick_rate;
@@ -771,13 +861,14 @@ impl NetServer {
                 // reaping, and dead clients would keep consuming interest and
                 // snapshot work forever, which is the exact leak the sweep
                 // exists to prevent.
-                if rounds % tick_rate as u64 == 0 {
+                if rounds.is_multiple_of(tick_rate as u64) {
                     Self::sweep_timeouts(
                         &connections,
                         &connection_by_addr,
                         &delta_compressor,
                         &client_layers,
                         &event_sender,
+                        &dropped_events,
                     );
                 }
 
@@ -827,7 +918,10 @@ impl NetServer {
         connection_by_addr: &Arc<RwLock<HashMap<SocketAddr, u32>>>,
         delta_compressor: &Arc<DeltaCompressor>,
         client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
-        event_sender: &mpsc::UnboundedSender<ServerEvent>,
+        event_sender: &mpsc::Sender<ServerEvent>,
+        // Bug №613: the bounded event queue drops what it cannot hold, and
+        // this is where that drop is counted.
+        dropped_events: &AtomicU64,
     ) {
         let timed_out: Vec<(u32, SocketAddr)> = {
             let conns = connections.read();
@@ -849,7 +943,7 @@ impl NetServer {
                 let drops = conn.pending_ack_drops_since(0);
                 if drops > 0 {
                     dropped_total += drops;
-                    if worst.map_or(true, |(_, d)| drops > d) {
+                    if worst.is_none_or(|(_, d)| drops > d) {
                         worst = Some((*id, drops));
                     }
                 }
@@ -865,11 +959,19 @@ impl NetServer {
         }
         for (id, addr) in timed_out {
             if Self::remove_connection(connection_by_addr, connections, delta_compressor, client_layers, id, addr) {
-                let _ = event_sender.send(ServerEvent::ClientDisconnected {
-                    connection_id: id,
-                    reason: DisconnectReason::Timeout,
-                });
-                let _ = event_sender.send(ServerEvent::ClientTimeout { connection_id: id });
+                emit_event(
+                    event_sender,
+                    dropped_events,
+                    ServerEvent::ClientDisconnected {
+                        connection_id: id,
+                        reason: DisconnectReason::Timeout,
+                    },
+                );
+                emit_event(
+                    event_sender,
+                    dropped_events,
+                    ServerEvent::ClientTimeout { connection_id: id },
+                );
             }
         }
     }
@@ -967,9 +1069,16 @@ impl NetServer {
         // this allows payload reuse across clients. The cache key is now
         // (layer, resync, base_tick, target_tick, content_hash) where
         // content_hash is computed from the actual entity/projectile data.
-        let delta_cache: std::sync::Mutex<
-            HashMap<(u8, bool, u64, u64, u64), (Vec<EntitySnapshot>, Vec<ProjectileSnapshot>, Vec<EntitySnapshot>, Vec<ProjectileSnapshot>, Vec<u8>)>,
-        > = std::sync::Mutex::new(HashMap::new());
+        type DeltaCacheKey = (u8, bool, u64, u64, u64);
+type DeltaCacheValue = (
+    Vec<EntitySnapshot>,
+    Vec<ProjectileSnapshot>,
+    Vec<EntitySnapshot>,
+    Vec<ProjectileSnapshot>,
+    Vec<u8>,
+);
+let delta_cache: std::sync::Mutex<HashMap<DeltaCacheKey, DeltaCacheValue>> =
+            std::sync::Mutex::new(HashMap::new());
 
         // Bug №29: snapshot the client list first, then take the layers lock        // per client and only for map access. Serialization, fragmentation
         // and delta diffing (the expensive parts at 200 clients) run without
@@ -1275,8 +1384,18 @@ impl NetServer {
         self.interest_manager.add_ship(entity);
     }
 
-    pub fn remove_entity_from_interest(&self, entity_id: EntityId) {
-        self.interest_manager.remove_ship(entity_id);
+    /// Bug №605: until now this had zero callers, so a hull the sim had
+    /// dropped was never taken out of the interest grids. `main` calls it the
+    /// moment the simulation no longer knows the ship, passing the interior
+    /// that hung off it so the wreck does not keep replicating as orphaned
+    /// compartments and stations.
+    pub fn remove_entity_from_interest(
+        &self,
+        entity_id: EntityId,
+        compartment_ids: &[EntityId],
+        station_ids: &[EntityId],
+    ) {
+        self.interest_manager.retire_ship(entity_id, compartment_ids, station_ids);
     }
 
     pub fn update_entity_interest(&self, entity: ShipEntity) {
@@ -1295,21 +1414,120 @@ impl NetServer {
         self.interest_manager.update_player(player);
     }
 
+    /// The entities an event is about, for interest filtering.
+    ///
+    /// Every variant of `GameEvent` names the entity it happened to, and an
+    /// event about a subject the viewer cannot see is exactly the leak Bug №635
+    /// describes. The two global variants — team score and match state — name no
+    /// entity at all; an empty list means "everyone", which is the only sensible
+    /// answer for something that has no position in the world.
+    fn event_subjects(event: &GameEvent) -> SmallVec<[EntityId; 2]> {
+        let mut subjects: SmallVec<[EntityId; 2]> = SmallVec::new();
+        match event {
+            GameEvent::ShipHit {
+                target,
+                projectile,
+                hit_compartment,
+                ..
+            } => {
+                subjects.push(*target);
+                subjects.push(*projectile);
+                if let Some(compartment) = hit_compartment {
+                    subjects.push(*compartment);
+                }
+            }
+            GameEvent::ShipSunk { ship, .. } => subjects.push(*ship),
+            GameEvent::CompartmentFlooded { compartment, .. }
+            | GameEvent::CompartmentSealed { compartment }
+            | GameEvent::CompartmentBreached { compartment }
+            | GameEvent::FireStarted { compartment, .. }
+            | GameEvent::FireExtinguished { compartment } => subjects.push(*compartment),
+            GameEvent::StationOccupied { station, player }
+            | GameEvent::StationVacated { station, player } => {
+                subjects.push(*station);
+                subjects.push(*player);
+            }
+            GameEvent::PlayerSpawned { player, ship, .. } => {
+                subjects.push(*player);
+                subjects.push(*ship);
+            }
+            GameEvent::PlayerDied { player, killer } => {
+                subjects.push(*player);
+                if let Some(killer) = killer {
+                    subjects.push(*killer);
+                }
+            }
+            GameEvent::ProjectileFired { projectile, .. }
+            | GameEvent::ProjectileImpact { projectile, .. } => subjects.push(*projectile),
+            GameEvent::BulkheadStateChanged { bulkhead, .. } => subjects.push(*bulkhead),
+            GameEvent::PumpStateChanged { pump, .. } => subjects.push(*pump),
+            GameEvent::TeamScoreChanged { .. } | GameEvent::MatchStateChanged { .. } => {}
+        }
+        subjects
+    }
+
+    /// Fan an event out to the connections that can actually see what it is
+    /// about.
+    ///
+    /// Bug №635: this used to send to every Connected connection while
+    /// snapshots were built per interest. Two costs, both real. The fan-out ran
+    /// as O(connections x events) whatever a client could physically see, and
+    /// the event itself leaked the state of ships the snapshot deliberately
+    /// omitted — a hull at the far end of the map was invisible to the client
+    /// and fully described by its events.
+    ///
+    /// The rule now is the one the snapshot path already keeps: a client is told
+    /// about an entity exactly when that entity would be in its snapshot.
+    /// `should_replicate_subject` is permissive on purpose (see there) so an
+    /// event cannot be silenced by an id the manager has never heard of, and an
+    /// event with no subject goes to everyone.
+    ///
+    /// A viewer that is not tracked yet gets nothing, by the same rule that
+    /// holds its first full state back (Bug №164): an event describes a world,
+    /// and a client with no world yet should not be handed pieces of one.
+    ///
+    /// Whether a viewer should receive `event` at all.
+    ///
+    /// Kept separate from the fan-out so the policy is testable without a
+    /// socket: `broadcast_event` decides *who* to write to, this decides *what*
+    /// each of them is allowed to learn. One visible subject is enough — a
+    /// player who can see the ship that was hit needs the hit even if the shell
+    /// that made it has already flown out of range, and a player who can see
+    /// the shell needs the impact. Requiring *all* subjects would fail both.
+    fn event_reaches(interest: &InterestManager, viewer_player_id: u32, event: &GameEvent) -> bool {
+        if !interest.has_player(viewer_player_id) {
+            return false;
+        }
+        let subjects = Self::event_subjects(event);
+        if subjects.is_empty() {
+            // Nothing is named: match and team state describes the world, not
+            // an entity, so every tracked viewer hears it (Bug №635).
+            return true;
+        }
+        subjects
+            .iter()
+            .any(|s| interest.should_replicate_subject(viewer_player_id, *s))
+    }
+
     pub fn broadcast_event(&self, event: GameEvent) {
-        let event_packet = EventPacket { events: vec![event] };
         // Bug №172: queue instead of spawning. A mass event to 256 conns is
         // now N queue pushes drained by the single writer task, not a task per
         // connection racing each other onto the wire.
-        let conns: Vec<Arc<Connection>> = {
+        let conns: Vec<(u32, Arc<Connection>)> = {
             let conns = self.connections.read();
             conns
-                .values()
-                .filter(|c| c.state() == ConnectionState::Connected)
-                .cloned()
+                .iter()
+                .filter(|(_, c)| c.state() == ConnectionState::Connected)
+                .map(|(client_id, conn)| (*client_id, conn.clone()))
                 .collect()
         };
-        for conn in conns {
-            let packets = conn.send_event(event_packet.clone());
+        for (client_id, conn) in conns {
+            if !Self::event_reaches(&self.interest_manager, client_id, &event) {
+                continue;
+            }
+            let packets = conn.send_event(EventPacket {
+                events: vec![event.clone()],
+            });
             if !packets.is_empty() {
                 self.enqueue(conn, packets);
             }
@@ -1362,10 +1580,14 @@ impl NetServer {
             connection_id,
             conn.addr,
         ) {
-            let _ = self.event_sender.send(ServerEvent::ClientDisconnected {
-                connection_id,
-                reason,
-            });
+            emit_event(
+                &self.event_sender,
+                &self.dropped_events,
+                ServerEvent::ClientDisconnected {
+                    connection_id,
+                    reason,
+                },
+            );
             true
         } else {
             false
@@ -1395,13 +1617,31 @@ impl NetServer {
             // connection — the sweep loop or a manual disconnect may have
             // raced us, and double-emission breaks the №32 uniqueness contract.
             if self.disconnect_client(id, DisconnectReason::Timeout) {
-                let _ = self.event_sender.send(ServerEvent::ClientTimeout { connection_id: id });
+                emit_event(
+                    &self.event_sender,
+                    &self.dropped_events,
+                    ServerEvent::ClientTimeout { connection_id: id },
+                );
             }
         }
     }
 
-    pub fn get_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<ServerEvent>> {
+    pub fn get_event_receiver(&self) -> Option<mpsc::Receiver<ServerEvent>> {
         self.event_receiver.lock().take()
+    }
+
+    /// Events dropped because the consumer fell behind (Bug №613).
+    ///
+    /// Exists so a bounded channel is not a new silent failure: the whole point
+    /// of bounding the queue is that something has to be dropped, and a drop
+    /// nobody can see has simply traded an OOM for a mystery.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Outbox entries dropped for the same reason (Bug №613).
+    pub fn dropped_outbox(&self) -> u64 {
+        self.dropped_outbox.load(Ordering::Relaxed)
     }
 
     pub fn bandwidth_stats(&self) -> BandwidthStats {
@@ -1438,5 +1678,358 @@ impl NetServer {
 
     pub fn interest_stats(&self) -> crate::interest::InterestStats {
         self.interest_manager.stats()
+    }
+}
+
+#[cfg(test)]
+mod bounded_queue_tests {
+    use super::*;
+
+    /// Bug №613: the event queue was an `unbounded_channel`, so a producer
+    /// outrunning the tick loop grew memory without limit — the failure mode is
+    /// an OOM, not a slowdown. Bounding it introduces a new one: a full queue
+    /// drops an event. That drop is counted here, because a bounded queue whose
+    /// drops are invisible has merely traded an OOM for a mystery.
+    #[test]
+    fn a_full_event_queue_drops_and_counts() {
+        let dropped = AtomicU64::new(0);
+        let (tx, rx) = mpsc::channel(2);
+
+        // Two fit; the third has nowhere to go.
+        for id in 1..=3 {
+            emit_event(
+                &tx,
+                &dropped,
+                ServerEvent::Error {
+                    connection_id: Some(id),
+                    error: format!("flood {id}"),
+                },
+            );
+        }
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "the event the full queue dropped was not counted"
+        );
+
+        // A closed channel is NOT counted: nothing is waiting to read it any
+        // more, so the number would only grow for a server already going down.
+        drop(rx);
+        emit_event(
+            &tx,
+            &dropped,
+            ServerEvent::Error {
+                connection_id: Some(4),
+                error: "after close".into(),
+            },
+        );
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "a closed channel must not inflate the backpressure counter"
+        );
+    }
+
+    /// The two queues are bounded for the same reason, so the cap has to be a
+    /// number rather than a default: a test that cannot fill the queue cannot
+    /// tell a bound from no bound.
+    #[test]
+    fn the_queues_really_are_bounded() {
+        let (tx, _rx) = mpsc::channel::<u8>(1);
+        assert!(tx.try_send(1).is_ok());
+        assert!(
+            matches!(tx.try_send(2), Err(mpsc::error::TrySendError::Full(_))),
+            "a channel of capacity 1 accepted a second item, so it is not bounded"
+        );
+    }
+}
+
+/// Bug №635: `broadcast_event` sent every event to every connection while
+/// snapshots were built per interest.
+///
+/// These test the policy, not the fan-out. `event_reaches` is the whole decision
+/// and is deliberately callable without a socket; the loop that applies it is
+/// three lines of plumbing around it.
+#[cfg(test)]
+mod event_interest_tests {
+    use super::*;
+    use rfs_core::entity::PlayerPosture;
+    use rfs_core::math::{Transform, Vec3f};
+
+    const VIEWER: u32 = 1;
+    const VIEWER_SHIP: u64 = 10;
+    const VIEWER_PLAYER_ENTITY: u64 = 20;
+    const FAR_SHIP: u64 = 30;
+    const FAR_PLAYER_ENTITY: u64 = 40;
+    const BULKHEAD: u64 = 50;
+
+    fn ship(id: u64, x: f32) -> ShipEntity {
+        ShipEntity {
+            entity_id: EntityId::new(id),
+            ship_class_id: 0,
+            transform: Transform::from_position(Vec3f::new(x, 0.0, 0.0)),
+            velocity: Vec3f::ZERO,
+            angular_velocity: Vec3f::ZERO,
+            health: 100.0,
+            max_health: 100.0,
+            flags: EntityFlags::empty(),
+            fuel: 50.0,
+            max_fuel: 50.0,
+            speed: 0.0,
+            max_speed: 10.0,
+            heading: 0.0,
+            rudder_angle: 0.0,
+            throttle: 0.0,
+            last_hit: None,
+            compartments: Vec::new(),
+            stations: Vec::new(),
+            team: 0,
+        }
+    }
+
+    fn player(entity_id: u64, player_id: u32, ship_id: u64, name: &str) -> PlayerEntity {
+        PlayerEntity {
+            entity_id: EntityId::new(entity_id),
+            player_id,
+            name: name.to_string(),
+            team: 0,
+            transform: Transform::from_position(Vec3f::new(0.0, 0.0, 0.0)),
+            velocity: Vec3f::ZERO,
+            posture: PlayerPosture::Standing,
+            health: 100.0,
+            max_health: 100.0,
+            stamina: 100.0,
+            max_stamina: 100.0,
+            current_station: None,
+            current_ship: Some(EntityId::new(ship_id)),
+            input_sequence: 0,
+            last_acknowledged_tick: 0,
+        }
+    }
+
+    /// The viewer at the origin on its own ship, plus a second hull and crewman
+    /// parked far beyond `ship_radius` (5000 by default), so anything about them
+    /// is invisible by construction.
+    fn world() -> InterestManager {
+        let mgr = InterestManager::new(InterestConfig::default());
+        mgr.add_ship(ship(VIEWER_SHIP, 0.0));
+        mgr.add_player(player(VIEWER_PLAYER_ENTITY, VIEWER, VIEWER_SHIP, "viewer"), EntityId::new(VIEWER_SHIP));
+        mgr.add_ship(ship(FAR_SHIP, 20_000.0));
+        mgr.add_player(
+            player(FAR_PLAYER_ENTITY, 2, FAR_SHIP, "far"),
+            EntityId::new(FAR_SHIP),
+        );
+        mgr.compute_interest(VIEWER);
+        mgr
+    }
+
+    fn ship_sunk(ship_id: u64) -> GameEvent {
+        GameEvent::ShipSunk {
+            ship: EntityId::new(ship_id),
+            position: Vec3f::ZERO,
+        }
+    }
+
+    /// Every variant has to name the entity it happened to, or the filter has
+    /// nothing to filter on and the leak comes straight back. The two global
+    /// variants name none — they cannot be filtered, and they are not meant to
+    /// be.
+    #[test]
+    fn every_event_variant_names_its_subject() {
+        let id = EntityId::new(1);
+        let empty = |e: GameEvent| NetServer::event_subjects(&e).is_empty();
+
+        assert!(empty(GameEvent::TeamScoreChanged { team: 0, score: 1 }));
+        assert!(empty(GameEvent::MatchStateChanged {
+            state: MatchState::Waiting
+        }));
+
+        let named = [
+            GameEvent::ShipHit {
+                target: id,
+                projectile: id,
+                position: Vec3f::ZERO,
+                normal: Vec3f::ZERO,
+                damage: 1.0,
+                penetration: 1.0,
+                hit_compartment: None,
+            },
+            ship_sunk(1),
+            GameEvent::CompartmentFlooded {
+                compartment: id,
+                water_level: 1.0,
+            },
+            GameEvent::CompartmentSealed { compartment: id },
+            GameEvent::CompartmentBreached { compartment: id },
+            GameEvent::StationOccupied {
+                station: id,
+                player: id,
+            },
+            GameEvent::StationVacated {
+                station: id,
+                player: id,
+            },
+            GameEvent::PlayerSpawned {
+                player: id,
+                ship: id,
+                position: Vec3f::ZERO,
+            },
+            GameEvent::PlayerDied {
+                player: id,
+                killer: None,
+            },
+            GameEvent::ProjectileFired {
+                projectile: id,
+                position: Vec3f::ZERO,
+                velocity: Vec3f::ZERO,
+                weapon: id,
+            },
+            GameEvent::ProjectileImpact {
+                projectile: id,
+                position: Vec3f::ZERO,
+                normal: Vec3f::ZERO,
+            },
+            GameEvent::BulkheadStateChanged {
+                bulkhead: id,
+                is_sealed: true,
+            },
+            GameEvent::PumpStateChanged {
+                pump: id,
+                is_active: true,
+            },
+            GameEvent::FireStarted {
+                compartment: id,
+                intensity: 1.0,
+            },
+            GameEvent::FireExtinguished { compartment: id },
+        ];
+        for event in named {
+            assert!(
+                !NetServer::event_subjects(&event).is_empty(),
+                "{event:?} named no subject, so it could never be filtered"
+            );
+        }
+    }
+
+    /// The defect itself: a hull the client's snapshot does not contain must not
+    /// be described by its events. Before №635 this reached the viewer.
+    #[test]
+    fn an_event_about_a_ship_outside_the_viewer_interest_is_not_sent() {
+        let mgr = world();
+        assert!(
+            !mgr.should_replicate_entity(VIEWER, EntityId::new(FAR_SHIP)),
+            "the fixture is not actually invisible, so this proves nothing"
+        );
+        assert!(
+            !NetServer::event_reaches(&mgr, VIEWER, &ship_sunk(FAR_SHIP)),
+            "a ship beyond interest leaked to the viewer through its events"
+        );
+    }
+
+    /// The other half: the same event about a hull the viewer can see still
+    /// arrives. Without this the filter could be made to pass by dropping
+    /// everything.
+    #[test]
+    fn an_event_about_a_ship_the_viewer_can_see_is_sent() {
+        let mgr = world();
+        assert!(
+            mgr.should_replicate_entity(VIEWER, EntityId::new(VIEWER_SHIP)),
+            "the fixture's own ship is not visible, so this proves nothing"
+        );
+        assert!(
+            NetServer::event_reaches(&mgr, VIEWER, &ship_sunk(VIEWER_SHIP)),
+            "an event about a visible ship was dropped"
+        );
+    }
+
+    /// `entity_layers` never holds bulkheads or pumps, so a plain
+    /// `should_replicate_entity` answers `false` for them and the whole
+    /// category goes silent. This is the carve-out that keeps that from
+    /// shipping unnoticed.
+    #[test]
+    fn an_event_about_an_id_the_manager_does_not_track_is_not_silenced() {
+        let mgr = world();
+        let event = GameEvent::BulkheadStateChanged {
+            bulkhead: EntityId::new(BULKHEAD),
+            is_sealed: true,
+        };
+        assert!(
+            NetServer::event_reaches(&mgr, VIEWER, &event),
+            "an event about an untracked id was silently dropped"
+        );
+    }
+
+    /// The same idea, checked from the other side: the manager must not report
+    /// a bulkhead as invisible just because it does not know it.
+    #[test]
+    fn an_untracked_id_is_not_reported_as_invisible() {
+        let mgr = world();
+        assert!(
+            mgr.should_replicate_subject(VIEWER, EntityId::new(BULKHEAD)),
+            "an id the manager has never seen was treated as hidden"
+        );
+        assert!(
+            !mgr.should_replicate_subject(VIEWER, EntityId::new(FAR_SHIP)),
+            "a tracked ship outside interest was treated as visible"
+        );
+    }
+
+    /// One visible subject is enough. A player who can see the hull that was
+    /// hit needs the hit even when the shell has already flown out of range.
+    #[test]
+    fn one_visible_subject_is_enough() {
+        let mgr = world();
+        let event = GameEvent::PlayerSpawned {
+            // Own crewman (visible) aboard a hull nobody can see.
+            player: EntityId::new(VIEWER_PLAYER_ENTITY),
+            ship: EntityId::new(FAR_SHIP),
+            position: Vec3f::ZERO,
+        };
+        assert!(
+            NetServer::event_reaches(&mgr, VIEWER, &event),
+            "an event was dropped although one of its subjects was visible"
+        );
+
+        // Neither subject visible ⇒ dropped.
+        let event = GameEvent::PlayerSpawned {
+            player: EntityId::new(FAR_PLAYER_ENTITY),
+            ship: EntityId::new(FAR_SHIP),
+            position: Vec3f::ZERO,
+        };
+        assert!(
+            !NetServer::event_reaches(&mgr, VIEWER, &event),
+            "an event about two invisible subjects reached the viewer"
+        );
+    }
+
+    /// Match and team state name no entity and go to everyone who has a world.
+    #[test]
+    fn an_event_with_no_subject_reaches_a_tracked_viewer() {
+        let mgr = world();
+        let event = GameEvent::MatchStateChanged {
+            state: MatchState::Starting,
+        };
+        assert!(NetServer::event_reaches(&mgr, VIEWER, &event));
+        assert!(NetServer::event_reaches(&mgr, VIEWER, &GameEvent::TeamScoreChanged {
+            team: 0,
+            score: 3,
+        }));
+    }
+
+    /// A connection the game layer has not registered yet has no world, and
+    /// Bug №164 already holds its first full state back for that reason. Events
+    /// follow the same rule instead of describing a world it has not been given.
+    #[test]
+    fn a_viewer_the_game_layer_has_not_registered_yet_hears_nothing() {
+        let mgr = world();
+        let unregistered = 99;
+        assert!(!mgr.has_player(unregistered));
+        assert!(!NetServer::event_reaches(&mgr, unregistered, &ship_sunk(VIEWER_SHIP)));
+        assert!(
+            !NetServer::event_reaches(&mgr, unregistered, &GameEvent::MatchStateChanged {
+                state: MatchState::Starting,
+            }),
+            "an untracked viewer was handed a match event"
+        );
     }
 }

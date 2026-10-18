@@ -35,6 +35,17 @@ pub struct Renderer {
     last_frame_time: Instant,
     /// Is running
     running: bool,
+    /// What the last frame cost and drew.
+    ///
+    /// Kept on the renderer rather than in the graph because it is a fact about
+    /// the frame as a whole, and the graph is rebuilt while the renderer is not.
+    stats: super::RenderStats,
+    /// The last execution summary that differed from the one before it.
+    ///
+    /// Kept so a change in "which passes ran" is logged once instead of once per
+    /// frame — a per-frame log of an unchanged summary is noise, and the summary
+    /// only changes when the graph does.
+    last_execution_summary: String,
     /// The real window presentation, when the renderer was given one.
     ///
     /// `None` means the renderer runs headless: the graph still records and
@@ -51,15 +62,25 @@ pub struct Renderer {
 
 /// A surface and the swapchain presenting to it.
 ///
-/// Ordered so the surface outlives the chain: fields drop in declaration order,
-/// and destroying a swapchain after its surface is invalid.
+/// Bug №295: the field order below is load-bearing, and it was previously the other
+/// way round. Rust drops struct fields in declaration order, so declaring the
+/// surface first destroyed it *before* the swapchain built from it — which is
+/// `VUID-vkDestroySurfaceKHR-surface-01266` on every exit. The struct comment used
+/// to claim the opposite of what the code did ("ordered so the surface outlives the
+/// chain" with the surface declared first), which is how the mistake survived review.
+///
+/// So: swapchain first, surface second, because the chain must die first. Reordering
+/// these two fields reintroduces the bug, and the comment is here so that the next
+/// reader takes the order as intentional rather than accidental.
 struct Presentation {
+    /// Destroyed first, so the surface below is still alive when it happens. That
+    /// ordering is required, not stylistic — see the note above.
+    swapchain: crate::rhi::backend::vulkan::Swapchain,
     /// Kept, not prefixed with `_`, because `resize` needs the same surface to
     /// rebuild the chain on. A surface is tied to the window handle and outlives
     /// any particular swapchain, so one surface is built once per window and
     /// every rebuild reuses it.
     surface: crate::rhi::backend::vulkan::WindowSurface,
-    swapchain: crate::rhi::backend::vulkan::Swapchain,
 }
 
 impl Renderer {
@@ -113,6 +134,8 @@ impl Renderer {
             config: renderer_config,
             last_frame_time: Instant::now(),
             running: true,
+            stats: super::RenderStats::new(),
+            last_execution_summary: String::new(),
             presentation: None,
         })
     }
@@ -234,6 +257,7 @@ impl Renderer {
         if !self.running {
             return;
         }
+        self.stats.begin_frame();
 
         // Calculate delta time
         let now = Instant::now();
@@ -262,7 +286,16 @@ impl Renderer {
         // published for the passes.
         let acquired_index = match self.presentation.as_mut() {
             Some(presentation) => {
-                let acquired = match presentation.swapchain.acquire(u64::MAX) {
+                // Bug №282: the acquire hands the presentation engine's semaphore
+                // to the frame's submit instead of blocking this thread on a
+                // fence. The CPU now gets ahead of the GPU by up to
+                // `FRAMES_IN_FLIGHT` frames, which is the entire point of the ring.
+                let image_acquired = self
+                    .device
+                    .backend_resource()
+                    .map(|backend| backend.image_acquired_semaphore())
+                    .unwrap_or_else(crate::rhi::ash::vk::Semaphore::null);
+                let acquired = match presentation.swapchain.acquire(u64::MAX, image_acquired) {
                     Ok(acquired) => acquired,
                     // Out of date means the chain no longer matches the surface,
                     // which happens on every resize and on entering fullscreen.
@@ -329,21 +362,60 @@ impl Renderer {
         // at 0 instead of cycling, which is the same defect as before, so this is
         // a reverted experiment rather than a partial fix. The real answer is a
         // ring of frames in flight with one semaphore per slot.
+        //
+        // Bug №282, closing: `arm_presentation_signal` was never called from
+        // anywhere in the tree. The flag existed, the submit honoured it, and the
+        // renderer passed a null semaphore to `present` while explaining in a
+        // comment that nothing was signalled — which is exactly what was
+        // happening. The comment described the defect instead of causing its
+        // removal.
+        //
+        // Arming here, not inside `execute`, because only the renderer knows
+        // whether this frame is bound for the swapchain. An offscreen frame must
+        // not signal a semaphore nothing waits on, or it stays signalled forever
+        // and the next present consumes it without waiting.
+        if self.presentation.is_some() {
+            if let Some(backend) = self.device.backend_resource() {
+                backend.arm_presentation_signal();
+            }
+        }
         self.render_graph
             .execute(&self.device, &mut self.context, scene);
+
+        // Picked up rather than read: the graph counted these while it recorded,
+        // and the number describes the frame that was just submitted.
+        let draws = self.render_graph.take_last_frame_draws();
+        self.stats
+            .add_draws(draws.draws, draws.triangles, draws.vertices);
+
+        // A change in "which passes ran" is worth one line; the same summary every
+        // frame is not. A pass that never runs is raised to a warning because the
+        // default threshold prints warnings and not info — the finding must be
+        // visible without anyone remembering to raise it (§313).
+        let summary = self.render_graph.execution_summary();
+        if summary != self.last_execution_summary {
+            self.last_execution_summary = summary.clone();
+            if self.render_graph.never_executed().is_empty() {
+                crate::info!("renderer", "graph: {summary}");
+            } else {
+                crate::warn!("renderer", "graph: {summary}");
+            }
+        }
 
         if self.presentation.is_some() {
             let presentation = self
                 .presentation
                 .as_mut()
                 .expect("presentation presence was just checked");
-            // No fence wait here: the graph's submit path already blocks on its
-            // own fence before returning, so the work is finished. There used to
-            // be a wait here, on a fence that the *acquire* had signalled rather
-            // than the render, so it never actually waited for anything.
-            // Bug №282: present waits on a per-frame semaphore. One semaphore is not enough
-            // (see above), so nothing is signalled yet and this waits on null.
-            let render_finished = crate::rhi::ash::vk::Semaphore::null();
+            // The submit that just ran signalled this slot's semaphore, and
+            // consuming it is what releases the image for the next acquire.
+            // `render_finished_semaphore` returns the slot the *last* submit
+            // used, which is the one being presented here.
+            let render_finished = self
+                .device
+                .backend_resource()
+                .map(|backend| backend.render_finished_semaphore())
+                .unwrap_or_else(crate::rhi::ash::vk::Semaphore::null);
             if let Err(e) = presentation.swapchain.present(acquired_index, render_finished) {
                 if !matches!(e, RhiError::SwapchainOutOfDate) {
                     crate::error!("renderer", "present failed: {e}");
@@ -351,8 +423,23 @@ impl Renderer {
             }
         }
 
-        // Increment frame counter
-        self.context.frame_number += 1;
+        // No frame counter increment here.
+        //
+        // Bug №286: `context.begin_frame`, called at the top of this function,
+        // already increments `context.frame_number`. This used to increment it a
+        // second time, so the counter advanced twice per rendered frame and
+        // anything deriving a phase or an id from it — TAA jitter, animation
+        // timing, a per-frame index — was wrong by a factor of two. It was
+        // invisible while the number was only ever printed.
+        //
+        // `begin_frame` is the single place that advances the frame, because it
+        // is also what advances `frame_index`, `delta_time` and `total_time`.
+        //
+        // `end_frame` is here for the same reason in reverse: it is the only place
+        // that measures the frame that just finished, and it must run after the
+        // present so the measurement covers the whole frame rather than the part
+        // of it before the swapchain was handed the image.
+        self.stats.end_frame();
     }
 
     /// Resize the renderer
@@ -361,9 +448,24 @@ impl Renderer {
         let height = height.max(1);
         self.context.resolution = crate::rhi::types::Extent2D::new(width, height);
 
-        // Recreate depth texture
-        self.context.depth_texture = None;
-        self.context.depth_view = None;
+        // The context's own depth texture is deliberately *not* cleared here.
+        //
+        // Bug №289: these two lines read as "drop the stale depth on resize" and
+        // were exactly a leak — assigning `None` drops the Rust handle while the
+        // Vulkan image and view stay in the teardown list, one pair per resize.
+        //
+        // They were also redundant. `resolution` is set above, and
+        // `RenderContext::begin_frame` rebuilds the depth texture whenever its
+        // dimensions no longer match, so the recreation happens on the next frame
+        // either way — and `create_depth_texture` now releases what it replaces.
+
+        // Passes are told about the new size before the chain is rebuilt. Bug №311:
+        // `RenderPassNode::resize` had no call sites, so a pass holding
+        // size-dependent resources would have kept the old ones and rendered at
+        // stale dimensions. Order does not matter between this and the rebuild
+        // below — both happen before the next frame is recorded — but both must
+        // happen before it, which is why neither is deferred to `render_frame`.
+        self.render_graph.resize(width, height);
 
         // Rebuild the swapchain at the new extent.
         //
@@ -395,7 +497,18 @@ impl Renderer {
                     .device
                     .create_swapchain(&presentation.surface, request, Some(&mut presentation.swapchain))
                 {
-                    Ok(swapchain) => presentation.swapchain = swapchain,
+                    Ok(swapchain) => {
+                        presentation.swapchain = swapchain;
+                        // Bug №289: assigning above drops the previous `Swapchain`,
+                        // and its `Drop` destroys the image views that any framebuffer
+                        // cached for those images still references. Bumping the
+                        // generation is what tells passes their cache is stale; without
+                        // it a resize that leaves the extent unchanged serves a dead
+                        // framebuffer and the driver reports an invalid `VkImageView`
+                        // at the next `beginRenderPass`.
+                        self.context.swapchain_generation =
+                            self.context.swapchain_generation.wrapping_add(1);
+                    }
                     Err(e) => {
                         // Reported rather than swallowed: a resize that could not
                         // rebuild the chain leaves presentation permanently broken,
@@ -492,6 +605,106 @@ impl Renderer {
             swapchain.images.iter().map(|i| i.as_raw() as u64).collect(),
             swapchain.image_views.iter().map(|v| v.as_raw() as u64).collect(),
         );
+        self.publish_typed_presentation_views();
+    }
+
+    /// Build typed `TextureView`s over the live swapchain images. Bug №298.
+    ///
+    /// A pass needs a typed view to build a framebuffer: `Texture` and `TextureView`
+    /// expose no `as_raw`, and a `TextureView` cannot be reconstructed from a `u64`
+    /// because it needs the `Texture` it was made from. So the raw handles below are
+    /// enough to describe the window and not enough to draw into it.
+    ///
+    /// Views are created, not adopted, because the swapchain's views are 2D and
+    /// single-layer while a `TextureView` carries a description — the description has
+    /// to exist either way. The underlying *images* are adopted, never destroyed:
+    /// `Swapchain` owns those, and tracking them here as well would give two owners
+    /// and a double free.
+    ///
+    /// A failure here must not take the frame down. Without these views a pass can
+    /// fall back to the raw handles it had before, which is exactly the state this
+    /// fixes but which does not crash.
+    fn publish_typed_presentation_views(&mut self) {
+        let Some(presentation) = self.presentation.as_ref() else {
+            self.context.set_presentation_texture_views(Vec::new());
+            return;
+        };
+        let swapchain = &presentation.swapchain;
+        let width = swapchain.extent.width.max(1);
+        let height = swapchain.extent.height.max(1);
+        let Some(format) = swapchain.rhi_format() else {
+            crate::error!(
+                "renderer",
+                "swapchain reports no format, so no typed presentation views can be \
+                 built; passes needing one will fall back to the raw handles"
+            );
+            self.context.set_presentation_texture_views(Vec::new());
+            return;
+        };
+
+        let mut views = Vec::with_capacity(swapchain.images.len());
+
+        // The views published last time are ours — created by this function, not the
+        // swapchain's — so nothing else will free them. Releasing them here is not an
+        // optimisation: skipping it leaked three per swapchain rebuild, which the
+        // resize self-check showed immediately as 23 → 26 → 29 tracked objects. Note
+        // they are independent objects even though they look at the same images; the
+        // swapchain destroying *its* views does not touch ours.
+        let previous = std::mem::take(&mut self.context.presentation_texture_views);
+        if !previous.is_empty() {
+            let stale: Vec<crate::rhi::core::device::Releasable<'_>> =
+                previous.iter().map(crate::rhi::core::device::Releasable::TextureView).collect();
+            self.device.release_many(&stale);
+        }
+
+        for &image in &swapchain.images {
+            let texture = self.device.adopt_texture(
+                crate::rhi::TextureDesc {
+                    width,
+                    height,
+                    depth: 1,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    // The swapchain can report no format before presentation is
+                    // attached. Falling back to `R8G8B8A8_UNORM` would silently
+                    // describe the image wrong, and the view would then disagree with
+                    // the render pass — better to publish nothing and let the caller
+                    // fall back to the raw handles.
+                    format: format,
+                    usage: crate::rhi::TextureUsage::COLOR_ATTACHMENT,
+                    sample_count: crate::rhi::SampleCount::X1,
+                    dimensions: crate::rhi::TextureDimensions::D2,
+                    sharing_mode: crate::rhi::SharingMode::Exclusive,
+                    queue_family_indices: Vec::new(),
+                },
+                image.as_raw() as u64,
+            );
+            match self.device.create_texture_view(
+                &texture,
+                &crate::rhi::TextureViewDesc {
+                    texture: texture.clone(),
+                    format: None,
+                    view_type: crate::rhi::TextureViewType::D2,
+                    aspects: crate::rhi::TextureAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    mip_level_count: 1,
+                    base_array_layer: 0,
+                    array_layer_count: 1,
+                },
+            ) {
+                Ok(view) => views.push(view),
+                Err(e) => {
+                    crate::error!(
+                        "renderer",
+                        "typed view for a swapchain image failed: {e}; passes needing a \
+                         typed view will fall back to the raw handles"
+                    );
+                    self.context.set_presentation_texture_views(Vec::new());
+                    return;
+                }
+            }
+        }
+        self.context.set_presentation_texture_views(views);
     }
 
     /// Update settings
@@ -518,6 +731,24 @@ impl Renderer {
     /// Get renderer configuration
     pub fn config(&self) -> &RendererConfig {
         &self.config
+    }
+
+    /// What the last frame cost and drew.
+    ///
+    /// `RenderStats` used to be exported and never called: `begin_frame`,
+    /// `end_frame` and `add_draw_call` had no call sites anywhere, so every
+    /// field read zero — a statistic that always reports nothing is worse than
+    /// no statistic, because it can be printed and believed.
+    pub fn stats(&self) -> &super::RenderStats {
+        &self.stats
+    }
+
+    /// One line describing which passes ran in the last frame and how often.
+    ///
+    /// Exists so a caller (an overlay, a test, a log on demand) can ask instead
+    /// of only seeing the line `render_frame` emits when the summary changes.
+    pub fn execution_summary(&self) -> &str {
+        &self.last_execution_summary
     }
 
     /// Get current settings
@@ -559,10 +790,34 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        // Wait for GPU to finish
-        self
-            .device
-            .wait_idle()
-            .expect("device wait_idle not implemented");
+        // Wait for the GPU to finish before the device is torn down underneath it.
+        //
+        // Bug №288: this used to `.expect("device wait_idle not implemented")`.
+        // Two defects in one line. The message was stale and wrong — `wait_idle`
+        // has been implemented for some time — so a genuine failure reported a
+        // reason that pointed nowhere. And panicking in `Drop` is worse than the
+        // condition it reports: a device that failed to go idle is already in a
+        // bad state, and unwinding out of a destructor while the GPU may still be
+        // reading destroyed objects turns a recoverable shutdown into an abort.
+        //
+        // Nothing useful can be done about it here, but reporting is better than
+        // aborting, and it keeps the real cause in the output.
+        if let Err(e) = self.device.wait_idle() {
+            eprintln!("[render] device_wait_idle failed during shutdown: {e}");
+        }
+
+        // Bug №295: presentation is torn down here, explicitly, before the fields
+        // drop.
+        //
+        // `device` is declared first, and Rust drops struct fields in declaration
+        // order — so the device was destroyed before the swapchain that belongs to
+        // it. Destroying a swapchain after its device has gone does not clean
+        // anything up; the validation layer counts its three image views, its fence
+        // and the swapchain itself as leaked on every exit, which is 5 of the objects
+        // that were reported missing even with no resize involved.
+        //
+        // Relying on field order would be the same bug waiting for the next
+        // reordering, so the order is stated instead of inherited.
+        self.presentation = None;
     }
 }

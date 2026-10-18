@@ -67,6 +67,16 @@ pub use types::*;
 
 // Re-export for convenience
 pub use backend::Backend;
+
+/// Re-exported from the Vulkan backend so tests and the debug overlay can read the
+/// validation error count without depending on which backend is active. Bug №292.
+pub use backend::vulkan::validation_error_count;
+
+/// Whether the validation layer is genuinely loaded. Bug №297.
+///
+/// Pairs with [`validation_error_count`]: a zero error count is only meaningful
+/// when this is `true`.
+pub use backend::vulkan::validation_layer_active;
 #[allow(ambiguous_glob_reexports)]
 pub use command::*;
 #[allow(ambiguous_glob_reexports)]

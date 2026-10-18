@@ -42,9 +42,9 @@ use super::{UiError, UiResult};
 pub fn ui_ortho_projection(width: u32, height: u32) -> [f32; 16] {
     let w = width.max(1) as f32;
     let h = height.max(1) as f32;
-    [
-        2.0 / w, 0.0, 0.0, 0.0, // column 0
-        0.0, -2.0 / h, 0.0, 0.0, // column 1
+        [
+            2.0 / w, 0.0, 0.0, 0.0, // column 0
+            0.0, -2.0 / h, 0.0, 0.0, // column 1
         0.0, 0.0, 0.0, 0.0, // column 2
         -1.0, 1.0, 0.0, 1.0, // column 3: translation
     ]
@@ -62,25 +62,96 @@ pub struct UiRenderPass {
 
 impl UiRenderPass {
     /// Build the UI pass for a surface format and size.
+    ///
+    /// See [`Self::new_offscreen`] for the variant that can be read back.
     pub fn new(device: &Device, format: Format, width: u32, height: u32) -> UiResult<Self> {
-// Deliberately the SAME helper the geometry pass uses, with the same
-    // `LoadOp::Clear` / `initial_layout: Undefined` / no subpass dependencies.
-//
-// This is a bisect, not a considered choice. `LoadOp::Load` is the semantically
-// right operator for an overlay — it is what preserves the 3D frame underneath —
-// but the geometry pass renders correctly with `Clear` and no dependencies, so
-// until a `Load` UI pass is seen drawing, the difference in operator is the only
-// variable left worth testing. If the UI appears with `Clear`, the fault is in
-// the load path or its barrier; if it does not, the fault is in the pipeline or
-// vertex state, and the operator was never the problem.
-//
-// Known cost of `Clear` here: it wipes the 3D frame the UI is meant to sit on.
-// That has to be fixed properly — an acquire barrier plus `Load` — but only
-// after the UI is drawing at all.
-let render_pass = device.presentation_render_pass(format).map_err(|e| {
+        // Deliberately the SAME helper the geometry pass uses, with the same
+        // `LoadOp::Clear` / `initial_layout: Undefined` / no subpass dependencies.
+        //
+        // This is a bisect, not a considered choice. `LoadOp::Load` is the
+        // semantically right operator for an overlay — it is what preserves the
+        // 3D frame underneath — but the geometry pass renders correctly with
+        // `Clear` and no dependencies, so until a `Load` UI pass is seen drawing,
+        // the difference in operator is the only variable left worth testing.
+        //
+        // Known cost of `Clear` here: it wipes the 3D frame the UI is meant to sit
+        // on. That has to be fixed properly — an acquire barrier plus `Load` — but
+        // only after the UI is drawing at all.
+        let render_pass = device.presentation_render_pass(format).map_err(|e| {
             UiError::BackendError(format!("UI presentation render pass: {e}"))
         })?;
 
+        Self::from_render_pass(render_pass, format, width, height)
+    }
+
+    /// Build the UI pass for an offscreen texture that can be read back.
+    ///
+    /// # Why this exists separately
+    ///
+    /// A presentation pass ends the frame in `PresentSrc`. That is correct for a
+    /// swapchain image and useless for verification: `download_texture` copies
+    /// out of `TransferSrcOptimal` (or `General`), and an image parked in
+    /// `PresentSrc` is neither readable nor copyable, so a UI pass that can only
+    /// present cannot be used to check whether it drew anything at all.
+    ///
+    /// That is the whole problem this exists to solve. Every check so far has
+    /// been indirect — "a draw call was recorded", "validation stayed quiet" —
+    /// and none of them can tell a correct draw from one that rasterised nothing.
+    /// Reading the pixels answers it.
+    ///
+    /// `Clear` rather than `Load`: an offscreen texture has no 3D frame to
+    /// preserve, and starting from `Undefined` makes the untouched part of the
+    /// image a known value rather than a guess.
+    pub fn new_offscreen(device: &Device, format: Format, width: u32, height: u32) -> UiResult<Self> {
+        use crate::command::pass::render::{
+            AttachmentDescription, AttachmentReference, LoadOp, PipelineBindPoint,
+            RenderPassDesc, StoreOp, SubpassDescription,
+        };
+        use crate::resource::TextureLayout;
+
+        let render_pass = device
+            .create_gpu_render_pass(&RenderPassDesc {
+                attachments: vec![AttachmentDescription {
+                    format,
+                    samples: crate::types::SampleCount::X1,
+                    load_op: LoadOp::Clear,
+                    store_op: StoreOp::Store,
+                    stencil_load_op: LoadOp::DontCare,
+                    stencil_store_op: StoreOp::DontCare,
+                    initial_layout: TextureLayout::Undefined,
+                    // The one difference that matters: not `PresentSrc`.
+                    // `ColorAttachmentOptimal`, not `TransferSrcOptimal`.
+            // `Device::download_texture` derives its barrier's `oldLayout` from
+            // the texture's *usage flags* - COLOR_ATTACHMENT_OPTIMAL for a
+            // colour attachment - so a pass that already leaves the image in
+            // TRANSFER_SRC_OPTIMAL makes that barrier lie about the old layout.
+            // Validation rejected it as `VUID-vkCmdDraw-None-09600` and the
+            // readback came back empty. Geometry already ends here, which is why
+            // the same readback is clean for it.
+            final_layout: TextureLayout::ColorAttachmentOptimal,
+                }],
+                subpasses: vec![SubpassDescription {
+                    pipeline_bind_point: PipelineBindPoint::Graphics,
+                    color_attachments: vec![AttachmentReference {
+                        attachment: 0,
+                        layout: TextureLayout::ColorAttachmentOptimal,
+                    }],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                }],
+                dependencies: vec![],
+            })
+            .map_err(|e| UiError::BackendError(format!("UI offscreen render pass: {e}")))?;
+
+        Self::from_render_pass(render_pass, format, width, height)
+    }
+
+    fn from_render_pass(
+        render_pass: RenderPass,
+        format: Format,
+        width: u32,
+        height: u32,
+    ) -> UiResult<Self> {
         let mut this = Self {
             render_pass,
             projection: [0.0; 16],

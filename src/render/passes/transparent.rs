@@ -229,7 +229,18 @@ impl RenderPass for TransparentPass {
             dependencies: vec![],
         };
 
-        self.render_pass = Some(device.create_render_pass(&render_pass_desc));
+        // Bug №314: `create_render_pass` reached the backend and could fail. Swallowing
+        // that would restore the old silence, so a failure leaves the pass unset
+        // and the resize reports it below instead of continuing with a
+        // descriptor that cannot be used.
+        match device.create_render_pass(&render_pass_desc) {
+            Ok(pass) => self.render_pass = Some(pass),
+            Err(e) => crate::error!(
+                "transparent",
+                "render pass could not be created: {}",
+                e
+            ),
+        }
 
         // Create framebuffer
         //

@@ -1,7 +1,6 @@
 //! Memory Budget
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 /// Memory budget
 #[derive(Debug, Clone, Default)]

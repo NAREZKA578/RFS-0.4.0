@@ -1,7 +1,6 @@
 //! Barriers
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use crate::resource::texture::TextureLayout;
 use crate::resource::{Buffer, Texture};

@@ -1,7 +1,6 @@
 //! Command Definitions
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use super::pass::render::RenderPassBeginInfo;
 use crate::descriptor::set::DescriptorSet;

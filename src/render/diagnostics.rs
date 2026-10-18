@@ -136,6 +136,22 @@ macro_rules! warn {
     };
 }
 
+/// Report something worth knowing.
+///
+/// `Severity::Info` existed without a way to emit it: the level, its prefix and
+/// the threshold that drops it were all in place, and nothing could produce a
+/// message at that level.
+#[macro_export]
+macro_rules! info {
+    ($subsystem:expr, $($arg:tt)*) => {
+        $crate::render::diagnostics::report(
+            $crate::render::diagnostics::Severity::Info,
+            $subsystem,
+            format_args!($($arg)*),
+        )
+    };
+}
+
 /// Report an error.
 #[macro_export]
 macro_rules! error {

@@ -99,17 +99,26 @@ impl MaterialLibrary {
         self.water_materials.remove(name)
     }
 
-    /// Create pipelines for all materials
-    pub fn create_pipelines(&mut self) {
+    /// Create pipelines for all materials.
+    ///
+    /// Bug №314: every material pipeline needs the pass it will be compatible
+    /// with. Taking it once here is better than each material inventing one:
+    /// two passes with the same attachments are still different handles, and a
+    /// pipeline built against one of them is rejected by the other.
+    pub fn create_pipelines(
+        &mut self,
+        render_pass: &crate::rhi::command::pass::render::RenderPass,
+        set_layouts: &[&crate::rhi::descriptor::DescriptorSetLayout],
+    ) {
         if let Some(device) = &self.device {
             for material in self.materials.values_mut() {
-                material.create_pipeline(device);
+                material.create_pipeline(device, render_pass, set_layouts);
             }
             for material in self.pbr_materials.values_mut() {
-                material.create_pipeline(device);
+                material.create_pipeline(device, render_pass, set_layouts);
             }
             for material in self.water_materials.values_mut() {
-                material.create_pipeline(device);
+                material.create_pipeline(device, render_pass, set_layouts);
             }
         }
     }

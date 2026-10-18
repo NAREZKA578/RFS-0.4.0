@@ -1,7 +1,6 @@
 //! Pipeline State
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use crate::descriptor::layout::DescriptorSetLayout;
 use crate::types::*;

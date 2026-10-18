@@ -1,8 +1,9 @@
-//! Geometry pass — the first pass that records real GPU work.
-//!
-//! Every other pass in the render layer is still a stub (#186), so nothing
-//! reached the GPU before this. This one records the full sequence a real frame
-//! needs:
+//! Geometry pass — the first pass in the render layer that recorded real GPU
+//! work, at a time when every other pass recorded nothing (#186), so nothing
+//! reached the GPU before this one. The transparent, water, lighting and UI
+//! passes record real work as well now; the pieces still missing are tracked
+//! individually, not by this sentence. This one records the full sequence a
+//! real frame needs:
 //!
 //! ```text
 //! BeginRenderPass -> BindGraphicsPipeline -> BindDescriptorSets
@@ -85,6 +86,17 @@ pub struct GeometryPassState {
     /// the chain has different dimensions, so the cached framebuffer is returned
     /// with attachments sized for the previous window and nothing renders.
     pub framebuffer_extent: Option<Extent2D>,
+    /// Which swapchain generation `framebuffer` was built for. Bug №289.
+    ///
+    /// The rest of the cache key — image index and extent — is not enough, and the
+    /// failure it misses is a use-after-free rather than a stale draw. Destroying a
+    /// swapchain destroys its image views, and a rebuild can produce a chain with
+    /// the *same* extent and hand back the *same* image index. Every part of the key
+    /// then matches while the framebuffer references destroyed views, so it is
+    /// served from the cache and the driver reports
+    /// `VUID-VkRenderPassBeginInfo-framebuffer-parameter` at the `beginRenderPass`,
+    /// with nothing in the message pointing at the resize that caused it.
+    pub framebuffer_generation: Option<u64>,
     // There are deliberately no cached width/height fields used as the draw size.
     //
     // They used to exist, initialised to 0 and never assigned again, and the pass
@@ -111,6 +123,49 @@ const UNIFORM_SIZE: u64 = 16 * 4 * 4;
 /// state is what makes the pass drivable from outside the graph, without a
 /// downcast and without a bespoke trait method for each field.
 pub type SharedState = std::sync::Arc<std::sync::Mutex<GeometryPassState>>;
+
+impl GeometryPassState {
+    /// A state with the GPU objects supplied and every per-frame cache empty.
+    ///
+    /// Bug №300, requested by AGENT-SBF2. The reason this is a constructor rather
+    /// than `#[derive(Default)]`: the five resources it takes deliberately do *not*
+    /// implement `Default`, and that is correct. A default `GraphicsPipeline` or
+    /// `DescriptorSetLayout` would be a resource with no backend, which is precisely
+    /// the trap that already cost two separate incidents in this codebase — a
+    /// `RenderPass` built by `Device::create_render_pass` that never reached the
+    /// backend, and a blend attachment whose write mask defaulted to empty and so
+    /// drew nothing while looking correct. Defaulting the fields would hand out more
+    /// of exactly those.
+    ///
+    /// So the GPU objects stay required and only the caches default. The point is the
+    /// one SBF2 asked for: adding a field now updates this one function instead of
+    /// breaking every test that enumerates the struct.
+    pub fn with_resources(
+        pipeline: GraphicsPipeline,
+        descriptor_layout: DescriptorSetLayout,
+        descriptor_set: DescriptorSet,
+        uniform_buffer: crate::rhi::Buffer,
+        render_pass: crate::rhi::RenderPass,
+        items: Vec<GeometryItem>,
+    ) -> Self {
+        Self {
+            pipeline,
+            descriptor_layout,
+            descriptor_set,
+            uniform_buffer,
+            depth_format: GeometryPass::DEPTH_FORMAT,
+            render_pass,
+            items,
+            depth_texture: None,
+            depth_view: None,
+            framebuffer: None,
+            framebuffer_pinned: false,
+            framebuffer_image: None,
+            framebuffer_extent: None,
+            framebuffer_generation: None,
+        }
+    }
+}
 
 pub struct GeometryPass {
     state: Option<SharedState>,
@@ -268,21 +323,14 @@ impl GeometryPass {
             ));
         }
 
-        Ok(Self::with_state(GeometryPassState {
+        Ok(Self::with_state(GeometryPassState::with_resources(
             pipeline,
             descriptor_layout,
             descriptor_set,
             uniform_buffer,
-            depth_format: Self::DEPTH_FORMAT,
             render_pass,
             items,
-            depth_texture: None,
-            depth_view: None,
-            framebuffer: None,
-            framebuffer_pinned: false,
-            framebuffer_image: None,
-            framebuffer_extent: None,
-        }))
+        )))
     }
 
     /// Whether a render pass declares a depth attachment.
@@ -325,8 +373,14 @@ impl GeometryPass {
         // `framebuffer_extent`. Without it, a resize that happens to reacquire
         // the same image number returns a framebuffer whose attachments are still
         // sized for the previous window.
+        //
+        // The generation is the other half, and unlike the extent it guards against
+        // memory that no longer exists: see `framebuffer_generation`. Checked first
+        // because it is the only part that can be wrong about *liveness* rather than
+        // about sizing.
         let current_extent = context.presentation_extent;
-        if state.framebuffer_image == Some(context.swapchain_image_index)
+        if state.framebuffer_generation == Some(context.swapchain_generation)
+            && state.framebuffer_image == Some(context.swapchain_image_index)
             && state.framebuffer_extent == Some(current_extent)
         {
             return state.framebuffer.clone();
@@ -347,6 +401,57 @@ impl GeometryPass {
                 .as_ref()
                 .is_none_or(|t| t.width() != width || t.height() != height);
             if stale {
+                // Bug №289: the old depth image is released *before* the new one
+                // is created. Dropping the Rust `Texture` used to be enough
+                // because the backend tracked nothing — but now every object goes
+                // into a teardown list that is only walked at `vkDestroyDevice`,
+                // so a depth image replaced on every resize would stay resident
+                // in VRAM for the life of the process. A window dragged around for
+                // an hour leaks one depth texture per resize step.
+                //
+                // Order matters more than it looks, and the first attempt at this
+                // was wrong. The framebuffer currently cached references *both* the
+                // old depth view and the old swapchain image view, so destroying
+                // the depth first leaves that framebuffer holding a dead attachment.
+                // Vulkan reports it at the next `vkCmdBeginRenderPass` as
+                // `VUID-VkRenderPassBeginInfo-framebuffer-parameter` — an
+                // invalid `VkImageView`, far from the call that caused it.
+                //
+                // So: framebuffer first (it references the views), then the depth
+                // view (referenced by the framebuffer), then the depth image
+                // (referenced by the view). That is the same dependency order the
+                // device uses at teardown, applied early.
+                // Bug №294: one device wait for the whole batch, not one per object.
+                // Three objects are replaced at once, and three waits stall the GPU
+                // three times for work that only needed finishing once — visible as
+                // stutter on every resize step.
+                //
+                // Order is dependencies first, and it is not checked for us:
+                // framebuffer references both views, the depth view references the
+                // depth image. Backwards, the framebuffer is left holding a destroyed
+                // attachment and the driver reports
+                // `VUID-VkRenderPassBeginInfo-framebuffer-parameter` at the next
+                // `beginRenderPass`, with nothing pointing back here.
+                let mut batch: Vec<crate::rhi::core::device::Releasable<'_>> = Vec::new();
+                if let Some(old) = state.framebuffer.as_ref() {
+                    batch.push(crate::rhi::core::device::Releasable::Framebuffer(old));
+                }
+                if let Some(old) = state.depth_view.as_ref() {
+                    batch.push(crate::rhi::core::device::Releasable::TextureView(old));
+                }
+                if let Some(old) = state.depth_texture.as_ref() {
+                    batch.push(crate::rhi::core::device::Releasable::Texture(old));
+                }
+                context.device().release_many(&batch);
+
+                state.framebuffer = None;
+                state.depth_view = None;
+                state.depth_texture = None;
+                // The cached framebuffer is gone now, so it must not be reused even
+                // though its recorded image and extent still match.
+                state.framebuffer_image = None;
+                state.framebuffer_extent = None;
+                state.framebuffer_generation = None;
                 let depth = context.device().create_texture(
                     width,
                     height,
@@ -408,9 +513,23 @@ impl GeometryPass {
 
         match framebuffer {
             Ok(framebuffer) => {
+                // Same reason as the depth image above: a framebuffer replaced
+                // because the acquired image or the extent changed used to stay in
+                // the teardown list forever. Vulkan forbids destroying a framebuffer
+                // whose attachments are still in flight, so this waits for the device
+                // to go idle first — correct here precisely because the replacement
+                // happens a handful of times per second at most, not per frame.
+                //
+                // Usually `None` already: the depth branch above takes it when the
+                // size changed. This covers the case where the depth did not change
+                // but the swapchain was rebuilt at the same extent.
+                if let Some(old) = state.framebuffer.take() {
+                    context.device().release_framebuffer(&old);
+                }
                 state.framebuffer = Some(framebuffer.clone());
                 state.framebuffer_image = Some(context.swapchain_image_index);
                 state.framebuffer_extent = Some(current_extent);
+                state.framebuffer_generation = Some(context.swapchain_generation);
                 Some(framebuffer)
             }
             Err(e) => {

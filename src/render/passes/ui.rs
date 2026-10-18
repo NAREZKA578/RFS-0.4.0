@@ -30,7 +30,7 @@ use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
 use crate::rhi::command::encoder::CommandEncoder;
-use crate::rhi::ui::{UiCommand, UiRenderStats, UiRenderTarget, UiRenderer, UiRendererConfig};
+use crate::rhi::ui::{UiCommand, UiRenderStats, UiRenderer, UiRendererConfig};
 use std::collections::HashMap;
 
 /// Compiled from `assets/shaders/ui_geom.wgsl`. The RHI takes SPIR-V as bytes
@@ -86,10 +86,10 @@ pub struct UIPass {
     ui: Option<UiRenderer>,
     /// The extent the renderer was initialized for, so a resize is noticed.
     built_for: Option<(u32, u32)>,
-    /// Reported once per change rather than every frame, which would drown the
-    /// log at 60 Hz.
-    reported_init: bool,
-    reported_resize: bool,
+        /// Reported once per change rather than every frame, which would drown the
+        /// log at 60 Hz.
+        reported_init: bool,
+        reported_resize: bool,
     /// Frames that actually recorded a draw. Drives the heartbeat log.
     frames: u64,
 }
@@ -109,8 +109,8 @@ impl UIPass {
             name: "ui".to_string(),
             config,
             ui: None,
-            built_for: None,
-            reported_init: false,
+        built_for: None,
+        reported_init: false,
             reported_resize: false,
             frames: 0,
         }
@@ -164,6 +164,16 @@ impl UIPass {
 
         match ui.initialize(format, width, height, UI_GEOM_SPV, Some(UI_TEX_SPV)) {
             Ok(()) => {
+                // A font and its atlas are one fact, and neither half was ever
+                // wired: with no atlas the textured pipeline cannot run, so every
+                // string was counted as skipped and nothing said why.
+                //
+                // Failure is reported once and is not fatal — geometry is
+                // independent of glyphs, and a renderer that cannot rasterise a
+                // font should still draw its panels.
+                if let Err(e) = ui.install_bitmap_font("bitmap8") {
+                    eprintln!("[ui] font install failed, text will be skipped: {e}");
+                }
                 if !self.reported_init {
                     eprintln!(
                         "[ui] renderer ready for {width}x{height} as {format:?} \
@@ -235,27 +245,40 @@ impl RenderPass for UIPass {
             return;
         };
 
-        // The acquired image, not a pinned one: pinning leaves every frame
-        // drawing into whichever image happened to be acquired first, and the
-        // other swapchain images are then presented having never been written.
-        let Some((image, view)) = context.acquired_image() else {
+        // The acquired image's *typed* view, not a raw handle and not a pinned
+        // image. Two separate reasons, and both are load-bearing:
+        //
+        //  - Pinning leaves every frame drawing into whichever image happened to
+        //    be acquired first, and the other swapchain images are then presented
+        //    having never been written.
+        //  - A raw handle cannot become a framebuffer: `TextureView` owns the
+        //    `Texture` it came from, so the RHI keeps no way to rebuild one from
+        //    a handle. `UiRenderer::record` takes raw handles and therefore
+        //    cannot record a render pass at all — it says so instead of returning
+        //    success (see its `# Why this cannot honour a target yet`). The index
+        //    is the same `swapchain_image_index` the presenter will present, so
+        //    the view and the presented image agree by construction.
+        let Some(view) = context
+            .presentation_texture_views
+            .get(context.swapchain_image_index as usize)
+        else {
             return;
         };
 
         // What is actually drawn this frame. Kept minimal on purpose — see
         // `UIConfig::debug_marker`.
         if self.config.debug_marker {
-            // Two rectangles, and the point is to tell them apart on screen:
+            // One rectangle at a fixed pixel offset. A single known-shape marker
+            // is what tells "the UI drew nothing" apart from "the UI drew in the
+            // wrong place": if this appears at the top-left corner at the right
+            // size, the pixel mapping and the blend state are both correct, and
+            // anything else wrong on screen is not the coordinate transform.
             //
-            //  - the small corner one is the real test of the pixel mapping. If it
-            //    is missing while the big one shows, the mapping is wrong and the
-            //    problem is coordinates, not the pass.
-            //  - the full-screen one is deliberately unmistakable. If *neither*
-            //    appears, the recorded draw is not reaching the image at all, and
-            //    the projection is not the place to look.
-            //
-            // A single small rectangle cannot distinguish these two, which is
-            // exactly the ambiguity that let this sit unresolved.
+            // It is deliberately not full-screen. An earlier version filled the
+            // frame with blue as well, on the theory that an unmistakable fill
+            // would be easier to spot. It was not: the fill covered up exactly
+            // the thing being measured, and a marker that hides the background
+            // cannot show whether it blended against it correctly.
             let corner = UiCommand::Rectangle {
                 x: 32.0,
                 y: 32.0,
@@ -264,29 +287,19 @@ impl RenderPass for UIPass {
                 color: [0.76, 0.95, 0.13, 1.0],
                 corner_radius: 0.0,
             };
-            let full = UiCommand::Rectangle {
-                x: 0.0,
-                y: 0.0,
-                width: width as f32,
-                height: height as f32,
-                // Blue, so it cannot be confused with the green corner marker.
-                color: [0.15, 0.35, 0.95, 1.0],
-                corner_radius: 0.0,
-            };
-            if let Err(e) = ui.submit_commands(vec![corner, full]) {
+            if let Err(e) = ui.submit_commands(vec![corner]) {
                 eprintln!("[ui] submit_commands failed: {e}");
             }
         }
 
-        let target = UiRenderTarget {
-            image,
-            view,
-            format,
-            width,
-            height,
-        };
-
-        match ui.record(encoder, Some(&target)) {
+        // The presentation path, using the typed view. `UiRenderer::record`
+        // cannot be used here: it identifies its target by raw `u64` handles and
+        // records no render pass for them, which is exactly the
+        // `VUID-vkCmdDrawIndexed-renderpass` and `VUID-VkPresentInfoKHR-
+        // pImageIndices-01430` pair this pass used to emit. `record_into_view`
+        // builds (and caches, per image view) the framebuffer and records
+        // Begin/Draw/End.
+        match ui.record_into_view(encoder, view, width, height) {
             // `false` means there was nothing to draw, which is normal on a frame
             // where every UI element was culled.
             Ok(true) => {

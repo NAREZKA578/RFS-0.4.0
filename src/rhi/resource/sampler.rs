@@ -1,7 +1,6 @@
 //! Sampler Resources
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use serde::{Deserialize, Serialize};
 

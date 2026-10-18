@@ -51,6 +51,8 @@ impl WindowSurface {
             hwnd,
             ..Default::default()
         };
+        // SAFETY: instance (via win32 loader) is valid; create_info contains valid window handles
+        // obtained from raw-window-handle; no allocator used (None).
         let handle = unsafe { win32.create_win32_surface(&create_info, None) }
             .map_err(|e| RhiError::BackendError(format!("create Win32 surface: {e}")))?;
         Ok(Self {
@@ -68,6 +70,8 @@ impl WindowSurface {
 
 impl Drop for WindowSurface {
     fn drop(&mut self) {
+        // SAFETY: surface handle is valid and owned by this struct; _instance Arc keeps instance
+        // alive (which owns the surface) for at least as long as the drop runs.
         unsafe {
             self.surface.destroy_surface(self.handle, None);
         }
@@ -166,6 +170,8 @@ impl Swapchain {
         let swapchain_loader = SwapchainLoader::new(&instance.instance, &device);
         let surface_loader = SurfaceLoader::new(&instance.entry, &instance.instance);
 
+        // SAFETY: surface_loader, physical_device and surface.handle are valid; no pointers returned
+        // to caller that outlive this call (returned caps struct is copied).
         let caps = unsafe {
             surface_loader.get_physical_device_surface_capabilities(physical_device, surface.handle)
         }
@@ -206,6 +212,9 @@ impl Swapchain {
             ..Default::default()
         };
 
+        // SAFETY: swapchain_loader, device, and surface.handle are valid; create_info fields are
+        // all derived from the negotiated caps/format/extent above, and old_swapchain (if present)
+        // is a live handle owned by this module.
         let handle = match unsafe { swapchain_loader.create_swapchain(&create_info, None) } {
             Ok(handle) => handle,
             Err(e) => {
@@ -213,17 +222,26 @@ impl Swapchain {
             }
         };
         // Only now, with a swapchain in hand, is the old one actually gone.
-        if let Some(old) = old.as_deref_mut() {
+        //
+        // Bug №295: this flag no longer suppresses `destroy_swapchain` in `Drop` —
+        // `oldSwapchain` transfers presentation responsibility, not ownership of the
+        // handle, and skipping the destroy leaked a swapchain per rebuild. It is
+        // kept because it still records that the chain was superseded, and it is the
+        // signal not to draw into or present from the old chain.
+        if let Some(old) = old.as_mut() {
             old.handed_over = true;
         }
 
+        // SAFETY: handle was just created and is valid; no external pointers returned.
         let images = match unsafe { swapchain_loader.get_swapchain_images(handle) } {
             Ok(images) if !images.is_empty() => images,
             Ok(_) => {
+                // SAFETY: handle valid, not yet handed out to caller.
                 unsafe { swapchain_loader.destroy_swapchain(handle, None) };
                 return Err(RhiError::BackendError("swapchain reported zero images".into()));
             }
             Err(e) => {
+                // SAFETY: handle valid, not yet handed out to caller.
                 unsafe { swapchain_loader.destroy_swapchain(handle, None) };
                 return Err(RhiError::BackendError(format!("swapchain images: {e}")));
             }
@@ -245,13 +263,17 @@ impl Swapchain {
                 },
                 ..Default::default()
             };
+            // SAFETY: device valid; image is an image obtained from this swapchain (owned by device);
+            // view_info uses a format negotiated for this surface (compatible with swapchain images).
             match unsafe { device.create_image_view(&view_info, None) } {
                 Ok(view) => image_views.push(view),
                 Err(e) => {
                     // Do not leak the views already created.
                     for made in &image_views {
+                        // SAFETY: each view was successfully created by this loop and is owned here.
                         unsafe { device.destroy_image_view(*made, None) };
                     }
+                    // SAFETY: handle valid, cleanup path before returning to caller.
                     unsafe { swapchain_loader.destroy_swapchain(handle, None) };
                     return Err(RhiError::BackendError(format!("swapchain image view: {e}")));
                 }
@@ -274,6 +296,8 @@ impl Swapchain {
         let acquire_fence = match create_fence(&device) {
             Ok(f) => f,
             Err(e) => {
+                // SAFETY: device, swapchain_loader, handle and image_views are all valid and owned
+                // by this construction path (not yet handed out to caller); fence is null (none created).
                 unsafe { Self::cleanup(&device, &swapchain_loader, handle, &image_views, vk::Fence::null()) };
                 return Err(e);
             }
@@ -298,13 +322,32 @@ impl Swapchain {
     /// Take the next image to draw into. `timeout` is nanoseconds;
     /// `u64::MAX` waits indefinitely.
     ///
-    /// Returns only once the image is genuinely ready to be drawn into, so the
-    /// caller may start recording without arranging any further waiting.
-    pub fn acquire(&mut self, timeout: u64) -> RhiResult<AcquiredImage> {
-        // Reset at acquire rather than at creation, so a second acquire after a
-        // completed frame cannot observe an already-signalled fence.
-        unsafe { self.device.reset_fences(&[self.acquire_fence]) }
-            .map_err(|e| RhiError::BackendError(format!("reset acquire fence: {e}")))?;
+    /// `image_acquired` is signalled when the presentation engine has genuinely
+    /// handed the image over, and the frame's submit waits on it. Bug №282: this
+    /// used to pass a null semaphore and block the calling thread on a fence
+    /// instead, which is why the renderer could never have more than one frame in
+    /// flight — the CPU was always stopped at this line until the previous frame
+    /// had been drawn.
+    ///
+    /// Pass a null semaphore to keep the old blocking behaviour. That is only
+    /// correct where there is no submit that can wait: offscreen work.
+    pub fn acquire(
+        &mut self,
+        timeout: u64,
+        image_acquired: vk::Semaphore,
+    ) -> RhiResult<AcquiredImage> {
+        let semaphore_based = image_acquired != vk::Semaphore::null();
+
+        // The fence is only a fallback. With a semaphore the CPU does not wait
+        // here, and the handover happens on the GPU timeline instead.
+        if !semaphore_based {
+            // Reset at acquire rather than at creation, so a second acquire after a
+            // completed frame cannot observe an already-signalled fence.
+            // SAFETY: acquire_fence is a valid fence owned by this device and not pending
+            // (previous acquire already waited or was never submitted against).
+            unsafe { self.device.reset_fences(&[self.acquire_fence]) }
+                .map_err(|e| RhiError::BackendError(format!("reset acquire fence: {e}")))?;
+        }
 
         // `ash` reports SUBOPTIMAL as `Ok((index, true))`, but the
         // `Err(SUBOPTIMAL_KHR)` arm below is unreachable then, and the flag
@@ -315,9 +358,19 @@ impl Swapchain {
         // No semaphore: the wait is done on this thread below, which is what
         // lets the submit path stay a plain blocking submit. One frame is in
         // flight at a time, so there is no pipelining to preserve.
+        // SAFETY: loader, handle, image_acquired (if non-null) and acquire_fence (if used) are
+        // all valid handles owned by this swapchain/device; timeout is a plain nanosecond value.
         let (index, suboptimal) = match unsafe {
-            self.loader
-                .acquire_next_image(self.handle, timeout, vk::Semaphore::null(), self.acquire_fence)
+            self.loader.acquire_next_image(
+                self.handle,
+                timeout,
+                image_acquired,
+                if semaphore_based {
+                    vk::Fence::null()
+                } else {
+                    self.acquire_fence
+                },
+            )
         } {
             Ok(pair) => pair,
             // A surface that is already out of date can refuse outright here
@@ -346,15 +399,21 @@ impl Swapchain {
             )));
         }
 
-        // Wait here rather than handing a semaphore to a submission. The image
-        // is not usable until this fence is signalled, and writing into it before
-        // then is what produced torn frames.
-        match unsafe { self.device.wait_for_fences(&[self.acquire_fence], true, timeout) } {
-            Ok(()) => {}
-            Err(vk::Result::TIMEOUT) => {
-                return Err(RhiError::BackendError("swapchain acquire timed out".into()))
+        // Wait here only in the fallback case. With a semaphore the image is not
+        // ready yet, but the submit that follows waits on the semaphore, and
+        // blocking the CPU here would defeat the entire point.
+        if !semaphore_based {
+            // Waiting here rather than handing a semaphore to a submission. The
+            // image is not usable until this fence is signalled, and writing into
+            // it before then is what produced torn frames.
+            // SAFETY: acquire_fence is a valid fence owned by this device; wait parameters valid.
+            match unsafe { self.device.wait_for_fences(&[self.acquire_fence], true, timeout) } {
+                Ok(()) => {}
+                Err(vk::Result::TIMEOUT) => {
+                    return Err(RhiError::BackendError("swapchain acquire timed out".into()))
+                }
+                Err(e) => return Err(RhiError::BackendError(format!("wait acquire fence: {e}"))),
             }
-            Err(e) => return Err(RhiError::BackendError(format!("wait acquire fence: {e}"))),
         }
 
         Ok(AcquiredImage {
@@ -402,6 +461,9 @@ impl Swapchain {
             },
             ..Default::default()
         };
+        // SAFETY: loader, queue and handle are valid and belong to this device; render_finished
+        // (when non-null) is a semaphore that was signalled by a prior submit on this queue; pointers
+        // in `present` reference locals that live for the duration of the call.
         match unsafe { self.loader.queue_present(self.queue, &present) } {
             // `Ok(true)` means SUBOPTIMAL: the frame was shown but the chain
             // no longer matches the surface.
@@ -428,6 +490,11 @@ impl Swapchain {
         &self.surface
     }
 
+    // SAFETY: caller must guarantee that `device`, `loader`, `handle`, `views` and `fence` are
+    // valid handles created on this device, and that no GPU work is still using them beyond
+    // what `device_wait_idle` (called inside) is relied on to drain. `cleanup` waits for idle
+    // before destroying, so this precondition is satisfied by any caller that has already
+    // submitted and is now tearing down.
     unsafe fn cleanup(
         device: &ash::Device,
         loader: &SwapchainLoader,
@@ -435,42 +502,53 @@ impl Swapchain {
         views: &[vk::ImageView],
         fence: vk::Fence,
     ) {
+        // Bug №295: wait first. This used to destroy the views and the fence and only
+        // then wait, which is backwards — Vulkan forbids destroying an object the GPU
+        // may still be reading, so the wait that makes destruction legal has to come
+        // before it. On an error path the swapchain is usually young and idle, which
+        // is why this never showed up; "usually" is not a guarantee.
+        device.device_wait_idle().ok();
         for view in views {
             device.destroy_image_view(*view, None);
         }
         if fence != vk::Fence::null() {
             device.destroy_fence(fence, None);
         }
-        device.device_wait_idle().ok();
         loader.destroy_swapchain(handle, None);
     }
 }
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
+        // SAFETY: every handle (device, image_views, acquire_fence, loader, handle) is owned by
+        // this struct; device_wait_idle is called first so the GPU is not using any of them.
         unsafe {
+            // Wait *before* destroying, not after. The GPU may still be reading any
+            // of these views, and Vulkan forbids destroying an object in use — the
+            // wait has to precede the teardown, not tidy up after it. `cleanup` gets
+            // this order wrong on its error paths, which is the same bug in the
+            // opposite direction.
             self.device.device_wait_idle().ok();
             for view in &self.image_views {
                 self.device.destroy_image_view(*view, None);
             }
             self.device.destroy_fence(self.acquire_fence, None);
-            // Skipped when Vulkan already destroyed the handle during a
-            // handover; destroying it twice is undefined.
-            if !self.handed_over {
-                self.loader.destroy_swapchain(self.handle, None);
-            }
+            // Bug №295: `handed_over` used to suppress this call, on the reading
+            // that passing `oldSwapchain` to `vkCreateSwapchainKHR` hands the old
+            // chain over and the driver disposes of it. It does not. That parameter
+            // transfers *presentation responsibility* for the old images so the
+            // driver can order things correctly; the application still owns the old
+            // `VkSwapchainKHR` and must destroy it. Suppressing the call leaked one
+            // swapchain per rebuild — measured at one `VkSwapchainKHR` per resize
+            // step, on top of a leak that is present even without resizing.
+            self.loader.destroy_swapchain(self.handle, None);
         }
     }
 }
 
-fn create_semaphore(device: &ash::Device) -> RhiResult<vk::Semaphore> {
-    let info = vk::SemaphoreCreateInfo::default();
-    unsafe { device.create_semaphore(&info, None) }
-        .map_err(|e| RhiError::BackendError(format!("create semaphore: {e}")))
-}
-
 fn create_fence(device: &ash::Device) -> RhiResult<vk::Fence> {
     let info = vk::FenceCreateInfo::default();
+    // SAFETY: device is a valid logical device; create_info is default (signaled=false, no flags).
     unsafe { device.create_fence(&info, None) }
         .map_err(|e| RhiError::BackendError(format!("create fence: {e}")))
 }
@@ -480,6 +558,8 @@ fn pick_surface_format(
     handle: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
 ) -> RhiResult<(vk::Format, vk::ColorSpaceKHR)> {
+    // SAFETY: surface loader, handle and physical_device are valid; returned vector is owned
+    // by the caller of the FFI call, no dangling pointers to driver memory.
     let formats = unsafe { surface.get_physical_device_surface_formats(physical_device, handle) }
         .map_err(|e| RhiError::BackendError(format!("surface formats: {e}")))?;
     if formats.is_empty() {
@@ -531,6 +611,8 @@ fn pick_present_mode(
     physical_device: vk::PhysicalDevice,
     preferred: vk::PresentModeKHR,
 ) -> RhiResult<vk::PresentModeKHR> {
+    // SAFETY: surface loader, handle and physical_device are valid; no pointers are returned
+    // that outlive the call (result is an owned Vec).
     let modes = unsafe { surface.get_physical_device_surface_present_modes(physical_device, handle) }
         .map_err(|e| RhiError::BackendError(format!("present modes: {e}")))?;
     if modes.contains(&preferred) {

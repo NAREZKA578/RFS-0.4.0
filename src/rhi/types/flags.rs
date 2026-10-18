@@ -78,8 +78,18 @@ bitflags! {
         const COLOR_ATTACHMENT_OUTPUT = 1 << 5;
         const COMPUTE_SHADER = 1 << 6;
         const TRANSFER = 1 << 7;
-        const BOTTOM_OF_PIPE = 1 << 8;
-        const HOST = 1 << 9;
+    const BOTTOM_OF_PIPE = 1 << 8;
+    const HOST = 1 << 9;
+    /// Bug №293: depth and stencil testing happens here, not in the fragment
+    /// shader. Without this stage there is no legal `dst_stage` for a barrier that
+    /// makes a depth write visible — naming `FRAGMENT_SHADER` instead is
+    /// `VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02820`, and naming
+    /// `COLOR_ATTACHMENT_OUTPUT` is the same error. Both are how a render graph
+    /// ends up unable to synchronise its depth buffer at all.
+    const EARLY_FRAGMENT_TESTS = 1 << 10;
+    /// Depth and stencil tests that write late. Kept separate because a barrier
+    /// for the depth *write* and one for the depth *read* want different stages.
+    const LATE_FRAGMENT_TESTS = 1 << 11;
     }
 }
 

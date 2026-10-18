@@ -348,7 +348,7 @@ impl UiTheme {
     pub fn nvidia_geforce() -> Self {
         Self::default()
     }
-    
+
     /// Create a dark theme
     pub fn dark() -> Self {
         Self {
@@ -356,7 +356,7 @@ impl UiTheme {
             ..Self::default()
         }
     }
-    
+
     /// Create a light theme (for contrast)
     pub fn light() -> Self {
         Self {
@@ -386,8 +386,32 @@ impl UiTheme {
             ..Self::default()
         }
     }
-    
-    /// Get button style for a given state
+
+    /// A panel or widget surface. The renderer needs one of these constantly and
+    /// every call site was picking its own grey.
+    pub fn surface(&self) -> [f32; 4] {
+        self.panel_background
+    }
+
+    /// The one colour used to mean "this is interactive" - focus rings, the
+    /// selected row, a checked box.
+    ///
+    /// Exists because a renderer that invents its own accent cannot be themed:
+    /// change the palette and half the UI stays the old colour.
+    pub fn accent(&self) -> [f32; 4] {
+        self.accent_primary
+    }
+
+    /// A muted row or separator colour.
+    pub fn muted(&self) -> [f32; 4] {
+        self.background_tertiary
+    }
+
+    /// A handle or thumb the user can drag.
+    pub fn border(&self) -> [f32; 4] {
+        self.border
+    }
+
     pub fn get_button_color(&self, state: ButtonState) -> [f32; 4] {
         match state {
             ButtonState::Normal => self.button_normal,
@@ -550,3 +574,4 @@ pub trait NvidiaStyle {
     /// Apply Nvidia progress bar style
     fn apply_nvidia_progress_style(&mut self);
 }
+

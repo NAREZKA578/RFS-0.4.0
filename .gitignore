@@ -15,3 +15,9 @@ UPl/
 *~
 .DS_Store
 Thumbs.db
+
+# Local assets: photos and a test model, ~182 MB of binaries with no source in
+# them. A `git add -A` without this line stages the lot, and `Model/` alone is
+# 968 075 "lines" - it drowns out the ~11 500 lines of real source that are
+# untracked and therefore one `git checkout` away from gone.
+Model/

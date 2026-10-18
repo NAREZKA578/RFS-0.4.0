@@ -239,6 +239,20 @@ impl Station {
         }
 
         if let Some(at) = ammo_type {
+            // Bug №631: this used to write any byte straight into
+            // `state.ammo_type`, while the comment on `ammo_type_to_projectile`
+            // claimed "`fire` also rejects an unknown type". It did not, so the
+            // `_ => Cannonball` arm fired a cannonball while the station went on
+            // reporting the unknown number — the same report/fire mismatch №192
+            // closed on the reload path, still open here through the direct API.
+            //
+            // Reject the shot rather than load a shell that does not exist: a
+            // caller asking for a type that is not a type has asked for nothing,
+            // and `None` (the wire path, where the type already sits in
+            // `state.ammo_type`) is unaffected.
+            if !Self::is_valid_ammo_type(at) {
+                return None;
+            }
             state.ammo_type = at;
         }
         
@@ -277,10 +291,32 @@ impl Station {
         }
     }
 
+    /// The ammo types this station can load.
+    ///
+    /// Bug №192: the numbering is not validated anywhere, so both entry points
+    /// — `ServerCommand::ReloadWeapon { ammo_type }` and
+    /// `StationAction::SetAmmoType { value as u8 }` — could store an arbitrary
+    /// byte into `state.ammo_type`. The old `_ => Cannonball` catch-all then
+    /// fired a cannonball while the station reported ammo type 200, so the
+    /// mismatch was invisible until a shell was inspected.
+    ///
+    /// Kept next to `ammo_type_to_projectile` so the two cannot drift: the
+    /// mapping below is the same list, and `is_valid_ammo_type` is what keeps
+    /// an out-of-range value from ever reaching it.
+    pub const VALID_AMMO_TYPES: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
+
+    /// Whether `ammo_type` names a real shell.
+    pub fn is_valid_ammo_type(ammo_type: u8) -> bool {
+        Self::VALID_AMMO_TYPES.contains(&ammo_type)
+    }
+
     /// Bug №193: the old `_ => Cannonball` swallowed ammo types 5 and 6, so a
     /// loaded torpedo and a depth charge were both fired as a cannonball —
     /// losing their 5000 and 300 damage, their guidance and their fuse. The
     /// numbering follows `ProjectileType`, which the shell types already used.
+    ///
+    /// The `_` arm stays for exhaustiveness, but it is no longer reachable
+    /// through `reload`, which validates first.
     fn ammo_type_to_projectile(&self, ammo_type: u8) -> rfs_core::packet::ProjectileType {
         match ammo_type {
             0 => rfs_core::packet::ProjectileType::Cannonball,
@@ -290,11 +326,28 @@ impl Station {
             4 => rfs_core::packet::ProjectileType::GrapeShot,
             5 => rfs_core::packet::ProjectileType::Torpedo,
             6 => rfs_core::packet::ProjectileType::DepthCharge,
+            // Unreachable now, and genuinely so: `reload` validates before it
+            // writes (№192), and `fire` validates an explicit type before it
+            // raises the gun (№631). The arm stays only for exhaustiveness;
+            // Cannonball is the safe direction for a gun that must fire
+            // something.
             _ => rfs_core::packet::ProjectileType::Cannonball,
         }
     }
 
-    pub fn reload(&self, state: &mut StationState, ammo_type: u8) {
+    /// Loads one round of `ammo_type`.
+    ///
+    /// Returns whether the shell was actually loaded. `false` means the request
+    /// was rejected and the station was left untouched — either the type is not
+    /// a real shell (Bug №192), or the magazine is full or the reload cycle has
+    /// not completed yet.
+    pub fn reload(&self, state: &mut StationState, ammo_type: u8) -> bool {
+        // Bug №192: reject the write, not just the fire. Storing an unknown type
+        // is the actual defect; refusing here also means the `_ => Cannonball`
+        // arm in `ammo_type_to_projectile` stays unreachable.
+        if !Self::is_valid_ammo_type(ammo_type) {
+            return false;
+        }
         // Bug №84: finishing one reload cycle actually loads a shell. The old
         // code reset the progress and swapped ammo_type but never touched
         // ammo_count, so a fired gun stayed empty forever (progress reset
@@ -303,10 +356,19 @@ impl Station {
             state.ammo_count += 1;
             state.ammo_type = ammo_type;
             state.reload_progress = 0.0;
+            return true;
         }
+        false
     }
 
     pub fn repair(&self, state: &mut StationState, amount: f32) {
+        // Bug №604: a non-finite amount (the input path used to pass
+        // `f32::INFINITY` straight through) would poison `health`, and the
+        // `.min(max_health)` below would then hand out a full repair from a
+        // single packet. Same guard shape as `apply_damage` (№194).
+        if !amount.is_finite() {
+            return;
+        }
         // Negative repairs must not damage the station.
         state.health = (state.health + amount.max(0.0)).min(state.max_health);
         if state.health > 0.0 {
@@ -453,6 +515,170 @@ mod tests {
     fn an_explosive_shell_keeps_a_blast_radius() {
         // ExplosiveShell is 1; its config declares a 10.0 blast. If the type is
         // right, `for_type` will hand back a non-zero radius.
-        assert_eq!(station().ammo_type_to_projectile(1), ProjectileType::ExplosiveShell);
+            assert_eq!(station().ammo_type_to_projectile(1), ProjectileType::ExplosiveShell);
+        }
+
+        /// Bug №192. The defect was not that a bad type fired the wrong shell — it
+        /// was that a bad type was *stored*, so the station reported one thing and
+        /// fired another, and nothing anywhere complained.
+        #[test]
+        fn an_unknown_ammo_type_is_never_written_to_the_station() {
+            for bad in [7u8, 8, 42, 200, 255] {
+                assert!(
+                    !Station::is_valid_ammo_type(bad),
+                    "{bad} must not count as a known shell"
+                );
+
+                let mut state = StationState {
+                    // A completed reload cycle, so the only thing that can stop
+                    // the shell from loading is the type check.
+                    reload_progress: 1.0,
+                    ammo_count: 0,
+                    ammo_type: 3,
+                    ..Default::default()
+                };
+                let loaded = station().reload(&mut state, bad);
+
+                assert!(!loaded, "ammo type {bad} was accepted");
+                assert_eq!(
+                    state.ammo_type, 3,
+                    "the rejected reload overwrote ammo_type with {bad}"
+                );
+                assert_eq!(state.ammo_count, 0, "the rejected reload added a round");
+            }
+        }
+
+        /// Bug №631. `fire` carried the promise, in a comment two functions
+        /// down, that it rejected an unknown type; it stored the byte and then
+        /// launched the `_` fallback, so the station reported one type and fired
+        /// another. The shot must not happen at all, and the station must be left
+        /// exactly as it was.
+        #[test]
+        fn an_unknown_ammo_type_fires_nothing_and_changes_nothing() {
+            for bad in [7u8, 8, 42, 200, 255] {
+                let mut state = StationState {
+                    // Ready to fire, with a known round already loaded, so the
+                    // only thing that can stop the shot is the type check.
+                    is_operational: true,
+                    health: 50.0,
+                    reload_progress: 1.0,
+                    cooldown: 0.0,
+                    ammo_count: 3,
+                    ammo_type: 2,
+                    ..Default::default()
+                };
+                let before = state.clone();
+
+                assert!(
+                    station().fire(&mut state, Some(bad)).is_none(),
+                    "a shot was fired with ammo type {bad}"
+                );
+                assert_eq!(
+                    state.ammo_type, before.ammo_type,
+                    "the refused shot overwrote ammo_type with {bad}"
+                );
+                assert_eq!(
+                    state.ammo_count, before.ammo_count,
+                    "the refused shot spent a round"
+                );
+                assert_eq!(
+                    state.cooldown, before.cooldown,
+                    "the refused shot set a cooldown"
+                );
+            }
+        }
+
+        /// Every type the mapping knows must survive the validator, or a real
+        /// shell would be rejected at the door. This is the check that keeps the
+        /// two lists from drifting apart.
+        #[test]
+        fn every_mapped_ammo_type_passes_validation() {
+            for mapped in 0u8..=6 {
+                assert!(
+                    Station::is_valid_ammo_type(mapped),
+                    "type {mapped} has a projectile mapping but is not accepted"
+                );
+            }
+            assert_eq!(Station::VALID_AMMO_TYPES.len(), 7);
+        }
+
+        /// The cast is the trap. `NaN as u8` and `-3.0 as u8` are both `0` in
+        /// Rust, and `0` is a *valid* cannonball — so validating after the cast
+        /// would have waved a malformed request straight through. This asserts
+        /// the fact the caller in `main.rs` relies on.
+        #[test]
+        // The casts are the subject of this test, not an oversight: the whole
+        // point is that `NaN as u8` is `0` and that `0` is a valid cannonball.
+        // Silencing the lint here is what keeps it firing everywhere else.
+        #[allow(clippy::cast_nan_to_int)]
+        fn a_float_ammo_type_would_survive_a_naive_cast_as_a_valid_shell() {
+            assert_eq!(f32::NAN as u8, 0);
+            assert_eq!(-3.0f32 as u8, 0);
+            assert_eq!(300.0f32 as u8, 255);
+            // Which is exactly why `main.rs` checks `is_finite`, `fract() == 0`
+            // and the range *before* casting. 255 does not pass the validator,
+            // but NaN and negatives do.
+            assert!(Station::is_valid_ammo_type(f32::NAN as u8));
+            assert!(!Station::is_valid_ammo_type(300.0f32 as u8));
+        }
+
+        /// A valid type still loads, and the validator did not break Bug №84
+        /// (finishing the cycle actually puts a round in the magazine).
+        #[test]
+        fn a_valid_ammo_type_still_loads() {
+            let mut state = StationState {
+                reload_progress: 1.0,
+                ammo_count: 0,
+                ..Default::default()
+            };
+            assert!(station().reload(&mut state, 5));
+            assert_eq!(state.ammo_type, 5);
+            assert_eq!(state.ammo_count, 1);
+            assert_eq!(state.reload_progress, 0.0);
+        }
+
+        /// Bug №604, negative control: `f32::INFINITY` used to reach
+        /// `.min(max_health)` and fill a half-damaged station in a single call,
+        /// which is exactly what the input path sent. Drop the guard above and
+        /// the first assertion goes red.
+        #[test]
+        fn a_non_finite_repair_amount_does_not_fill_the_station() {
+            let mut state = StationState {
+                health: 250.0,
+                max_health: 500.0,
+                ..Default::default()
+            };
+
+            station().repair(&mut state, f32::INFINITY);
+            assert_eq!(
+                state.health, 250.0,
+                "an infinite repair amount filled the station"
+            );
+
+            station().repair(&mut state, f32::NAN);
+            assert_eq!(
+                state.health, 250.0,
+                "a NaN repair amount changed the station's health"
+            );
+        }
+
+        /// The guard must not break the honest case: a finite amount still
+        /// repairs, and negative amounts still cannot damage the station.
+        #[test]
+        fn a_finite_repair_amount_still_repairs() {
+            let mut state = StationState {
+                health: 250.0,
+                max_health: 500.0,
+                ..Default::default()
+            };
+
+            station().repair(&mut state, 100.0);
+            assert_eq!(state.health, 350.0, "a finite repair stopped working");
+
+            station().repair(&mut state, -10_000.0);
+            assert_eq!(state.health, 350.0, "a negative repair damaged the station");
+
+            station().repair(&mut state, 10_000.0);
+            assert_eq!(state.health, 500.0, "a repair overshoots max_health");
+        }
     }
-}

@@ -236,6 +236,19 @@ impl SnapshotBuffer {
         inner.snapshots[idx] = Some(snapshot);
     }
 
+    /// Bug №636: a restarted server is a new session with a fresh tick space.
+    /// The old session's frames would keep the stale-guard alive forever (every
+    /// low tick from the new session loses to the high ticks of the old one),
+    /// so a new `match_id` must be able to empty this buffer.
+    pub fn reset(&self) {
+        let mut inner = self.inner.write();
+        for slot in inner.snapshots.iter_mut() {
+            *slot = None;
+        }
+        inner.current_index = 0;
+        inner.base_tick = Tick(0);
+    }
+
     pub fn get_snapshot(&self, tick: Tick) -> Option<Snapshot> {
         let inner = self.inner.read();
 
@@ -663,6 +676,14 @@ impl SnapshotInterpolator {
         }
     }
 
+    /// Bug №636: a restarted server is a new session — old-session frames must
+    /// not feed an interpolation between a dead world and the new one, so a
+    /// new `match_id` clears the frame ring the same way the buffer resets
+    /// (`SnapshotBuffer::reset`, Bug №636).
+    pub fn reset(&mut self) {
+        self.snapshots.clear();
+    }
+
     pub fn add_snapshot(&mut self, mut snapshot: Snapshot) {
         // Bug №20: truncate oversized snapshots instead of buffering them whole.
         if snapshot.entities.len() > MAX_ENTITIES_PER_SNAPSHOT {
@@ -922,7 +943,15 @@ impl From<&CompartmentEntity> for EntitySnapshot {
             transform: Transform::from_position(compartment.world_bounds.center()),
             velocity: Vec3f::ZERO,
             angular_velocity: Vec3f::ZERO,
-            health: 100.0,
+            // Bug №606: a constant `100.0` claimed every compartment was at
+            // full health no matter what layer 0 said, so layer 1 contradicted
+            // the truth it is supposed to mirror. Compartments have no HP
+            // model anywhere (no field in `CompartmentTemplate`, none in
+            // `CompartmentState`), and the wire type carries a mandatory
+            // `f32`, so the honest mapping is structural: intact = full,
+            // breached = destroyed. Flood and fire stay layer 0's job —
+            // this field no longer asserts anything those two contradict.
+            health: if compartment.is_breached { 0.0 } else { 100.0 },
             max_health: 100.0,
             flags: EntityFlags::NONE,
             ship_data: None,
@@ -1071,37 +1100,54 @@ impl From<&StatePacket> for Snapshot {
 }
 
 impl Snapshot {
-    pub fn apply_delta(&self, delta: &StateDeltaPacket) -> Snapshot {
+    /// Bug №637: this used to take `&self` and deep-copy both vectors
+    /// (`iter().cloned().collect()`) into the result, on top of the caller
+    /// already owning a base copy — four full entity/projectile copies per
+    /// applied delta, each frame, layered. Taking `self` by value moves the
+    /// vectors for free; the caller's base is a private clone or a boot
+    /// snapshot, so nothing outside the call referenced it.
+    pub fn apply_delta(self, delta: &StateDeltaPacket) -> Snapshot {
         // Layered deltas carry only their own layer, so `created` is an upsert:
         // the entity may already be present from an earlier full state or resync.
-        let mut entities = self.entities.clone();
+        let mut entities = self.entities;
+        // Bug №637: the four `find` scans looked the whole vector up per
+        // created/updated record — O(records × entities) each frame. One index
+        // pass up front makes it O(entities + records); updated/created lookups
+        // go through the index and pushes extend it, so the merge order of
+        // records is preserved exactly as before.
+        let mut index: HashMap<EntityId, usize> =
+            entities.iter().enumerate().map(|(i, e)| (e.entity_id, i)).collect();
         for created in &delta.created {
             let snapshot = EntitySnapshot::from(created);
-            if let Some(slot) = entities.iter_mut().find(|e| e.entity_id == snapshot.entity_id) {
-                *slot = snapshot;
+            if let Some(slot) = index.get(&snapshot.entity_id).copied() {
+                entities[slot] = snapshot;
             } else {
+                index.insert(snapshot.entity_id, entities.len());
                 entities.push(snapshot);
             }
         }
         for update in &delta.updated {
-            if let Some(entity) = entities.iter_mut().find(|e| e.entity_id == update.entity_id) {
-                entity.apply_state_update(update);
+            if let Some(&slot) = index.get(&update.entity_id) {
+                entities[slot].apply_state_update(update);
             }
         }
         entities.retain(|e| !delta.destroyed.contains(&e.entity_id));
 
-        let mut projectiles = self.projectiles.clone();
+        let mut projectiles = self.projectiles;
+        let mut pindex: HashMap<EntityId, usize> =
+            projectiles.iter().enumerate().map(|(i, p)| (p.entity_id, i)).collect();
         for created in &delta.projectile_created {
             let snapshot = ProjectileSnapshot::from(created);
-            if let Some(slot) = projectiles.iter_mut().find(|p| p.entity_id == snapshot.entity_id) {
-                *slot = snapshot;
+            if let Some(slot) = pindex.get(&snapshot.entity_id).copied() {
+                projectiles[slot] = snapshot;
             } else {
+                pindex.insert(snapshot.entity_id, projectiles.len());
                 projectiles.push(snapshot);
             }
         }
         for update in &delta.projectile_updated {
-            if let Some(proj) = projectiles.iter_mut().find(|p| p.entity_id == update.entity_id) {
-                proj.apply_state_update(update);
+            if let Some(&slot) = pindex.get(&update.entity_id) {
+                projectiles[slot].apply_state_update(update);
             }
         }
         projectiles.retain(|p| !delta.projectile_destroyed.contains(&p.entity_id));
@@ -1111,6 +1157,8 @@ impl Snapshot {
             time: delta.server_time,
             entities,
             projectiles,
+            // The merged snapshot carries no events — same contract as before
+            // №637 (`Vec::new()`), events travel via the event stream.
             events: Vec::new(),
         }
     }
@@ -1313,5 +1361,262 @@ impl DeltaSnapshot {
             projectile_updated: self.projectile_updated.iter().map(ProjectileUpdate::to_state_update).collect(),
             projectile_destroyed: self.projectile_destroyed.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod compartment_entity_snapshot_tests {
+    use super::*;
+    use rfs_core::entity::{Bounds, CompartmentEntity, EntityId};
+
+    fn compartment(is_breached: bool) -> CompartmentEntity {
+        let local = Bounds::new(Vec3f::new(-10.0, -5.0, -20.0), Vec3f::new(10.0, 5.0, 20.0));
+        CompartmentEntity {
+            entity_id: EntityId::new(7),
+            ship_id: EntityId::new(1),
+            name: "bow".into(),
+            local_bounds: local,
+            world_bounds: local,
+            water_level: 0.0,
+            max_water_level: 100.0,
+            is_sealed: !is_breached,
+            is_breached,
+            fire_intensity: 0.0,
+            pump_active: false,
+            connected_compartments: SmallVec::new(),
+            stations: SmallVec::new(),
+            pump_capacity: 0.0,
+            bulkheads: SmallVec::new(),
+        }
+    }
+
+    #[test]
+    fn an_intact_compartment_reports_full_health() {
+        let snapshot = EntitySnapshot::from(&compartment(false));
+        assert_eq!(snapshot.health, 100.0);
+        assert_eq!(snapshot.max_health, 100.0);
+    }
+
+    /// Bug №606, negative control: with the old constant this passes 100.0 and
+    /// the assertion below goes red, so the test measures the fix and not the
+    /// fixture.
+    #[test]
+    fn a_breached_compartment_does_not_claim_full_health() {
+        let snapshot = EntitySnapshot::from(&compartment(true));
+        assert_eq!(
+            snapshot.health, 0.0,
+            "layer 1 reports full health for a compartment layer 0 marks breached"
+        );
+        assert_eq!(snapshot.max_health, 100.0, "the ceiling must stay for ratio math");
+    }
+}
+
+#[cfg(test)]
+mod apply_delta_tests {
+    //! Behavioral coverage for the merge rewrite (Bug №637). The old code
+    //! answered every created/updated record with a linear scan of the whole
+    //! vector; the rewrite answers through an index. Same semantics must be
+    //! pinned, because the index rewrite is exactly the kind of change that
+    //! silently breaks record ordering or upsert handling.
+
+    use super::*;
+    use rfs_core::entity::EntityId;
+    use rfs_core::math::Quatf;
+
+    fn entity(id: u64, health: f32) -> EntitySnapshot {
+        EntitySnapshot {
+            entity_id: EntityId::new(id),
+            entity_type: EntityType::Ship,
+            transform: Transform::new(Vec3f::new(1.0, 2.0, 3.0), Quatf::IDENTITY, Vec3f::ONE),
+            velocity: Vec3f::ZERO,
+            angular_velocity: Vec3f::ZERO,
+            health,
+            max_health: 100.0,
+            flags: EntityFlags::NONE,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        }
+    }
+
+    fn wire_entity(id: u64, health: f32) -> EntityState {
+        EntityState {
+            entity_id: EntityId::new(id),
+            entity_type: EntityType::Ship,
+            transform: Transform::new(Vec3f::new(9.0, 0.0, 0.0), Quatf::IDENTITY, Vec3f::ONE),
+            velocity: Vec3f::new(5.0, 0.0, 0.0),
+            angular_velocity: Vec3f::ZERO,
+            health,
+            max_health: 100.0,
+            flags: EntityFlags::NONE,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        }
+    }
+
+    fn projectile(id: u64, lifetime: f32) -> ProjectileSnapshot {
+        ProjectileSnapshot {
+            entity_id: EntityId::new(id),
+            projectile_type: ProjectileType::Cannonball,
+            position: Vec3f::new(1.0, 1.0, 1.0),
+            velocity: Vec3f::new(10.0, 0.0, 0.0),
+            spawn_tick: 1,
+            lifetime,
+            owner: EntityId::new(1),
+            damage: 5.0,
+            penetration: 0.0,
+        }
+    }
+
+    fn wire_projectile(id: u64) -> ProjectileState {
+        ProjectileState {
+            entity_id: EntityId::new(id),
+            projectile_type: ProjectileType::Cannonball,
+            position: Vec3f::new(2.0, 2.0, 2.0),
+            velocity: Vec3f::new(3.0, 0.0, 0.0),
+            spawn_tick: 2,
+            lifetime: 7.0,
+            owner: EntityId::new(1),
+            damage: 9.0,
+            penetration: 0.0,
+        }
+    }
+
+    fn base_snapshot() -> Snapshot {
+        Snapshot {
+            tick: Tick(10),
+            time: 10.0 / 30.0,
+            entities: vec![entity(1, 100.0), entity(2, 90.0)],
+            projectiles: vec![projectile(500, 4.0)],
+            events: Vec::new(),
+        }
+    }
+
+    fn delta() -> StateDeltaPacket {
+        StateDeltaPacket {
+            layer: LAYER_SHIP,
+            base_tick: 10,
+            server_tick: 12,
+            server_time: 12.0 / 30.0,
+            is_resync: false,
+            created: Vec::new(),
+            updated: Vec::new(),
+            destroyed: Vec::new(),
+            projectile_created: Vec::new(),
+            projectile_updated: Vec::new(),
+            projectile_destroyed: Vec::new(),
+        }
+    }
+
+    /// Layered deltas carry `created` as an upsert: an id already present from
+    /// a full state or another layer's resync must be replaced in place, not
+    /// duplicated — and the records not named by the delta must all survive.
+    ///
+    /// The `updated` record for 3 (arriving *created* in this very delta) is
+    /// the index-regression guard: the lookup must see entities created by the
+    /// same delta, not only those that came with the base.
+    #[test]
+    fn a_created_record_upserts_in_place_instead_of_duplicating() {
+        let mut d = delta();
+        d.created = vec![wire_entity(2, 80.0), wire_entity(3, 70.0)];
+        d.updated.push(EntityStateUpdate {
+            entity_id: EntityId::new(3),
+            transform: None,
+            velocity: None,
+            angular_velocity: None,
+            health: Some(42.0),
+            flags: None,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        });
+        d.destroyed = vec![EntityId::new(1)];
+
+        let merged = base_snapshot().apply_delta(&d);
+
+        let ids: Vec<u64> = merged.entities.iter().map(|e| e.entity_id.0).collect();
+        assert_eq!(ids, vec![2, 3], "existing id replaced in place, new id appended, destroyed dropped");
+        assert_eq!(merged.entities[0].health, 80.0, "the upsert replaces the stored record");
+        let created = merged
+            .entities
+            .iter()
+            .find(|e| e.entity_id == EntityId::new(3))
+            .expect("the created entity stays in the merged snapshot");
+        assert_eq!(
+            created.health, 42.0,
+            "an update for an entity created by the same delta must reach it, not fall through the index"
+        );
+        assert_eq!(merged.tick, Tick(12), "the merged snapshot carries the delta's tick");
+    }
+
+    /// A partial update name-touches only its fields: everything left None
+    /// keeps the stored value.
+    #[test]
+    fn a_partial_update_touches_only_its_fields() {
+        let mut d = delta();
+        d.updated.push(EntityStateUpdate {
+            entity_id: EntityId::new(1),
+            transform: None,
+            velocity: Some(Vec3f::new(2.0, 0.0, 0.0)),
+            angular_velocity: None,
+            health: Some(50.0),
+            flags: None,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        });
+
+        let merged = base_snapshot().apply_delta(&d);
+
+        let updated = &merged.entities[0];
+        assert_eq!(updated.health, 50.0);
+        assert_eq!(updated.velocity, Vec3f::new(2.0, 0.0, 0.0));
+        assert_eq!(
+            updated.transform.position,
+            Vec3f::new(1.0, 2.0, 3.0),
+            "fields the delta left None keep the stored value"
+        );
+        assert_eq!(merged.entities[1].health, 90.0, "records outside the delta stay untouched");
+    }
+
+    /// Projectile side has its own three branches (upsert, partial update,
+    /// destroy). None-fields of a partial update keep the stored values, so
+    /// the update names only velocity/lifetime and the position must survive.
+    #[test]
+    fn a_projectile_delta_upserts_and_partially_updates() {
+        let mut d = delta();
+        d.projectile_created = vec![wire_projectile(600)];
+        d.projectile_updated.push(ProjectileStateUpdate {
+            entity_id: EntityId::new(500),
+            position: None,
+            velocity: Some(Vec3f::new(1.0, 1.0, 1.0)),
+            lifetime: Some(2.0),
+        });
+
+        let merged = base_snapshot().apply_delta(&d);
+
+        assert_eq!(merged.projectiles.len(), 2, "created arrives alongside the base shell");
+        let updated = &merged.projectiles[0];
+        assert_eq!(updated.entity_id, EntityId::new(500));
+        // Bug №24 semantics: None keeps the stored value in place.
+        assert_eq!(updated.position, Vec3f::new(1.0, 1.0, 1.0), "position the delta left None keeps the stored value");
+        assert_eq!(updated.velocity, Vec3f::new(1.0, 1.0, 1.0));
+        assert_eq!(updated.lifetime, 2.0);
+        assert_eq!(merged.projectiles[1].entity_id, EntityId::new(600));
+        assert_eq!(merged.projectiles[1].position, Vec3f::new(2.0, 2.0, 2.0));
+    }
+
+    /// `projectile_destroyed` removes exactly the named ids and nothing else.
+    #[test]
+    fn a_projectile_destroy_removes_exactly_the_named_id() {
+        let mut d = delta();
+        d.projectile_created = vec![wire_projectile(600)];
+        d.projectile_destroyed = vec![EntityId::new(500)];
+
+        let merged = base_snapshot().apply_delta(&d);
+
+        let ids: Vec<u64> = merged.projectiles.iter().map(|p| p.entity_id.0).collect();
+        assert_eq!(ids, vec![600], "the named shell is gone, the rest stays");
     }
 }

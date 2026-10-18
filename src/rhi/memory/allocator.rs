@@ -1,7 +1,6 @@
 //! Memory Allocator Trait
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use crate::error::*;
 use crate::types::*;

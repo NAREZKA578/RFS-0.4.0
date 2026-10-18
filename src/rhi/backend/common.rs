@@ -11,6 +11,33 @@ use crate::resource::{Buffer, BufferDesc, Sampler, SamplerDesc, Texture, Texture
 use crate::shader::module::{ShaderModule, ShaderModuleDesc};
 use crate::types::{ClearValue, GraphicsApi, IndexType};
 
+/// What kind of backend object is being released early. Bug №294.
+///
+/// Backend-neutral on purpose. The caller says "the framebuffer"; the backend
+/// decides what that means for its own bookkeeping. Passing a raw discriminant
+/// instead would tie this trait to one backend's internal enum ordering — a backend
+/// that renumbered its variants would then release the wrong object kind, and the
+/// compiler would not object.
+///
+/// Every variant must exist in every backend that tracks objects. A backend that
+/// tracks nothing has no mapping for them, which is why
+/// [`BackendResource::release`] is defaulted to a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseKind {
+    Image,
+    ImageView,
+    Framebuffer,
+    Buffer,
+    Sampler,
+    ShaderModule,
+    DescriptorSetLayout,
+    DescriptorPool,
+    PipelineLayout,
+    RenderPass,
+    GraphicsPipeline,
+    ComputePipeline,
+}
+
 /// Trait for backend resources
 pub trait BackendResource: Send + Sync {
     fn as_raw(&self) -> *const ();
@@ -254,8 +281,97 @@ pub trait BackendResource: Send + Sync {
     ///
     /// Bug №282. Null here means `present` must not wait, which is what a backend
     /// without presentation wants; a Vulkan backend returns a real semaphore.
-    fn render_finished_semaphore(&self) -> crate::ash::vk::Semaphore {
-        crate::ash::vk::Semaphore::null()
+fn render_finished_semaphore(&self) -> crate::ash::vk::Semaphore {
+             crate::ash::vk::Semaphore::null()
+         }
+
+         /// The semaphore `vkAcquireNextImageKHR` should signal for the next frame.
+         ///
+         /// Bug №282: `acquire` used to block the CPU on a fence instead, which is
+         /// precisely why the renderer could never have more than one frame in
+         /// flight. Handing the semaphore to the acquire lets the submit wait for
+         /// the handover on the GPU timeline rather than stalling the thread.
+         fn image_acquired_semaphore(&self) -> crate::ash::vk::Semaphore {
+             crate::ash::vk::Semaphore::null()
+         }
+
+         /// Give back a presentation frame that will not be submitted.
+         ///
+         /// Bug №282: `vkAcquireNextImageKHR` was given a semaphore to signal, and
+         /// if no submit follows, nothing ever waits on it. The semaphore stays
+         /// signalled forever, and the next `acquire` of that slot is then
+         /// VUID-vkAcquireNextImageKHR-semaphore-01779 — "must not have any pending
+         /// operations" — which is what happened on every frame that recorded no
+         /// commands.
+         ///
+         /// A backend with per-frame semaphores drains the signal here. One without
+         /// them has nothing pending and needs nothing.
+         fn cancel_presentation_frame(&self) {}
+
+    /// Release a texture early instead of at device teardown. Bug №289.
+    ///
+    /// Default is a no-op, which is the honest answer for a backend with no
+    /// tracking: nothing to untrack means nothing to leak.
+    fn release_texture(&self, _texture: &crate::resource::Texture) {}
+
+    /// Release a framebuffer early instead of at device teardown. Bug №289.
+    fn release_framebuffer(&self, _framebuffer: &crate::command::pass::render::Framebuffer) {}
+
+    /// Release a texture view early instead of at device teardown. Bug №289.
+    ///
+    /// Needed in its own right, not as a convenience: a view outlives nothing, but
+    /// it is destroyed only when its image is, and `release_texture` frees the
+    /// image. Releasing the image underneath a live view leaves the view pointing at
+    /// freed memory, which is the failure mode bug №289's first attempt produced.
+    fn release_texture_view(&self, _view: &crate::resource::TextureView) {}
+
+    /// Destroy one tracked object now rather than at device teardown. Bug №289.
+    ///
+    /// Provided rather than required because most backends track nothing and have
+    /// nothing to release.
+    fn release(&self, _kind: ReleaseKind, _object: u64) {}
+
+    /// Release several objects with a single wait. Bug №294.
+    ///
+    /// [`release`](Self::release) waits for the device to go idle before destroying,
+    /// which it must: Vulkan forbids destroying an object the GPU may still be
+    /// reading. Doing that per object is correct and slow — a resize replaces three
+    /// objects at once, and three consecutive waits stall the GPU three times for
+    /// work that only needed to be finished once. On this machine that showed up as
+    /// visible stutter on every resize step.
+    ///
+    /// So the wait belongs to the batch, not to the object. Same guarantee, one
+    /// stall.
+    ///
+    /// Order is the caller's responsibility and is not checked: the backend destroys
+    /// in the order given, and Vulkan requires dependents before dependencies. A
+    /// wrong order here is a use-after-free, so it is left visible rather than
+    /// silently sorted — sorting would require the backend to model the dependency
+    /// graph, which is exactly the knowledge it does not have.
+    fn release_many(&self, _objects: &[(ReleaseKind, u64)]) {}
+
+    /// How many backend objects are still waiting to be destroyed.
+    ///
+    /// Diagnostics, added with bug №289. Leaks used to be hunted for by reading the
+    /// validation layer's report at `vkDestroyDevice`, which tells you *that*
+    /// something leaked but not *which object* or whether the count grew while the
+    /// program ran. That distinction is the whole point for objects owned by a cache
+    /// that is replaced on resize: the symptom is unbounded growth over time, and it
+    /// is invisible in a single-frame report.
+    ///
+    /// Zero for a backend that tracks nothing, so callers need no per-backend
+    /// branching and no `Option`.
+    fn tracked_object_count(&self) -> usize {
+        0
+    }
+
+    /// Which backend objects are outstanding, broken down by kind.
+    ///
+    /// Bug №289. A bare count localises nothing: "+2" is equally consistent with two
+    /// images, two views, or a pair that grows every frame. See
+    /// [`tracked_object_count`] for the underlying reason this exists.
+    fn tracked_object_summary(&self) -> String {
+        String::new()
     }
 
     /// Draw into a framebuffer with a single pipeline, an optional index buffer

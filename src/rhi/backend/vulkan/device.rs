@@ -2,7 +2,7 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
-use crate::backend::common::BackendResource;
+use crate::backend::common::{BackendResource, ReleaseKind};
 use crate::backend::vulkan::convert;
 use crate::backend::vulkan::instance::{vk_fail, DestroyableInstance};
 use crate::backend::vulkan::memory::MemoryAllocator;
@@ -40,6 +40,8 @@ pub(crate) fn supported_device_extensions(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
 ) -> RhiResult<Vec<&'static CStr>> {
+    // SAFETY: instance and physical are valid Vulkan handles; the returned array lifetime is tied
+    // to the call and we borrow properties locally.
     let properties = unsafe { instance.enumerate_device_extension_properties(physical) }
         .map_err(|e| vk_fail(e, "enumerate device extensions"))?;
     Ok(DEVICE_EXTENSIONS
@@ -47,6 +49,8 @@ pub(crate) fn supported_device_extensions(
         .filter(|candidate| {
             properties
                 .iter()
+                // SAFETY: p.extension_name is a valid null-terminated C string returned by Vulkan
+                // for this enumeration; its lifetime persists for as long as properties vector.
                 .any(|p| unsafe { CStr::from_ptr(p.extension_name.as_ptr()) } == **candidate)
         })
         .copied()
@@ -141,6 +145,8 @@ pub(crate) fn create_logical_device(
         ..Default::default()
     };
 
+    // SAFETY: all pointers in create_info (queue create infos, extension names, p_next chain) are valid
+    // for the duration of the call; instance and physical are valid. Memory pools/allocators not used (None).
     let device = unsafe { instance.create_device(physical, &create_info, None) }
         .map_err(|e| RhiError::DeviceCreationError(format!("Vulkan device creation failed: {e:?}")))?;
 
@@ -189,6 +195,28 @@ pub(crate) enum TrackedKind {
 }
 
 impl TrackedKind {
+    /// Translate the backend-neutral release vocabulary into this backend's own
+    /// tracking kind. Bug №294.
+    ///
+    /// Exhaustive on purpose: adding a `ReleaseKind` without deciding what it means
+    /// here should be a compile error, not a runtime no-op that quietly leaks.
+    fn from_release(kind: ReleaseKind) -> TrackedKind {
+        match kind {
+            ReleaseKind::Image => TrackedKind::Image,
+            ReleaseKind::ImageView => TrackedKind::ImageView,
+            ReleaseKind::Framebuffer => TrackedKind::Framebuffer,
+            ReleaseKind::Buffer => TrackedKind::Buffer,
+            ReleaseKind::Sampler => TrackedKind::Sampler,
+            ReleaseKind::ShaderModule => TrackedKind::ShaderModule,
+            ReleaseKind::DescriptorSetLayout => TrackedKind::DescriptorSetLayout,
+            ReleaseKind::DescriptorPool => TrackedKind::DescriptorPool,
+            ReleaseKind::PipelineLayout => TrackedKind::PipelineLayout,
+            ReleaseKind::RenderPass => TrackedKind::RenderPass,
+            ReleaseKind::GraphicsPipeline => TrackedKind::GraphicsPipeline,
+            ReleaseKind::ComputePipeline => TrackedKind::ComputePipeline,
+        }
+    }
+
     /// Human-readable, for the leak report. Without a name a count of 400 is
     /// not actionable.
     fn name(self) -> &'static str {
@@ -221,6 +249,21 @@ pub(crate) struct TrackedObject {
     pub object: u64,
     pub memory: vk::DeviceMemory,
     pub mapped: usize,
+    /// The layout the image is currently in. Bug №299.
+    ///
+    /// Only meaningful for `TrackedKind::Image`. It exists because a barrier's
+    /// `oldLayout` must be the layout the image is *actually* in, and nothing else in
+    /// the system knows that: usage flags say what an image *may* be used for, not
+    /// where it is. A texture declared `COLOR_ATTACHMENT` can equally be in
+    /// `SHADER_READ_ONLY_OPTIMAL`, and `download_texture` used to guess from the flag,
+    /// so it wrote a barrier claiming `COLOR_ATTACHMENT_OPTIMAL` for an image sitting
+    /// in `TRANSFER_SRC_OPTIMAL`. The driver reported
+    /// `VUID-vkCmdDraw-None-09600` far from the mistake, and the readback returned
+    /// nothing.
+    ///
+    /// `vk::ImageLayout::UNDEFINED` initially, which is correct: an image starts
+    /// undefined until something transitions it.
+    pub layout: vk::ImageLayout,
 }
 
 impl TrackedObject {
@@ -231,11 +274,78 @@ impl TrackedObject {
             object,
             memory: vk::DeviceMemory::from_raw(memory),
             mapped,
+            layout: vk::ImageLayout::UNDEFINED,
         }
     }
 }
 
 impl VulkanLogicalDeviceResource {
+    /// The layout an image is currently in. Bug №299.
+    ///
+    /// `None` when the image is not tracked, which means it was never created through
+    /// this device — a swapchain image, for instance, whose layout belongs to whoever
+    /// owns it. Callers must treat that as "unknown", not as `UNDEFINED`: claiming
+    /// `UNDEFINED` in a barrier discards the contents, and claiming anything else
+    /// invents a fact.
+    pub(crate) fn image_layout(&self, image: u64) -> Option<vk::ImageLayout> {
+        let objects = self.tracked.lock().ok()?;
+        objects
+            .iter()
+            .find(|o| o.kind == TrackedKind::Image && o.object == image)
+            .map(|o| o.layout)
+    }
+
+    /// Record that an image moved to `layout`. Bug №299.
+    ///
+    /// Called from the submit path after the recorded commands are known, which is
+    /// the earliest point where the new layout is a fact rather than an intention.
+    /// Best-effort like [`track`](Self::track): a stale layout degrades the next
+    /// barrier, it does not corrupt anything on its own.
+    pub(crate) fn note_image_layout(&self, image: u64, layout: vk::ImageLayout) {
+        let Ok(mut objects) = self.tracked.lock() else {
+            return;
+        };
+        for object in objects.iter_mut() {
+            if object.kind == TrackedKind::Image && object.object == image {
+                object.layout = layout;
+                return;
+            }
+        }
+    }
+
+    /// Update the per-image layout tracker from the barriers in this submit. Bug №299.
+    ///
+    /// Done at submit time rather than inside the translator, because that is the
+    /// earliest moment a new layout is a fact rather than a request. Updating it
+    /// during translation would let the tracker change even if the submit later
+    /// failed, leaving it confidently wrong.
+    ///
+    /// Only texture barriers move a layout; memory and buffer barriers do not.
+    ///
+    /// **Known limit:** a render pass boundary is invisible here. A pass that
+    /// transitions an image through its render pass `initial_layout`/`final_layout`
+    /// rather than an explicit barrier leaves the tracker stale, and the next barrier
+    /// that reads it will be wrong. Making this exact needs render-pass bookkeeping as
+    /// well, which is a larger change than the problem it fixes — so callers that
+    /// transition through a render pass must not rely on the tracker. Stated rather
+    /// than hidden because the failure it produces is a validation error with no
+    /// useful message.
+    pub(crate) fn note_layout_transitions(&self, commands: &[crate::command::commands::Command]) {
+        for command in commands {
+            let crate::command::commands::Command::PipelineBarrier { texture_barriers, .. } =
+                command
+            else {
+                continue;
+            };
+            for barrier in texture_barriers {
+                let Some(gpu) = barrier.texture.backend() else {
+                    continue;
+                };
+                self.note_image_layout(gpu.handle, convert::texture_layout(barrier.new_layout));
+            }
+        }
+    }
+
     /// Record a created object so `Drop` can destroy it.
     ///
     /// Best-effort: a poisoned lock means a previous panic while tracking, and
@@ -267,6 +377,8 @@ impl VulkanLogicalDeviceResource {
         let count = objects.len();
         for kind in TEARDOWN_ORDER {
             for object in objects.iter().filter(|o| o.kind == kind) {
+                // SAFETY: TODO(verify): ensure command buffer is in a state valid for begin (recording state
+                // constraints per command pool/usage) before calling begin_command_buffer; caller must guarantee.
                 unsafe {
                     // Unmap before freeing: Vulkan requires it, and freeing
                     // still-mapped memory is undefined rather than a shortcut.
@@ -348,7 +460,7 @@ impl VulkanLogicalDeviceResource {
 /// 5. Samplers and image views — views reference their image.
 /// 6. Shader modules.
 /// 7. Images and buffers last, each followed by its own device memory.
-const TEARDOWN_ORDER: [TrackedKind; 11] = [
+const TEARDOWN_ORDER: [TrackedKind; 12] = [
     TrackedKind::GraphicsPipeline,
     TrackedKind::ComputePipeline,
     TrackedKind::DescriptorPool,
@@ -360,7 +472,54 @@ const TEARDOWN_ORDER: [TrackedKind; 11] = [
     TrackedKind::ImageView,
     TrackedKind::ShaderModule,
     TrackedKind::Image,
+    // Bug №284: `Buffer` was missing from this list while `create_buffer` was
+    // tracking it, so `destroy_tracked` iterated eleven kinds and never reached
+    // the twelfth. Every buffer and its memory survived to `vkDestroyDevice`,
+    // which reported VUID-vkDestroyDevice-device-05137 on exit. It only showed up
+    // at process exit, so no windowed run could see it.
+    //
+    // Last because buffers depend on nothing else here and nothing depends on
+    // them. The position within the tail is not critical; the presence is.
+    //
+    // `teardown_order_covers_every_tracked_kind` exists so this cannot recur by
+    // omission: adding a kind to `TrackedKind` without adding it here fails that
+    // test rather than silently leaking.
+    TrackedKind::Buffer,
 ];
+
+/// Every kind the backend can track, for the coverage test below.
+///
+/// Duplicated on purpose. Deriving it from the enum would need a derive and a
+/// registry, and the point of the test is to catch a hand-written list drifting,
+/// so the second list is written out and compared against the real one.
+const ALL_TRACKED_KINDS: [TrackedKind; 12] = [
+    TrackedKind::ImageView,
+    TrackedKind::Image,
+    TrackedKind::Buffer,
+    TrackedKind::Sampler,
+    TrackedKind::ShaderModule,
+    TrackedKind::DescriptorSetLayout,
+    TrackedKind::DescriptorPool,
+    TrackedKind::PipelineLayout,
+    TrackedKind::RenderPass,
+    TrackedKind::Framebuffer,
+    TrackedKind::GraphicsPipeline,
+    TrackedKind::ComputePipeline,
+];
+
+/// Bug №284: a tracked kind missing from the teardown order is a silent leak.
+///
+/// It fails only when the device is destroyed, which no test that renders a frame
+/// can observe — so the invariant is asserted directly instead. Without this, the
+/// omission I made went unnoticed through a full round of leak work.
+/// How many frames may be recorded before the CPU has to wait for the GPU.
+///
+/// Bug №282: there was no such number — one command buffer and one fence meant
+/// one frame, and the submit path blocked on the fence to keep it that way. Two is
+/// the minimum that lets the CPU build frame N+1 while the GPU draws frame N; the
+/// usual argument for more is latency hiding rather than correctness, so this is
+/// deliberately not larger than it needs to be.
+pub const FRAMES_IN_FLIGHT: usize = 2;
 
 pub(crate) struct VulkanLogicalDeviceResource {
     pub device: ash::Device,
@@ -373,12 +532,18 @@ pub(crate) struct VulkanLogicalDeviceResource {
     /// `PhysicalDevice` report carries no native handle, so it would otherwise
     /// be unreachable by the time presentation is set up.
     physical_device: vk::PhysicalDevice,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    /// Signalled by every submit, waited by `vkQueuePresentKHR`. See `present`.
-    ///
-    /// Bug №282.
-    pub render_finished: vk::Semaphore,
+command_pool: vk::CommandPool,
+        /// One command buffer per frame slot. Bug №282: this was a single buffer,
+        /// which forced the submit path to block until the GPU finished before the
+        /// CPU could reuse it, and therefore capped the whole renderer at one
+        /// frame in flight.
+        command_buffers: Vec<vk::CommandBuffer>,
+        /// The semaphore `vkQueuePresentKHR` waits on, one per frame slot. Bug №282.
+        pub render_finished: Vec<vk::Semaphore>,
+        /// Signalled by `vkAcquireNextImageKHR`, waited by the submit that first
+        /// touches the image. One per slot, for the same reason as above: a
+        /// semaphore cannot be re-signalled while a previous wait is pending.
+        pub image_acquired: Vec<vk::Semaphore>,
     /// Set by the renderer before the graph records, consumed by the next submit.
     ///
     /// Bug №282: only the submit that feeds a swapchain image may signal
@@ -403,26 +568,32 @@ pub(crate) struct VulkanLogicalDeviceResource {
     /// references it is alive, and creation order is a reasonable proxy for
     /// dependency order.
     tracked: std::sync::Mutex<Vec<TrackedObject>>,
-    /// Bug №177: guards `command_pool` and `command_buffer` for the whole
-    /// record-and-submit window. See `submit_recorded`.
-    submit_lock: std::sync::Mutex<()>,
-    /// The submit fence, created once with the device.
-    ///
-    /// It used to be created and destroyed inside `submit_recorded`, on every
-    /// frame. Two separate costs, both avoidable:
-    ///
-    ///  - `vkCreateFence` and `vkDestroyFence` are driver calls on the hot path.
-    ///    Allocating a 1-byte handle per frame to signal a condition that is
-    ///    waited on immediately afterwards buys nothing.
-    ///  - A fresh fence starts unsignalled, so the wait that follows is a real
-    ///    block every frame. That is unavoidable while one command buffer is
-    ///    reused, but it must be caused by the frame we just submitted rather
-    ///    than by the allocation of the object used to observe it.
-    ///
-    /// A fence cannot be reset while the GPU may still be using it, so
-    /// `submit_recorded` resets it only after having waited on the previous
-    /// submit. That ordering is what makes a single fence reusable.
-    submit_fence: vk::Fence,
+/// Bug №177: guards `command_pool` and the per-slot command buffers for the
+      /// whole record-and-submit window. See `submit_recorded`.
+      submit_lock: std::sync::Mutex<()>,
+      /// One fence per frame slot, created once with the device and reset on reuse.
+      ///
+      /// Bug №282. These used to be a single fence waited on with `u64::MAX` at the
+      /// end of every submit, which is what made one frame in flight the only legal
+      /// arrangement. The CPU still has to wait on one before reusing its slot —
+      /// that wait is the correct place to block, and it no longer blocks the
+      /// frame being recorded right now, only the one from `FRAMES_IN_FLIGHT`
+      /// submissions ago.
+      submit_fences: Vec<vk::Fence>,
+      /// The slot the next frame will use.
+      ///
+      /// Atomic because it is read from two places: the submit path under the
+      /// lock, and `image_acquired_semaphore`, which is called by `acquire` before
+      /// the submit happens. Relaxed is enough and sufficient: it is a counter
+      /// choosing among resources this thread owns, not synchronising anything.
+      next_frame: std::sync::atomic::AtomicUsize,
+      /// The slot the most recent submit used.
+      ///
+      /// Bug №282: `present` asks for the render-finished semaphore immediately
+      /// after the submit that signals it. Recomputing the slot from `next_frame`
+      /// at that point would return the *next* frame's semaphore, and the present
+      /// would wait on a semaphore nothing has signalled.
+      last_submitted_slot: std::sync::atomic::AtomicUsize,
     /// Keeps the owning `VkInstance` alive for as long as this device lives.
     instance_guard: Arc<DestroyableInstance>,
 }
@@ -436,54 +607,97 @@ impl VulkanLogicalDeviceResource {
         instance_guard: Arc<DestroyableInstance>,
     ) -> RhiResult<Self> {
         let allocator = MemoryAllocator::new(device.clone(), memory);
+        // SAFETY: device is valid; queue_family_index is a valid family for this device; index 0 is valid
+        // as created by this device.
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-        let allocate_info = vk::CommandPoolCreateInfo {
-            queue_family_index,
-            ..Default::default()
-        };
+let allocate_info = vk::CommandPoolCreateInfo {
+              queue_family_index,
+              // Bug №282: required now that buffers are reset individually. The
+              // submit path used to call `vkResetCommandPool`, which resets every
+              // buffer at once and needs no flag — but it cannot be used with a
+              // ring, because it would invalidate the command buffers belonging to
+              // the other frames still in flight.
+              //
+              // Resetting a single buffer without this flag is
+              // VUID-vkResetCommandBuffer-commandBuffer-00046, which the validator
+              // reported once the reset moved from pool to buffer.
+              flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+              ..Default::default()
+          };
         // Both of these used to fall back to a null handle, so a device whose
         // pool or buffer could not be created still came up "successfully" and
         // then failed on every submit with an error that pointed at the wrong
         // thing. Failing here names the actual cause.
+        // SAFETY: device valid; allocate_info fields consistent (queue_family_index valid).
         let command_pool = unsafe { device.create_command_pool(&allocate_info, None) }
             .map_err(|e| vk_fail(e, "create command pool"))?;
         let allocate_info = vk::CommandBufferAllocateInfo {
             command_pool,
             level: vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
+            command_buffer_count: (FRAMES_IN_FLIGHT + 1) as u32,
             ..Default::default()
         };
-        let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info) }
-            .map_err(|e| vk_fail(e, "allocate command buffer"))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                RhiError::BackendError(
-                    "command buffer allocation succeeded but returned no buffers".into(),
-                )
-            })?;
-        // Created once here rather than per submit; see `submit_fence`.
-        let submit_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(|e| vk_fail(e, "create submit fence"))?;
-        // Bug №282: the semaphore `vkQueuePresentKHR` waits on.
-        //
-        // The fence above answers "may the CPU reset the command buffer", which
-        // is a CPU question. Presentation needs a different answer: "is the GPU
-        // finished writing this image", and that has to be signalled by the queue
-        // and consumed by the present call. Without it, `present` waits on nothing
-        // and `acquire` never learns that an image is free — observed as the
-        // acquired index moving 0 -> 2 and then sticking at 2.
-        //
-        // One semaphore, not one per frame: the current submit path blocks on the
-        // fence before returning, so there is never more than one outstanding
-        // signal. A ring of frames in flight would need one semaphore per slot.
-        let render_finished = unsafe {
-            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        // SAFETY: device and command_pool (referenced by allocate_info) valid; count within limits.
+        let command_buffers = unsafe { device.allocate_command_buffers(&allocate_info) }
+            .map_err(|e| vk_fail(e, "allocate command buffers"))?;
+        if command_buffers.len() != FRAMES_IN_FLIGHT + 1 {
+            return Err(RhiError::BackendError(format!(
+                "asked for {} command buffers, got {}",
+                FRAMES_IN_FLIGHT,
+                command_buffers.len()
+            )));
         }
-        .map_err(|e| vk_fail(e, "create render-finished semaphore"))?;
+
+        // One of each per slot, not one shared. Bug №282.
+        //
+        // Everything below used to be a single handle shared by every frame,
+        // which is only correct while exactly one frame is in flight at a time —
+        // and the submit path enforced that by blocking on a fence before it
+        // returned. So the single-fence rule was not a design choice, it was the
+        // thing preventing more than one frame from existing.
+        //
+        // A Vulkan semaphore may be signalled only once per wait, and may not be
+        // signalled again while an earlier wait is still pending. That is
+        // VUID-vkQueueSubmit-pSignalSemaphores-00067, and it is why one semaphore
+        // cannot serve N frames: re-signalling it next frame trips the rule
+        // immediately. Per-slot semaphores remove the sharing, and the blocking
+        // wait goes away with them.
+        let mut submit_fences = Vec::with_capacity(FRAMES_IN_FLIGHT + 1);
+        let mut render_finished = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        let mut image_acquired = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        // One extra buffer and fence, reserved for one-shot work.
+        //
+        // Bug #317: one-shot submits used to share the frame ring's counter. That
+        // silently stole frame slots — a texture upload between the acquire and the
+        // frame's submit advanced the counter, so the submit waited on the *next*
+        // slot's acquire semaphore while the one just signalled stayed pending. The
+        // next acquire of that slot then failed
+        // VUID-vkAcquireNextImageKHR-semaphore-01779. The frame ring and the
+        // transfers now have disjoint resources, which is the only way the frame
+        // slot is stable for the whole of a frame.
+        for slot in 0..=FRAMES_IN_FLIGHT {
+            // SAFETY: device valid.
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .map_err(|e| vk_fail(e, format!("create submit fence for slot {slot}")))?;
+            submit_fences.push(fence);
+            // The presentation semaphores belong to frame slots only; the one-shot
+            // slot has no image to present and nothing to wait for.
+            if slot < FRAMES_IN_FLIGHT {
+                // SAFETY: device valid.
+                let finished = unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                    .map_err(|e| vk_fail(e, format!("create render-finished semaphore for slot {slot}")))?;
+                // SAFETY: device valid.
+                let acquired = unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                    .map_err(|e| vk_fail(e, format!("create image-acquired semaphore for slot {slot}")))?;
+                render_finished.push(finished);
+                image_acquired.push(acquired);
+            }
+        }
+
         Ok(Self {
             device,
             render_finished,
+            image_acquired,
             presentation_signal_armed: std::sync::atomic::AtomicBool::new(false),
             tracked: std::sync::Mutex::new(Vec::new()),
             allocator,
@@ -491,9 +705,11 @@ impl VulkanLogicalDeviceResource {
             queue,
             physical_device,
             command_pool,
-            command_buffer,
+            command_buffers,
             submit_lock: std::sync::Mutex::new(()),
-            submit_fence,
+            submit_fences,
+            next_frame: std::sync::atomic::AtomicUsize::new(0),
+            last_submitted_slot: std::sync::atomic::AtomicUsize::new(0),
             instance_guard,
         })
     }
@@ -513,25 +729,57 @@ impl VulkanLogicalDeviceResource {
     /// in flight today makes this unobservable, which is exactly why it was
     /// worth fixing now rather than after the race reports itself as visual
     /// corruption nobody can reproduce.
-    fn submit_recorded(
-        &self,
-        record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>,
-    ) -> RhiResult<()> {
-        use std::sync::atomic::Ordering;
-        // `swap` rather than `load`: the flag belongs to exactly one submit, and
-        // a `load` would let two consecutive submits both signal the same
-        // semaphore, which Vulkan forbids (a semaphore may only be signalled once
-        // per wait).
-        let armed = self
-            .presentation_signal_armed
-            .swap(false, Ordering::AcqRel);
-        let signal = if armed {
-            self.render_finished
-        } else {
-            vk::Semaphore::null()
-        };
-        self.submit_recorded_signalling(record, signal)
-    }
+fn submit_recorded(
+          &self,
+          record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>,
+      ) -> RhiResult<()> {
+          use std::sync::atomic::Ordering;
+          // `swap` rather than `load`: the flag belongs to exactly one submit, and a
+          // `load` would let two consecutive submits both signal the same
+          // semaphore, which Vulkan forbids (a semaphore may only be signalled once
+          // per wait).
+          //
+          // Bug №282: the semaphore is now chosen per slot, because one shared
+          // semaphore cannot serve two frames — re-signalling it while the previous
+          // present is still waiting is VUID-vkQueueSubmit-pSignalSemaphores-00067.
+          let armed = self
+              .presentation_signal_armed
+              .swap(false, Ordering::AcqRel);
+          let slot = self.next_frame.load(std::sync::atomic::Ordering::Relaxed) % FRAMES_IN_FLIGHT;
+          let (waits, signal): (&[vk::Semaphore], vk::Semaphore) = if armed {
+              // A frame bound for the swapchain must wait until the presentation
+              // engine has actually handed over the image, and must signal the
+              // semaphore that `present` will wait on. Both belong to this slot.
+              (
+                  &[self.image_acquired[slot]],
+                  self.render_finished[slot],
+              )
+          } else {
+              (&[], vk::Semaphore::null())
+          };
+          self.submit_recorded_signalling(record, waits, signal, true, false)
+      }
+
+      /// Submit the recorded frame without waiting for the GPU.
+      ///
+      /// Bug №282: the only caller that must not block. Everything else on this
+      /// path — uploads, copies, staging helpers — reads its result on return.
+      fn submit_frame(&self, record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>) -> RhiResult<()> {
+          use std::sync::atomic::Ordering;
+          let armed = self
+              .presentation_signal_armed
+              .swap(false, Ordering::AcqRel);
+          let slot = self.next_frame.load(Ordering::Relaxed) % FRAMES_IN_FLIGHT;
+          let (waits, signal): (&[vk::Semaphore], vk::Semaphore) = if armed {
+              (
+                  &[self.image_acquired[slot]],
+                  self.render_finished[slot],
+              )
+          } else {
+              (&[], vk::Semaphore::null())
+          };
+          self.submit_recorded_signalling(record, waits, signal, false, true)
+      }
 
     /// Submit and signal an optional semaphore in addition to the submit fence.
     ///
@@ -552,43 +800,112 @@ impl VulkanLogicalDeviceResource {
     /// semaphore nobody waits on would leak a signal forever.
     fn submit_recorded_signalling(
         &self,
-        record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>,
-        signal: vk::Semaphore,
-    ) -> RhiResult<()> {
-        let _guard = self.submit_lock.lock();
-        unsafe {
-            // The pool still holds the previous submit's command buffer, so it
-            // must be reset before it can be recorded into again. Resetting the
-            // pool alone is not enough: the fence has to be cleared too, or the
-            // wait below returns immediately on a signalled fence from a frame
-            // that is long finished, and the CPU races ahead of the GPU.
+record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>,
+          waits: &[vk::Semaphore],
+          signal: vk::Semaphore,
+          block_until_complete: bool,
+          advances_frame: bool,
+      ) -> RhiResult<()> {
+let _guard = self.submit_lock.lock();
+            // Bug #317: one-shot work gets a reserved slot of its own and never advances the
+            // frame counter. Sharing the ring's counter let a texture upload steal a
+            // frame slot between the acquire and the frame's submit, so the submit
+            // waited on the wrong acquire semaphore and the right one stayed pending.
+            let slot = if advances_frame {
+                self.next_frame.load(std::sync::atomic::Ordering::Relaxed) % FRAMES_IN_FLIGHT
+            } else {
+                FRAMES_IN_FLIGHT
+            };
+            let fence = self.submit_fences[slot];
+
+            // A fresh fence starts *unsignalled*, so waiting on one that has never been
+            // submitted to blocks forever. On the very first turn around the
+            // ring there is nothing outstanding to wait for, and that is not a
+            // special case bolted on: slots are visited round-robin, so slot `i`
+            // has no previous submission exactly while fewer than
+            // `FRAMES_IN_FLIGHT` frames have been submitted.
             //
-            // Both resets are safe here because the previous submit was waited on
-            // before this function returned, so the GPU cannot still be reading
-            // either object. That single-wait-per-frame is a consequence of
-            // sharing one command buffer across frames; a ring of buffers in
-            // flight would need per-frame fences instead and would allow this
-            // wait to be removed entirely.
-            self.device
-                .reset_fences(&[self.submit_fence])
-                .map_err(|e| vk_fail(e, "reset submit fence"))?;
-            self.device
-                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
-                .map_err(|e| vk_fail(e, "reset command pool"))?;
+            // Getting this wrong hangs the process rather than corrupting it —
+            // which is how it was found, by watching a test suite time out.
+            let frame_number = self.next_frame.load(std::sync::atomic::Ordering::Relaxed);
+            let first_use_of_slot = frame_number < FRAMES_IN_FLIGHT || !advances_frame;
+
+            // The CPU may only reuse a slot once its previous submit finished.
+            // This is the one wait that remains, and it is the right one: it
+            // blocks the frame from `FRAMES_IN_FLIGHT` submissions ago, not the
+            // frame being recorded now. Before this existed the wait sat at the
+            // end of the submit, which meant the CPU could never get ahead of the
+            // GPU at all.
+            //
+            // Reset follows the wait, never precedes it: a fence cannot be reset
+            // while the GPU may still be using it.
+            if advances_frame {
+                if !first_use_of_slot {
+                    // SAFETY: fences array valid and owned by this device; wait parameters valid.
+                    unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX) }
+                        .map_err(|e| vk_fail(e, "wait for frame fence"))?;
+                    // SAFETY: fences belong to this device and are not in use by pending submits.
+                    unsafe { self.device.reset_fences(&[fence]) }
+                        .map_err(|e| vk_fail(e, "reset frame fence"))?;
+                }
+            } else {
+                // One-shot work does not wait before submitting, because the
+                // previous one-shot call already blocked until its fence was
+                // signalled. It must still reset: handing `queue_submit` an
+                // already-signalled fence is undefined, and the fence is never
+                // fresh after the first call.
+                // SAFETY: fence valid and owned by this device; previous one-shot call already
+                // waited for completion, so fence is not pending.
+                unsafe { self.device.reset_fences(&[fence]) }
+                    .map_err(|e| vk_fail(e, "reset one-shot fence"))?;
+            }
+
+            // Per-buffer reset, not a pool reset. `vkResetCommandPool` invalidates
+            // every buffer allocated from it, so resetting the pool here would
+            // destroy the buffers belonging to the other in-flight frames — the
+            // exact opposite of what a ring needs.
+            // SAFETY: command buffer is allocated from a valid pool and not currently pending on GPU.
+            unsafe {
+                self.device
+                    .reset_command_buffer(self.command_buffers[slot], vk::CommandBufferResetFlags::empty())
+            }
+            .map_err(|e| vk_fail(e, "reset command buffer"))?;
+
             let begin = vk::CommandBufferBeginInfo::default();
-            self.device
-                .begin_command_buffer(self.command_buffer, &begin)
-                .map_err(|e| vk_fail(e, "begin command buffer"))?;
-            record(self.command_buffer)?;
-            self.device
-                .end_command_buffer(self.command_buffer)
+            // SAFETY: command buffer valid and reset; begin info valid.
+            unsafe {
+                self.device
+                    .begin_command_buffer(self.command_buffers[slot], &begin)
+            }
+            .map_err(|e| vk_fail(e, "begin command buffer"))?;
+            record(self.command_buffers[slot])?;
+            // SAFETY: command buffer was in recording state and all commands recorded are valid.
+            unsafe { self.device.end_command_buffer(self.command_buffers[slot]) }
                 .map_err(|e| vk_fail(e, "end command buffer"))?;
 
-            // A signal semaphore nobody waits on would stay signalled forever, so the
-            // signal is only attached when there is one.
+            let command_buffer = self.command_buffers[slot];
+
+            // A signal semaphore nobody waits on would stay signalled forever, so
+            // the signal is only attached when there is one.
+            // `pWaitDstStageMask` must not be null when there is a wait: the
+            // stage mask is what says *which* stage waits, and there is
+            // nothing sensible to point it at otherwise. Kept as a local
+            // because Vulkan reads it at submit time, not at construction.
+            let wait_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
             let submit = vk::SubmitInfo {
                 command_buffer_count: 1,
-                p_command_buffers: &self.command_buffer,
+                p_command_buffers: &command_buffer,
+                wait_semaphore_count: waits.len() as u32,
+                p_wait_semaphores: if waits.is_empty() {
+                    std::ptr::null()
+                } else {
+                    waits.as_ptr()
+                },
+                p_wait_dst_stage_mask: if waits.is_empty() {
+                    std::ptr::null()
+                } else {
+                    &wait_stage as *const _
+                },
                 signal_semaphore_count: u32::from(signal != vk::Semaphore::null()),
                 p_signal_semaphores: if signal == vk::Semaphore::null() {
                     std::ptr::null()
@@ -597,16 +914,46 @@ impl VulkanLogicalDeviceResource {
                 },
                 ..Default::default()
             };
-            self.device
-                .queue_submit(self.queue, &[submit], self.submit_fence)
+            // SAFETY: all semaphores, command buffers and fence in submit are valid and belong to this device;
+            // wait stage masks valid when waits present; pointers in submit live as long as call.
+            unsafe { self.device.queue_submit(self.queue, &[submit], fence) }
                 .map_err(|e| vk_fail(e, "queue submit"))?;
-            // `u64::MAX` is the correct timeout for a fence we have just
-            // signalled: there is no useful partial result, and returning early
-            // would mean tearing down the command buffer under the GPU.
-            self.device
-                .wait_for_fences(&[self.submit_fence], true, u64::MAX)
-                .map_err(|e| vk_fail(e, "wait for fence"))?;
-        }
+            // `present` runs after this returns and must wait on the semaphore
+            // *this* submit signalled, so the slot is recorded rather than
+            // recomputed. Only a frame records one: a one-shot submit uses the
+            // reserved slot, which has no render-finished semaphore at all, and
+            // storing it here would index past the end of that vector.
+            if advances_frame {
+                self.last_submitted_slot
+                    .store(slot, std::sync::atomic::Ordering::Release);
+            }
+
+            // Two kinds of caller share this path, and they need opposite
+            // behaviour.
+            //
+            // One-shot work — texture uploads, buffer copies, the staging helpers
+            // — reads its result the moment the call returns. It relied on the
+            // submit having completed, which is what the wait at the end of this
+            // function used to provide for *every* caller. Removing that wait for
+            // the ring silently broke those paths: they mapped staging memory and
+            // destroyed buffers while the copy was still queued, which the
+            // validation layer reports as a buffer in use and which ended in
+            // ERROR_DEVICE_LOST.
+            //
+            // The frame loop is the opposite case: it must *not* wait, or there
+            // is no ring at all.
+            if block_until_complete {
+                // SAFETY: fence valid and owned by this device; wait parameters valid (allFences=true,
+                // single-element array); no concurrent use of this fence elsewhere.
+                unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX) }
+                    .map_err(|e| vk_fail(e, "wait for one-shot submit"))?;
+            }
+
+            // One-shot work never moves the frame counter, so the next frame gets
+            // the same slot it would have had.
+            if advances_frame {
+                self.next_frame.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         Ok(())
     }
 
@@ -622,8 +969,10 @@ impl VulkanLogicalDeviceResource {
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             ..Default::default()
         };
+        // SAFETY: device valid; buffer create info valid (size>0, usage flags consistent).
         let buffer = unsafe { self.device.create_buffer(&info, None) }
             .map_err(|e| vk_fail(e, "create staging buffer"))?;
+        // SAFETY: buffer is a valid buffer owned by this device.
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
         let (memory, _) = self
             .allocator
@@ -637,6 +986,8 @@ impl VulkanLogicalDeviceResource {
                 crate::types::MemoryPropertyFlags::HOST_VISIBLE,
             )
             .map_err(|e| RhiError::BufferCreationError(format!("staging memory: {e}")))?;
+        // SAFETY: buffer and memory valid, owned by this device; offset 0 within allocation and
+        // satisfies buffer memory requirements (memory allocated from allocator for this device).
         unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
             .map_err(|e| RhiError::BufferCreationError(format!("bind staging memory: {e:?}")))?;
         let ptr = self.allocator.map(memory, size)?;
@@ -651,6 +1002,8 @@ impl VulkanLogicalDeviceResource {
     /// some drivers it leaks the mapping as well. Buffer before memory, and
     /// only once the GPU is idle: `submit_recorded` already waits on a fence.
     fn destroy_staging_buffer(&self, buffer: vk::Buffer, memory: vk::DeviceMemory) {
+        // SAFETY: buffer and memory are valid handles owned by this device; unmapping before free
+        // prevents freeing a still-mapped allocation (validation error, possible driver leak).
         unsafe {
             self.device.destroy_buffer(buffer, None);
             self.allocator.unmap(memory);
@@ -697,8 +1050,250 @@ impl BackendResource for VulkanLogicalDeviceResource {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn render_finished_semaphore(&self) -> vk::Semaphore {
-        self.render_finished
+fn render_finished_semaphore(&self) -> vk::Semaphore {
+        // Bug №282: per slot. This used to return one shared handle, which is
+        // only correct while a single frame is in flight — the second frame would
+        // re-signal a semaphore the first present is still waiting on.
+        self.render_finished[self.last_submitted_slot.load(std::sync::atomic::Ordering::Acquire)]
+    }
+
+      /// The semaphore `vkAcquireNextImageKHR` should signal for the next frame.
+      ///
+      /// Bug №282: `acquire` used to block on a fence instead, so the CPU never
+      /// got ahead of the presentation engine. Passing the semaphore lets the
+      /// submit wait for the handover on the GPU timeline.
+      fn image_acquired_semaphore(&self) -> vk::Semaphore {
+          self.image_acquired[self.next_frame.load(std::sync::atomic::Ordering::Relaxed) % FRAMES_IN_FLIGHT]
+      }
+
+      /// Bug №282: drain a presentation frame that will not be submitted.
+      ///
+      /// The acquire already signalled `image_acquired[slot]`. With no submit to
+      /// wait on it, the semaphore stays signalled, and the slot's next acquire
+      /// fails VUID-vkAcquireNextImageKHR-semaphore-01779. Draining is the only
+      /// way back: a semaphore cannot be reset, only waited on.
+      fn cancel_presentation_frame(&self) {
+          let armed = self
+              .presentation_signal_armed
+              .swap(false, std::sync::atomic::Ordering::AcqRel);
+          if !armed {
+              return;
+          }
+          let slot = self.next_frame.load(std::sync::atomic::Ordering::Relaxed) % FRAMES_IN_FLIGHT;
+          let values: [u64; 1] = [1];
+          let semaphores = [self.image_acquired[slot]];
+          let wait = vk::SemaphoreWaitInfo {
+              semaphore_count: 1,
+              p_semaphores: semaphores.as_ptr(),
+              p_values: values.as_ptr(),
+              ..Default::default()
+          };
+          // SAFETY: semaphore array valid (semaphore owned by this device); wait info points to valid arrays.
+          unsafe {
+              self.device
+                  .wait_semaphores(&wait, u64::MAX)
+                  .map_err(|e| vk_fail(e, "drain unused image-acquired semaphore"))
+          }
+          .ok();
+      }
+
+    /// Bug №289: destroy now rather than at `vkDestroyDevice`.
+    ///
+    /// The texture is more than the image: its device memory must go with it, and
+    /// host-visible memory must be unmapped first. Forgetting any of those three
+    /// is exactly the class of mistake bug №284 was.
+    ///
+    /// `device_wait_idle` is the price of correctness. Vulkan does not permit
+    /// destroying an object the GPU may still be reading, and tracking in-flight
+    /// usage per object is a real allocator. Callers release on resize rather than
+    /// per frame, so the wait is affordable.
+    fn release_texture(&self, texture: &crate::resource::Texture) {
+        let Some(gpu) = texture.backend() else {
+            return;
+        };
+        // An adopted swapchain image is not ours to destroy.
+        if gpu.memory == 0 && gpu.handle == 0 {
+            return;
+        }
+        self.release(ReleaseKind::Image, gpu.handle);
+    }
+
+    /// Bug №289: framebuffers are replaced when the acquired image or the extent
+    /// changes, so the same reasoning as [`release_texture`] applies.
+    fn release_framebuffer(&self, framebuffer: &crate::command::pass::render::Framebuffer) {
+        let Some(gpu) = framebuffer.backend() else {
+            return;
+        };
+        self.release(ReleaseKind::Framebuffer, gpu.handle);
+    }
+
+    /// Bug №289: see [`release_texture`] for why the view is released before the
+    /// image it was created from.
+    fn release_texture_view(&self, view: &crate::resource::TextureView) {
+        let Some(gpu) = view.backend() else {
+            return;
+        };
+        self.release(ReleaseKind::ImageView, gpu.handle);
+    }
+
+    /// Drop one object from the teardown list and destroy it immediately.
+    ///
+    /// Bug №289. Kept separate from `destroy_tracked` so an object that is no longer
+    /// needed — a texture replaced by a resize, say — dies when its owner drops it
+    /// instead of living until the device does.
+    ///
+    /// Removed from the list *first*, so a later `destroy_tracked` cannot destroy it
+    /// a second time — the same double-free hazard that bug №283 was about.
+    ///
+    /// Only the handle is needed: memory and mapping come from the tracked entry, so
+    /// they are not parameters. Passing them in would be a second source of truth for
+    /// a value that must match the entry exactly, and a mismatch would free the wrong
+    /// memory.
+    fn release(&self, kind: ReleaseKind, object: u64) {
+        self.release_many(&[(kind, object)]);
+    }
+
+    /// Bug №294: see [`BackendResource::release_many`] for why the wait is per
+    /// batch rather than per object.
+    fn release_many(&self, objects: &[(ReleaseKind, u64)]) {
+        if objects.is_empty() {
+            return;
+        }
+        // Translate first, then look up. The public vocabulary is
+        // backend-neutral; `TrackedKind` is this backend's private bookkeeping, and
+        // the translation is the single place the two are allowed to meet.
+        let wanted: Vec<(TrackedKind, u64)> = objects
+            .iter()
+            .map(|(kind, handle)| (TrackedKind::from_release(*kind), *handle))
+            .collect();
+
+        // Collect first, destroy second. Removing an entry and destroying while still
+        // holding the lock would serialise the driver calls behind the mutex, and
+        // there is no reason to hold it across `destroy_*`.
+        let Ok(mut tracked) = self.tracked.lock() else {
+            return;
+        };
+        let mut entries = Vec::with_capacity(wanted.len());
+        for (kind, object) in wanted {
+            let Some(position) = tracked
+                .iter()
+                .position(|o| o.kind == kind && o.object == object)
+            else {
+                // Not tracked. Either it never was, or it was already released.
+                // Either way there is nothing to destroy — and this is what makes a
+                // double release harmless rather than a double free.
+                continue;
+            };
+            entries.push(tracked.remove(position));
+        }
+        drop(tracked);
+
+        if entries.is_empty() {
+            return;
+        }
+        // SAFETY: every handle in `entries` was tracked as created by this device; unmapping before
+        // free_memory, GPU idled first (device_wait_idle) so no object is still in use during destruction.
+        unsafe {
+            // One wait for the whole batch. Vulkan forbids destroying an object the
+            // GPU may still be reading, so it cannot be skipped — but it does not
+            // need repeating per object.
+            self.device.device_wait_idle().ok();
+            for entry in entries {
+            if entry.mapped != 0 {
+                self.device.unmap_memory(entry.memory);
+            }
+            let raw = entry.object;
+            match entry.kind {
+                TrackedKind::Image => {
+                    self.device.destroy_image(vk::Image::from_raw(raw), None);
+                }
+                TrackedKind::Framebuffer => {
+                    self.device
+                        .destroy_framebuffer(vk::Framebuffer::from_raw(raw), None);
+                }
+                TrackedKind::Buffer => {
+                    self.device.destroy_buffer(vk::Buffer::from_raw(raw), None);
+                }
+                TrackedKind::ImageView => {
+                    self.device.destroy_image_view(vk::ImageView::from_raw(raw), None);
+                }
+                TrackedKind::Sampler => {
+                    self.device.destroy_sampler(vk::Sampler::from_raw(raw), None);
+                }
+                TrackedKind::ShaderModule => {
+                    self.device
+                        .destroy_shader_module(vk::ShaderModule::from_raw(raw), None);
+                }
+                TrackedKind::DescriptorSetLayout => {
+                    self.device
+                        .destroy_descriptor_set_layout(
+                            vk::DescriptorSetLayout::from_raw(raw),
+                            None,
+                        );
+                }
+                TrackedKind::DescriptorPool => {
+                    self.device
+                        .destroy_descriptor_pool(vk::DescriptorPool::from_raw(raw), None);
+                }
+                TrackedKind::PipelineLayout => {
+                    self.device
+                        .destroy_pipeline_layout(vk::PipelineLayout::from_raw(raw), None);
+                }
+                TrackedKind::RenderPass => {
+                    self.device.destroy_render_pass(vk::RenderPass::from_raw(raw), None);
+                }
+                TrackedKind::GraphicsPipeline | TrackedKind::ComputePipeline => {
+                    self.device.destroy_pipeline(vk::Pipeline::from_raw(raw), None);
+                }
+            }
+            if entry.memory != vk::DeviceMemory::null() {
+                self.device.free_memory(entry.memory, None);
+            }
+            }
+        }
+    }
+
+    /// Bug №289: see [`BackendResource::tracked_object_count`] for why this exists.
+    ///
+    /// A poisoned lock would mean a panic while the list was held, which is already
+    /// a broken state, but reporting zero would read as "nothing leaked" — the
+    /// opposite of the truth and the most misleading answer available. Reporting the
+    /// poison as a maximum keeps the observable direction right: the count goes up
+    /// and cannot be mistaken for healthy.
+    fn tracked_object_count(&self) -> usize {
+        match self.tracked.lock() {
+            Ok(objects) => objects.len(),
+            Err(_) => usize::MAX,
+        }
+    }
+
+    /// Bug №289: which objects are outstanding, not merely how many.
+    ///
+    /// A count alone cannot localise a leak — "+2" does not say whether it is two
+    /// depth images, two image views, or a pair that grows on every frame. The kind
+    /// breakdown does, and that is what identifies which of the three release sites
+    /// in `GeometryPass::resolve_target` is missing.
+    fn tracked_object_summary(&self) -> String {
+        let Ok(objects) = self.tracked.lock() else {
+            return "<poisoned>".to_string();
+        };
+        let mut counts: Vec<(&'static str, usize)> = Vec::new();
+        for entry in objects.iter() {
+            let name = entry.kind.name();
+            match counts.iter_mut().find(|(n, _)| *n == name) {
+                Some(slot) => slot.1 += 1,
+                None => counts.push((name, 1)),
+            }
+        }
+        counts.sort_unstable();
+        if counts.is_empty() {
+            return "<empty>".to_string();
+        }
+        counts
+            .into_iter()
+            .map(|(name, n)| format!("{name}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn backend_type(&self) -> GraphicsApi {
@@ -706,6 +1301,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
     }
 
     fn wait_idle(&self) -> RhiResult<()> {
+        // SAFETY: device is a valid logical device owned by this struct.
         unsafe { self.device.device_wait_idle() }.map_err(|e| vk_fail(e, "device wait idle"))
     }
 
@@ -721,13 +1317,17 @@ impl BackendResource for VulkanLogicalDeviceResource {
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             ..Default::default()
         };
+        // SAFETY: device valid; buffer create info valid (size>0, usage flags consistent).
         let buffer = unsafe { self.device.create_buffer(&create_info, None) }
             .map_err(|e| vk_fail(e, "create buffer"))?;
+        // SAFETY: buffer is a valid buffer owned by this device.
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
         let (memory, _) = self
             .allocator
             .allocate(requirements.size, requirements.memory_type_bits, desc.memory_flags)
             .map_err(|e| RhiError::BufferCreationError(format!("{e}")))?;
+        // SAFETY: buffer and memory are valid handles owned by this device; memory offset 0
+        // within allocation, meets buffer memory requirements.
         unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
             .map_err(|e| RhiError::BufferCreationError(format!("{e:?}")))?;
 
@@ -757,6 +1357,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
                 buffer,
                 ..Default::default()
             };
+            // SAFETY: buffer is a valid buffer created earlier with SHADER_DEVICE_ADDRESS usage; device valid.
             let address = unsafe { self.device.get_buffer_device_address(&address_info) };
             if address != 0 {
                 out.set_device_address(address);
@@ -791,8 +1392,10 @@ impl BackendResource for VulkanLogicalDeviceResource {
             initial_layout: vk::ImageLayout::UNDEFINED,
             ..Default::default()
         };
+        // SAFETY: device valid; image create info valid (extent>0, usage flags consistent, format supported).
         let image = unsafe { self.device.create_image(&create_info, None) }
             .map_err(|e| RhiError::TextureCreationError(format!("{e:?}")))?;
+        // SAFETY: image is a valid image owned by this device.
         let requirements = unsafe { self.device.get_image_memory_requirements(image) };
         // GPU-resident images use device-local memory; staging uploads later
         // go through an explicit host-visible staging buffer.
@@ -801,6 +1404,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
             .allocator
             .allocate(requirements.size, requirements.memory_type_bits, required)
             .map_err(|e| RhiError::TextureCreationError(format!("{e}")))?;
+        // SAFETY: image and memory are valid handles owned by this device; offset 0 within allocation,
+        // memory satisfies image memory requirements.
         unsafe { self.device.bind_image_memory(image, memory, 0) }
             .map_err(|e| RhiError::TextureCreationError(format!("{e:?}")))?;
 
@@ -841,6 +1446,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
             subresource_range: range,
             ..Default::default()
         };
+        // SAFETY: device valid; image view create info valid (image is a live image on this device,
+        // view type/format/range compatible with image properties).
         let view = unsafe { self.device.create_image_view(&create_info, None) }
             .map_err(|e| RhiError::TextureCreationError(format!("image view creation failed: {e:?}")))?;
 
@@ -873,6 +1480,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             unnormalized_coordinates: desc.unnormalized_coordinates as vk::Bool32,
             ..Default::default()
         };
+        // SAFETY: device valid; sampler create info fields (filters, address modes, LOD range) valid.
         let sampler = unsafe { self.device.create_sampler(&create_info, None) }
             .map_err(|e| vk_fail(e, "create sampler"))?;
         let mut out = Sampler::from_desc(desc.clone());
@@ -897,6 +1505,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
             )));
         }
         if gpu.mapped != 0 {
+            // SAFETY: gpu.mapped points into a live device memory mapping created by this allocator
+            // (not freed elsewhere); data.len() was checked <= buffer.size() above (mapped region covers buffer).
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), gpu.mapped as *mut u8, data.len());
             }
@@ -915,12 +1525,15 @@ impl BackendResource for VulkanLogicalDeviceResource {
             ));
         }
         let (staging, staging_memory, ptr) = self.create_staging_buffer(data.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        // SAFETY: ptr points into live device memory mapping (from create_staging_buffer), large enough for data.len().
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
         self.allocator.flush(staging_memory, data.len() as u64)?;
         let dst = vk::Buffer::from_raw(gpu.handle);
         let result = self.submit_recorded(|cb| {
+            // SAFETY: cb is a valid command buffer in recording state (owned by this device); staging
+            // and dst are valid buffers on this device; region covers full valid range of both buffers.
             unsafe {
                 let region = vk::BufferCopy {
                     src_offset: 0,
@@ -1000,12 +1613,15 @@ impl BackendResource for VulkanLogicalDeviceResource {
             layer_count: texture.array_layers(),
         };
         let (staging, staging_memory, ptr) = self.create_staging_buffer(total, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        // SAFETY: ptr points into live staging buffer mapping, large enough for `total` bytes (checked above).
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, total as usize);
         }
         self.allocator.flush(staging_memory, total)?;
         let sampled = texture.is_sampled();
         let result = self.submit_recorded(|cb| {
+            // SAFETY: cb valid, in recording state; image valid and owned by this device; layout
+            // transitions match the copy (UNDEFINED->TRANSFER_DST before copy, ->SHADER_READ after if sampled).
             unsafe {
                 let to_transfer = vk::ImageMemoryBarrier {
                     src_access_mask: vk::AccessFlags::empty(),
@@ -1044,7 +1660,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
                         dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                         image,
                         subresource_range: range,
-                        ..Default::default()
+..Default::default()
                     };
                     self.device.cmd_pipeline_barrier(
                         cb,
@@ -1086,6 +1702,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
             p_code: words.as_ptr(),
             ..Default::default()
         };
+        // SAFETY: device valid; SPIR-V bytecode in words is validated above (length multiple of 4);
+        // p_code points to valid words vec that lives for duration of the call.
         let shader = unsafe { self.device.create_shader_module(&create_info, None) }
             .map_err(|e| vk_fail(e, "create shader module"))?;
         let mut out = ShaderModule::new(desc.clone());
@@ -1118,6 +1736,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             p_bindings: bindings.as_ptr(),
             ..Default::default()
         };
+        // SAFETY: device valid; create_info valid (bindings list is live for call, descriptors/types valid).
         let layout = unsafe { self.device.create_descriptor_set_layout(&create_info, None) }
             .map_err(|e| vk_fail(e, "create descriptor set layout"))?;
         let mut out = DescriptorSetLayout::new(desc.clone());
@@ -1157,6 +1776,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             p_pool_sizes: sizes.as_ptr(),
             ..Default::default()
         };
+        // SAFETY: device valid; pool_info valid (sizes list is live for call, counts within limits).
         let pool = unsafe { self.device.create_descriptor_pool(&pool_info, None) }
             .map_err(|e| vk_fail(e, "create descriptor pool"))?;
         let alloc_info = vk::DescriptorSetAllocateInfo {
@@ -1165,6 +1785,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             p_set_layouts: &vk_layout,
             ..Default::default()
         };
+        // SAFETY: device and pool are valid; alloc_info valid (vk_layout is a live layout handle on this device).
         let vk_set = unsafe { self.device.allocate_descriptor_sets(&alloc_info) }
             .map_err(|e| vk_fail(e, "allocate descriptor set"))?
             .remove(0);
@@ -1292,6 +1913,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
             })
             .collect();
 
+        // SAFETY: device and dst_set are valid; vk_writes entries point into buffer_infos/image_infos
+        // vecs that live for the duration of the call; buffer/image handles in infos are live resources.
         unsafe { self.device.update_descriptor_sets(&vk_writes, &[]) };
         Ok(())
     }
@@ -1325,6 +1948,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             p_set_layouts: &layout_handle,
             ..Default::default()
         };
+        // SAFETY: device valid; layout_info valid (set_layouts points to valid layout handle from this device).
         let pipeline_layout = unsafe { self.device.create_pipeline_layout(&layout_info, None) }
             .map_err(|e| {
                 RhiError::PipelineCreationError(format!("create pipeline layout: {e:?}"))
@@ -1334,6 +1958,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             layout: pipeline_layout,
             ..Default::default()
         };
+        // SAFETY: device valid; create_info valid (shader module and layout are live handles on this device).
         let mut pipeline = unsafe {
             self.device.create_compute_pipelines(
                 vk::PipelineCache::null(),
@@ -1390,6 +2015,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
         })?;
 
         self.submit_recorded(|cb| {
+            // SAFETY: cb valid and in recording state (owned by this device); vk_pipeline/vk_layout/
+            // vk_sets are live handles created on this device; barrier describes compute->compute/transfer hazard.
             unsafe {
                 self.device
                     .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
@@ -1453,6 +2080,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
         let src = vk::Buffer::from_raw(backend.handle);
         let (staging, staging_memory, ptr) = self.create_staging_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
         let result = self.submit_recorded(|cb| {
+            // SAFETY: cb valid, in recording state; src and staging are valid buffers on this device;
+            // barrier covers the exact [offset, offset+size) range being copied, which was bounds-checked above.
             unsafe {
                 let barrier = vk::BufferMemoryBarrier {
                     src_access_mask: vk::AccessFlags::empty(),
@@ -1489,6 +2118,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
         // The device wrote this range; without an invalidate the host may read the
         // contents the range held before the copy.
         self.allocator.invalidate(staging_memory, size)?;
+        // SAFETY: ptr is the live mapped pointer from create_staging_buffer, covering `size` bytes;
+        // to_vec() copies out before staging buffer is destroyed on the next line.
         let data = unsafe { std::slice::from_raw_parts(ptr, size as usize) }.to_vec();
         self.destroy_staging_buffer(staging, staging_memory);
         Ok(data)
@@ -1523,22 +2154,55 @@ impl BackendResource for VulkanLogicalDeviceResource {
         let (staging, staging_memory, ptr) =
             self.create_staging_buffer(total, vk::BufferUsageFlags::TRANSFER_DST)?;
 
-        let old_layout = if texture.is_color_attachment() {
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-        } else if texture.is_depth_stencil() {
-            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-        } else {
-            vk::ImageLayout::GENERAL
-        };
-        let src_access = if texture.is_color_attachment() {
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-        } else if texture.is_depth_stencil() {
-            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
-        } else {
-            vk::AccessFlags::SHADER_WRITE
+        // Bug №299: the old layout came from the usage flags, which say what an
+        // image *may* be used for, not where it is. A texture declared
+        // `COLOR_ATTACHMENT` may equally be in `SHADER_READ_ONLY_OPTIMAL`, and a
+        // barrier claiming `COLOR_ATTACHMENT_OPTIMAL` for an image in
+        // `TRANSFER_SRC_OPTIMAL` is `VUID-vkCmdDraw-None-09600` — reported at a
+        // draw, nowhere near the cause, with the readback returning nothing.
+        //
+        // So the layout is read from tracking. An untracked image means the tracker
+        // has no opinion — a swapchain image, whose layout belongs to whoever owns
+        // it — and that case now fails loudly instead of guessing. Guessing is what
+        // made this wrong in the first place.
+        let old_layout = self.image_layout(backend.handle).ok_or_else(|| {
+            RhiError::BackendError(
+                "cannot download a texture whose layout is not tracked: the backend \
+                 does not know what layout this image is in, and guessing from its \
+                 usage flags produces an invalid barrier. Images created through this \
+                 device are tracked; images adopted from elsewhere (swapchain) are \
+                 not, and must be transitioned by the caller first"
+                    .into(),
+            )
+        })?;
+
+        // The access masks follow from the *old* layout, not from usage. A layout
+        // says who last touched the image, which is exactly what a barrier's source
+        // access has to describe.
+        let (src_access, src_stage) = match old_layout {
+            l if l == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ),
+            l if l == vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => (
+                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            ),
+            l if l == vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::PipelineStageFlags::TRANSFER,
+            ),
+            l if l == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ),
+            _ => (vk::AccessFlags::SHADER_WRITE, vk::PipelineStageFlags::FRAGMENT_SHADER),
         };
 
         let result = self.submit_recorded(|cb| {
+            // SAFETY: cb valid, in recording state; image is a live image on this device;
+            // barrier describes the exact mip/layer being downloaded and matches the layout
+            // transition (old_layout -> TRANSFER_SRC_OPTIMAL) before the copy below.
             unsafe {
                 let barrier = vk::ImageMemoryBarrier {
                     src_access_mask: src_access,
@@ -1563,12 +2227,18 @@ impl BackendResource for VulkanLogicalDeviceResource {
                 };
                 self.device.cmd_pipeline_barrier(
                     cb,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    // Bug №299: was `ALL_COMMANDS` with no reason. That is legal and
+                    // it is also the weakest possible statement — it says nothing
+                    // about which access is being waited for, so a later refactor can
+                    // change `src_access_mask` and the stage mask stays as wide as
+                    // everything, hiding the mistake. The stage now follows the
+                    // layout the image is actually in.
+                    src_stage,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
                     &[],
                     &[],
-                    &[barrier],
+                    std::slice::from_ref(&barrier),
                 );
                 let region = vk::BufferImageCopy {
                     buffer_offset: 0,
@@ -1609,6 +2279,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
         // Same reason as the buffer readback: the device wrote this range, so the host
         // must not read it before the write is made visible.
         self.allocator.invalidate(staging_memory, total)?;
+        // SAFETY: ptr is the live mapped pointer from create_staging_buffer, covering `total` bytes;
+        // raw is used to copy out rows before staging buffer is destroyed at end of function.
         let raw = unsafe { std::slice::from_raw_parts(ptr, total as usize) };
         let tight_row = width as usize * bpp as usize;
         let mut out = Vec::with_capacity(tight_row * height as usize * depth as usize);
@@ -1762,6 +2434,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
             p_dependencies: dependencies.as_ptr(),
             ..Default::default()
         };
+        // SAFETY: device valid; create_info valid (attachments/subpasses/dependencies vectors live
+        // for duration of the call, attachment/subpass references consistent).
         let render_pass = unsafe { self.device.create_render_pass(&create_info, None) }
             .map_err(|e| vk_fail(e, "create render pass"))?;
 
@@ -1803,6 +2477,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
             layers: desc.layers.max(1),
             ..Default::default()
         };
+        // SAFETY: device valid; render_pass and all image views in views are live handles created
+        // on this device; views vector lives for duration of the call.
         let framebuffer = unsafe { self.device.create_framebuffer(&create_info, None) }
             .map_err(|e| vk_fail(e, "create framebuffer"))?;
 
@@ -1999,6 +2675,7 @@ impl BackendResource for VulkanLogicalDeviceResource {
             p_set_layouts: vk_layouts.as_ptr(),
             ..Default::default()
         };
+        // SAFETY: device valid; layout_info valid (vk_layouts vector is live for the call).
         let pipeline_layout = unsafe { self.device.create_pipeline_layout(&layout_info, None) }
             .map_err(|e| {
                 RhiError::PipelineCreationError(format!("create pipeline layout: {e:?}"))
@@ -2024,6 +2701,9 @@ impl BackendResource for VulkanLogicalDeviceResource {
             ..Default::default()
         };
 
+        // SAFETY: device valid; create_info references live shader stages, pipeline layout and
+        // render pass (all handles from this device); every sub-struct pointer is a reference
+        // that outlives the call.
         let mut pipelines = unsafe {
             self.device.create_graphics_pipelines(
                 vk::PipelineCache::null(),
@@ -2071,6 +2751,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
         request: crate::backend::vulkan::SwapchainRequest,
         old: Option<&mut crate::backend::vulkan::Swapchain>,
     ) -> RhiResult<crate::backend::vulkan::Swapchain> {
+        // SAFETY: device valid; queue_family_index was validated at device creation (advertised family);
+        // index 0 matches the single queue requested in DeviceQueueCreateInfo.
         let queue = unsafe { self.device.get_device_queue(self.queue_family_index, 0) };
         crate::backend::vulkan::Swapchain::create(
             &self.instance_guard,
@@ -2160,7 +2842,10 @@ impl BackendResource for VulkanLogicalDeviceResource {
                     .into(),
             ));
         }
-        self.submit_recorded(|cb| record::record(&self.device, cb, commands))
+        self.note_layout_transitions(commands);
+        // Bug №282: a frame, not a one-shot. Waiting here would put the CPU back
+        // in lockstep with the GPU and there would be no ring.
+        self.submit_frame(|cb| record::record(&self.device, cb, commands))
     }
 
     fn draw_framebuffer_indexed(
@@ -2266,6 +2951,8 @@ impl BackendResource for VulkanLogicalDeviceResource {
 
 impl Drop for VulkanLogicalDeviceResource {
     fn drop(&mut self) {
+        // SAFETY: every tracked object, fence, semaphore and command pool owned by this device;
+        // device_wait_idle is called first so nothing is in GPU use during destruction.
         unsafe {
             // Idle first: every tracked object, the fence and the pool belong to
             // this device, and destroying any of them while the GPU still refers
@@ -2278,13 +2965,17 @@ impl Drop for VulkanLogicalDeviceResource {
             if leaked > 0 {
                 eprintln!("[rhi/vulkan] released {leaked} GPU objects at device teardown");
             }
-            self.device.destroy_fence(self.submit_fence, None);
-            // The semaphore may still be referenced by an in-flight present, and
-            // `device_wait_idle` above has already drained everything, so this is
-            // safe. It leaked before because nothing owned it.
-            self.device.destroy_semaphore(self.render_finished, None);
-            self.device.destroy_command_pool(self.command_pool, None);
-            self.device.destroy_device(None);
+            for fence in &self.submit_fences {
+            self.device.destroy_fence(*fence, None);
+        }
+        for semaphore in self.render_finished.iter().chain(self.image_acquired.iter()) {
+            self.device.destroy_semaphore(*semaphore, None);
+        }
+              // Every per-slot fence and semaphore above is destroyed in the same
+              // loop. `device_wait_idle` above has already drained the device, so
+              // none of them can still be referenced by an in-flight present.
+              self.device.destroy_command_pool(self.command_pool, None);
+              self.device.destroy_device(None);
         }
     }
 }
@@ -2292,4 +2983,82 @@ impl Drop for VulkanLogicalDeviceResource {
 fn align_up(value: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
     (value + (align - 1)) & !(align - 1)
+}
+
+// At the end of the file on purpose: clippy's `items_after_test_module` fires when
+// anything follows a `mod tests`, and a warning here is a warning every future
+// contributor learns to ignore.
+
+#[cfg(test)]
+mod teardown_coverage {
+    use super::{ALL_TRACKED_KINDS, TrackedKind, TEARDOWN_ORDER};
+    use crate::backend::common::ReleaseKind;
+
+    #[test]
+    fn teardown_order_covers_every_tracked_kind() {
+        for kind in ALL_TRACKED_KINDS {
+            assert!(
+                TEARDOWN_ORDER.contains(&kind),
+                "{:?} is tracked at creation but absent from TEARDOWN_ORDER, so it \
+                 would never be destroyed and Vulkan would report it as leaked at \
+                 vkDestroyDevice",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn teardown_order_has_no_duplicates() {
+        for (i, kind) in TEARDOWN_ORDER.iter().enumerate() {
+            let first = TEARDOWN_ORDER.iter().position(|k| k == kind);
+            assert_eq!(
+                first,
+                Some(i),
+                "{:?} appears twice in TEARDOWN_ORDER; the object would be destroyed \
+                 twice, which is undefined behaviour",
+                kind
+            );
+        }
+    }
+
+    /// Bug №295: every `ReleaseKind` must mean something to this backend.
+    ///
+    /// `TrackedKind::from_release` is exhaustive, so a new variant cannot be added
+    /// without deciding what it maps to. This test guards the other direction — that
+    /// the mapping is total and never collapses two release kinds onto one tracked
+    /// kind, which would release the wrong object without any compile error.
+    #[test]
+    fn every_release_kind_maps_to_a_distinct_tracked_kind() {
+        let all = [
+            ReleaseKind::Image,
+            ReleaseKind::ImageView,
+            ReleaseKind::Framebuffer,
+            ReleaseKind::Buffer,
+            ReleaseKind::Sampler,
+            ReleaseKind::ShaderModule,
+            ReleaseKind::DescriptorSetLayout,
+            ReleaseKind::DescriptorPool,
+            ReleaseKind::PipelineLayout,
+            ReleaseKind::RenderPass,
+            ReleaseKind::GraphicsPipeline,
+            ReleaseKind::ComputePipeline,
+        ];
+        for kind in all {
+            let mapped = TrackedKind::from_release(kind);
+            assert!(
+                ALL_TRACKED_KINDS.contains(&mapped),
+                "{kind:?} maps to {mapped:?}, which is not a kind this backend tracks; \
+                 releasing it would silently free the wrong object"
+            );
+            let duplicates = all
+                .iter()
+                .filter(|other| TrackedKind::from_release(**other) == mapped)
+                .count();
+            assert_eq!(
+                duplicates,
+                1,
+                "{kind:?} and {duplicates} other release kinds all map to {mapped:?}"
+            );
+        }
+    }
 }

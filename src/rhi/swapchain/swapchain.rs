@@ -1,7 +1,6 @@
 //! Swap Chain
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use super::surface::Surface;
 use crate::error::*;

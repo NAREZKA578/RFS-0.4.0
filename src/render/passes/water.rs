@@ -332,7 +332,12 @@ impl RenderPass for WaterPass {
             dependencies: vec![],
         };
 
-        self.water_render_pass = Some(device.create_render_pass(&render_pass_desc));
+        // Bug №314: `create_render_pass` reaches the backend now and can fail, so the
+        // outcome is checked rather than assumed.
+        match device.create_render_pass(&render_pass_desc) {
+            Ok(pass) => self.water_render_pass = Some(pass),
+            Err(e) => crate::error!("water", "render pass could not be created: {}", e),
+        }
 
         // Create framebuffer
         let depth_texture = device.create_texture(

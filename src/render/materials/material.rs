@@ -130,8 +130,20 @@ impl Material {
         self.shader = Some(shader);
     }
 
-    /// Create pipeline for this material
-    pub fn create_pipeline(&mut self, device: &Device) {
+    /// Create pipeline for this material.
+    ///
+    /// Takes the render pass and descriptor set layouts. Bug №314: the device
+    /// method used to accept only a description and hand back
+    /// `Ok(GraphicsPipeline::new(desc))` without ever calling the backend, so
+    /// this pipeline had no native handle, could not draw, and reported success.
+    /// A material pipeline is only valid against a compatible pass in any case,
+    /// so naming the pass here is not a workaround — it is the real dependency.
+    pub fn create_pipeline(
+        &mut self,
+        device: &Device,
+        render_pass: &crate::rhi::command::pass::render::RenderPass,
+        set_layouts: &[&crate::rhi::descriptor::DescriptorSetLayout],
+    ) {
         if let Some(shader) = &self.shader {
             // Create pipeline
             // This is a placeholder - actual implementation would create
@@ -175,7 +187,16 @@ impl Material {
                 ..Default::default()
             };
 
-            self.pipeline = Some(device.create_graphics_pipeline(&pipeline_desc).unwrap());
+            // No `.unwrap()`: a failed pipeline must leave `self.pipeline` as `None`, which
+            // is visibly "no pipeline", rather than panic somewhere unrelated.
+            match device.create_graphics_pipeline(&pipeline_desc, render_pass, set_layouts) {
+                Ok(pipeline) => self.pipeline = Some(pipeline),
+                Err(e) => crate::error!(
+                    "material",
+                    "material pipeline could not be created: {}",
+                    e
+                ),
+            }
         }
     }
 

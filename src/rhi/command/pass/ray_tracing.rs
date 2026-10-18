@@ -1,7 +1,6 @@
 //! Ray Tracing Pass
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 /// Ray tracing pass description
 #[derive(Debug, Clone, Default)]

@@ -153,31 +153,41 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
         // Bug №62: MAX_ENTITIES_PER_CELL was never enforced — the SmallVec
         // grew on the heap without limit. Bug №201: overflow is parked in a
         // spill list rather than a neighbouring cell, because a neighbouring
-        // cell falls outside the range a query walks.
+        // cell falls outside the range a query walks. `spill_cell` holds that
+        // rule and `update_position` goes through it too (Bug №632), so the two
+        // placement paths cannot drift.
         let cell = CellCoord::from_position(position);
-        // `entry`, not `get_mut`: a cell that does not exist yet has to be
-        // created here, or the first insert of every cell misses the map and
-        // lands in the spill list instead.
-        let cell_entities = self.cells.entry(cell).or_default();
-        if cell_entities.len() < MAX_ENTITIES_PER_CELL {
-            cell_entities.push(entity);
-        } else {
-            self.spilled.push(entity);
+        match self.spill_cell(cell) {
+            // `entry`, not `get_mut`: a cell that does not exist yet has to be
+            // created here, or the first insert of every cell misses the map and
+            // lands in the spill list instead.
+            Some(target) => self.cells.entry(target).or_default().push(entity),
+            None => self.spilled.push(entity),
         }
         self.entity_cells.insert(id, cell);
     }
 
-    /// Pick the closest cell with room left for `MAX_ENTITIES_PER_CELL`.
-    fn spill_cell(&self, cell: CellCoord) -> CellCoord {
+    /// Where an entity belonging to `cell` should be placed, or `None` when
+    /// `cell` is full and the entity has to go to the spill list.
+    ///
+    /// Bug №632. This had two latent defects, both waiting for the first caller:
+    ///
+    /// - It walked the 27 neighbours, which is exactly the placement `insert`
+    ///   rejected in №201 — a neighbour can sit outside the range a query walks,
+    ///   so the entity becomes invisible to the query that centred on it. `insert`
+    ///   parks overflow in the spill list for that reason.
+    /// - When every neighbour was full it returned `cell` unchanged, so the
+    ///   caller pushed into a cell already at `MAX_ENTITIES_PER_CELL` and the cap
+    ///   evaporated for that cell.
+    ///
+    /// One rule now, shared by `insert` and `update_position`: room in `cell` ⇒
+    /// `cell`, otherwise ⇒ spill list.
+    fn spill_cell(&self, cell: CellCoord) -> Option<CellCoord> {
         if self.cells.get(&cell).map_or(0, |v| v.len()) < MAX_ENTITIES_PER_CELL {
-            return cell;
+            Some(cell)
+        } else {
+            None
         }
-        for candidate in cell.neighbors() {
-            if self.cells.get(&candidate).map_or(0, |v| v.len()) < MAX_ENTITIES_PER_CELL {
-                return candidate;
-            }
-        }
-        cell
     }
 
     pub fn remove(&mut self, id: EntityId) -> Option<T> {
@@ -202,39 +212,30 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
         None
     }
 
-    pub fn update_position(&mut self, id: EntityId, new_pos: Vec3f) -> bool {
-        // Bug №62: new_pos was ignored — the entity was removed and
-        // re-inserted from its STORED (stale) position, so it could never
-        // change cell. The supplied position now drives the relocation.
-        if !new_pos.x.is_finite() || !new_pos.y.is_finite() || !new_pos.z.is_finite() {
-            return false;
-        }
-        let Some(&old_cell) = self.entity_cells.get(&id) else {
-            return false;
-        };
-        let new_cell = CellCoord::from_position(new_pos);
-        if old_cell == new_cell {
-            return true;
-        }
-
-        let entity = {
-            let Some(ents) = self.cells.get_mut(&old_cell) else {
-                return false;
-            };
-            let Some(idx) = ents.iter().position(|e| e.entity_id() == id) else {
-                return false;
-            };
-            let e = ents.swap_remove(idx);
-            if ents.is_empty() {
-                self.cells.remove(&old_cell);
-            }
-            e
-        };
-
-        let new_cell = self.spill_cell(new_cell);
-        self.entity_cells.insert(id, new_cell);
-        self.cells.entry(new_cell).or_default().push(entity);
-        true
+    /// Re-place `entity` in the grid, wherever its own position puts it.
+    ///
+    /// Returns whether the id was already tracked, so a caller can tell a move
+    /// from a first insertion — the one thing `insert` does not report.
+    ///
+    /// Bug №632. This took `(id, new_pos)` and moved the *stored* copy into the
+    /// cell for `new_pos`. The stored copy is a snapshot from the last `insert`,
+    /// and nothing rewrites its own `position()`, which is what every query
+    /// filters on. So a relocated entity changed cell while still reporting its
+    /// old position and became unreachable from both: gone from the old cell,
+    /// filtered out of the new one by distance. The path was also dead — called
+    /// from nowhere — which is why nothing had tripped over it.
+    ///
+    /// The grid cannot repair the snapshot from here either. For
+    /// `CompartmentEntity`, `StationEntity` and `PlayerEntity`, `position()` is
+    /// derived from the ship they ride, so there is no single world coordinate
+    /// the grid could assign on its own. That answer belongs to the caller, so
+    /// it now passes the entity itself — the same thing `insert` takes, and the
+    /// same policy it applies: the entity's own cell, or the spill list when
+    /// that cell is full.
+    pub fn update_position(&mut self, entity: T) -> bool {
+        let was_tracked = self.entity_cells.contains_key(&entity.entity_id());
+        self.insert(entity);
+        was_tracked
     }
 
     /// Every entity held in the spill list, for a query to consider.
@@ -344,10 +345,16 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
     }
 
     pub fn all_entities(&self) -> Vec<T> {
+        // Bug №603: the spill list was scanned by every spatial query but not
+        // by this one, so an entity parked in it (its cell was full) never
+        // reached `InterestManager::get_*` and vanished from client-bound
+        // snapshots while still alive. `entity_cells` counts it, so the
+        // capacity below already assumes it comes back.
         let mut result = Vec::with_capacity(self.entity_cells.len());
         for entities in self.cells.values() {
             result.extend(entities.iter().cloned());
         }
+        result.extend(self.spilled.iter().cloned());
         result
     }
 
@@ -358,6 +365,13 @@ impl<T: SpatialEntity + Clone> SpatialGrid<T> {
     pub fn clear(&mut self) {
         self.cells.clear();
         self.entity_cells.clear();
+        // Bug №632 (found while fixing it): `spilled` was left behind. With
+        // `entity_cells` emptied, `remove` keys off nothing and can never find
+        // those entities again, yet `all_entities` and every query still return
+        // them — a cleared grid that keeps serving the previous one's overflow
+        // forever. `clear` and `spilled` had been added separately and the new
+        // field was never wired into the existing reset.
+        self.spilled.clear();
     }
 }
 
@@ -483,7 +497,9 @@ mod neighbour_tests {
 }
 #[cfg(test)]
 mod spill_tests {
-    use super::{Bounds, SpatialEntity, SpatialGrid, MAX_ENTITIES_PER_CELL};
+    use super::{
+        Bounds, SpatialEntity, SpatialGrid, MAX_ENTITIES_PER_CELL, SPATIAL_CELL_SIZE,
+    };
     use crate::math::Vec3f;
     use crate::spatial::EntityId;
 
@@ -585,6 +601,36 @@ mod spill_tests {
         );
     }
 
+    /// `all_entities` is what the interest getters hand to the snapshot
+    /// builder, so it must include the spill list — Bug №603: entities in an
+    /// overflowing cell were alive, queryable, and simply absent from every
+    /// client-bound snapshot.
+    #[test]
+    fn all_entities_includes_the_spill_list() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        let total = (MAX_ENTITIES_PER_CELL as u64) * 3;
+        for i in 0..total {
+            grid.insert(entity(i, 10.0, 10.0, 10.0));
+        }
+        assert!(
+            !grid.spilled.is_empty(),
+            "the fixture must actually overflow, or this proves nothing"
+        );
+        let all = grid.all_entities();
+        assert_eq!(
+            all.len() as u64,
+            total,
+            "all_entities returned {} of {} entities; the {} in the spill list \
+             never reach a snapshot",
+            all.len(),
+            total,
+            grid.spilled.len()
+        );
+        let unique: std::collections::HashSet<_> =
+            all.iter().map(|e| e.entity_id()).collect();
+        assert_eq!(unique.len() as u64, total, "all_entities duplicated an entity");
+    }
+
     /// An entity removed from the spill list must actually disappear, or it
     /// keeps being returned forever.
     #[test]
@@ -664,6 +710,185 @@ mod spill_tests {
             grid.entity_cells.len() as u64,
             total,
             "re-insertion lost track of an entity"
+        );
+    }
+
+    /// The centre of `cell`, so the tests below can address a cell without
+    /// depending on the arithmetic `from_position` uses.
+    fn cell_centre(x: i32, y: i32, z: i32) -> Vec3f {
+        Vec3f::new(
+            x as f32 * SPATIAL_CELL_SIZE + SPATIAL_CELL_SIZE * 0.5,
+            y as f32 * SPATIAL_CELL_SIZE + SPATIAL_CELL_SIZE * 0.5,
+            z as f32 * SPATIAL_CELL_SIZE + SPATIAL_CELL_SIZE * 0.5,
+        )
+    }
+
+    /// Bug №632: a position change has to leave the entity findable at its new
+    /// position and nowhere at the old one. The path it took to get there was
+    /// the defect — see `update_position` for the long form. The point of this
+    /// test is the second half of the contract, which the old code broke: it
+    /// moved the *cell* while the stored snapshot kept reporting its old
+    /// `position()`, so queries filtered the entity out of the cell it had just
+    /// been placed in and it was findable neither there nor at home.
+    #[test]
+    fn moving_an_entity_away_from_its_cell_finds_it_at_the_new_position() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        grid.insert(entity(1, 10.0, 10.0, 10.0));
+
+        let new_pos = cell_centre(5, 0, 0);
+        assert!(
+            grid.update_position(entity(1, new_pos.x, new_pos.y, new_pos.z)),
+            "a plain relocation was refused"
+        );
+
+        assert_eq!(
+            grid.query_radius(Vec3f::new(10.0, 10.0, 10.0), 1.0).len(),
+            0,
+            "the entity is still found at its old position"
+        );
+        let found = grid.query_radius(new_pos, 1.0);
+        assert_eq!(found.len(), 1, "the entity is not found at its new position");
+        assert_eq!(found[0].entity_id(), EntityId::new(1));
+    }
+
+    /// An entity parked in the spill list has to relocate like any other. The
+    /// path that used to exist here looked only *inside* the recorded cell —
+    /// where a spilled entity by definition is not — found nothing, and refused
+    /// the move. So the entity that most needed moving (its cell was full) was
+    /// precisely the one guaranteed not to move. The two halves are worth
+    /// separate tests: reaching the entity at all, and leaving no ghost behind.
+    #[test]
+    fn an_overflowed_entity_can_still_be_moved() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        let home = cell_centre(0, 0, 0);
+        // `MAX + 1` entities in one cell, so exactly the last lands in the spill.
+        for i in 0..=MAX_ENTITIES_PER_CELL as u64 {
+            grid.insert(entity(i, home.x, home.y, home.z));
+        }
+        assert_eq!(
+            grid.spilled.len(),
+            1,
+            "the fixture must overflow or this proves nothing"
+        );
+
+        let spilled_id = EntityId::new(MAX_ENTITIES_PER_CELL as u64);
+        let new_pos = cell_centre(5, 0, 0);
+        assert!(
+            grid.update_position(entity(spilled_id.0, new_pos.x, new_pos.y, new_pos.z)),
+            "an overflowed entity could not be relocated (Bug №632)"
+        );
+        assert_eq!(grid.spilled.len(), 0, "the entity is still parked after moving");
+
+        let at_new = grid.query_radius(new_pos, 1.0);
+        assert_eq!(at_new.len(), 1, "the moved entity is not at its new position");
+        assert_eq!(at_new[0].entity_id(), spilled_id);
+
+        let at_old = grid.query_radius(home, 1.0);
+        assert_eq!(
+            at_old.len(),
+            MAX_ENTITIES_PER_CELL,
+            "the cell it left still holds {} of {} entities",
+            at_old.len(),
+            MAX_ENTITIES_PER_CELL
+        );
+        assert!(
+            !at_old.iter().any(|e| e.entity_id() == spilled_id),
+            "the moved entity still answers to its old cell"
+        );
+    }
+
+    /// The second half of №632: `spill_cell` walked the neighbours and, when
+    /// they were *all* full, returned the original cell — so the caller pushed
+    /// an entity into a cell already at the cap. Parking the entity in the
+    /// spill list is what `insert` has always done (№201), and it is what a
+    /// query centred on the entity can still reach. The neighbours no longer
+    /// enter into it at all — `spill_cell` never looks at them — so the fixture
+    /// below fills them only to pin down the scenario the old code got wrong.
+    #[test]
+    fn moving_into_a_cell_with_no_room_anywhere_does_not_break_the_cap() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        let target = cell_centre(9, 0, 0);
+
+        // Fill the destination cell and all 26 of its neighbours, so no empty
+        // cell is left to divert into.
+        let mut next_id: u64 = 0;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let pos = cell_centre(9 + dx, dy, dz);
+                    for _ in 0..MAX_ENTITIES_PER_CELL as u64 {
+                        grid.insert(entity(next_id, pos.x, pos.y, pos.z));
+                        next_id += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            grid.cells.len(),
+            27,
+            "the fixture should have filled the destination and its neighbours"
+        );
+
+        // The mover comes from a cell that does have room.
+        let home = cell_centre(0, 0, 0);
+        let mover_id = EntityId::new(next_id);
+        grid.insert(entity(mover_id.0, home.x, home.y, home.z));
+
+        assert!(
+            grid.update_position(entity(mover_id.0, target.x, target.y, target.z)),
+            "relocation into a full cell was refused"
+        );
+
+        let biggest = grid.cells.values().map(|c| c.len()).max().unwrap_or(0);
+        assert!(
+            biggest <= MAX_ENTITIES_PER_CELL,
+            "a cell holds {biggest}, past the cap of {MAX_ENTITIES_PER_CELL}"
+        );
+        assert_eq!(
+            grid.spilled.len(),
+            1,
+            "the mover should be parked in the spill list"
+        );
+
+        let found = grid.query_radius(target, 1.0);
+        assert!(
+            found.iter().any(|e| e.entity_id() == mover_id),
+            "the mover is unreachable from a query centred on it: {} entities",
+            found.len()
+        );
+    }
+
+    /// `clear` emptied `cells` and `entity_cells` but not `spilled`. Since
+    /// `remove` keys off `entity_cells`, those entities could never be removed
+    /// again — yet `all_entities` and every query kept returning them, so a
+    /// cleared grid went on serving the previous one's overflow forever.
+    #[test]
+    fn clearing_a_grid_forgets_its_spill_list() {
+        let mut grid: SpatialGrid<TestEntity> = SpatialGrid::new();
+        let home = Vec3f::new(10.0, 10.0, 10.0);
+        for i in 0..=MAX_ENTITIES_PER_CELL as u64 {
+            grid.insert(entity(i, home.x, home.y, home.z));
+        }
+        assert_eq!(grid.spilled.len(), 1, "the fixture must overflow");
+
+        grid.clear();
+
+        assert_eq!(grid.entity_count(), 0, "the grid still counts cleared entities");
+        assert_eq!(
+            grid.spilled.len(),
+            0,
+            "clear() left {} spilled entities behind",
+            grid.spilled.len()
+        );
+        assert_eq!(
+            grid.query_radius(home, 10.0).len(),
+            0,
+            "a cleared grid still answers queries"
+        );
+        assert_eq!(
+            grid.all_entities().len(),
+            0,
+            "a cleared grid still hands out entities"
         );
     }
 }

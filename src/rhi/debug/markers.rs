@@ -1,7 +1,6 @@
 //! Debug Markers
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 /// Debug label
 #[derive(Debug, Clone)]

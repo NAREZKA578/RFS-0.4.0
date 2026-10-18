@@ -22,12 +22,14 @@
 //! target is described by plain handles, so the same path serves every backend
 //! that can supply them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::command::commands::Command;
 use crate::command::encoder::CommandEncoder;
-use crate::command::pass::render::RenderPassBeginInfo;
+use crate::command::pass::render::{
+    Framebuffer, FramebufferAttachment, FramebufferDesc, RenderPass, RenderPassBeginInfo,
+};
 use crate::descriptor::{
     DescriptorBinding, DescriptorInfo, DescriptorSet, DescriptorSetLayout,
     DescriptorSetLayoutDesc, DescriptorType, DescriptorWrite,
@@ -38,8 +40,12 @@ use crate::pipeline::graphics::{
     VertexAttribute, VertexBinding, VertexInputRate, VertexInputState,
 };
 use crate::pipeline::GraphicsPipeline;
-use crate::resource::Buffer;
-use crate::types::{BufferUsage, Extent2D, Format, IndexType, Offset2D, Rect2D, ShaderStage, Viewport};
+use crate::resource::{Buffer, Texture, TextureLayout, TextureView};
+use crate::sync::barrier::TextureBarrier;
+use crate::types::{
+    AccessFlags, BufferUsage, ColorComponentFlags, Extent2D, Format, IndexType, Offset2D,
+    PipelineStage, Rect2D, ShaderStage, Viewport,
+};
 use crate::Device;
 
 use super::elements::{UiElement, UiElementId};
@@ -141,6 +147,11 @@ struct UiDrawBatch {
 struct UiDrawBatches {
     geometry: Vec<UiDrawBatch>,
     text: Vec<UiDrawBatch>,
+    /// Image quads, grouped by the texture they sample. One group per texture
+    /// rather than one per image, because the textured pipeline binds exactly
+    /// one texture and switching it costs a descriptor write and a bind - but
+    /// several images from the same atlas region are free to share.
+    images: Vec<(u64, UiDrawBatch)>,
 }
 
 /// What one pass over the input produced, before anything is uploaded.
@@ -194,6 +205,12 @@ struct UiBuilder {
     /// buffer would mean rebinding the pipeline mid-stream for no benefit.
     text_batches: Vec<UiDrawBatch>,
     text_current: UiDrawBatch,
+    /// Image quads as they arrive, with their texture id and the scissor in
+    /// force at the time. Kept flat rather than pre-grouped: images for one
+    /// texture may be interleaved with others, and grouping on arrival would
+    /// start a new draw every time the id changed. Grouped once, in
+    /// first-appearance order, when the build is assembled.
+    images: Vec<(u64, Option<(i32, i32, u32, u32)>, [UiVertex; 4])>,
     transform: [f32; 6],
     transform_stack: Vec<[f32; 6]>,
     scissor: Option<(i32, i32, u32, u32)>,
@@ -210,9 +227,10 @@ impl UiBuilder {
         Self {
             batches: Vec::new(),
             current: UiDrawBatch::default(),
-            text_batches: Vec::new(),
-            text_current: UiDrawBatch::default(),
-            transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+text_batches: Vec::new(),
+    text_current: UiDrawBatch::default(),
+images: Vec::new(),
+    transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             transform_stack: Vec::new(),
             scissor: None,
             scissor_stack: Vec::new(),
@@ -385,6 +403,97 @@ impl UiBuilder {
         self.index_total += 6;
     }
 
+    /// An image quad, sampled from `uv_min` to `uv_max` of `texture_id`.
+    ///
+    /// The same finite/positive guards as [`Self::quad`], for the same reason:
+    /// a NaN position discards the primitive on some drivers and a NaN colour
+    /// propagates through blending into every primitive after it. The UV rect is
+    /// checked too, because an inverted or non-finite UV is not clamped away by
+    /// the sampler and would sample across the whole texture.
+    fn image_quad(
+        &mut self,
+        texture_id: u64,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uv_min: [f32; 2],
+        uv_max: [f32; 2],
+        color: [f32; 4],
+    ) {
+        let positive = |v: f32| v.is_finite() && v > 0.0;
+        if !x.is_finite() || !y.is_finite() || !positive(w) || !positive(h) {
+            return;
+        }
+        if !color.iter().all(|c| c.is_finite()) {
+            return;
+        }
+        if !uv_min.iter().all(|c| c.is_finite()) || !uv_max.iter().all(|c| c.is_finite()) {
+            return;
+        }
+        // An image that samples nothing is dropped, not drawn transparent: the
+        // caller asked for a picture and there is no picture, and a zero-area
+        // primitive still costs a draw.
+        if !positive(uv_max[0] - uv_min[0]) || !positive(uv_max[1] - uv_min[1]) {
+            return;
+        }
+
+        let corners = [
+            (x, y, uv_min),
+            (x + w, y, [uv_max[0], uv_min[1]]),
+            (x + w, y + h, uv_max),
+            (x, y + h, [uv_min[0], uv_max[1]]),
+        ];
+        let mut quad = [UiVertex::default(); 4];
+        for (slot, (cx, cy, uv)) in quad.iter_mut().zip(corners) {
+            *slot = UiVertex {
+                position: self.apply(cx, cy),
+                tex_coords: uv,
+                color,
+            };
+        }
+
+        self.images.push((texture_id, self.scissor, quad));
+        self.vertex_total += 4;
+        self.index_total += 6;
+    }
+
+    /// Groups the queued image quads into contiguous runs and hands back the draw
+    /// batches in command order.
+    ///
+    /// Deliberately *runs*, not "every quad of this texture". Merging non-adjacent
+    /// images of one texture into a single group would draw them together and
+    /// push whatever was between them later, which silently changes the stacking
+    /// of overlapping images from different textures. A few extra descriptor
+    /// binds is a fair price for drawing in the order the caller asked for.
+    fn flush_images(&mut self) -> Vec<(u64, UiDrawBatch)> {
+        let pending = std::mem::take(&mut self.images);
+        let mut groups: Vec<(u64, UiDrawBatch)> = Vec::new();
+        for (texture_id, scissor, quad) in pending {
+            let extends_last = groups
+                .last()
+                .is_some_and(|(id, _)| *id == texture_id)
+                && groups.last().is_some_and(|(_, b)| b.scissor == scissor);
+            if !extends_last {
+                groups.push((
+                    texture_id,
+                    UiDrawBatch {
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                        scissor,
+                    },
+                ));
+            }
+            let (_, batch) = groups.last_mut().expect("a group was just ensured");
+            let base = batch.vertices.len() as u32;
+            batch.vertices.extend_from_slice(&quad);
+            batch
+                .indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        groups
+    }
+
     /// Axis-aligned outline drawn as four thin quads.
     fn outline(&mut self, x: f32, y: f32, w: f32, h: f32, t: f32, color: [f32; 4]) {
         if !(w.is_finite() && h.is_finite() && t.is_finite()) {
@@ -479,9 +588,28 @@ pub struct UiRenderer {
     shaders: UiShaderManager,
     pass: Option<UiRenderPass>,
     gpu: Option<UiGpu>,
+    /// One framebuffer per swapchain image view, keyed by the view's handle.
+    ///
+    /// Not one framebuffer reused for all of them: a swapchain cycles through
+    /// several images, so a single cached framebuffer would send every frame
+    /// into whichever image happened to be acquired first, and the rest would
+    /// be presented never having been written.
+    presentation_framebuffers: HashMap<u64, Framebuffer>,
     command_queue: Vec<UiCommand>,
     elements: HashMap<UiElementId, UiElement>,
     texture_cache: HashMap<u64, Arc<crate::resource::Texture>>,
+    /// One descriptor set per sampled texture, created on first use.
+    image_descriptor_sets: HashMap<u64, DescriptorSet>,
+    /// Textures already moved from the transfer layout to the sampled layout.
+    ///
+    /// `Texture` does not track its own current layout, so the renderer remembers
+    /// which registered images it has already transitioned. The sampler
+    /// descriptor always declares `ShaderReadOnlyOptimal`, while an uploaded or
+    /// cleared image arrives in `TransferDstOptimal`; the first sample moves it
+    /// across. Doing that more than once would name `TransferDstOptimal` as the
+    /// old layout of an image already sitting in `ShaderReadOnlyOptimal`, which is
+    /// a validation error rather than a harmless repeat.
+    transitioned_images: HashSet<u64>,
     /// Fonts available to `UiCommand::Text`, by name.
     fonts: HashMap<String, Box<dyn super::text::UiFont>>,
     /// Name of the font used when a command does not name one.
@@ -490,6 +618,36 @@ pub struct UiRenderer {
     atlas: Option<(Arc<crate::resource::Texture>, u32, u32)>,
     /// Text laid out ahead of recording, waiting to become geometry.
     pending_text: Vec<(super::text::UiTextLayout, [f32; 4])>,
+    /// Cursor and press state, resolved once per frame from the queued events.
+    ///
+    /// This field is the whole missing edge in the input chain. `input::update`
+    /// had been written, unit-tested and correct since the UI was first laid
+    /// out; `UiRenderer` drew `element.hovered` and `element.pressed` when
+    /// painting a button, but nothing ever set them, because the renderer held
+    /// no input state and no caller built a `UiInputState`. So a button could
+    /// never show a hover, an input field could never show a caret, and task #9
+    /// "input" was reported done while being a subsystem with no entrance.
+    input: super::input::UiInputState,
+    /// Fallback colours for elements that do not specify their own.
+    ///
+    /// Was not wired at all: `theme.rs` had a complete palette and the renderer
+    /// painted hard-coded literals instead - the same mistake as filling an open
+    /// sea with asteroids, at a smaller scale. A theme is also the only thing
+    /// that can answer "what does a disabled button look like" in one place
+    /// instead of per call site.
+    theme: super::theme::UiTheme,
+    /// Named themes the renderer can switch between.
+    ///
+    /// Held next to the active theme so `select_theme` has somewhere to look:
+    /// a caller that wants "light mode" should not have to construct a whole
+    /// `UiTheme` to get one, and the palette is the part most likely to be
+    /// changed by whoever asks for it.
+    themes: super::theme::ThemeManager,
+    /// Events waiting to be applied on the next record.
+    pending_input: Vec<super::input::UiInputEvent>,
+    /// What this frame's input resolved to, for a caller that wants clicks and
+    /// focus changes rather than just the painted result.
+    interaction: super::input::UiInteraction,
     stats: UiRenderStats,
     frame_number: u64,
     initialized: bool,
@@ -504,13 +662,21 @@ impl UiRenderer {
             ui_config: UiConfig::default(),
             pass: None,
             gpu: None,
+            presentation_framebuffers: HashMap::new(),
             command_queue: Vec::new(),
             elements: HashMap::new(),
             texture_cache: HashMap::new(),
+    image_descriptor_sets: HashMap::new(),
+            transitioned_images: HashSet::new(),
             fonts: HashMap::new(),
             default_font: None,
             atlas: None,
             pending_text: Vec::new(),
+        input: Default::default(),
+        theme: Default::default(),
+        themes: Default::default(),
+        pending_input: Vec::new(),
+        interaction: Default::default(),
             stats: UiRenderStats::default(),
             frame_number: 0,
             initialized: false,
@@ -530,9 +696,40 @@ impl UiRenderer {
         geometry_spirv: &[u8],
         text_spirv: Option<&[u8]>,
     ) -> UiResult<()> {
+        let pass = UiRenderPass::new(&self.device, format, width, height)?;
+        self.initialize_with_pass(pass, format, width, height, geometry_spirv, text_spirv)
+    }
+
+    /// Like [`Self::initialize`], but the pass ends in a layout the pixels can
+    /// be read back from instead of `PresentSrc`.
+    ///
+    /// This exists so "did the UI actually draw" can be answered by reading the
+    /// image, rather than inferred from a recorded draw call and a quiet
+    /// validation layer. A draw that records perfectly and rasterises nothing
+    /// looks identical from the outside to one that worked.
+    pub fn initialize_offscreen(
+        &mut self,
+        format: Format,
+        width: u32,
+        height: u32,
+        geometry_spirv: &[u8],
+        text_spirv: Option<&[u8]>,
+    ) -> UiResult<()> {
+        let pass = UiRenderPass::new_offscreen(&self.device, format, width, height)?;
+        self.initialize_with_pass(pass, format, width, height, geometry_spirv, text_spirv)
+    }
+
+    fn initialize_with_pass(
+        &mut self,
+        pass: UiRenderPass,
+        _format: Format,
+        width: u32,
+        height: u32,
+        geometry_spirv: &[u8],
+        text_spirv: Option<&[u8]>,
+    ) -> UiResult<()> {
         self.shaders.load_geometry(geometry_spirv)?;
 
-        let pass = UiRenderPass::new(&self.device, format, width, height)?;
         let (uniform_buffer, descriptor_layout, descriptor_set) = self.build_uniforms()?;
         let pipeline = self.build_pipeline(&descriptor_layout, &pass)?;
 
@@ -564,6 +761,10 @@ impl UiRenderer {
         let (vertex_buffer, index_buffer) = self.build_buffers(vertex_capacity, index_capacity)?;
 
         self.pass = Some(pass);
+        // A framebuffer is built against one render pass. Keeping them across a
+        // rebuild would leave framebuffers pointing at the previous pass, which
+        // the driver rejects when the pass is begun with a mismatched one.
+        self.presentation_framebuffers.clear();
         self.gpu = Some(UiGpu {
             pipeline,
             descriptor_layout,
@@ -702,7 +903,18 @@ impl UiRenderer {
                     src_alpha_blend_factor: BlendFactor::One,
                     dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
                     alpha_blend_op: BlendOp::Add,
-                    ..Default::default()
+                    // Must be explicit. `ColorComponentFlags` is a `bitflags`
+                    // type that derives `Default`, and for bitflags `Default` is
+                    // the *empty* set - so `..Default::default()` here silently
+                    // gave this attachment a write mask of zero. The draw then
+                    // blended correctly into nothing: the framebuffer kept the
+                    // clear colour, no validation layer complains (a zero write
+                    // mask is legal), and any shader produced the same empty
+                    // frame.
+                    color_write_mask: ColorComponentFlags::R
+                        | ColorComponentFlags::G
+                        | ColorComponentFlags::B
+                        | ColorComponentFlags::A,
                 }],
                 ..Default::default()
             }),
@@ -889,6 +1101,9 @@ impl UiRenderer {
     }
 
     pub fn add_texture(&mut self, id: u64, texture: Arc<crate::resource::Texture>) {
+        // A newly registered image has not been moved to the sampled layout yet,
+        // even if an earlier texture carried the same id.
+        self.transitioned_images.remove(&id);
         self.texture_cache.insert(id, texture);
     }
 
@@ -920,6 +1135,43 @@ impl UiRenderer {
 
     pub fn has_atlas(&self) -> bool {
         self.atlas.is_some()
+    }
+
+    /// Rasterises `font`'s atlas to a texture and registers it, as `name`.
+    ///
+    /// Why this is one call: `register_font` and `set_atlas` are two halves of
+    /// one fact, and in practice only the first was ever reachable. A renderer
+    /// with a font and no atlas reports every string as skipped, and a renderer
+    /// with an atlas and no font never looks at it — both states are silent, and
+    /// nothing in the tree put them together. The bitmap font owns its own atlas
+    /// data, so the pairing is not optional here; it is the point.
+    ///
+    /// Text drawn before this call is still counted as skipped, and `push_text`
+    /// starts working after it. Replacing this with a TTF font means passing
+    /// that font's atlas instead, and nothing above changes.
+    ///
+    /// `R8` rather than a colour format: glyph coverage is single-channel, and
+    /// the fragment shader samples it as alpha, so three quarters of the atlas
+    /// would be replicated bytes.
+    pub fn install_bitmap_font(&mut self, name: &str) -> UiResult<()> {
+        let font = super::bitmap_font::UiBitmapFont::new();
+        let (w, h) = (font.atlas_width(), font.atlas_height());
+
+        let texture = self.device.create_texture(
+            w,
+            h,
+            1,
+            crate::types::Format::R8_UNORM,
+            crate::types::TextureUsage::SAMPLED | crate::types::TextureUsage::TRANSFER_DST,
+            1,
+        );
+        self.device
+            .upload_texture(&texture, font.atlas_pixels())
+            .map_err(|e| UiError::BackendError(format!("UI atlas upload: {e}")))?;
+
+        self.register_font(name, Box::new(font));
+        self.set_atlas(Arc::new(texture), w, h);
+        Ok(())
     }
 
     /// Lay `text` out with the named font and queue the resulting glyphs.
@@ -970,6 +1222,7 @@ impl UiRenderer {
                 width,
                 height,
                 &self.fonts,
+                &self.texture_cache,
                 default_font.as_deref(),
                 &mut collected,
             );
@@ -1009,6 +1262,12 @@ impl UiRenderer {
         // panel that was visibly underneath.
         let ids: Vec<UiElementId> = super::input::draw_order(&self.elements);
         let mut elements_rendered = 0u32;
+        // Text carried by retained elements. Collected here and resolved below,
+        // after the element loop, through the same `UiBuilder::text` the
+        // immediate path uses - one code path means one set of bugs rather than
+        // two that agree today and drift tomorrow.
+        let mut retained_text: Vec<(super::text::UiTextLayout, [f32; 4])> = Vec::new();
+        let rects = super::layout::resolve_rects(&self.elements, (0.0, 0.0, width as f32, height as f32));
         for id in ids {
             let Some(element) = self.elements.get(&id) else {
                 continue;
@@ -1016,7 +1275,33 @@ impl UiRenderer {
             if !element.style.visible || !element.enabled {
                 continue;
             }
-            Self::emit_element(&mut b, element, &mut elements_rendered);
+            Self::emit_element(
+                &mut b,
+                element,
+                &mut elements_rendered,
+                &self.fonts,
+                self.default_font.as_deref(),
+                &self.texture_cache,
+                &self.theme,
+                &rects,
+                &mut retained_text,
+            );
+        }
+
+        // Retained text is resolved after the immediate text, in draw order, so
+        // the two streams merge into one set of glyph batches.
+        if can_draw_text && !retained_text.is_empty() {
+            let (_, aw, ah) = self.atlas.as_ref().expect("checked above").clone();
+            for (layout, color) in &retained_text {
+                b.text(&UiTextDraw {
+                    layout,
+                    color: *color,
+                    atlas_width: aw as f32,
+                    atlas_height: ah as f32,
+                });
+            }
+        } else if !can_draw_text {
+            b.skipped += retained_text.len() as u32;
         }
 
         b.flush_all();
@@ -1027,10 +1312,13 @@ impl UiRenderer {
             indices: b.index_total as u32,
             skipped: b.skipped,
         };
+// Collected before the other fields are moved out of the builder.
+        let images = b.flush_images();
         (
             UiDrawBatches {
                 geometry: b.batches,
                 text: b.text_batches,
+                images,
             },
             stats,
         )
@@ -1042,6 +1330,7 @@ impl UiRenderer {
         width: u32,
         height: u32,
         fonts: &HashMap<String, Box<dyn super::text::UiFont>>,
+        textures: &HashMap<u64, Arc<crate::resource::Texture>>,
         default_font: Option<&str>,
         out_text: &mut Vec<(super::text::UiTextLayout, [f32; 4])>,
     ) {
@@ -1166,7 +1455,26 @@ impl UiRenderer {
                     None => b.skipped += 1,
                 }
             }
-            UiCommand::Image { .. } => b.skipped += 1,
+            UiCommand::Image {
+                texture_id,
+                x,
+                y,
+                width,
+                height,
+                uv_min,
+                uv_max,
+                color,
+            } => {
+                if textures.contains_key(texture_id) {
+                    b.image_quad(*texture_id, *x, *y, *width, *height, *uv_min, *uv_max, *color);
+                } else {
+                    // Counted, not drawn. An unknown id is a caller mistake, and
+                    // drawing an untextured quad in its place would show a solid
+                    // rectangle that looks like a loaded image that is merely the
+                    // wrong one.
+                    b.skipped += 1;
+                }
+            }
             // Cursor bookkeeping is the context's concern; by the time commands
             // reach the renderer the positions are already resolved.
             UiCommand::SetCursor { .. }
@@ -1179,10 +1487,21 @@ impl UiRenderer {
         b: &mut UiBuilder,
         element: &UiElement,
         elements_rendered: &mut u32,
+        fonts: &HashMap<String, Box<dyn super::text::UiFont>>,
+        default_font: Option<&str>,
+        textures: &HashMap<u64, Arc<crate::resource::Texture>>,
+        theme: &super::theme::UiTheme,
+        rects: &HashMap<super::elements::UiElementId, super::layout::UiRect>,
+        out_text: &mut Vec<(super::text::UiTextLayout, [f32; 4])>,
     ) {
-        use super::elements::{UiElementData, UiElementType};
-        let (x, y) = element.position;
-        let (w, h) = element.size;
+        use crate::ui::elements::{UiElementData, UiElementType};
+        // Anchor and pivot are resolved once per frame in `build`, from the
+        // same map the hit test uses. Reading `position` directly here is what
+        // made both of those fields do nothing.
+        let (x, y, w, h) = rects
+            .get(&element.id)
+            .copied()
+            .unwrap_or((element.position.0, element.position.1, element.size.0, element.size.1));
         *elements_rendered += 1;
 
         match element.element_type {
@@ -1199,8 +1518,14 @@ impl UiRenderer {
             }
             UiElementType::ProgressBar => {
                 if let UiElementData::ProgressBar { progress, .. } = &element.data {
-                    let bg = element.style.background_color.unwrap_or([0.15, 0.15, 0.15, 1.0]);
-                    let fill = element.style.foreground_color.unwrap_or([0.0, 0.85, 0.35, 1.0]);
+                    let bg = element
+                        .style
+                        .background_color
+                        .unwrap_or_else(|| theme.surface());
+                    let fill = element
+                        .style
+                        .foreground_color
+                        .unwrap_or_else(|| theme.get_progress_color(*progress));
                     b.quad(x, y, w, h, bg);
                     b.quad(x, y, w * progress.clamp(0.0, 1.0), h, fill);
                 }
@@ -1213,16 +1538,28 @@ impl UiRenderer {
                     } else {
                         0.0
                     };
-                    let track = element.style.background_color.unwrap_or([0.15, 0.15, 0.15, 1.0]);
-                    let fill = element.style.foreground_color.unwrap_or([0.0, 0.85, 0.35, 1.0]);
+                    let track = element
+                        .style
+                        .background_color
+                        .unwrap_or_else(|| theme.surface());
+                    let fill = element
+                        .style
+                        .foreground_color
+                        .unwrap_or_else(|| theme.get_progress_color(t));
                     b.quad(x, y, w, h, track);
                     b.quad(x, y, w * t, h, fill);
                 }
             }
             UiElementType::Checkbox => {
                 if let UiElementData::Checkbox { checked, .. } = &element.data {
-                    let off = element.style.background_color.unwrap_or([0.25, 0.25, 0.25, 1.0]);
-                    let on = element.style.foreground_color.unwrap_or([0.0, 0.85, 0.35, 1.0]);
+                    let off = element
+                        .style
+                        .background_color
+                        .unwrap_or_else(|| theme.get_button_color(super::theme::ButtonState::Normal));
+                    let on = element
+                        .style
+                        .foreground_color
+                        .unwrap_or_else(|| theme.get_button_color(super::theme::ButtonState::Hover));
                     b.quad(x, y, w, h, if *checked { on } else { off });
                 }
             }
@@ -1246,14 +1583,22 @@ impl UiRenderer {
                         let highlight = element
                             .style
                             .border_color
-                            .unwrap_or([0.0, 0.85, 0.35, 1.0]);
+                            .unwrap_or_else(|| theme.accent());
                         b.outline(x, y, w, h, 1.0, highlight);
                     }
                 }
             }
             UiElementType::InputField => {
                 if let UiElementData::InputField { .. } = &element.data {
-                    let bg = element.style.background_color.unwrap_or([0.12, 0.12, 0.12, 1.0]);
+                    let style_for_input = theme.get_input_style(if element.focused {
+                        super::theme::InputState::Focused
+                    } else {
+                        super::theme::InputState::Normal
+                    });
+                    let bg = element
+                        .style
+                        .background_color
+                        .unwrap_or(style_for_input.background);
                     b.quad(x, y, w, h, bg);
                     // Focus is shown as an accent border, so the caret — and the
                     // text — are not the only cues.
@@ -1261,34 +1606,458 @@ impl UiRenderer {
                         let accent = element
                             .style
                             .border_color
-                            .unwrap_or([0.0, 0.85, 0.35, 1.0]);
+                            .unwrap_or_else(|| theme.accent());
                         b.outline(x, y, w, h, 2.0, accent);
                     }
                 }
             }
-            // Text and images need resources this stage does not have yet.
-            UiElementType::Text | UiElementType::Image => b.skipped += 1,
-            _ => {}
+            UiElementType::RadioButton => {
+                if let UiElementData::RadioButton { checked, .. } = &element.data {
+                    // A radio button is a checkbox with a mutual-exclusion contract,
+                    // so it gets the checkbox's two-state fill. Drawn as a square
+                    // rather than a circle: this pipeline has no round primitive,
+                    // and a square that fills on selection is unambiguous next to a
+                    // checkbox in the same list.
+                    let off = element
+                        .style
+                        .background_color
+                        .unwrap_or_else(|| theme.get_button_color(super::theme::ButtonState::Normal));
+                    let on = element
+                        .style
+                        .foreground_color
+                        .unwrap_or_else(|| theme.accent());
+                    b.quad(x, y, w, h, if *checked { on } else { off });
+                    if let Some(border) = element.style.border_color {
+                        b.outline(x, y, w, h, element.style.border_width.max(1.0), border);
+                    }
+                }
+            }
+            UiElementType::ScrollContainer => {
+                if let UiElementData::ScrollContainer {
+                    scroll_x,
+                    scroll_y,
+                    scroll_width,
+                    scroll_height,
+                } = &element.data
+                {
+                    // The viewport, then a thumb sized by the visible fraction and
+                    // positioned by the scroll offset. Both are computed from the
+                    // declared content size rather than from children, because the
+                    // children have already been appended as siblings and are not
+                    // available here.
+                    b.quad(
+                        x,
+                        y,
+                        w,
+                        h,
+                        element
+                            .style
+                            .background_color
+.unwrap_or_else(|| theme.muted()),
+                      );
+                      let thumb = element
+                          .style
+                          .foreground_color
+                          .unwrap_or_else(|| theme.border());
+                    let fraction = |visible: f32, content: f32| -> f32 {
+                        if content > 0.0 && content.is_finite() {
+                            (visible / content).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        }
+                    };
+                    // Vertical bar.
+                    if *scroll_height > h && scroll_height.is_finite() && *scroll_height > 0.0 {
+                        let frac = fraction(h, *scroll_height);
+                        let travel = h * (1.0 - frac);
+                        let t = if (scroll_height - h).abs() > f32::EPSILON {
+                            (scroll_y / (scroll_height - h)).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        b.quad(x + w, y + travel * t, 4.0, (h * frac).max(4.0), thumb);
+                    }
+                    // Horizontal bar, only when there is something to scroll.
+                    if *scroll_width > w && scroll_width.is_finite() && *scroll_width > 0.0 {
+                        let frac = fraction(w, *scroll_width);
+                        let travel = w * (1.0 - frac);
+                        let t = if (scroll_width - w).abs() > f32::EPSILON {
+                            (scroll_x / (scroll_width - w)).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        b.quad(x + travel * t, y + h, (w * frac).max(4.0), 4.0, thumb);
+                    }
+                }
+            }
+            UiElementType::Dropdown => {
+                if let UiElementData::Dropdown { selected_index, items, is_open } = &element.data
+                {
+                    let bg = element
+                        .style
+                        .background_color
+                        .unwrap_or_else(|| theme.surface());
+                    let accent = element
+                        .style
+                        .foreground_color
+                        .unwrap_or_else(|| theme.accent());
+                    b.quad(x, y, w, h, bg);
+                    // The closed field shows the selection as a filled bar. The row
+                    // labels themselves need a font atlas and are drawn by the text
+                    // pass, so this is the selection, not the text.
+                    if let Some(index) = selected_index {
+                        if *index < items.len() {
+                            b.quad(x, y + h * 0.5, w, h * 0.5, accent);
+                        }
+                    }
+                    // An open dropdown lists one row per item beneath the field.
+                    // Rows are drawn as separators; the labels are the text pass's
+                    // job, so the row geometry is what is available here.
+                    if *is_open {
+                        let row = h * 0.75;
+                        for (i, _) in items.iter().enumerate() {
+                            let top = y + h + row * i as f32;
+                            b.quad(x, top, w, row, bg);
+                            b.line(x, top + row, x + w, top + row, 1.0, accent);
+                            if selected_index == &Some(i) {
+                                b.quad(x, top, 3.0, row, accent);
+                            }
+                        }
+                    }
+                }
+            }
+            UiElementType::ListView => {
+                if let UiElementData::ListView { items, selected_indices } = &element.data {
+                    let bg = element
+                        .style
+                        .background_color
+                        .unwrap_or_else(|| theme.muted());
+                    let accent = element
+                        .style
+                        .foreground_color
+                        .unwrap_or_else(|| theme.accent());
+                    b.quad(x, y, w, h, bg);
+                    // Even split: a list that has not been measured is better drawn
+                    // than not drawn, and the row count comes from the data.
+                    let count = items.len().max(1);
+                    let row = h / count as f32;
+                    for (i, _) in items.iter().enumerate() {
+                        let top = y + row * i as f32;
+                        if selected_indices.contains(&i) {
+                            b.quad(x, top, w, row, accent);
+                        } else if i > 0 {
+                            b.line(x, top, x + w, top, 1.0, [0.3, 0.3, 0.35, 1.0]);
+                        }
+                    }
+                }
+            }
+            UiElementType::GridView => {
+                if let UiElementData::GridView { columns, items, selected_indices } = &element.data {
+                    let bg = element
+                        .style
+                        .background_color
+                        .unwrap_or_else(|| theme.muted());
+                    let accent = element
+                        .style
+                        .foreground_color
+                        .unwrap_or_else(|| theme.accent());
+                    b.quad(x, y, w, h, bg);
+                    // Zero columns would divide by zero; one column is the safe
+                    // reading of a grid whose column count was never set.
+                    let cols = (*columns).max(1);
+                    let cell_w = w / cols as f32;
+                    for (i, _) in items.iter().enumerate() {
+                        let (cx, cy) = (i % cols, i / cols);
+                        let left = x + cell_w * cx as f32;
+                        let top = y + cell_w * cy as f32;
+                        if selected_indices.contains(&i) {
+                            b.quad(left, top, cell_w, cell_w, accent);
+                        } else {
+                            b.line(left, top, left + cell_w, top, 1.0, [0.3, 0.3, 0.35, 1.0]);
+                            b.line(left, top, left, top + cell_w, 1.0, [0.3, 0.3, 0.35, 1.0]);
+                        }
+                    }
+                }
+            }
+            UiElementType::Custom { .. } => {
+                // `UiElementData::Custom` holds the *name* of a render function,
+                // not the function, and this pipeline has no way to call one. So
+                // there is nothing honest to draw here: no placeholder box, because
+                // a box would be mistaken for the element's own output, and no
+                // `skipped` bump, because that counter means "needs a resource
+                // this stage lacks" and would send a caller looking for a missing
+                // atlas instead of a missing callback contract.
+            }
+            UiElementType::Text => {
+                // Was counted as skipped because no font and no atlas existed
+                // anywhere in the tree. Both do now - `install_bitmap_font`
+                // rasterises the atlas - so the reason has gone and counting it
+                // would hide a real failure behind a stale excuse.
+                if let UiElementData::Text { content } = &element.data {
+                    let name = default_font;
+                    match name.and_then(|n| fonts.get(n)) {
+                        Some(font) => {
+                            let color = element
+                                .style
+                                .foreground_color
+                                .or(element.style.background_color)
+                                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                            let style = super::text::UiTextStyle {
+                                size: element.style.font_size.max(1.0),
+                                color,
+                                ..Default::default()
+                            };
+                            let layout = super::text::UiTextLayout::layout(
+                                content,
+                                font.as_ref(),
+                                &style,
+                                [x, y],
+                            );
+                            out_text.push((layout, color));
+                        }
+                        // No font registered: skipped, because this *is* the
+                        // resource this stage lacks, unlike the old claim.
+                        None => b.skipped += 1,
+                    }
+                }
+            }
+            UiElementType::Image => {
+                // The textured pipeline binds one texture per descriptor set, and
+                // that machinery exists now - `image_descriptor_set` and
+                // `write_image_descriptors`. A retained image takes the same path
+                // as `UiCommand::Image`, so the two cannot drift apart.
+                if let UiElementData::Image { texture_id, uv_min, uv_max } = &element.data {
+                    if textures.contains_key(texture_id) {
+                        let color = element.style.foreground_color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                        b.image_quad(*texture_id, x, y, w, h, *uv_min, *uv_max, color);
+                    } else {
+                        b.skipped += 1;
+                    }
+                }
+            }
         }
+    }
+
+    /// The fallback theme.
+    pub fn theme(&self) -> &super::theme::UiTheme {
+        &self.theme
+    }
+
+    /// Replaces the fallback theme.
+    pub fn set_theme(&mut self, theme: super::theme::UiTheme) {
+        self.theme = theme;
+    }
+
+    /// The names of the themes that can be selected.
+    pub fn theme_names(&self) -> Vec<&String> {
+        self.themes.theme_names()
+    }
+
+    /// Adds or replaces a named theme.
+    pub fn add_theme(&mut self, name: String, theme: super::theme::UiTheme) {
+        self.themes.add_theme(name, theme);
+    }
+
+    /// Selects a named theme and makes it the one elements are painted with.
+    ///
+    /// Reports whether the name was known, so a caller can fall back rather
+    /// than silently keep the current theme and call it a settings change.
+    pub fn select_theme(&mut self, name: &str) -> bool {
+        if self.themes.set_theme(name).is_none() {
+            return false;
+        }
+        self.theme = self.themes.current().clone();
+        true
+    }
+
+    /// Queues an input event for the next frame.
+    ///
+    /// Applied at the start of [`Self::record`] rather than immediately, so a
+    /// press and a release inside one frame resolve against one set of element
+    /// flags - doing it on arrival is how an element ends up stuck pressed.
+    pub fn push_input_event(&mut self, event: super::input::UiInputEvent) {
+        self.pending_input.push(event);
+    }
+
+    /// The retained element tree.
+    ///
+    /// Read-only on purpose. `submit_element` and `remove_element` are the way
+    /// in: letting a caller hold `&mut` to an element would let it change
+    /// `hovered` or `pressed`, which are resolved once per frame from the input
+    /// state and would then disagree with what was painted.
+    pub fn elements(&self) -> &std::collections::HashMap<UiElementId, UiElement> {
+        &self.elements
+    }
+
+    /// The interaction this frame's input produced: what was clicked, whether
+    /// focus moved, what was typed.
+    ///
+    /// Empty until the first frame is recorded.
+    pub fn interaction(&self) -> super::input::UiInteraction {
+        self.interaction.clone()
+    }
+
+    /// The render pass this renderer records against.
+    ///
+    /// A caller that builds its own framebuffer — the offscreen verification
+    /// path does — must build it against **this** pass. A framebuffer made from a
+    /// different, even identically-described, render pass is not compatible, and
+    /// pairing the two is a mistake that does not necessarily announce itself.
+    pub fn render_pass(&self) -> Option<RenderPass> {
+        self.pass.as_ref().map(|p| p.render_pass().clone())
+    }
+
+    /// TEMPORARY DIAGNOSTIC: the bytes the GPU would actually read for the
+    /// projection and the vertex buffer.
+    ///
+    /// Added because the offscreen harness reports a correct recording
+    /// (4 vertices, 2 triangles, 1 draw call, `skipped = 0`) and still an image
+    /// with zero lit pixels. That is only possible if either the data never
+    /// reached the GPU or it reached and did not rasterise, and reading those are
+    /// the two possibilities — so read them instead of choosing between them by
+    /// argument.
+    pub fn debug_visible_bytes(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let gpu = self.gpu.as_ref()?;
+        let uniform = self.device.buffer_data(&gpu.uniform_buffer)?.to_vec();
+        let vertices = self.device.buffer_data(&gpu.vertex_buffer)?.to_vec();
+        Some((uniform, vertices))
     }
 
     /// Record the frame's UI into `encoder`.
     ///
-    /// Returns whether any draw was recorded. `target` is the acquired swapchain
-    /// image; `None` means there is nothing to draw into (headless, or the
-    /// chain was rebuilt this frame) and nothing is recorded rather than a
-    /// guessed-at image being used.
+    /// Returns whether any draw was recorded.
+    ///
+    /// # Why this cannot honour a target yet
+    ///
+    /// `target` identifies the image by raw `u64` handles, and a framebuffer
+    /// cannot be built from those: `TextureView` owns the `Texture` it came
+    /// from, so the RHI keeps no way to rebuild one from a handle. This used to
+    /// accept the target, ignore it, and return `Ok(true)` - so the pass printed
+    /// "first frame recorded" every launch while recording **no render pass at
+    /// all**, and the validator duly complained twice per frame. A caller was
+    /// told the UI drew when nothing was submitted.
+    ///
+    /// So the two outcomes are now kept apart instead of being one: no target
+    /// means nothing was drawn and says so, and a target that cannot be
+    /// honoured is an error naming what is missing. Carrying the typed
+    /// `TextureView` through `RenderContext` is what turns the second into the
+    /// first - see `record_into_framebuffer` for the working shape.
     pub fn record(
         &mut self,
-        encoder: &mut CommandEncoder,
+        _encoder: &mut CommandEncoder,
         target: Option<&UiRenderTarget>,
     ) -> UiResult<bool> {
+        let Some(target) = target else {
+            // Nothing to draw into: headless, or the chain was rebuilt this
+            // frame. Recording against a guessed-at image is worse than drawing
+            // nothing.
+            return Ok(false);
+        };
+
+        Err(UiError::BackendError(format!(
+            "UI cannot record into swapchain image {} (view {}, {}x{}): a framebuffer needs a \
+             typed TextureView, and RenderContext passes raw handles. Pass the typed view \
+             through and build the framebuffer as `record_into_framebuffer` does.",
+            target.image, target.view, target.width, target.height
+        )))
+    }
+
+    /// Record this frame's UI into a swapchain image, given its typed view.
+    ///
+    /// This is the working presentation path. [`Self::record`] cannot honour a
+    /// target because a framebuffer needs the typed view, and an offscreen target
+    /// is the only kind whose pixels can be read back, so a caller that holds the
+    /// typed view passes it here instead of a raw handle.
+    ///
+    /// The framebuffer is cached per image view, and one is built the first time
+    /// each image is drawn into. Reusing a single framebuffer across the chain
+    /// would send every frame into whichever image was acquired first; rebuilding
+    /// one every frame would allocate a Vulkan object per frame for nothing.
+    pub fn record_into_view(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        view: &TextureView,
+        width: u32,
+        height: u32,
+    ) -> UiResult<bool> {
+        let key = view.backend().map(|b| b.handle).unwrap_or(0);
+        if !self.presentation_framebuffers.contains_key(&key) {
+            let render_pass = self
+                .render_pass()
+                .ok_or(UiError::RendererNotInitialized)?;
+            let framebuffer = self
+                .device
+                .create_gpu_framebuffer(&FramebufferDesc {
+                    render_pass,
+                    attachments: vec![FramebufferAttachment {
+                        texture_view: view.clone(),
+                        layer: 0,
+                        mip_level: 0,
+                    }],
+                    width,
+                    height,
+                    layers: 1,
+                })
+                .map_err(|e| UiError::BackendError(format!("UI framebuffer: {e}")))?;
+            self.presentation_framebuffers.insert(key, framebuffer);
+        }
+
+        // Taken out and put back rather than borrowed: `record_into_framebuffer`
+        // needs `&mut self`, and the framebuffer lives in `self`.
+        let framebuffer = self
+            .presentation_framebuffers
+            .remove(&key)
+            .ok_or(UiError::RendererNotInitialized)?;
+        let recorded = self.record_into_framebuffer(encoder, &framebuffer, width, height);
+        self.presentation_framebuffers.insert(key, framebuffer);
+        recorded
+    }
+
+    /// Record the frame's UI into a caller-built framebuffer.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::record`] identifies its target by raw image/view handles, which
+    /// only a swapchain can supply — the RHI keeps no handle accessor on
+    /// `Texture` or `TextureView`. An offscreen target therefore cannot be
+    /// described to `record` at all, and offscreen is the only way to *verify*
+    /// that the UI drew anything: a presentation pass ends the frame in
+    /// `PresentSrc`, and `download_texture` cannot read that layout.
+    ///
+    /// Without this method, "did the UI render" can only be inferred from a
+    /// recorded draw call and a silent validation layer — which is exactly the
+    /// evidence that let a correctly-recorded, never-rasterised draw pass for a
+    /// working one. Mirroring `GeometryPass::set_framebuffer`, which already
+    /// serves that purpose for geometry, keeps the two passes honest in the same
+    /// way.
+    ///
+    /// The framebuffer must have been built against this renderer's render pass,
+    /// which [`Self::initialize_offscreen`] arranges.
+    pub fn record_into_framebuffer(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        framebuffer: &Framebuffer,
+        width: u32,
+        height: u32,
+    ) -> UiResult<bool> {
+        self.record_internal(encoder, Some(framebuffer), Some((width, height)))
+    }
+
+    fn record_internal(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        framebuffer: Option<&Framebuffer>,
+        extent: Option<(u32, u32)>,
+    ) -> UiResult<bool> {
+        let (width, height) = extent.unwrap_or((
+            self.ui_config.screen_width,
+            self.ui_config.screen_height,
+        ));
+        let target: Option<&UiRenderTarget> = None;
+
         if !self.initialized {
             return Err(UiError::RendererNotInitialized);
         }
-
-        let width = target.map_or(self.ui_config.screen_width, |t| t.width).max(1);
-        let height = target.map_or(self.ui_config.screen_height, |t| t.height).max(1);
 
         // The projection must describe the same extent as the viewport, or the
         // UI is stretched or letterboxed.
@@ -1310,6 +2079,18 @@ impl UiRenderer {
                 }
             }
         }
+
+        // Input first, so the flags the pass paints from describe this frame's input.
+        // Applying it here rather than on arrival is the documented contract of
+        // `input::update`: a press and a release inside one frame must not leave
+        // an element stuck in a state the final cursor position contradicts.
+        let events = std::mem::take(&mut self.pending_input);
+        self.interaction = super::input::update(
+            &mut self.elements,
+            &mut self.input,
+            &events,
+            (0.0, 0.0, width as f32, height as f32),
+        );
 
         let (batches, build) = self.build(width, height);
 
@@ -1340,6 +2121,75 @@ impl UiRenderer {
             }
             vertices.extend_from_slice(&batch.vertices);
             text_spans.push((first, batch.indices.len() as u32, batch.scissor));
+        }
+
+        // Images come last, one group per texture, each with its own descriptor
+        // set. The texture id travels with the span because the draw has to bind
+        // the set that samples it.
+        let mut image_spans: Vec<(u64, UiSpan)> = Vec::with_capacity(batches.images.len());
+        for (texture_id, batch) in &batches.images {
+            if !self.texture_cache.contains_key(texture_id) {
+                continue;
+            }
+            let first = indices.len() as u32;
+            let base = vertices.len() as u32;
+            for &i in &batch.indices {
+                indices.push(base + i);
+            }
+            vertices.extend_from_slice(&batch.vertices);
+            image_spans.push((
+                *texture_id,
+                (first, batch.indices.len() as u32, batch.scissor),
+            ));
+        }
+        image_spans.retain(|(_, span)| span.1 > 0);
+
+        // The sampler descriptors declare `ShaderReadOnlyOptimal`, but a texture
+        // is left in the transfer layout its upload wrote through. Move each one
+        // the first time it is sampled, and record that it has been moved so a
+        // later frame does not name `TransferDstOptimal` as the old layout of an
+        // image that is already readable. Collected here, before the render pass
+        // begins and before `gpu` is borrowed: a sampled texture is not the pass
+        // attachment, so its layout change belongs outside the pass.
+        let mut sample_transitions: Vec<Texture> = Vec::new();
+        {
+            let mut already_named: HashSet<u64> = HashSet::new();
+            for &(texture_id, _) in &image_spans {
+                if !already_named.insert(texture_id)
+                    || self.transitioned_images.contains(&texture_id)
+                {
+                    continue;
+                }
+                if let Some(texture) = self.texture_cache.get(&texture_id) {
+                    // A CPU-only texture has no image to move.
+                    if let Some(backend) = texture.backend() {
+                        if std::env::var_os("UI_SPIKE_DUMP").is_some() {
+                            eprintln!("[ui] transitioning texture {texture_id} image=0x{:x}", backend.handle);
+                        }
+                        sample_transitions.push((**texture).clone());
+                        self.transitioned_images.insert(texture_id);
+                    }
+                }
+            }
+        }
+
+        // Resolve every group's descriptor set here, before `gpu` is borrowed for
+        // the recording below. Doing it later would need `&mut self` while the
+        // buffers are borrowed immutably by the closures that emit the binds.
+        let mut image_groups: Vec<(DescriptorSet, Vec<UiSpan>)> = Vec::new();
+        let mut last_image_id: Option<u64> = None;
+        for (texture_id, span) in image_spans.iter().copied() {
+            let set = self.image_descriptor_set(texture_id)?;
+            self.write_image_descriptors(&set, texture_id)?;
+            match image_groups.last_mut() {
+                Some((_, spans)) if last_image_id == Some(texture_id) => {
+                    spans.push(span);
+                }
+                _ => {
+                    last_image_id = Some(texture_id);
+                    image_groups.push((set, vec![span]));
+                }
+            }
         }
 
         let vertex_count = vertices.len();
@@ -1386,39 +2236,137 @@ impl UiRenderer {
             .upload_buffer(&gpu.index_buffer, &indices)
             .map_err(|e| UiError::BackendError(format!("UI index upload: {e}")))?;
 
-        let mut commands: Vec<Command> = Vec::with_capacity(20 + geometry_spans.len() + text_spans.len());
-        if self.config.debug_label {
+        // One-shot dump of what is actually uploaded. A correct pass, viewport,
+        // scissor and draw that rasterise nothing are the signature of degenerate
+        // or zeroed vertex/index data, and that is only visible in the bytes.
+        if std::env::var_os("UI_SPIKE_DUMP").is_some()
+            && DUMP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) == false
+        {
+            eprintln!("[ui] upload: {} verts, {} indices", vertices.len(), indices.len());
+            for (i, v) in vertices.iter().take(4).enumerate() {
+                eprintln!(
+                    "  v[{i}] pos=({:.3},{:.3}) uv=({:.3},{:.3}) color=({:.2},{:.2},{:.2},{:.2})",
+                    v.position[0], v.position[1], v.tex_coords[0], v.tex_coords[1],
+                    v.color[0], v.color[1], v.color[2], v.color[3]
+                );
+            }
+            eprintln!("  i[..] = {:?}", &indices[..indices.len().min(6)]);
+            // Which buffers are actually bound, and what reached the mapped
+            // memory. If the upload never lands, every vertex is (0,0), the quad
+            // collapses to a point and nothing rasterises - with no validation
+            // error, because nothing Vulkan sees is actually invalid.
+            if let Some(gpu) = self.gpu.as_ref() {
+                if let Some(bytes) = self.device.buffer_data(&gpu.vertex_buffer) {
+                    let head: Vec<String> =
+                        bytes[..16.min(bytes.len())].iter().map(|b| b.to_string()).collect();
+                    eprintln!("  vbuf[0..16] bytes = [{}]", head.join(", "));
+                }
+                if let Some(bytes) = self.device.buffer_data(&gpu.index_buffer) {
+                    let idx: Vec<u32> = bytes[..8.min(bytes.len())]
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    eprintln!("  ibuf[..2] indices = {idx:?}");
+                }
+            }
+            // Positions are in pixels; the vertex shader expects clip space. A
+            // wrong projection puts every vertex outside the frustum, which
+            // rasterises nothing and raises no validation error at all.
+            eprintln!(
+                "  projection = [{}]",
+                projection
+                    .iter()
+                    .map(|v| format!("{v:.5}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        let mut commands: Vec<Command> = Vec::with_capacity(20 + geometry_spans.len() + text_spans.len());        if self.config.debug_label {
             commands.push(Command::BeginDebugLabel {
                 label: "ui".into(),
                 color: [0.0, 0.85, 0.35, 1.0],
             });
         }
 
-        // Without a target there is no image to draw into. The state bindings
-        // are still recorded so the caller can tell the work was produced.
-        if let Some(target) = target {
-            let framebuffer = self
-                .device
-                .swapchain_image_framebuffer(
-                    &render_pass,
-                    target.image,
-                    target.view,
-                    target.format,
-                    target.width,
-                    target.height,
-                )
-                .map_err(|e| UiError::BackendError(format!("UI framebuffer: {e}")))?;
+        // Move the newly sampled images to `ShaderReadOnlyOptimal` before the
+        // pass opens. `TRANSFER` is where the upload left them and where the
+        // transfer write happened; `FRAGMENT_SHADER` is where the sampler reads
+        // them. Emitted outside the render pass on purpose: a sampled image is
+        // not an attachment, so it can change layout here without a subpass
+        // dependency.
+        if !sample_transitions.is_empty() {
+            commands.push(Command::PipelineBarrier {
+                src_stage: PipelineStage::TRANSFER,
+                dst_stage: PipelineStage::FRAGMENT_SHADER,
+                memory_barriers: Vec::new(),
+                buffer_barriers: Vec::new(),
+                texture_barriers: sample_transitions
+                    .iter()
+                    .map(|texture| TextureBarrier {
+                        texture: texture.clone(),
+                        src_access: AccessFlags::TRANSFER_WRITE,
+                        dst_access: AccessFlags::SHADER_READ,
+                        old_layout: TextureLayout::TransferDstOptimal,
+                        new_layout: TextureLayout::ShaderReadOnlyOptimal,
+                    })
+                    .collect(),
+            });
+        }
 
+        // Without a framebuffer there is no image to draw into. The state
+        // bindings are still recorded so the caller can tell the work was
+        // produced.
+        //
+        // Two ways in, because two kinds of target exist and only one of them
+        // can be described by handles:
+        //
+        //  - a swapchain image, which arrives as raw handles and whose
+        //    framebuffer the RHI can build from them, and
+        //  - an offscreen texture, which has no handle accessor in the RHI at
+        //    all, so its framebuffer has to be built by the caller.
+        //
+        // Routing the second case through the first would mean either inventing
+        // a second framebuffer or giving `Texture`/`TextureView` handle
+        // accessors just to satisfy this one call.
+        let framebuffer = match (framebuffer, target) {
+            (Some(provided), _) => Some(provided.clone()),
+            (None, Some(t)) => Some(
+                self.device
+                    .swapchain_image_framebuffer(
+                        &render_pass,
+                        t.image,
+                        t.view,
+                        t.format,
+                        t.width,
+                        t.height,
+                    )
+                    .map_err(|e| UiError::BackendError(format!("UI framebuffer: {e}")))?,
+            ),
+            (None, None) => None,
+        };
+
+        if let Some(framebuffer) = &framebuffer {
             commands.push(Command::BeginRenderPass(RenderPassBeginInfo {
                 render_pass,
-                framebuffer,
+                framebuffer: framebuffer.clone(),
                 render_area: Rect2D {
                     offset: Offset2D { x: 0, y: 0 },
                     extent: Extent2D { width, height },
                 },
-                // No clear values: the pass loads what the 3D frame left, and a
-                // clear here would wipe it.
-                clear_values: vec![],
+                // One clear value, one attachment.
+                //
+                // This used to be an empty list, which is invalid whenever the
+                // pass declares `LoadOp::Clear` — VUID-VkRenderPassBeginInfo-
+                // clearValueCount-00902 — and leaves the attachment's contents
+                // undefined rather than merely unwritten. Both the presentation
+                // and the offscreen pass clear, so both were affected.
+                //
+                // The colour is fully transparent black: it must not leave a
+                // visible wash where the UI has nothing to draw. The real fix for
+                // an overlay is `LoadOp::Load` with an acquire barrier, so the 3D
+                // frame survives — that is still open, and is tracked separately.
+                clear_values: vec![crate::primitives::ClearValue::color(0.0, 0.0, 0.0, 0.0)],
             }));
         }
 
@@ -1523,11 +2471,58 @@ impl UiRenderer {
             }
         }
 
-        if target.is_some() {
+        // Images last: they are the topmost UI layer, and each texture group gets
+        // its own descriptor set because the textured pipeline binds exactly one
+        // texture. Groups are already contiguous, so consecutive images of the
+        // same texture rebind nothing.
+        if !image_groups.is_empty() {
+            if let Some(pipeline) = gpu.text_pipeline.as_ref() {
+                for (set, spans) in &image_groups {
+                    commands.push(Command::BindGraphicsPipeline(pipeline.clone()));
+                    commands.push(Command::BindDescriptorSets {
+                        pipeline: pipeline.clone(),
+                        first_set: 0,
+                        sets: vec![set.clone()],
+                    });
+                    bind_buffers(&mut commands);
+                    // Each group rebinds the pipeline, so the scissor has to be
+                    // restated rather than assumed to carry over.
+                    previous = None;
+                    draw_spans(&mut commands, spans, &mut previous, &mut draw_calls);
+                }
+            } else {
+                // Same reasoning as the text arm above: image geometry without a
+                // textured pipeline has nowhere to go, and drawing it with the
+                // untextured one would render every image as a solid block.
+                eprintln!("[ui] image geometry without a textured pipeline; dropped");
+            }
+        }
+
+        // Keyed on whether a render pass was actually *opened*, not on whether a
+        // swapchain target was supplied.
+        //
+        // Refactoring this body to accept a caller-supplied framebuffer left
+        // `target` permanently `None`, so this test went false and
+        // `EndRenderPass` was never emitted. The render pass stayed open, which
+        // makes `vkEndCommandBuffer` invalid (VUID-00060), so the driver
+        // discarded the entire command buffer — every draw in the frame vanished,
+        // with no error anywhere unless validation was running. It was not.
+        if framebuffer.is_some() {
             commands.push(Command::EndRenderPass);
         }
         if self.config.debug_label {
             commands.push(Command::EndDebugLabel);
+        }
+
+        // One-shot command dump, gated so it never spams a running frame loop.
+        // Validation reported `VUID-vkCmdDrawIndexed-renderpass` in the windowed
+        // path — the draw landed outside an active render pass — and the recorded
+        // order is the only way to tell a misplaced Begin/End from a missing one.
+        if std::env::var_os("UI_SPIKE_DUMP").is_some()
+            && DUMP_ORDER_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) == false
+        {
+            let names: Vec<&str> = commands.iter().map(command_name).collect();
+            eprintln!("[ui] recorded order: {names:?}");
         }
 
         for command in commands {
@@ -1560,10 +2555,20 @@ impl UiRenderer {
     ) -> UiResult<()> {
         use crate::resource::sampler::{AddressMode, FilterMode};
 
+        // Zero, not 1.0.
+        //
+        // The Vulkan backend decides `anisotropyEnable` from
+        // `max_anisotropy > 0.0`, and the device does not enable the
+        // `samplerAnisotropy` feature. So any non-zero value - including 1.0,
+        // which is one sample and therefore *no* anisotropy - produces
+        // `VUID-VkSamplerCreateInfo-anisotropyEnable-01070` and a sampler the
+        // validator rejects. Zero leaves anisotropy off, which is what was
+        // wanted anyway. The backend predicate is the real bug and is in
+        // `src/rhi/backend/vulkan/device.rs`; it should be `> 1.0`.
         let sampler = self
             .device
-            .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 1.0);
-        let view = atlas.create_view(crate::resource::TextureViewDesc::default());
+            .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 0.0);
+        let view = self.gpu_texture_view(atlas)?;
 
         self.device
             .write_descriptors(
@@ -1599,6 +2604,105 @@ impl UiRenderer {
             )
             .map_err(|e| UiError::BackendError(format!("UI text descriptor write: {e}")))?;
         Ok(())
+    }
+
+    /// A GPU-backed view of `texture`, for binding as a sampled image.
+///
+/// Not `Texture::create_view`: that returns a CPU-side handle with no GPU
+/// backing, and the failure surfaces much later as "descriptor texture view has
+/// no GPU backing" when the write is issued — pointing at the descriptor rather
+/// than at the view that was built the wrong way. Going through the device is
+/// what actually allocates the view.
+fn gpu_texture_view(
+    &self,
+    texture: &crate::resource::Texture,
+) -> UiResult<crate::resource::TextureView> {
+    self.device
+        .create_texture_view(texture, texture.create_default_view().desc())
+        .map_err(|e| UiError::BackendError(format!("UI texture view: {e}")))
+}
+
+/// The descriptor set that samples the texture registered under `texture_id`.
+    ///
+    /// One set per texture, cached, because the layout is the text layout
+    /// (uniform, texture, sampler) and only the texture differs between images.
+    /// Rebuilding it every frame would allocate a new set per frame and grow
+    /// without bound.
+    fn image_descriptor_set(&mut self, texture_id: u64) -> UiResult<DescriptorSet> {
+        if let Some(set) = self.image_descriptor_sets.get(&texture_id) {
+            return Ok(set.clone());
+        }
+        let layout = self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.text_descriptor_layout.clone())
+            .ok_or(UiError::RendererNotInitialized)?;
+        let set = self
+            .device
+            .create_descriptor_set(&layout)
+            .map_err(|e| UiError::BackendError(format!("UI image descriptor set: {e}")))?;
+        self.image_descriptor_sets.insert(texture_id, set.clone());
+        Ok(set)
+    }
+
+    /// Points `set` at the texture registered under `texture_id`.
+    ///
+    /// The same three bindings the atlas uses - uniform at 0, sampled texture at
+    /// 1, sampler at 2 - so the textured pipeline serves both glyphs and images
+    /// without a second layout.
+    fn write_image_descriptors(&self, set: &DescriptorSet, texture_id: u64) -> UiResult<()> {
+        use crate::resource::sampler::{AddressMode, FilterMode};
+
+        let texture = self
+            .texture_cache
+            .get(&texture_id)
+            .ok_or_else(|| UiError::BackendError(format!("unknown UI texture {texture_id}")))?;
+        // See `write_text_descriptors` for why the anisotropy argument is 0.
+        let sampler = self
+            .device
+            .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 0.0);
+        let view = self.gpu_texture_view(texture)?;
+        if std::env::var_os("UI_SPIKE_DUMP").is_some() {
+            if let Some(backend) = texture.backend() {
+                eprintln!(
+                    "[ui] image descriptor {texture_id} image=0x{:x} view=0x{:x}",
+                    backend.handle,
+                    view.backend().map_or(0, |b| b.handle)
+                );
+            }
+        }
+        let uniform = self
+            .gpu
+            .as_ref()
+            .ok_or(UiError::RendererNotInitialized)?
+            .uniform_buffer
+            .clone();
+
+        self.device
+            .write_descriptors(
+                set,
+                &[
+                    DescriptorWrite {
+                        dst_set: set.clone(),
+                        dst_binding: 0,
+                        dst_array_element: 0,
+                        descriptors: vec![DescriptorInfo::Buffer(uniform, 0, UI_UNIFORM_SIZE)],
+                    },
+                    DescriptorWrite {
+                        dst_set: set.clone(),
+                        dst_binding: 1,
+                        dst_array_element: 0,
+                        descriptors: vec![DescriptorInfo::Texture(view, None)],
+                    },
+                    DescriptorWrite {
+                        dst_set: set.clone(),
+                        dst_binding: 2,
+                        dst_array_element: 0,
+                        descriptors: vec![DescriptorInfo::Sampler(sampler)],
+                    },
+                ],
+            )
+            .map_err(|e| UiError::BackendError(format!("UI image descriptor write: {e}")))
     }
 
     /// Grow the vertex and index buffers if this frame does not fit.
@@ -1852,5 +2956,312 @@ mod tests {
             state.attributes[0].offset,
             std::mem::offset_of!(UiVertex, position) as u32
         );
+    }
+
+    /// Builds a retained element of `element_type` with `data`, sized so the
+    /// element's own geometry is non-degenerate.
+    fn retained(
+        element_type: crate::ui::elements::UiElementType,
+        data: crate::ui::elements::UiElementData,
+    ) -> UiElement {
+        let mut element = UiElement::new(element_type, 1u64);
+        element.position = (10.0, 10.0);
+        element.size = (120.0, 60.0);
+        element.data = data;
+        element
+    }
+
+    /// Runs one element through `emit_element` and reports what came out:
+    /// drawable batches, vertex count, and how many commands were skipped.
+    ///
+    /// No fonts and no textures are supplied, which is the case that matters for
+    /// the geometry-like elements: a text or image element under it is skipped,
+    /// because a missing font *is* a resource this stage lacks. Text that does
+    /// draw is covered by `ui_spike_offscreen` reading real pixels.
+    fn emitted(element: &UiElement) -> (usize, usize, u32) {
+        let mut b = builder();
+        let mut rendered = 0u32;
+        let fonts = HashMap::new();
+        let textures: HashMap<u64, Arc<crate::resource::Texture>> = HashMap::new();
+        let theme = crate::ui::theme::UiTheme::default();
+        let mut text = Vec::new();
+        UiRenderer::emit_element(
+            &mut b,
+            element,
+            &mut rendered,
+            &fonts,
+            None,
+            &textures,
+            &theme,
+            &std::collections::HashMap::new(),
+            &mut text,
+        );
+        b.flush();
+        (b.batches.len(), b.vertex_total as usize, b.skipped)
+    }
+
+    /// Every retained type that has no resource dependency must produce
+    /// geometry. An element type that quietly produces nothing is
+    /// indistinguishable from one that was never implemented.
+    #[test]
+    fn retained_elements_without_resources_draw_something() {
+        use crate::ui::elements::{UiElementData, UiElementType};
+
+        let cases: Vec<(&str, UiElementType, UiElementData)> = vec![
+            ("radio unchecked", UiElementType::RadioButton, UiElementData::RadioButton {
+                checked: false, label: "a".into(), group: "g".into(),
+            }),
+            ("radio checked", UiElementType::RadioButton, UiElementData::RadioButton {
+                checked: true, label: "a".into(), group: "g".into(),
+            }),
+            ("scroll", UiElementType::ScrollContainer, UiElementData::ScrollContainer {
+                scroll_x: 0.0, scroll_y: 20.0, scroll_width: 100.0, scroll_height: 400.0,
+            }),
+            ("dropdown closed", UiElementType::Dropdown, UiElementData::Dropdown {
+                selected_index: Some(1), items: vec!["a".into(), "b".into()], is_open: false,
+            }),
+            ("dropdown open", UiElementType::Dropdown, UiElementData::Dropdown {
+                selected_index: Some(0), items: vec!["a".into(), "b".into()], is_open: true,
+            }),
+            ("list", UiElementType::ListView, UiElementData::ListView {
+                items: vec!["a".into(), "b".into(), "c".into()], selected_indices: vec![1],
+            }),
+            ("grid", UiElementType::GridView, UiElementData::GridView {
+                columns: 3,
+                items: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                selected_indices: vec![2],
+            }),
+        ];
+
+        for (name, element_type, data) in cases {
+            let (batches, vertices, skipped) = emitted(&retained(element_type, data));
+            assert!(batches > 0, "{name} produced no drawable geometry");
+            assert!(vertices > 0, "{name} produced no vertices");
+            assert_eq!(skipped, 0, "{name} was counted as skipped");
+        }
+    }
+
+    /// Retained text and images skip **only** because the resource is missing.
+    ///
+    /// This used to read "they need an atlas and a sampled-texture binding that
+    /// this stage does not have" — true when it was written, false since
+    /// `install_bitmap_font` and the per-texture descriptor sets landed. The
+    /// count is still the right thing to assert, but for a different reason: with
+    /// no font registered and no texture uploaded, a skipped element is the
+    /// honest answer, and it is what tells a caller the difference between "this
+    /// element cannot be drawn yet" and "this element drew nothing on purpose".
+    ///
+    /// What they do *with* those resources is proved by pixels, not here:
+    /// `ui_spike_offscreen` renders a string through the real pipeline and reads
+    /// the atlas out of the frame.
+    #[test]
+    fn text_and_image_skip_only_when_their_resource_is_missing() {
+        use crate::ui::elements::{UiElementData, UiElementType};
+
+        let text = retained(
+            UiElementType::Text,
+            UiElementData::Text { content: "hi".into() },
+        );
+        assert_eq!(
+            emitted(&text).2,
+            1,
+            "text with no font registered must report as skipped"
+        );
+
+        let image = retained(
+            UiElementType::Image,
+            UiElementData::Image {
+                texture_id: 1,
+                uv_min: [0.0, 0.0],
+                uv_max: [1.0, 1.0],
+            },
+        );
+        assert_eq!(
+            emitted(&image).2,
+            1,
+            "an image whose texture was never uploaded must report as skipped"
+        );
+    }
+
+    /// A `Custom` element must not be counted as skipped. `skipped` means "needs
+    /// a resource this stage lacks", and a caller reading that would go looking
+    /// for a missing atlas when the real gap is that there is no callback
+    /// contract to call at all.
+    #[test]
+    fn a_custom_element_neither_draws_nor_claims_a_missing_resource() {
+        use crate::ui::elements::{UiElementData, UiElementType};
+
+        let element = retained(
+            UiElementType::Custom,
+            UiElementData::Custom { render_function: Some("draw_hud".into()) },
+        );
+        let (batches, vertices, skipped) = emitted(&element);
+        assert_eq!((batches, vertices), (0, 0), "a custom element drew a placeholder");
+        assert_eq!(skipped, 0, "a custom element reported a missing resource");
+    }
+
+    /// A scroll container whose content fits must not draw a scrollbar: the
+    /// thumb would cover the whole track and read as a permanent border.
+    #[test]
+    fn a_scroll_container_that_fits_draws_no_bar() {
+        use crate::ui::elements::{UiElementData, UiElementType};
+
+        let element = retained(
+            UiElementType::ScrollContainer,
+            UiElementData::ScrollContainer {
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                // Content no larger than the 120x60 viewport.
+                scroll_width: 100.0,
+                scroll_height: 50.0,
+            },
+        );
+        // The background only: one quad, four vertices, no thumb.
+        let (batches, vertices, _) = emitted(&element);
+        assert_eq!((batches, vertices), (1, 4));
+    }
+
+    /// A grid with zero columns would divide by zero when splitting the width.
+    #[test]
+    fn a_grid_with_no_columns_does_not_divide_by_zero() {
+        use crate::ui::elements::{UiElementData, UiElementType};
+
+        let element = retained(
+            UiElementType::GridView,
+            UiElementData::GridView {
+                columns: 0,
+                items: vec!["a".into(), "b".into()],
+                selected_indices: vec![],
+            },
+        );
+        let (_, vertices, _) = emitted(&element);
+        assert!(vertices > 0, "a zero-column grid drew nothing");
+    }
+
+    /// Image quads must carry the UV rect they were asked for.
+    ///
+    /// The vertex layout has always had texture coordinates, but until now
+    /// nothing wrote anything but `[0, 0]`, so a sampled draw would have shown
+    /// one texel stretched over the quad. This asserts the mapping corner by
+    /// corner, which is where an inverted axis shows up.
+    #[test]
+    fn an_image_quad_carries_the_requested_uv_rect() {
+        let mut b = builder();
+        b.image_quad(7, 10.0, 20.0, 100.0, 50.0, [0.25, 0.5], [0.75, 1.0], RED);
+        let groups = b.flush_images();
+        assert_eq!(groups.len(), 1, "one texture must produce one group");
+        assert_eq!(groups[0].0, 7, "the group lost its texture id");
+        let v = &groups[0].1.vertices;
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0].tex_coords, [0.25, 0.5]);
+        assert_eq!(v[1].tex_coords, [0.75, 0.5]);
+        assert_eq!(v[2].tex_coords, [0.75, 1.0]);
+        assert_eq!(v[3].tex_coords, [0.25, 1.0]);
+        // And the rectangle itself, so a UV fix cannot quietly move the quad.
+        assert_eq!(v[0].position, [10.0, 20.0]);
+        assert_eq!(v[2].position, [110.0, 70.0]);
+        assert!(v.iter().all(|x| x.color == RED));
+    }
+
+    /// Several images of one texture share a single draw; a new texture starts a
+    /// new group. This is the batching the descriptor-set-per-texture design buys,
+    /// and losing it would mean a bind per image.
+    #[test]
+    fn images_of_one_texture_share_a_group() {
+        let mut b = builder();
+        for i in 0..4 {
+            b.image_quad(1, i as f32 * 10.0, 0.0, 8.0, 8.0, [0.0, 0.0], [1.0, 1.0], RED);
+        }
+        b.image_quad(2, 0.0, 20.0, 8.0, 8.0, [0.0, 0.0], [1.0, 1.0], RED);
+        let groups = b.flush_images();
+        assert_eq!(groups.len(), 2, "expected one group per texture");
+        assert_eq!(groups[0].0, 1);
+        assert_eq!(groups[0].1.indices.len(), 4 * 6);
+        assert_eq!(groups[1].0, 2);
+        assert_eq!(groups[1].1.indices.len(), 6);
+    }
+
+    /// Interleaved images of the same texture still group together. Grouping on
+    /// arrival would start a new draw every time the id changed, which is the
+    /// case this design exists to avoid.
+    #[test]
+    fn interleaved_images_of_one_texture_still_group() {
+        let mut b = builder();
+        b.image_quad(1, 0.0, 0.0, 8.0, 8.0, [0.0, 0.0], [1.0, 1.0], RED);
+        b.image_quad(2, 8.0, 0.0, 8.0, 8.0, [0.0, 0.0], [1.0, 1.0], RED);
+        b.image_quad(1, 16.0, 0.0, 8.0, 8.0, [0.0, 0.0], [1.0, 1.0], RED);
+        let groups = b.flush_images();
+        // Two textures, but three runs: the second image of texture 1 cannot
+        // share the descriptor set bind with its earlier one, because texture 2's
+        // bind intervened. Ordering is preserved, so the middle group is what
+        // split.
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2, 1]);
+    }
+
+    /// A zero-area UV rect is dropped, not drawn. A degenerate primitive still
+    /// costs a draw call, and it samples the whole texture's edge.
+    #[test]
+    fn an_image_with_a_degenerate_uv_rect_is_dropped() {
+        let mut b = builder();
+        b.image_quad(1, 0.0, 0.0, 8.0, 8.0, [0.5, 0.5], [0.5, 0.5], RED);
+        b.image_quad(1, 0.0, 0.0, 8.0, 8.0, [0.5, 0.5], [0.25, 0.5], RED);
+        let groups = b.flush_images();
+        assert!(groups.is_empty(), "a zero-area UV rect produced geometry");
+    }
+
+    /// Non-finite positions, sizes, colours and UVs are all dropped, for the same
+    /// reason `quad` drops them: they reach the vertex buffer unchanged.
+    #[test]
+    fn an_image_with_non_finite_values_is_dropped() {
+        let nan = f32::NAN;
+        let mut b = builder();
+        b.image_quad(1, nan, 0.0, 8.0, 8.0, [0.0, 0.0], [1.0, 1.0], RED);
+        b.image_quad(1, 0.0, 0.0, nan, 8.0, [0.0, 0.0], [1.0, 1.0], RED);
+        b.image_quad(1, 0.0, 0.0, 8.0, 8.0, [0.0, 0.0], [nan, 1.0], RED);
+        b.image_quad(1, 0.0, 0.0, 8.0, 8.0, [0.0, 0.0], [1.0, 1.0], [nan, 0.0, 0.0, 1.0]);
+        let groups = b.flush_images();
+        assert!(groups.is_empty(), "a non-finite image produced geometry");
+    }
+}
+
+/// One-shot gate for the `UI_SPIKE_DUMP` command-order dump.
+static DUMP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One-shot gate for the `UI_SPIKE_DUMP` command-order dump.
+static DUMP_ORDER_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A short label for a recorded command, used only by the debug dump.
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::BeginRenderPass(info) => {
+            // The backend honours `render_area` whenever it is non-zero, and
+            // rasterisation outside it is discarded outright - so a wrong rect is
+            // a silent full-frame wipe, not an error.
+            eprintln!(
+                "[ui] BeginRenderPass area=({},{} {}x{}) clears={:?}",
+                info.render_area.offset.x,
+                info.render_area.offset.y,
+                info.render_area.extent.width,
+                info.render_area.extent.height,
+                info.clear_values.len()
+            );
+            "BeginRenderPass"
+        }
+        Command::EndRenderPass => "EndRenderPass",
+        Command::NextSubpass => "NextSubpass",
+        Command::BindGraphicsPipeline(_) => "BindGraphicsPipeline",
+        Command::BindDescriptorSets { .. } => "BindDescriptorSets",
+        Command::BindVertexBuffers { .. } => "BindVertexBuffers",
+        Command::BindIndexBuffer { .. } => "BindIndexBuffer",
+        Command::SetViewport(_) => "SetViewport",
+        Command::SetScissor(_) => "SetScissor",
+        Command::DrawIndexed { .. } => "DrawIndexed",
+        Command::Draw { .. } => "Draw",
+        Command::PipelineBarrier { .. } => "PipelineBarrier",
+        Command::BeginDebugLabel { .. } => "BeginDebugLabel",
+        Command::EndDebugLabel => "EndDebugLabel",
+        _ => "other",
     }
 }

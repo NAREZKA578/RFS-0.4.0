@@ -178,9 +178,18 @@ impl WaterMaterial {
             .set_vector("fresnel_params", [factor, bias, power, 0.0]);
     }
 
-    /// Create pipeline
-    pub fn create_pipeline(&mut self, device: &crate::rhi::Device) {
-        self.base.create_pipeline(device);
+    /// Create pipeline.
+    ///
+    /// Bug №314: a pipeline cannot be created without the pass it must be
+    /// compatible with, so the pass and layouts are threaded through rather
+    /// than invented here.
+    pub fn create_pipeline(
+        &mut self,
+        device: &crate::rhi::Device,
+        render_pass: &crate::rhi::command::pass::render::RenderPass,
+        set_layouts: &[&crate::rhi::descriptor::DescriptorSetLayout],
+    ) {
+        self.base.create_pipeline(device, render_pass, set_layouts);
     }
 
     /// Bind the material

@@ -7,8 +7,9 @@ pub mod node;
 pub mod resource;
 pub mod types;
 
-pub use graph::RenderGraph;
+pub use graph::{FrameDraws, RenderGraph};
 pub use node::PassDependency;
+pub use node::RenderPass;
 pub use node::RenderPassNode;
 pub use resource::{GraphResource, ResourceType};
 pub use types::ResourceUsage;

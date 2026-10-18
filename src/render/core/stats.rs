@@ -99,6 +99,17 @@ impl RenderStats {
         self.vertices += vertices;
     }
 
+    /// Add the draw work of a whole recorded frame at once.
+    ///
+    /// The graph counts draws while it records them, because that is the only
+    /// place where a draw still carries its vertex and index counts — by the
+    /// time a frame reaches the renderer the commands have been submitted.
+    pub fn add_draws(&mut self, draws: u32, triangles: u32, vertices: u32) {
+        self.draw_calls += draws;
+        self.triangles += triangles;
+        self.vertices += vertices;
+    }
+
     /// Add CPU time
     pub fn add_cpu_time(&mut self, duration: Duration) {
         self.cpu_time_ms += duration.as_secs_f32() * 1000.0;

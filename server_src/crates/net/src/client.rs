@@ -67,6 +67,12 @@ const RELIABLE_ADMIT_BUDGET: std::time::Duration = std::time::Duration::from_mil
 /// the oldest event is dropped rather than growing without bound.
 const CLIENT_EVENT_QUEUE: usize = 4096;
 
+/// Bug №613: capacity of the outbox. Same reasoning as the event queue — a full
+/// queue means the writer is not keeping up, so the newest datagram is dropped
+/// and counted rather than buffered until the process dies. Generous next to
+/// `CLIENT_EVENT_QUEUE` because state updates legitimately queue in bursts.
+const CLIENT_OUTBOX_QUEUE_LIMIT: usize = 8192;
+
 fn deserialize_limited<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, bincode::Error> {
     use bincode::Options;
     bincode::DefaultOptions::new()
@@ -262,9 +268,11 @@ pub struct NetClient {
     /// (`send_input`, `send_command`). They cannot await, so they used to spawn
     /// a task per packet — unbounded scheduler growth and no ordering
     /// guarantee between concurrent senders.
-    outbox: mpsc::UnboundedSender<OutboxItem>,
+    outbox: mpsc::Sender<OutboxItem>,
     outbox_handle: Mutex<Option<JoinHandle<()>>>,
-    outbox_rx: Mutex<Option<mpsc::UnboundedReceiver<OutboxItem>>>,
+    outbox_rx: Mutex<Option<mpsc::Receiver<OutboxItem>>>,
+    /// Bug №613: outbox entries dropped because the writer fell behind.
+    dropped_outbox: Arc<AtomicU64>,
     input_sequence: Arc<Mutex<u32>>,
     pending_inputs: Arc<Mutex<HashMap<u32, InputPacket>>>,
     last_acknowledged_tick: Arc<Mutex<u32>>,
@@ -295,6 +303,24 @@ pub struct NetClient {
     /// were added while chasing #267 and base-mismatch measured zero, making
     /// this the path that still needs accounting.
     stale_delta_drops: Arc<AtomicU64>,
+    /// Bug №636: the session this client is attached to.
+    ///
+    /// A reconnect to a restarted server is a *new* session whose ticks start
+    /// over, and the client cannot tell that from the packets alone — a full
+    /// state from a fresh server looks exactly like a very late one. Holding the
+    /// previous `match_id` is what makes the difference observable.
+    match_id: Arc<Mutex<Option<Uuid>>>,
+    /// How many times the applied world was discarded because the session
+    /// changed. Counted rather than left to a log line: a client that resets on
+    /// every reconnect never accumulates a world, and that is a condition, not
+    /// a one-off.
+    session_resets: Arc<AtomicU64>,
+    /// Bug №636: full states dropped by the stale-guard (`server_tick` at or
+    /// below the newest layer clock already applied). It used to return without
+    /// a word, which is why a client in a ghost world looked healthy from the
+    /// outside: the one number that would have shown the stall was never
+    /// taken.
+    stale_full_state_drops: Arc<AtomicU64>,
 }
 
 /// One queued client datagram awaiting the writer task.
@@ -333,6 +359,13 @@ impl Default for ClientConfig {
 }
 
 #[derive(Debug, Clone)]
+// The variants differ in size because some carry a snapshot inline. Boxing the
+// large one would shrink the enum at the cost of an allocation on every state
+// update, and would change a public enum that the UI and the harness both match
+// on — a cost paid outside this crate to save bytes that are never allocated in
+// bulk here, because these events are queued once and moved, not stored in
+// dense arrays. The lint is real and deliberately not acted on.
+#[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
     Connected { connection_id: u32, server_tick: u64, match_id: Uuid },
     Disconnected { reason: DisconnectReason },
@@ -361,7 +394,9 @@ impl NetClient {
         // the same one so `event_channel_closed()` and the sink cannot drift.
         let events_closed = event_sender.closed.clone();
         // Bug №172: outbox for the synchronous send entry points.
-        let (outbox, outbox_rx) = mpsc::unbounded_channel();
+        // Bug №613: bounded, for the same reason as the server's — an unbounded
+        // queue is an OOM waiting for a producer that outruns the writer.
+        let (outbox, outbox_rx) = mpsc::channel(CLIENT_OUTBOX_QUEUE_LIMIT);
 
         let client = Self {
             socket,
@@ -389,6 +424,7 @@ impl NetClient {
             outbox,
             outbox_handle: Mutex::new(None),
             outbox_rx: Mutex::new(Some(outbox_rx)),
+            dropped_outbox: Arc::new(AtomicU64::new(0)),
             input_sequence: Arc::new(Mutex::new(0)),
             pending_inputs: Arc::new(Mutex::new(HashMap::new())),
             last_acknowledged_tick: Arc::new(Mutex::new(0)),
@@ -400,7 +436,10 @@ impl NetClient {
             base_mismatch_drops: Arc::new(AtomicU64::new(0)),
             base_mismatch_drops_by_layer: Arc::new(std::sync::Mutex::new(vec![0u64; LAYER_COUNT])),
             stall_logged: Arc::new(std::sync::Mutex::new(vec![false; LAYER_COUNT])),
-        stale_delta_drops: Arc::new(AtomicU64::new(0)),
+            stale_delta_drops: Arc::new(AtomicU64::new(0)),
+            match_id: Arc::new(Mutex::new(None)),
+            session_resets: Arc::new(AtomicU64::new(0)),
+            stale_full_state_drops: Arc::new(AtomicU64::new(0)),
         };
         
         Ok(client)
@@ -527,9 +566,24 @@ impl NetClient {
             return;
         };
         header.payload_size = len;
-        if self.outbox.send(OutboxItem { header, payload }).is_err() {
-            warn!("client outbox closed; dropping a queued packet");
+        // Bug №613: the queue is bounded, so a send can now fail because it is
+        // FULL — the writer fell behind. That is a dropped packet and it is
+        // counted; bounding a queue must not become a new silent loss.
+        match self.outbox.try_send(OutboxItem { header, payload }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped_outbox.fetch_add(1, Ordering::Relaxed);
+                warn!("client outbox full; dropping a queued packet");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("client outbox closed; dropping a queued packet");
+            }
         }
+    }
+
+    /// Bug №613: outbox entries dropped because the writer fell behind.
+    pub fn dropped_outbox(&self) -> u64 {
+        self.dropped_outbox.load(Ordering::Relaxed)
     }
 
     fn send_connect_request(&self) {
@@ -733,6 +787,11 @@ impl NetClient {
         let base_mismatch_drops_by_layer = self.base_mismatch_drops_by_layer.clone();
         let stall_logged = self.stall_logged.clone();
         let stale_delta_drops = self.stale_delta_drops.clone();
+        // Bug №636: the receive loop is where a session change is first
+        // observable, so it owns both the record and the counter.
+        let match_id = self.match_id.clone();
+        let session_resets = self.session_resets.clone();
+        let stale_full_state_drops = self.stale_full_state_drops.clone();
         let connect_attempt = self.connect_attempt.clone();
 
         let handle = tokio::spawn(async move {
@@ -771,6 +830,9 @@ impl NetClient {
                             &base_mismatch_drops_by_layer,
                             &stall_logged,
                             &stale_delta_drops,
+                            &match_id,
+                            &session_resets,
+                            &stale_full_state_drops,
                             &running,
                             &bandwidth_tracker,
                             &limiter,
@@ -836,6 +898,13 @@ impl NetClient {
         base_mismatch_drops_by_layer: &Arc<std::sync::Mutex<Vec<u64>>>,
         stall_logged: &Arc<std::sync::Mutex<Vec<bool>>>,
         stale_delta_drops: &Arc<AtomicU64>,
+        // Bug №636: the session this connection belongs to, and how many times
+        // the applied world has been thrown away for a new one.
+        match_id: &Arc<Mutex<Option<Uuid>>>,
+        session_resets: &Arc<AtomicU64>,
+        // Bug №636: same accounting for the full-state twin of the stale-delta
+        // guard below.
+        stale_full_state_drops: &Arc<AtomicU64>,
         running: &Arc<Mutex<bool>>,
         bandwidth: &BandwidthTracker,
         // Bug №169: the HeartbeatAck answer leaves through the limiter too.
@@ -899,6 +968,49 @@ PacketType::ConnectAccept => {
                 // stale pending inputs the new server cannot ack.
                 pending_inputs.lock().clear();
                 *last_ack_tick.lock() = 0;
+
+                // Bug №636: everything above is transport. The *world* this
+                // client holds is the previous session's: layer clocks pinned
+                // at the old server's last tick, mirrors full of its entities,
+                // a snapshot history the new server will never re-base on. From
+                // the packets alone a fresh session is indistinguishable from
+                // a very late packet of the old one — a full state at tick ~5
+                // loses to `incoming <= max_applied` and the client listens to
+                // a ghost world forever. The accept names a session; a change
+                // of session discards everything tied to it.
+                let session_changed = {
+                    let mut slot = match_id.lock();
+                    let changed = !matches!(slot.as_ref(), Some(prev) if prev == &accept.match_id);
+                    if changed {
+                        *slot = Some(accept.match_id);
+                    }
+                    changed
+                };
+                if session_changed {
+                    *last_applied_layer.lock() = [0; LAYER_COUNT];
+                    entity_states.write().clear();
+                    projectile_states.write().clear();
+                    snapshot_buffer.reset();
+                    snapshot_interpolator.lock().reset();
+                    *latest_state.lock() = None;
+                    // Per-session diagnostics reset with the world they
+                    // measured, otherwise the next session starts with a
+                    // "stalled" latch it never earned.
+                    stall_logged.lock().unwrap().iter_mut().for_each(|f| *f = false);
+                    applied_delta_count.store(0, Ordering::Relaxed);
+                    applied_delta_count_by_layer.lock().unwrap().fill(0);
+                    base_mismatch_drops.store(0, Ordering::Relaxed);
+                    base_mismatch_drops_by_layer.lock().unwrap().fill(0);
+                    stale_delta_drops.store(0, Ordering::Relaxed);
+                    stale_full_state_drops.store(0, Ordering::Relaxed);
+                    // Bug №636: the discard is observable, not just counted —
+                    // exactly the kind of event that must not happen silently.
+                    warn!(
+                        "match_id changed to {}: discarded the previous session's applied world",
+                        accept.match_id
+                    );
+                    session_resets.fetch_add(1, Ordering::Relaxed);
+                }
 
                 if !already {
                     event_sender.send_critical(ClientEvent::Connected {
@@ -980,10 +1092,11 @@ PacketType::ConnectAccept => {
                                 // fragmented delta is applied the same way.
                                 applied_delta_count,
                                 applied_delta_count_by_layer,
-                                &base_mismatch_drops,
-                                &base_mismatch_drops_by_layer,
-                                &stall_logged,
-                                &stale_delta_drops,
+                                base_mismatch_drops,
+                                base_mismatch_drops_by_layer,
+                                stall_logged,
+                                stale_delta_drops,
+                                stale_full_state_drops,
                             )?;
             }
             PacketType::Fragment => {
@@ -1014,10 +1127,11 @@ last_applied_layer,
                                 // the coalescing slot.
                                 applied_delta_count,
                                 applied_delta_count_by_layer,
-                                &base_mismatch_drops,
-                                &base_mismatch_drops_by_layer,
-                                &stall_logged,
-                                &stale_delta_drops,
+                                base_mismatch_drops,
+                                base_mismatch_drops_by_layer,
+                                stall_logged,
+                                stale_delta_drops,
+                                stale_full_state_drops,
                             )?;
                         }
                         // Bug №163: these were dropped with a debug!(), so any
@@ -1150,6 +1264,7 @@ last_applied_layer,
         base_mismatch_drops_by_layer: &Arc<std::sync::Mutex<Vec<u64>>>,
         stall_logged: &Arc<std::sync::Mutex<Vec<bool>>>,
         stale_delta_drops: &Arc<AtomicU64>,
+        stale_full_state_drops: &Arc<AtomicU64>,
     ) -> Result<(), ConnectionError> {
         if packet_type == PacketType::State || packet_type == PacketType::StateFull {
             // Bug №168: full states may be up to MAX_REASSEMBLED_SIZE.
@@ -1169,6 +1284,7 @@ last_applied_layer,
             let incoming = state.server_tick as u64;
             let max_applied = last_applied_layer.lock().iter().copied().max().unwrap_or(0);
             if incoming <= max_applied {
+                stale_full_state_drops.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
             *server_tick.lock() = Tick(incoming);
@@ -1313,11 +1429,9 @@ last_applied_layer,
                     }
                 }
                 base_mismatch_drops.fetch_add(1, Ordering::Relaxed);
-                base_mismatch_drops_by_layer
-                    .lock()
-                    .unwrap()
-                    .get_mut(layer)
-                    .map(|c| *c += 1);
+                if let Some(c) = base_mismatch_drops_by_layer.lock().unwrap().get_mut(layer) {
+                    *c += 1;
+                }
                 return Ok(());
             }
             // Bug №269: these two are the client's view of "where the world
@@ -1347,7 +1461,10 @@ last_applied_layer,
             // resync delta is a complete layer definition, so bootstrap an
             // empty snapshot and apply it (other layers heal on their own
             // resyncs).
-            let latest = match snapshot_buffer.get_latest() {
+            // Bug №637: the match result is already an owned copy (the buffer
+            // hands out its own clone); the extra `latest.clone()` of the old
+            // code was a second deep copy of every entity per applied delta.
+            let mut base = match snapshot_buffer.get_latest() {
                 Some(latest) => latest,
                 None => {
                     if !delta.is_resync {
@@ -1365,7 +1482,6 @@ last_applied_layer,
                 }
             };
             {
-                let mut base = latest.clone();
                 if delta.is_resync {
                     // Full layer replace: drop everything this layer previously
                     // held so entities destroyed while we were desynced do not
@@ -1376,6 +1492,12 @@ last_applied_layer,
                     }
                 }
 
+                // Bug №637: `apply_delta` consumes the base (its vectors move
+                // into the result), and the two storage sites each take an
+                // owned copy; the third use — the `StateUpdate` event below —
+                // moves the original into the slot. Three full copies exist by
+                // storage contract (buffer, interpolator, latest-state slot);
+                // the old code made five per applied delta.
                 let target = base.apply_delta(&delta);
                 snapshot_buffer.write_snapshot(target.clone());
                 snapshot_interpolator.lock().add_snapshot(target.clone());
@@ -1710,6 +1832,22 @@ last_applied_layer,
         self.stale_delta_drops.load(Ordering::Relaxed)
     }
 
+    pub fn get_stale_delta_drops(&self) -> u64 {
+        self.stale_delta_drops.load(Ordering::Relaxed)
+    }
+
+    pub fn get_session_resets(&self) -> u64 {
+        self.session_resets.load(Ordering::Relaxed)
+    }
+
+    pub fn get_stale_full_state_drops(&self) -> u64 {
+        self.stale_full_state_drops.load(Ordering::Relaxed)
+    }
+
+    pub fn get_match_id(&self) -> Option<Uuid> {
+        *self.match_id.lock()
+    }
+
     pub fn server_tick(&self) -> Tick {
         *self.server_tick.lock()
     }
@@ -1783,6 +1921,7 @@ mod event_delivery_tests {
 
     use super::*;
     use crate::{NetServer, ServerConfig};
+    use rfs_core::math::{Transform, Vec3f};
     use std::time::Duration;
 
     /// A real client/server pair over loopback UDP, plus the event receiver.
@@ -1891,6 +2030,32 @@ mod event_delivery_tests {
         server.stop();
     }
 
+    /// Bug №610: stopping the server has to be something the client *learns*.
+    /// `stop()` used to abort the outbox writer first and queue the farewell
+    /// `Disconnect(ServerShutdown)` afterwards, into a channel with no reader
+    /// left — so the one packet that says "the match is over" was the one packet
+    /// guaranteed not to arrive, and the client saw a silent socket instead.
+    /// This is the whole point of wiring Ctrl-C to `stop()` in the first place,
+    /// so it is pinned end to end rather than through a mock.
+    #[tokio::test]
+    async fn a_stopping_server_tells_the_client_why() {
+        let (server, client, mut rx) = connected_pair().await;
+        wait_for(&mut rx, &client, "Connected", is_connected).await;
+
+        server.stop_gracefully().await;
+
+        match wait_for(&mut rx, &client, "Disconnected", is_disconnected).await {
+            ClientEvent::Disconnected { reason } => {
+                assert_eq!(
+                    reason,
+                    DisconnectReason::ServerShutdown,
+                    "the client must be told the match ended by the server, not by a dead socket"
+                );
+            }
+            other => panic!("expected Disconnected after a server shutdown, got {other:?}"),
+        }
+    }
+
     /// `Full` and `Closed` must not be conflated.
     ///
     /// The two demand opposite responses: `Full` means a lagging consumer that
@@ -1919,5 +2084,186 @@ mod event_delivery_tests {
         drop(rx);
         assert_eq!(sink.try_send(ClientEvent::Error { error: "fourth".into() }), Disposition::Closed);
         assert!(sink.channel_is_closed(), "a dropped receiver must be reported as closed");
+    }
+
+    /// Bug №636 harness: a client driven by hand-crafted packets from a fake
+    /// UDP "server" socket. Unlike `connected_pair`, the session identity
+    /// (`match_id`) is fully under test control — that identity is exactly what
+    /// the session-reset decision in the accept handler keys off, so a real
+    /// server would hide the one thing being tested.
+    type CraftedSession = (NetClient, UdpSocket, mpsc::Receiver<ClientEvent>, SocketAddr);
+
+    async fn crafted_session() -> CraftedSession {
+        let server = UdpSocket::bind("127.0.0.1:0").await.expect("fake server bind");
+        let server_addr = server.local_addr().expect("fake server addr");
+        let client = NetClient::new(ClientConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            player_name: "session-reset-test".to_string(),
+            ..ClientConfig::default()
+        })
+        .await
+        .expect("client create");
+        client.connect();
+        let rx = client.get_event_receiver().expect("event receiver");
+
+        // The first datagram the fake server sees is the client's
+        // ConnectRequest; answering it is both the handshake and how the test
+        // learns the client's address — the same two jobs a real server does.
+        let mut buf = [0u8; 2048];
+        let (_, client_addr) = server.recv_from(&mut buf).await.expect("connect request");
+        (client, server, rx, client_addr)
+    }
+
+    /// Hand-crafted UDP datagram in the exact wire format `deserialize_packet`
+    /// expects: bincode header (with payload_size), then the bincode body.
+    fn craft<T: Serializable>(packet_type: PacketType, channel: ChannelType, sequence: u32, packet: &T) -> Vec<u8> {
+        serialize_packet(packet, PacketHeader::new(packet_type, channel, sequence, 0, 0, 0))
+            .expect("serialize crafted packet")
+    }
+
+    /// One entity, enough for the state path: a full state is authoritative,
+    /// so whatever the test sends is what the mirror holds.
+    fn craft_entity(id: u64) -> EntityState {
+        EntityState {
+            entity_id: EntityId(id),
+            entity_type: EntityType::Ship,
+            transform: Transform::from_position(Vec3f::new(1.0, 0.0, 0.0)),
+            velocity: Vec3f::ZERO,
+            angular_velocity: Vec3f::ZERO,
+            health: 100.0,
+            max_health: 100.0,
+            flags: EntityFlags::NONE,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        }
+    }
+
+    fn craft_full_state(tick: u32, ids: &[u64]) -> StatePacket {
+        StatePacket {
+            server_tick: tick,
+            server_time: f64::from(tick) / 30.0,
+            entities: ids.iter().copied().map(craft_entity).collect(),
+            projectiles: Vec::new(),
+        }
+    }
+
+    /// Poll for a state that no event announces (counters, layer clocks).
+    async fn wait_until<F: FnMut() -> bool>(what: &str, mut check: F) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if check() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: client never reached the expected state"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn send_to(server: &UdpSocket, client_addr: SocketAddr, bytes: &[u8]) {
+        server.send_to(bytes, client_addr).await.expect("send crafted packet");
+    }
+
+    /// Bug №636: a reconnect to a *different* session must throw the previous
+    /// session's applied world away. Pre-fix, the new session's full state
+    /// (ticks near zero) lost to the stale-guard (`incoming <= max_applied`)
+    /// forever, and the client listened to a ghost world with no warning.
+    ///
+    /// Also pins the counter-behaviour of the reset: the first session counts
+    /// as a reset, a *duplicate* Accept for the same session must NOT count —
+    /// a retransmitted handshake would otherwise wipe a healthy world.
+    #[tokio::test]
+    async fn a_connect_accept_for_a_new_session_discards_the_previous_world() {
+        let (client, server, mut rx, client_addr) = crafted_session().await;
+        let seq = Arc::new(AtomicU64::new(2));
+        let next_seq = |seq: &AtomicU64| seq.fetch_add(1, Ordering::Relaxed) as u32;
+
+        // Session 1: accept, then a full state that pins every layer clock.
+        let m1 = Uuid::new_v4();
+        let accept1 = ConnectAcceptPacket {
+            server_tick: 12,
+            server_time: 0.4,
+            assigned_client_id: 7,
+            match_id: m1,
+            tick_rate: 30,
+        };
+        send_to(&server, client_addr, &craft(PacketType::ConnectAccept, ChannelType::ReliableOrdered, next_seq(&seq), &accept1)).await;
+        let connected = wait_for(&mut rx, &client, "Connected(session1)", is_connected).await;
+        match connected {
+            ClientEvent::Connected { match_id, .. } => {
+                assert_eq!(match_id, m1, "the client must be attached to session 1");
+            }
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        assert_eq!(client.get_match_id(), Some(m1));
+
+        send_to(&server, client_addr, &craft(PacketType::StateFull, ChannelType::Unreliable, next_seq(&seq), &craft_full_state(12, &[777]))).await;
+        wait_until("full state 12 applied", || client.applied_layer_ticks().iter().all(|&t| t == 12)).await;
+        assert_eq!(client.get_session_resets(), 1, "the first session counts as one reset");
+
+        // A retransmitted Accept for the SAME session must not wipe the world.
+        send_to(&server, client_addr, &craft(PacketType::ConnectAccept, ChannelType::ReliableOrdered, next_seq(&seq), &accept1)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            client.applied_layer_ticks().iter().all(|&t| t == 12),
+            "a duplicate Accept for the same session must preserve the applied world"
+        );
+        assert_eq!(client.get_session_resets(), 1, "a duplicate Accept must not count as a reset");
+
+        // Session 2: a *new* match id. The accept carries no world of its own —
+        // the old world (ticks pinned at 12) must be discarded here, not by the
+        // next full state.
+        let m2 = Uuid::new_v4();
+        let accept2 = ConnectAcceptPacket { server_tick: 5, server_time: 0.1, assigned_client_id: 7, match_id: m2, tick_rate: 30 };
+        send_to(&server, client_addr, &craft(PacketType::ConnectAccept, ChannelType::ReliableOrdered, next_seq(&seq), &accept2)).await;
+        wait_until("session 2 accepted", || client.get_match_id() == Some(m2)).await;
+        wait_until("layer clocks reset to zero", || client.applied_layer_ticks().iter().all(|&t| t == 0)).await;
+        assert_eq!(client.get_session_resets(), 2, "accepting a second session resets the world once");
+
+        // The proof that the world really moved: session 2's low-tick full
+        // state now applies. Pre-fix this is a ghost: tick 8 loses to the
+        // session-1 clock (12), every state is dropped, stale_full_state_drops
+        // climbs, and the client listens to the dead session forever.
+        send_to(&server, client_addr, &craft(PacketType::StateFull, ChannelType::Unreliable, next_seq(&seq), &craft_full_state(8, &[888]))).await;
+        wait_until("session 2 full state 8 applied", || client.applied_layer_ticks().iter().all(|&t| t == 8)).await;
+        assert_eq!(client.get_stale_full_state_drops(), 0, "session 2 states must not be dropped as stale");
+    }
+
+    /// Bug №636: the stale-guard for full states used to `return Ok(())` in
+    /// silence — the drop path №267's counter work could never cover, and the
+    /// reason shadow №№571-636: "a client that resets on every reconnect never
+    /// accumulates a world" could only be found by luck.
+    #[tokio::test]
+    async fn a_stale_full_state_is_counted_not_dropped_in_silence() {
+        let (client, server, mut rx, client_addr) = crafted_session().await;
+        let seq = Arc::new(AtomicU64::new(2));
+        let next_seq = |seq: &AtomicU64| seq.fetch_add(1, Ordering::Relaxed) as u32;
+
+        let accept = ConnectAcceptPacket {
+            server_tick: 500,
+            server_time: 16.0,
+            assigned_client_id: 9,
+            match_id: Uuid::new_v4(),
+            tick_rate: 30,
+        };
+        send_to(&server, client_addr, &craft(PacketType::ConnectAccept, ChannelType::ReliableOrdered, next_seq(&seq), &accept)).await;
+        wait_for(&mut rx, &client, "Connected", is_connected).await;
+
+        send_to(&server, client_addr, &craft(PacketType::StateFull, ChannelType::Unreliable, next_seq(&seq), &craft_full_state(500, &[77]))).await;
+        wait_until("full state 500 applied", || client.applied_layer_ticks().iter().all(|&t| t == 500)).await;
+
+        // Tick 100 arrived after 500 was applied: genuinely stale, must be
+        // refused — but every other drop path on this stream counts its
+        // refusals, and so does this one.
+        send_to(&server, client_addr, &craft(PacketType::StateFull, ChannelType::Unreliable, next_seq(&seq), &craft_full_state(100, &[78]))).await;
+        wait_until("stale full state counted", || client.get_stale_full_state_drops() == 1).await;
+        assert!(
+            client.applied_layer_ticks().iter().all(|&t| t == 500),
+            "a stale full state must not rewind the applied world"
+        );
     }
 }

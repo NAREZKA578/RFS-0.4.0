@@ -20,7 +20,28 @@ impl Default for DamageConfig {
             direct_damage_multiplier: 1.0,
             falloff_distance: 3.0,
             falloff_power: 1.5,
-            max_damage_radius: 12.0,
+            // How far a blast still reaches, measured to the nearest point of a
+            // compartment box. This is NOT free to pick: it has to be at least
+            // the distance from the shell-collision box of the hull to the
+            // compartments inside it, or a shell that strikes the hull lands
+            // outside every falloff radius and does nothing at all.
+            //
+            // For the default frigate that distance is worst-case 111.8 m,
+            // measured by `every_part_of_the_default_hull_can_be_damaged` in
+            // sim/src/tick.rs, which walks the hull's surface and finds the
+            // point furthest from any compartment:
+            //   hull collision box  x +-50, y +-30, z +-150   (ship/src/ship.rs)
+            //   compartments        x +-12, y -5..+6, z -70..+50
+            // At 12.0 the whole hull - all 486 sampled points - was outside the
+            // reach, so every shell in the game did nothing.
+            //
+            // The upper bound comes from a test that must keep passing:
+            // `Tool/harness/tests/damage.rs` fires from (100,100,100) at a
+            // +-5 m box, which is 164.5 m away, and requires zero damage.
+            //
+            // So the usable window is roughly 112..164 m. 140 sits inside it.
+            // The hull test fails if either side of this coupling moves.
+            max_damage_radius: 140.0,
         }
     }
 }
@@ -44,6 +65,20 @@ pub struct StationHit {
     pub entity_id: EntityId,
     pub name: String,
     pub bounds: Bounds,
+}
+
+/// What one blast did to a ship (Bug №607).
+///
+/// `breached` is what the caller needs to mirror a fresh breach into the ship's
+/// own state (Bug №151). `inflicted` is new: every compartment that absorbed a
+/// non-zero share of the blast, with the share dealt. An explosive hit uses it
+/// to light the compartment the blast actually reached — the hull collision box
+/// is far larger than any compartment, so the shell's impact point alone names
+/// no compartment at all.
+#[derive(Debug, Default, Clone)]
+pub struct DamageReport {
+    pub breached: Vec<EntityId>,
+    pub inflicted: Vec<(EntityId, f32)>,
 }
 
 pub trait DamageTarget {
@@ -94,14 +129,16 @@ impl DamageSystem {
 
     /// Apply damage and report which compartments breached for the first time
     /// (Bug №151: the caller mirrors the breach into the ship's own state so
-    /// battle damage actually floods it).
-    pub fn apply_damage_to_ship(&self, target: &impl DamageTarget, position: Vec3f, damage: f32) -> Vec<EntityId> {
+    /// battle damage actually floods it) and every compartment that took a
+    /// share of the blast (Bug №607: an explosive hit lights the compartment it
+    /// reached).
+    pub fn apply_damage_to_ship(&self, target: &impl DamageTarget, position: Vec3f, damage: f32) -> DamageReport {
         // Bug №65: NaN/negative "damage" must never reach the hull or the
         // compartments — a negative blast used to heal the ship.
         // Spelled out rather than `!(damage > 0.0)`: the NaN case has to stay
         // rejected, and `<=` alone would let NaN through.
         if damage.is_nan() || damage <= 0.0 {
-            return Vec::new();
+            return DamageReport::default();
         }
 
         let hits = target.compartment_hits();
@@ -224,7 +261,10 @@ impl DamageSystem {
         }
         let hull_factor = if hits.is_empty() { 1.0 } else { max_factor };
         target.apply_health_damage(damage * self.config.hull_damage_multiplier * hull_factor);
-        newly_breached
+        DamageReport {
+            breached: newly_breached,
+            inflicted,
+        }
     }
 
     /// Register the ship's compartment/bulkhead topology so the production
@@ -305,6 +345,12 @@ fn distance_to_bounds(point: Vec3f, bounds: &Bounds) -> f32 {
         safe_clamp(point.z, bounds.min.z, bounds.max.z),
     );
     clamped.distance(point)
+}
+
+impl Default for DamageSystem {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -454,11 +500,5 @@ mod tests {
         );
         let d = distance_to_bounds(Vec3f::new(13.0, 5.0, 1.0), &bounds);
         assert!((d - 3.0).abs() < 1e-4, "expected 3.0, got {d}");
-    }
-}
-
-impl Default for DamageSystem {
-    fn default() -> Self {
-        Self::new()
     }
 }

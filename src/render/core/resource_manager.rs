@@ -13,6 +13,7 @@ use crate::rhi::{
     AddressMode, BorderColor, CompareOp, Device, FilterMode, Pipeline, Sampler, ShaderModule,
     ShaderModuleDesc,
 };
+use crate::rhi::command::pass::render::RenderPass;
 use glam::{Vec2, Vec4};
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,6 +35,14 @@ pub struct ResourceManager {
     shaders: HashMap<String, Arc<ShaderModule>>,
     /// Pipeline cache
     pipelines: HashMap<String, Arc<Pipeline>>,
+    /// Cache of render passes, parallel to `pipelines`.
+    ///
+    /// Present because of bug №314: a graphics pipeline cannot be built without
+    /// the pass it is compatible with, so a manager that caches pipelines but
+    /// not passes has nothing to hand to the device. Keyed by name, which is why
+    /// `PipelineDesc` carries `render_pass` as a name — it was ignored before,
+    /// and an ignored field is a description of a dependency that does not exist.
+    render_passes: HashMap<String, Arc<RenderPass>>,
     /// Sampler cache
     samplers: HashMap<String, Arc<Sampler>>,
 
@@ -62,6 +71,7 @@ impl ResourceManager {
             material_library: MaterialLibrary::new(),
             shaders: HashMap::new(),
             pipelines: HashMap::new(),
+            render_passes: HashMap::new(),
             samplers: HashMap::new(),
             stats: ResourceStats::default(),
         }
@@ -139,10 +149,13 @@ impl ResourceManager {
         );
         // The counter must not claim a texture arrived when the upload failed:
         // it is used as evidence that assets are present on the GPU.
+        // Registered in the library rather than wrapped in a bare `Arc`: an
+        // unregistered texture is unreachable from `clear()`, so it outlives the
+        // manager and its GPU memory is never released.
         if texture.upload_data(&data_bytes, &self.device) {
             self.stats.textures_loaded += 1;
         }
-        Arc::new(texture)
+        self.texture_library.add(name, texture)
     }
 
     /// Creates a procedural texture
@@ -239,10 +252,12 @@ impl ResourceManager {
             crate::render::textures::TextureUsage::Sampled,
             &self.device,
         );
+        // Same reason as `create_color_texture`: the library owns the texture, so
+        // `clear()` can actually reach it.
         if texture.upload_data(&data_bytes, &self.device) {
             self.stats.textures_loaded += 1;
         }
-        Arc::new(texture)
+        self.texture_library.add(name, texture)
     }
 
     /// Loads a material
@@ -282,13 +297,56 @@ impl ResourceManager {
             return Some(shader.clone());
         }
 
-        // Load shader from file
-        let code = std::fs::read(path).ok()?;
-        let shader = ShaderModule::new(ShaderModuleDesc {
+        // Load shader from file.
+        //
+        // Two things were wrong here. The module was built with
+        // `ShaderModule::new`, which leaves `backend: None`, so every cached
+        // "shader" was a descriptor with no native handle. And `..Default::default()`
+        // left the format unset, so the bytes were handed to the backend without
+        // being declared as SPIR-V — the file was read correctly and then
+        // interpreted as whatever the default happened to be.
+        let code = match std::fs::read(path) {
+            Ok(code) => code,
+            Err(e) => {
+                crate::error!(
+                    "resource_manager",
+                    "shader {}: cannot read {}: {}",
+                    name,
+                    path,
+                    e
+                );
+                return None;
+            }
+        };
+
+        // SPIR-V magic. Cheap, and it turns a wrong path or a stale source file
+        // into a named error instead of a backend complaint much later.
+        const SPIRV_MAGIC: [u8; 4] = [0x03, 0x02, 0x23, 0x07];
+        if code.len() < 4 || code[..4] != SPIRV_MAGIC {
+            crate::error!(
+                "resource_manager",
+                "shader {}: {} is not a SPIR-V module (bad magic); shaders must be \
+                 compiled to .spv before loading",
+                name,
+                path
+            );
+            return None;
+        }
+
+        let shader = self.device.create_shader_module(&ShaderModuleDesc {
             code,
+            format: crate::rhi::ShaderFormat::SpirV,
+            entry_point: None,
             name: Some(name.to_string()),
-            ..Default::default()
         });
+        if !shader.has_gpu_backing() {
+            crate::error!(
+                "resource_manager",
+                "shader {}: created without GPU backing; a pipeline built on it cannot draw",
+                name
+            );
+            return None;
+        }
         let arc_shader = Arc::new(shader);
         self.shaders.insert(key, arc_shader.clone());
         self.stats.shaders_loaded += 1;
@@ -296,10 +354,33 @@ impl ResourceManager {
         Some(arc_shader)
     }
 
-    /// Creates a pipeline
+    /// Creates a pipeline.
+    ///
+    /// Two defects made this function incapable of producing anything drawable,
+    /// and both are worth recording because they failed *quietly*.
+    ///
+    /// First, the shader name was passed as the file path. `std::fs::read` on a
+    /// name like `"water"` fails, the `?` returned `None`, and the caller had no
+    /// way to tell that apart from a legitimately absent pipeline. `PipelineDesc`
+    /// now carries a path separately from the name.
+    ///
+    /// Second, the result came from `GraphicsPipeline::new`, which builds a
+    /// descriptor and leaves `backend: None`. Such a pipeline looks complete,
+    /// prints correctly, and has `has_gpu_backing() == false`, so nothing could
+    /// ever draw with it. Only the device attaches a native handle, so only the
+    /// device is used here.
+    ///
+    /// A requested-but-unsupported pipeline is now reported rather than built as
+    /// graphics. Silently substituting a graphics pipeline for a compute request
+    /// produces a green build and a wrong frame, which is the failure mode this
+    /// whole subsystem was written to avoid.
     pub fn create_pipeline(&mut self, name: &str, desc: PipelineDesc) -> Option<Arc<Pipeline>> {
         if let Some(pipeline) = self.pipelines.get(name) {
             return Some(pipeline.clone());
+        }
+
+        if !pipeline_request_is_supported(name, &desc) {
+            return None;
         }
 
         use crate::rhi::{
@@ -309,8 +390,15 @@ impl ResourceManager {
             ShaderStage as RhiShaderStage, VertexInputState,
         };
 
-        let vertex_shader = self.load_shader(&desc.vertex_shader, &desc.vertex_shader, ShaderStage::Vertex)?;
-        let fragment_shader = desc.fragment_shader.as_ref().and_then(|s| self.load_shader(s, s, ShaderStage::Fragment));
+        let vertex_shader = self.load_shader(
+            &desc.vertex_shader,
+            &desc.vertex_shader_path,
+            ShaderStage::Vertex,
+        )?;
+        let fragment_shader = desc.fragment_shader.as_ref().and_then(|s| {
+            let path = desc.fragment_shader_path.as_deref().unwrap_or(s);
+            self.load_shader(s, path, ShaderStage::Fragment)
+        });
 
         let mut stages = vec![PipelineShaderStage {
             stage: RhiShaderStage::VERTEX,
@@ -387,7 +475,35 @@ impl ResourceManager {
             multisample_state: crate::rhi::MultisampleState::default(),
         };
 
-        let pipeline = crate::rhi::GraphicsPipeline::new(pipeline_desc);
+        let render_pass = self.resolve_render_pass(&desc)?;
+
+        // The device is the only path that attaches a native pipeline handle.
+        // `GraphicsPipeline::new` would leave `backend: None` and the pipeline
+        // would be unusable while still looking complete.
+        let pipeline = match self.device.create_graphics_pipeline(&pipeline_desc, &render_pass, &[]) {
+            Ok(pipeline) => pipeline,
+            Err(e) => {
+                crate::error!(
+                    "resource_manager",
+                    "pipeline {}: device refused to create it: {}",
+                    name,
+                    e
+                );
+                return None;
+            }
+        };
+        // A pipeline with no native handle cannot be drawn with. Returning it would be
+        // worse than returning `None`: it has a complete descriptor, it prints,
+        // and `is_some()` says yes. Callers would bind it and draw nothing. The
+        // cache is left untouched so a later attempt can succeed.
+        if !pipeline.has_gpu_backing() {
+            crate::error!(
+                "resource_manager",
+                "pipeline {}: created without GPU backing; it cannot be drawn with",
+                name
+            );
+            return None;
+        }
         let arc_pipeline = Arc::new(pipeline);
         self.pipelines.insert(name.to_string(), arc_pipeline.clone());
         self.stats.pipelines_created += 1;
@@ -471,6 +587,79 @@ impl ResourceManager {
     pub fn unload_level(&mut self, _level_name: &str) {
         // Unload resources that were loaded for a specific level
     }
+
+    /// The render pass a pipeline needs, creating and caching it on first use.
+    ///
+    /// A pipeline is incompatible with a pass it was not built against: the
+    /// attachment formats are baked into the pipeline at creation, and a
+    /// mismatch is an error from the driver rather than a warning anyone reads.
+    ///
+    /// Returns `None` when no description was supplied, rather than inventing a
+    /// pass. An invented pass would be compatible with nothing and would fail
+    /// later, further from the cause.
+    pub fn resolve_render_pass(&mut self, desc: &PipelineDesc) -> Option<Arc<RenderPass>> {
+        if let Some(pass) = self.render_passes.get(&desc.render_pass) {
+            return Some(pass.clone());
+        }
+
+        let pass_desc = desc.render_pass_desc.as_ref()?;
+        let pass = match self.device.create_render_pass(pass_desc) {
+            Ok(pass) => pass,
+            Err(e) => {
+                crate::error!(
+                    "resource_manager",
+                    "render pass {}: device refused to create it: {}",
+                    desc.render_pass,
+                    e
+                );
+                return None;
+            }
+        };
+        if !pass.has_gpu_backing() {
+            crate::error!(
+                "resource_manager",
+                "render pass {}: created without GPU backing; every pipeline built \
+                 against it would be unusable",
+                desc.render_pass
+            );
+            return None;
+        }
+        let arc = Arc::new(pass);
+        self.render_passes.insert(desc.render_pass.clone(), arc.clone());
+        Some(arc)
+    }
+}
+
+/// Whether a pipeline request can be honoured as written.
+///
+/// Pure, and deliberately separate from `create_pipeline`, because a check
+/// buried inside a function that also opens files and calls the driver is
+/// untestable: the function returns `None` for a dozen unrelated reasons, so an
+/// assertion on `None` proves nothing about which guard fired. Separated, this
+/// can be tested directly, and it is the only way to tell "refused on purpose"
+/// apart from "failed by accident".
+pub fn pipeline_request_is_supported(name: &str, desc: &PipelineDesc) -> bool {
+    if desc.pipeline_type != PipelineType::Graphics {
+        crate::error!(
+            "resource_manager",
+            "pipeline {}: only graphics pipelines are implemented, refusing to build {:?} as graphics",
+            name,
+            desc.pipeline_type
+        );
+        return false;
+    }
+
+    if desc.geometry_shader.is_some() {
+        crate::error!(
+            "resource_manager",
+            "pipeline {}: a geometry stage is declared but never compiled into the stage list; \
+             refusing to build a pipeline that would silently drop it",
+            name
+        );
+        return false;
+    }
+
+    true
 }
 
 /// Primitive mesh type
@@ -495,16 +684,33 @@ pub enum ShaderStage {
     Miss,
 }
 
-/// Pipeline description
+/// Pipeline description.
+///
+/// The shader fields are names for the cache key; the `*_path` fields are what
+/// is actually opened. Collapsing the two is what made `create_pipeline` fail
+/// silently for every pipeline it was handed.
 #[derive(Debug, Clone)]
 pub struct PipelineDesc {
     pub name: String,
     pub vertex_shader: String,
+    /// File path to the vertex shader. Defaults to the name if left empty,
+    /// which is only correct when the name is itself a path.
+    pub vertex_shader_path: String,
     pub fragment_shader: Option<String>,
+    /// File path to the fragment shader, when it differs from its name.
+    pub fragment_shader_path: Option<String>,
     pub geometry_shader: Option<String>,
     pub compute_shader: Option<String>,
     pub vertex_layout: VertexLayout,
+    /// Name the pass is cached under.
     pub render_pass: String,
+    /// The pass itself, for the first request under that name.
+    ///
+    /// `render_pass` alone is not enough: a pass needs colour attachment
+    /// formats, and those come from the target being rendered into, not from
+    /// the name. Both are kept because the first request supplies the description
+    /// and later ones reuse whatever was built.
+    pub render_pass_desc: Option<crate::rhi::command::pass::render::RenderPassDesc>,
     pub pipeline_type: PipelineType,
 }
 

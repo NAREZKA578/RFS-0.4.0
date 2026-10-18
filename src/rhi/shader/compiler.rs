@@ -1,7 +1,6 @@
 //! Shader Compiler
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use super::module::{ShaderModule, ShaderModuleDesc};
 use super::reflection::ShaderReflection;

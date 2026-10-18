@@ -182,7 +182,10 @@ fn draw_frame(
     render_pass: &RenderPass,
     pipeline: &GraphicsPipeline,
 ) -> RhiResult<()> {
-    let acquired = swapchain.acquire(u64::MAX)?;
+    // A null semaphore keeps the old blocking behaviour: this example records
+    // into a single shared command buffer and waits on the submit fence, so
+    // handing the acquire over to a semaphore it never waits on would be wrong.
+    let acquired = swapchain.acquire(u64::MAX, rhi::ash::vk::Semaphore::null())?;
     let width = swapchain.extent.width;
     let height = swapchain.extent.height;
     let Some(format) = swapchain.rhi_format() else {
@@ -217,7 +220,14 @@ fn draw_frame(
 
     // No fence wait: draw_framebuffer submits and blocks until the GPU is
     // finished, so the image cannot be handed over half-written.
-    swapchain.present(acquired.image_index)?;
+    //
+    // Null semaphore, see bug #282: presentation normally has to wait on a
+    // semaphore the submit signalled, and that signal is per frame — one shared
+    // semaphore is re-signalled while a previous present may still hold it
+    // (VUID-vkQueueSubmit-pSignalSemaphores-00067). This example presents once and
+    // exits, so there is no second frame to collide with.
+    swapchain
+        .present(acquired.image_index, rhi::ash::vk::Semaphore::null())?;
     Ok(())
 }
 

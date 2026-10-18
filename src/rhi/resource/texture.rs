@@ -110,6 +110,29 @@ impl Texture {
         Self::new(desc)
     }
 
+    /// Wrap an image handle owned by someone else.
+    ///
+    /// Bug №298. Exists because swapchain images are real `VkImage`s that this
+    /// crate did not create and must not destroy, yet every pass that wants to draw
+    /// into one needs a typed `Texture` — `Texture` and `TextureView` have no
+    /// `as_raw`, and a `TextureView` cannot be rebuilt from a `u64` because it needs
+    /// the `Texture` it came from. So a pass holding raw handles could build a
+    /// framebuffer for the window but not for an ordinary offscreen texture, and a
+    /// window-only path cannot be verified by reading pixels back.
+    ///
+    /// **Non-owning.** The handle is not registered anywhere, so nothing will
+    /// destroy it. Whoever passed it in keeps that responsibility — for swapchain
+    /// images that is `Swapchain`, which destroys its views and the chain itself.
+    /// Adopting a handle that *is* tracked elsewhere would give two owners and a
+    /// double free, so this must only ever be used for handles this crate created
+    /// outside its own tracking, i.e. the swapchain.
+    pub(crate) fn adopt(desc: TextureDesc, image_handle: u64) -> Self {
+        Self {
+            desc,
+            backend: Some(GpuResource { handle: image_handle, memory: 0, mapped: 0 }),
+        }
+    }
+
     pub fn desc(&self) -> &TextureDesc {
         &self.desc
     }

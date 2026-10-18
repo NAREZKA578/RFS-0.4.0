@@ -1,7 +1,6 @@
 //! Graphics Pipeline
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use crate::resource::sampler::CompareOp;
 use crate::shader::ShaderModule;

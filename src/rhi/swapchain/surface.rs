@@ -1,7 +1,6 @@
 //! Surface
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use crate::types::*;
 

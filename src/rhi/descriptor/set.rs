@@ -1,7 +1,6 @@
 //! Descriptor Set
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use super::layout::DescriptorSetLayout;
 use crate::resource::acceleration::AccelerationStructure;

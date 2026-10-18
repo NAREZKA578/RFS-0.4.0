@@ -1,7 +1,6 @@
 //! Query Results
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 /// Query result
 #[derive(Debug, Clone, PartialEq)]

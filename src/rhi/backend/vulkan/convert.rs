@@ -582,6 +582,12 @@ pub(crate) fn pipeline_stage(stages: crate::types::PipelineStage) -> vk::Pipelin
     if stages.contains(PipelineStage::COLOR_ATTACHMENT_OUTPUT) {
         flags |= vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
     }
+    if stages.contains(PipelineStage::EARLY_FRAGMENT_TESTS) {
+        flags |= vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS;
+    }
+    if stages.contains(PipelineStage::LATE_FRAGMENT_TESTS) {
+        flags |= vk::PipelineStageFlags::LATE_FRAGMENT_TESTS;
+    }
     if stages.contains(PipelineStage::COMPUTE_SHADER) {
         flags |= vk::PipelineStageFlags::COMPUTE_SHADER;
     }

@@ -1,7 +1,6 @@
 //! Debug Module
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 pub mod capture;
 pub mod markers;

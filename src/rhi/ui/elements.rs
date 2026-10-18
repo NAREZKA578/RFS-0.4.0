@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 use super::UiAlignment;
+use super::layout::{UiConstraints, UiLayoutMode};
+use super::theme::NvidiaStyle;
 
 /// Unique identifier for UI elements
 pub type UiElementId = u64;
@@ -206,10 +208,23 @@ pub struct UiElement {
     pub min_size: Option<(f32, f32)>,
     /// Maximum size
     pub max_size: Option<(f32, f32)>,
+    /// Size constraints: preferred size, fill fraction, aspect ratio.
+    ///
+    /// Kept apart from `min_size`/`max_size` because they answer different
+    /// questions: those clamp what the element asked for, these describe what
+    /// it wants in the first place.
+    pub constraints: UiConstraints,
     /// Anchor point (0.0 to 1.0)
     pub anchor: (f32, f32),
     /// Pivot point (0.0 to 1.0)
     pub pivot: (f32, f32),
+    /// How this container arranges its children.
+    ///
+    /// `Absolute` is the default; `Row`/`Column` stack the children with
+    /// [`Self::layout_spacing`] between them, inside this element's padded box.
+    pub layout: UiLayoutMode,
+    /// Gap between children under `Row`/`Column` layout, in pixels.
+    pub layout_spacing: f32,
     /// Rotation in radians
     pub rotation: f32,
     /// Scale (x, y)
@@ -246,8 +261,11 @@ impl UiElement {
             size: (0.0, 0.0),
             min_size: None,
             max_size: None,
+            constraints: UiConstraints::default(),
             anchor: (0.0, 0.0),
             pivot: (0.0, 0.0),
+            layout: UiLayoutMode::Absolute,
+            layout_spacing: 0.0,
             rotation: 0.0,
             scale: (1.0, 1.0),
             interactive: false,
@@ -356,6 +374,34 @@ impl UiElement {
         element.style.background_color = Some([0.15, 0.15, 0.15, 0.9]);
         element.style.corner_radius = 4.0;
         element.style.padding = [8.0, 8.0, 8.0, 8.0];
+        element
+    }
+
+    /// A button in the Nvidia GeForce Experience palette.
+    pub fn nvidia_button(id: UiElementId, text: String) -> Self {
+        let mut element = Self::button(id, text);
+        element.apply_nvidia_button_style();
+        element
+    }
+
+    /// A panel in the Nvidia GeForce Experience palette.
+    pub fn nvidia_panel(id: UiElementId) -> Self {
+        let mut element = Self::panel(id);
+        element.apply_nvidia_panel_style();
+        element
+    }
+
+    /// An input field in the Nvidia GeForce Experience palette.
+    pub fn nvidia_input(id: UiElementId, placeholder: String, value: String) -> Self {
+        let mut element = Self::input_field(id, placeholder, value);
+        element.apply_nvidia_input_style();
+        element
+    }
+
+    /// A progress bar in the Nvidia GeForce Experience palette.
+    pub fn nvidia_progress(id: UiElementId, progress: f32) -> Self {
+        let mut element = Self::progress_bar(id, progress);
+        element.apply_nvidia_progress_style();
         element
     }
     
@@ -539,6 +585,28 @@ impl UiElementBuilder {
         self.element.anchor = (anchor_x, anchor_y);
         self
     }
+
+    pub fn with_min_size(mut self, width: f32, height: f32) -> Self {
+        self.element.min_size = Some((width, height));
+        self
+    }
+
+    pub fn with_max_size(mut self, width: f32, height: f32) -> Self {
+        self.element.max_size = Some((width, height));
+        self
+    }
+
+    pub fn with_constraints(mut self, constraints: UiConstraints) -> Self {
+        self.element.constraints = constraints;
+        self
+    }
+
+    /// Arrange the children in a row or column, `spacing` pixels apart.
+    pub fn with_layout(mut self, layout: UiLayoutMode, spacing: f32) -> Self {
+        self.element.layout = layout;
+        self.element.layout_spacing = spacing;
+        self
+    }
     
     pub fn with_style(mut self, style: UiVisualStyle) -> Self {
         self.element.style = style;
@@ -553,5 +621,131 @@ impl UiElementBuilder {
 impl From<UiElement> for UiElementBuilder {
     fn from(element: UiElement) -> Self {
         Self { element }
+    }
+}
+
+/// The Nvidia GeForce Experience look, applied to a single element.
+///
+/// The palette already existed in [`super::theme::nvidia_colors`] and the trait
+/// already existed here, but nothing implemented it, so "apply the Nvidia
+/// style" was a promise no element could keep. A button also carries its own
+/// four state colours in [`UiElementData::Button`]; those are repainted too,
+/// because the renderer reads them and would otherwise keep drawing the grey
+/// defaults over the green fill.
+impl NvidiaStyle for UiElement {
+    fn apply_nvidia_button_style(&mut self) {
+        use super::theme::nvidia_colors as c;
+        if let UiElementData::Button {
+            normal_color,
+            hover_color,
+            pressed_color,
+            disabled_color,
+            ..
+        } = &mut self.data
+        {
+            *normal_color = c::NVIDIA_GREEN;
+            *hover_color = c::NVIDIA_GREEN_LIGHT;
+            *pressed_color = c::NVIDIA_GREEN_DARK;
+            *disabled_color = c::BACKGROUND_TERTIARY;
+        }
+        self.style.background_color = Some(c::NVIDIA_GREEN);
+        // Dark text on the green fill; the default light foreground would wash
+        // out against it.
+        self.style.foreground_color = Some(c::BACKGROUND_PRIMARY);
+        self.style.border_color = Some(c::NVIDIA_GREEN_LIGHT);
+        self.style.border_width = 1.0;
+        self.style.corner_radius = 4.0;
+    }
+
+    fn apply_nvidia_panel_style(&mut self) {
+        use super::theme::nvidia_colors as c;
+        self.style.background_color = Some(c::PANEL_BACKGROUND);
+        self.style.border_color = Some(c::BORDER);
+        self.style.border_width = 1.0;
+        self.style.corner_radius = 6.0;
+        self.style.padding = [8.0, 8.0, 8.0, 8.0];
+    }
+
+    fn apply_nvidia_input_style(&mut self) {
+        use super::theme::nvidia_colors as c;
+        self.style.background_color = Some(c::BACKGROUND_SECONDARY);
+        self.style.foreground_color = Some(c::TEXT_PRIMARY);
+        self.style.border_color = Some(c::BORDER);
+        self.style.border_width = 1.0;
+        self.style.corner_radius = 3.0;
+        self.style.padding = [10.0, 6.0, 10.0, 6.0];
+    }
+
+    fn apply_nvidia_progress_style(&mut self) {
+        use super::theme::nvidia_colors as c;
+        self.style.background_color = Some(c::PROGRESS_BACKGROUND);
+        // A progress bar has no colour of its own, so the fill is the
+        // foreground: the trough is the background and the bar is what is
+        // painted over it.
+        self.style.foreground_color = Some(c::PROGRESS_FILL);
+        self.style.border_width = 0.0;
+        self.style.corner_radius = 3.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::theme::nvidia_colors as c;
+
+    #[test]
+    fn a_plain_button_is_not_green() {
+        // The negative control for the tests below: if the default button were
+        // already green, none of them would prove the trait did anything.
+        let button = UiElement::button(1, "Play".to_string());
+        match &button.data {
+            UiElementData::Button { normal_color, .. } => {
+                assert_ne!(*normal_color, c::NVIDIA_GREEN);
+            }
+            other => panic!("expected a button, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_nvidia_button_paints_the_fill_and_its_states() {
+        let button = UiElement::nvidia_button(1, "Play".to_string());
+        assert_eq!(button.style.background_color, Some(c::NVIDIA_GREEN));
+        assert_eq!(button.style.corner_radius, 4.0);
+        match &button.data {
+            UiElementData::Button {
+                normal_color,
+                hover_color,
+                pressed_color,
+                ..
+            } => {
+                assert_eq!(*normal_color, c::NVIDIA_GREEN);
+                assert_eq!(*hover_color, c::NVIDIA_GREEN_LIGHT);
+                assert_eq!(*pressed_color, c::NVIDIA_GREEN_DARK);
+            }
+            other => panic!("expected a button, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_nvidia_panel_uses_the_panel_palette() {
+        let panel = UiElement::nvidia_panel(1);
+        assert_eq!(panel.style.background_color, Some(c::PANEL_BACKGROUND));
+        assert_eq!(panel.style.border_color, Some(c::BORDER));
+        assert_eq!(panel.style.corner_radius, 6.0);
+    }
+
+    #[test]
+    fn an_nvidia_input_uses_the_secondary_background() {
+        let input = UiElement::nvidia_input(1, "host".to_string(), String::new());
+        assert_eq!(input.style.background_color, Some(c::BACKGROUND_SECONDARY));
+        assert_eq!(input.style.foreground_color, Some(c::TEXT_PRIMARY));
+        assert_eq!(input.style.padding, [10.0, 6.0, 10.0, 6.0]);
+    }
+
+    #[test]
+    fn an_nvidia_progress_paints_the_fill_as_its_foreground() {
+        let bar = UiElement::nvidia_progress(1, 0.5);
+        assert_eq!(bar.style.background_color, Some(c::PROGRESS_BACKGROUND));
+        assert_eq!(bar.style.foreground_color, Some(c::PROGRESS_FILL));
     }
 }

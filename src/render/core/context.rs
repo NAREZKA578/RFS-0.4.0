@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::settings::GraphicsSettings;
 use crate::rhi::core::Queue;
+use crate::render::core::resource_manager::ResourceManager;
 use crate::rhi::resource::{Texture, TextureView, TextureViewDesc, TextureViewType};
 use crate::rhi::swapchain::{SwapChain, SwapChainDesc};
 use crate::rhi::types::{
@@ -44,12 +45,38 @@ pub struct RenderContext {
     pub settings: GraphicsSettings,
     /// Renderer configuration
     pub config: super::RendererConfig,
+    /// Central resource cache for meshes, textures, materials, shaders, pipelines
+    /// and samplers.
+    ///
+    /// It lives on the context because the device alone is the wrong owner: every
+    /// one of those resources is keyed by name and is looked up per frame, so
+    /// they need a cache that outlives a single pass. Constructed here rather
+    /// than on demand so that a pass cannot create a second, private cache and
+    /// quietly duplicate every pipeline.
+    pub resources: ResourceManager,
+
     /// Depth texture for current frame
     pub depth_texture: Option<Texture>,
     /// Depth texture view
     pub depth_view: Option<TextureView>,
     /// Current render target (swapchain image)
     pub render_target: Option<TextureView>,
+    /// Incremented every time the swapchain is replaced. Bug №289.
+    ///
+    /// A pass caching a framebuffer for a swapchain image cannot tell, from the
+    /// image index and the extent alone, that the chain it was built from has been
+    /// destroyed — and destroying a `Swapchain` destroys its image views. So a
+    /// cache keyed on `(image index, extent)` looks valid after a resize that left
+    /// the extent unchanged, returns the dead framebuffer, and the driver reports
+    /// `VUID-VkRenderPassBeginInfo-framebuffer-parameter` naming an invalid
+    /// `VkImageView` — at the `beginRenderPass`, nowhere near the resize that
+    /// caused it.
+    ///
+    /// This counter is the missing half of the cache key. It is deliberately a
+    /// number rather than a chain handle: the render layer must not depend on the
+    /// backend type, and comparing "is this the same chain" across that boundary is
+    /// not possible without exactly that dependency.
+    pub swapchain_generation: u64,
     /// Format of the presentation surface, `None` when there is no surface.
     ///
     /// A pass needs this to build a framebuffer for a swapchain image, and it
@@ -66,6 +93,21 @@ pub struct RenderContext {
     pub presentation_images: Vec<u64>,
     /// Raw image-view handles, parallel to `presentation_images`.
     pub presentation_views: Vec<u64>,
+    /// Typed image views, parallel to `presentation_images`.
+    ///
+    /// Added because the raw handles above are not enough to build a framebuffer, and
+    /// the difference is not cosmetic: `Texture` and `TextureView` have no `as_raw`,
+    /// so from a `u64` there is no way back to a `Texture` — a `TextureView` cannot be
+    /// reconstructed, because it needs the texture it was made from. A pass holding
+    /// only handles can build something for a swapchain, where the backend happens to
+    /// keep `Vec<vk::ImageView>` directly, and cannot build anything for an ordinary
+    /// texture target. That asymmetry is why a pass that works against the window can
+    /// be impossible to verify offscreen.
+    ///
+    /// Both forms are kept deliberately. The raw handles predate this field and are
+    /// read in places that genuinely want a handle; replacing them would be a larger
+    /// change than the fix needs.
+    pub presentation_texture_views: Vec<TextureView>,
     /// Frame number (increments every frame)
     pub frame_number: u64,
     camera_position_value: Vec3,
@@ -107,12 +149,14 @@ impl RenderContext {
         settings: GraphicsSettings,
     ) -> Self {
         let resolution = Extent2D::new(1920, 1080);
+        let resources = ResourceManager::new(device.clone());
 
         Self {
             device,
             graphics_queue,
             present_queue,
             swapchain,
+            resources,
             frame_index: 0,
             swapchain_image_index: 0,
             delta_time: Duration::from_secs_f32(1.0 / 60.0),
@@ -120,13 +164,15 @@ impl RenderContext {
             resolution,
             settings,
             config,
-            depth_texture: None,
-            depth_view: None,
+        depth_texture: None,
+        depth_view: None,
             render_target: None,
+            swapchain_generation: 0,
             presentation_format: None,
             presentation_extent: resolution,
             presentation_images: Vec::new(),
             presentation_views: Vec::new(),
+            presentation_texture_views: Vec::new(),
             frame_number: 0,
             camera_position_value: Vec3::ZERO,
         }
@@ -159,6 +205,23 @@ impl RenderContext {
     /// №261, in a different place.
     fn create_depth_texture(&mut self) {
         let depth_format = Format::D32_SFLOAT;
+
+        // Bug №289: the previous depth texture is released here, not dropped.
+        // Assigning over `depth_texture`/`depth_view` used to look like cleanup and
+        // was not: dropping the Rust handle leaves the Vulkan image and its view in
+        // the teardown list, so every resolution change added a pair of objects
+        // that survived to the end of the process. Measured on `cube` with the
+        // resize self-check — the summary went from `image=2 image view=2` to
+        // `image=3 image view=3` after a single resize and kept climbing.
+        //
+        // View before image: the view is created from the image, so freeing the
+        // image first leaves the view pointing at freed memory.
+        if let Some(old) = self.depth_view.take() {
+            self.device.release_texture_view(&old);
+        }
+        if let Some(old) = self.depth_texture.take() {
+            self.device.release_texture(&old);
+        }
 
         let texture = self.device.create_texture(
             self.resolution.width,
@@ -247,6 +310,16 @@ impl RenderContext {
         self.presentation_extent = extent;
         self.presentation_images = images;
         self.presentation_views = views;
+    }
+
+    /// Set the typed views, parallel to the raw handles passed to
+    /// [`set_presentation`](Self::set_presentation).
+    ///
+    /// Separate rather than an extra parameter because the raw-handle call has three
+    /// existing callers that have no use for typed views, and changing its signature
+    /// would make a fix into a refactor.
+    pub fn set_presentation_texture_views(&mut self, views: Vec<TextureView>) {
+        self.presentation_texture_views = views;
     }
 
     /// The image and view of the image acquired for the current frame.

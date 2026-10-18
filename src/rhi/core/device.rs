@@ -2,7 +2,7 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
-use crate::backend::common::BackendResource;
+use crate::backend::common::{BackendResource, ReleaseKind};
 use crate::backend::vulkan::{Swapchain, SwapchainRequest, WindowSurface};
 use crate::command::pass::render::{
     Framebuffer, FramebufferAttachment, FramebufferDesc, RenderPass, RenderPassDesc,
@@ -103,6 +103,16 @@ pub struct DeviceDesc {
     pub validation: bool,
 }
 
+/// A backend object that can be destroyed ahead of teardown. Bug №294.
+///
+/// A thin enum so one batch can mix kinds without exposing raw handles to the
+/// render layer. See [`Device::release_many`].
+pub enum Releasable<'a> {
+    Texture(&'a Texture),
+    TextureView(&'a TextureView),
+    Framebuffer(&'a Framebuffer),
+}
+
 /// Logical device
 pub struct Device {
     physical_device: PhysicalDevice,
@@ -144,13 +154,53 @@ impl Device {
     }
 
     /// Create a graphics pipeline from a description.
-    pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> RhiResult<GraphicsPipeline> {
-        Ok(GraphicsPipeline::new(desc.clone()))
+    ///
+    /// Takes the render pass and the descriptor set layouts because the backend
+    /// genuinely cannot build a pipeline without them: the subpass index and the
+    /// attachment compatibility come from the pass, and the layout from the
+    /// layouts. Bug №314 — this method used to accept only `desc` and return
+    /// `Ok(GraphicsPipeline::new(desc.clone()))` unconditionally, never calling
+    /// the backend. The pipeline it produced had `backend: None`, could not be
+    /// drawn with, and reported success, which is the most convincing kind of
+    /// broken: a caller would bind it and draw nothing.
+    ///
+    /// There is no fallback here on purpose. A descriptor-only pipeline is
+    /// exactly the defect, so returning one again would reintroduce it with the
+    /// signature change as cover.
+    pub fn create_graphics_pipeline(
+        &self,
+        desc: &GraphicsPipelineDesc,
+        render_pass: &RenderPass,
+        set_layouts: &[&crate::descriptor::DescriptorSetLayout],
+    ) -> RhiResult<GraphicsPipeline> {
+        if let Some(backend) = &self.backend_resource {
+            return backend.create_graphics_pipeline(desc, render_pass, set_layouts);
+        }
+        Err(crate::error::RhiError::BackendError(
+            "active backend cannot create graphics pipelines".into(),
+        ))
     }
 
     /// Create a render pass from a description.
-    pub fn create_render_pass(&self, desc: &RenderPassDesc) -> RenderPass {
-        RenderPass::new(desc.clone())
+    ///
+    /// Bug №314, the same defect as `create_graphics_pipeline`: this returned
+    /// `RenderPass::new(desc)` without ever calling the backend, so the pass had
+    /// no native handle. It was worse there, because it did not even return a
+    /// `Result` — there was nowhere for a failure to be reported and nothing to
+    /// distinguish a real pass from a descriptor.
+    ///
+    /// Found while fixing №314 in the pipeline path: fixing pipelines alone
+    /// would have left every pipeline unable to reach a usable pass.
+    pub fn create_render_pass(
+        &self,
+        desc: &RenderPassDesc,
+    ) -> crate::error::RhiResult<RenderPass> {
+        if let Some(backend) = &self.backend_resource {
+            return backend.create_render_pass(desc);
+        }
+        Err(crate::error::RhiError::BackendError(
+            "active backend cannot create render passes".into(),
+        ))
     }
 
     /// Create a framebuffer from the given render pass and texture views.
@@ -468,8 +518,121 @@ impl Device {
         backend.submit_commands(commands)
     }
 
-    /// Tell the backend that the next submit is the one being presented.
+    /// Give back a presentation frame whose submit will not happen. Bug №282.
     ///
+    /// See [`BackendResource::cancel_presentation_frame`](crate::backend::BackendResource::cancel_presentation_frame).
+    pub fn cancel_presentation_frame(&self) {
+        if let Some(backend) = &self.backend_resource {
+            backend.cancel_presentation_frame();
+        }
+    }
+
+    /// Destroy a texture now instead of at device teardown.
+///
+/// Bug №289: objects go into a teardown list that is only walked at
+/// `vkDestroyDevice`. A texture replaced on every resize therefore stayed
+/// resident in VRAM for the whole session — one leak per resize step, which is
+/// not visible in any test and very visible in a long play session.
+///
+/// Waits for the device to be idle first, because Vulkan forbids destroying an
+/// object the GPU may still be reading. That is affordable here: callers release
+/// on resize, not per frame.
+pub fn release_texture(&self, texture: &crate::resource::Texture) {
+    let Some(backend) = &self.backend_resource else {
+        return;
+    };
+    backend.release_texture(texture);
+}
+
+/// Destroy a framebuffer now instead of at device teardown.
+///
+/// Same reasoning as [`release_texture`](Self::release_texture); see bug №289.
+pub fn release_framebuffer(&self, framebuffer: &crate::command::pass::render::Framebuffer) {
+    let Some(backend) = &self.backend_resource else {
+        return;
+    };
+    backend.release_framebuffer(framebuffer);
+}
+
+    /// Destroy a texture view now instead of at device teardown.
+    ///
+    /// Bug №289. Must be called before the texture the view was created from, or
+    /// the view is left referencing freed memory — which the driver does not report
+    /// at the mistake but later, at whatever command used it.
+    pub fn release_texture_view(&self, view: &crate::resource::TextureView) {
+        let Some(backend) = &self.backend_resource else {
+            return;
+        };
+        backend.release_texture_view(view);
+    }
+
+    /// How many backend objects are still alive and waiting for teardown.
+    ///
+    /// Bug №289. Zero means nothing is tracked, which is the honest answer for a
+    /// backend that keeps no list.
+    pub fn tracked_object_count(&self) -> usize {
+        match &self.backend_resource {
+            Some(backend) => backend.tracked_object_count(),
+            None => 0,
+        }
+    }
+
+    /// Wrap an image this device did not create, without taking ownership.
+    ///
+    /// Bug №298. For swapchain images and nothing else: they are owned by
+    /// `Swapchain`, which destroys them, and this handle is deliberately *not*
+    /// tracked, so nothing here will destroy it a second time. Adopting a handle that
+    /// this crate already tracks would produce exactly that.
+    ///
+    /// The reason it exists is asymmetry: `create_texture` returns a typed `Texture`
+    /// that any pass can build a framebuffer from, but swapchain images were
+    /// reachable only as raw `u64` handles, so a pass could target the window and
+    /// could not target an offscreen texture — which made the window path impossible
+    /// to verify by reading pixels back.
+    pub fn adopt_texture(&self, desc: crate::resource::TextureDesc, image_handle: u64) -> Texture {
+        crate::resource::Texture::adopt(desc, image_handle)
+    }
+
+    /// Which backend objects are still alive, broken down by kind. Bug №289.
+    pub fn tracked_object_summary(&self) -> String {
+        match &self.backend_resource {
+            Some(backend) => backend.tracked_object_summary(),
+            None => String::new(),
+        }
+    }
+
+    /// Destroy several tracked objects with a single device wait. Bug №294.
+    ///
+    /// Takes resource references rather than raw handles on purpose: `backend()` is
+    /// private to this crate, which is exactly why the single-object helpers exist
+    /// at all. Exposing handles would undo that, and the caller has no way to be
+    /// right about them.
+    ///
+    /// Order is the caller's responsibility and is not checked: the backend destroys
+    /// in the order given, and Vulkan requires dependents before dependencies. A
+    /// wrong order is a use-after-free, so it is left visible rather than silently
+    /// sorted.
+    pub fn release_many(&self, objects: &[Releasable<'_>]) {
+        let Some(backend) = &self.backend_resource else {
+            return;
+        };
+        let raw: Vec<(ReleaseKind, u64)> = objects
+            .iter()
+            .filter_map(|item| match item {
+                Releasable::Texture(texture) => {
+                    texture.backend().map(|gpu| (ReleaseKind::Image, gpu.handle))
+                }
+                Releasable::TextureView(view) => {
+                    view.backend().map(|gpu| (ReleaseKind::ImageView, gpu.handle))
+                }
+                Releasable::Framebuffer(framebuffer) => framebuffer
+                    .backend()
+                    .map(|gpu| (ReleaseKind::Framebuffer, gpu.handle)),
+            })
+            .collect();
+        backend.release_many(&raw);
+    }
+
     /// Bug №282: `vkQueuePresentKHR` has to wait on a semaphore that the frame's
     /// submit signals, and the submit happens deep inside the render graph, which
     /// has no idea whether its output reaches a swapchain. The renderer arms this

@@ -147,6 +147,44 @@ fn run() -> RhiResult<()> {
     );
 
     let start = std::time::Instant::now();
+
+    // Bug №289 self-check.
+    //
+    // Resizing used to drop the old depth texture and framebuffer from the pass
+    // cache and destroy neither, so every resize step added a pair of Vulkan
+    // objects that survived to the end of the process. Nothing in the windowed
+    // path could see it: the leak only surfaces in the validation layer's report at
+    // `vkDestroyDevice`, which gives a final number and says nothing about whether
+    // it grew while the program ran.
+    //
+    // `RFS_RESIZE_SELFCHECK=<n>` resizes the window `n` times, one per frame, and
+    // prints the live object count after each. The count must come back to its
+    // baseline; if it climbs, the same defect is back.
+    //
+    // Driven by an env var rather than being always on because it is a diagnostic,
+    // and a diagnostic that always runs is a diagnostic nobody reads.
+    let resize_steps: Option<usize> = std::env::var("RFS_RESIZE_SELFCHECK")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(steps) = resize_steps {
+        println!("[cube] resize self-check: {steps} steps");
+    }
+    const SELFCHECK_WARMUP_FRAMES: u32 = 5;
+    let mut frames_done: u32 = 0;
+    let mut resize_step: usize = 0;
+    let mut baseline_objects: Option<usize> = None;
+
+    // `RFS_FRAME_LIMIT=<n>` renders n frames and exits.
+    //
+    // Needed to compare an ordinary run against the resize self-check: without a
+    // way to stop, `cube` runs until the window is closed, and the only exit paths
+    // available are the ones that change what gets torn down. A leak count measured
+    // after an abrupt exit is not comparable with one measured after an orderly
+    // shutdown, and blaming the resize fix for that difference would be wrong.
+    let frame_limit: Option<u32> = std::env::var("RFS_FRAME_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+
     event_loop
         .run(move |event, control_flow| {
             control_flow.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -178,6 +216,18 @@ fn run() -> RhiResult<()> {
                     _ => {}
                 },
                 winit::event::Event::AboutToWait => {
+                    // Resize before drawing, so the frame being drawn is the one
+                    // that rebuilds the chain and therefore exercises the release
+                    // path in `GeometryPass::resolve_target`. The rebuild is lazy by
+                    // design, so resizing here still lands in this same frame.
+                    if let Some(steps) = resize_steps {
+                        if resize_step < steps && frames_done >= SELFCHECK_WARMUP_FRAMES {
+                            let w = 640 + (resize_step as u32) * 37;
+                            let h = 480 + (resize_step as u32) * 23;
+                            renderer.resize(w, h);
+                            resize_step += 1;
+                        }
+                    }
                     // A minimised window reports a zero-sized swapchain. Acquiring
                     // or presenting there is not a valid Vulkan operation, so the
                     // frame has to be skipped until the window is restored. The
@@ -219,8 +269,50 @@ fn run() -> RhiResult<()> {
                         );
                     }
                     }
-                }
-                _ => {}
+
+                    // `frames_done` is only advanced in the self-check path, so a
+                    // frame limit has to count independently of it.
+                    let frame_no = {
+                        let n = frames_done;
+                        frames_done = n + 1;
+                        n
+                    };
+                    if let Some(limit) = frame_limit {
+                        if frame_no >= limit {
+                            control_flow.exit();
+                        }
+                    }
+
+                    if let Some(steps) = resize_steps {
+                        // Sampled after the frame that used the new size, so the
+                        // replacement has already happened.
+                        let objects = renderer.device().tracked_object_count();
+                        match baseline_objects {
+                            None => {
+                                baseline_objects = Some(objects);
+                                println!(
+                                    "[cube] baseline tracked objects: {objects} [{}]",
+                                    renderer.device().tracked_object_summary()
+                                );
+                            }
+                            Some(baseline) => {
+                                let verdict = if objects == baseline { "ok" } else { "LEAK" };
+                                println!(
+                                    "[cube] resize step {}/{steps}: {objects} tracked objects \
+                                     (baseline {baseline}) -> {verdict} [{}]",
+                                    resize_step,
+                                    renderer.device().tracked_object_summary()
+                                );
+                            }
+                        }
+                        if resize_step >= steps && resize_step > 0 {
+                            let baseline = baseline_objects.unwrap_or(0);
+                            let objects = renderer.device().tracked_object_count();
+                            println!("[cube] resize self-check done: {objects} objects, baseline {baseline}");
+                            control_flow.exit();
+                        }
+                    }
+                }                _ => {}
             }
         })
         .map_err(|e| rhi::RhiError::BackendError(format!("event loop: {e}")))?;

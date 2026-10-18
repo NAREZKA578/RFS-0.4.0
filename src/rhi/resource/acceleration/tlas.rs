@@ -1,7 +1,6 @@
 //! Top-Level Acceleration Structure (TLAS)
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use super::blas::{AccelerationStructureFlags, Blas};
 

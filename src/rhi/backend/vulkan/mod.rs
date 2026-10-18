@@ -13,6 +13,7 @@ mod record;
 // surface needs the crate-internal `DestroyableInstance`. They are re-exported
 // so the render layer can *hold* a `Swapchain` and be handed an already-built
 // one by the backend, without being able to construct one behind its back.
+pub use instance::{validation_error_count, validation_layer_active};
 pub use present::{AcquiredImage, Swapchain, SwapchainRequest, WindowSurface};
 
 use crate::backend::Backend;

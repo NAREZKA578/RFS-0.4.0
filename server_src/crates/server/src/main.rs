@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rfs_core::entity::{
     BulkheadEntity, CompartmentEntity, EntityFlags, EntityId, HitMark, PlayerEntity, ProjectileEntity,
-    ShipEntity, StationEntity,
+    ShipEntity, StationEntity, StationType,
 };
 use rfs_core::math::{Bounds, Quatf, Transform, Vec3f};
 use rfs_core::packet::{
@@ -13,8 +13,9 @@ use rfs_damage::damage::DamageSystem;
 use rfs_net::*;
 use rfs_ship::loader::create_default_frigate;
 use rfs_ship::ship::{Ship, ShipConfig, ShipState};
-use rfs_ship::station::FireResult;
+use rfs_ship::station::{FireResult, Station};
 use rfs_sim::ballistics::ProjectileConfig;
+use rfs_sim::map::WorldMap;
 use rfs_sim::tick::{GameEvent as SimGameEvent, Projectile, TickSystem};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +28,220 @@ const SHIP_ID_STRIDE: u64 = 10_000;
 const SHIP_SPACING: f32 = 3000.0;
 const PLAYER_ID_BASE: u64 = 1_000_000;
 const PROJECTILE_ID_BASE: u64 = 5_000_000;
+/// Bug №604 (analysis 3.1.3): the repair amount arrives as an `f32` from the
+/// trusted-ish client. `f32::INFINITY` used to sail through `.max(0.0)` and
+/// `.min(max_health)`, turning one packet into a full repair. One answer for
+/// both paths: the command path and the input path clamp to the same ceiling.
+const MAX_REPAIR_PER_ACTION: f32 = 25.0;
+
+/// Name used in logs for a generated world, so a line in the log says which of
+/// the two paths produced it.
+const PROCEDURAL_MAP_NAME: &str = "open-sea";
+const PROCEDURAL_MAP_SEED: u64 = 1;
+/// **Zero.**
+///
+/// `TODO.md` part G, «Погода, мир, обнаружение»: the map is 50×50 km of open
+/// sea with no land. A world generator that emits nothing looked unfinished, so
+/// the default was filled with 256 drifting rocks - from a project with no rocks
+/// in it. Structures exist because the same section says hard obstacles cast a
+/// radar shadow, but the server has no reason to invent any.
+///
+/// A map that has them is a map file: `--map path.json`.
+const PROCEDURAL_MAP_OBSTACLES: usize = 0;
+/// Half-extent of a 50x50 km world — the size the architecture note names.
+const DOCUMENTED_MAP_HALF_EXTENT: f32 = 25_000.0;
+/// Room kept between the last spawn and the map face, so the boundary test in
+/// the tick has something to work with instead of clamping on frame one.
+const MAP_EDGE_MARGIN: f32 = 5_000.0;
+
+/// Reads the value that follows a flag: `--map foo.json` gives `Some("foo.json")`.
+///
+/// Returns `None` for a flag at the end of the line with no value, which is a
+/// typo rather than an absent flag, so the caller says so instead of quietly
+/// using a default.
+fn arg_value(args: &[String], flag: &str) -> Option<String> {
+    let index = args.iter().position(|a| a == flag)?;
+    args.get(index + 1).cloned()
+}
+
+/// How many ships a match runs with when `--ships` is not given.
+///
+/// Bug №609 (analysis 3.7.3/4.1): the default was 1. The declared scenario is
+/// 15-40 ships, so running the server with no arguments produced a match that
+/// the design never described, and the only way to reach the real one was to
+/// know a flag. A default that does not reproduce the documented scenario makes
+/// the documentation untested. The low end of the declared range is the honest
+/// choice: it is a number the plan names, and `--ships` still moves it.
+const DEFAULT_SHIP_COUNT: usize = 15;
+/// The declared ceiling; also the clamp, so an absurd `--ships 1000` is refused
+/// rather than silently generating a 3 000 km spawn line.
+const MAX_SHIP_COUNT: usize = 64;
+
+/// Counts ticks the interval skipped, which it does silently by design.
+///
+/// Bug №614 (analysis 3.6.4): `MissedTickBehavior::Skip` drops a tick whose
+/// deadline passed while the loop was busy, and says nothing. The only evidence
+/// was `loop avg` sitting above budget — which cannot separate "the iteration
+/// is slow" from "the iteration never happened". A server silently running at
+/// 23 Hz against a 30 Hz contract looks like a network problem to every client
+/// and like nothing at all in the log.
+///
+/// `Interval::tick()` hands back the *scheduled* deadline even when it is
+/// already late, so the expected count is the deadline's distance from the first
+/// one, and the skipped count is whatever the loop did not run. No wall-clock
+/// guessing: the answer comes from the same clock the scheduler uses.
+struct TickCadence {
+    origin: Option<tokio::time::Instant>,
+    ran: u64,
+    skipped: u64,
+}
+
+impl TickCadence {
+    fn new() -> Self {
+        Self {
+            origin: None,
+            ran: 0,
+            skipped: 0,
+        }
+    }
+
+    /// Records one completed iteration against the deadline that woke it.
+    fn observe(&mut self, deadline: tokio::time::Instant, period: Duration) {
+        let period_nanos = period.as_nanos();
+        if period_nanos == 0 {
+            // A zero period would divide by zero. The tick budget is a constant
+            // of the crate, but this is the answer to "how many did we skip",
+            // and a panic here would be reported as a tick-rate bug.
+            self.ran += 1;
+            return;
+        }
+        match self.origin {
+            // The first deadline is the origin, not a measurement.
+            None => self.origin = Some(deadline),
+            Some(origin) => {
+                self.ran += 1;
+                let expected =
+                    deadline.saturating_duration_since(origin).as_nanos() / period_nanos;
+                // Assigned, not accumulated. `expected` and `ran` are both
+                // absolute from the first deadline, so their difference is the
+                // total skipped so far; adding the difference on every tick
+                // would count the same shortfall once per tick it persists, and
+                // the number would climb for as long as the loop stayed behind.
+                if expected > self.ran as u128 {
+                    self.skipped = (expected - self.ran as u128) as u64;
+                }
+            }
+        }
+    }
+
+    fn ran(&self) -> u64 {
+        self.ran
+    }
+
+    fn skipped(&self) -> u64 {
+        self.skipped
+    }
+}
+
+/// Resolves the ship count from the command line, or the default.
+///
+/// Bug №609: `--ships` with no value, or with junk, silently fell back to 1 —
+/// the same number as "flag absent", so a typo looked exactly like the
+/// default. Both are reported instead, because a match that runs one ship when
+/// the operator asked for forty looks like the engine ignoring them.
+fn resolve_ship_count(args: &[String]) -> Result<usize> {
+    // The flag being present with nothing after it is a typo, not an absent
+    // flag: `arg_value` cannot tell the two apart on its own, and treating the
+    // typo as "use the default" is how a mistyped flag silently produces the
+    // default match.
+    if !args.iter().any(|a| a == "--ships") {
+        return Ok(DEFAULT_SHIP_COUNT);
+    }
+    let raw = arg_value(args, "--ships")
+        .with_context(|| "`--ships` was given with no value")?;
+    let parsed = raw
+        .parse::<usize>()
+        .with_context(|| format!("`--ships {raw}` is not a number"))?;
+    if parsed == 0 || parsed > MAX_SHIP_COUNT {
+        anyhow::bail!("`--ships {parsed}` is outside 1..={MAX_SHIP_COUNT}");
+    }
+    Ok(parsed)
+}
+
+/// Half-extent of a generated world, derived from the spawn line rather than
+/// fixed.
+///
+/// The spawn line is `ship_count * SHIP_SPACING` long, which reaches 189 km at
+/// the `--ships 64` limit. A constant radius would leave the last ships outside
+/// the world, where the tick's boundary clamp stacks them on the face — a bug
+/// that looks like a physics problem and is not one. Small matches get the
+/// documented 50x50 km instead, so the generated world matches the architecture
+/// note whenever the layout allows it.
+fn world_radius_for(ship_count: usize) -> f32 {
+    let needed = ship_count as f32 * SHIP_SPACING * 0.5 + MAP_EDGE_MARGIN;
+    needed.max(DOCUMENTED_MAP_HALF_EXTENT)
+}
+
+/// Loads the world the match runs in.
+///
+/// Two paths, and the log line at startup says which one produced the map:
+/// an authored file (`--map <path>`) or a generated one from `--map-seed`.
+/// There is no silent fallback. A match that runs in an empty universe because
+/// a path was wrong looks exactly like a match where nothing happens, and the
+/// first one costs an hour of looking at the wrong subsystem.
+fn load_world(args: &[String], ship_count: usize) -> Result<WorldMap> {
+    if let Some(path) = arg_value(args, "--map") {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read map file `{path}`"))?;
+        let name = std::path::Path::new(&path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let world = WorldMap::from_json(&name, &text)
+            .with_context(|| format!("map file `{path}` is not usable"))?;
+        info!(
+            "world: `{}` loaded from {}, obstacles={}, bounds={:?}..{:?}",
+            world.name,
+            path,
+            world.obstacles.len(),
+            world.bounds.min,
+            world.bounds.max
+        );
+        return Ok(world);
+    }
+
+    let seed = match arg_value(args, "--map-seed") {
+        Some(raw) => raw
+            .parse::<u64>()
+            .with_context(|| format!("`--map-seed {raw}` is not a number"))?,
+        None => PROCEDURAL_MAP_SEED,
+    };
+    let radius = world_radius_for(ship_count);
+    let world = WorldMap::procedural(PROCEDURAL_MAP_NAME, seed, radius, PROCEDURAL_MAP_OBSTACLES)
+        .context("generated world failed its own validation")?;
+    info!(
+        "world: `{}` generated, seed={}, obstacles={}, bounds={:?}..{:?}",
+        world.name,
+        seed,
+        world.obstacles.len(),
+        world.bounds.min,
+        world.bounds.max
+    );
+    Ok(world)
+}
+
+/// Whether a spawn point is inside a solid volume.
+///
+/// Reported, not repaired. Ships do not collide with map obstacles yet, so
+/// moving the spawn would hide the fact rather than fix anything; the useful
+/// output is the line saying the starting position is already inside a rock.
+fn spawn_is_blocked(world: &WorldMap, point: Vec3f) -> Option<u64> {
+    world
+        .obstacles
+        .iter()
+        .find(|obstacle| obstacle.bounds.contains(point))
+        .map(|obstacle| obstacle.id)
+}
 
 static NEXT_PROJECTILE_ID: AtomicU64 = AtomicU64::new(PROJECTILE_ID_BASE);
 
@@ -418,9 +633,27 @@ fn handle_station_interaction(
                 );
             }
         }
-        StationAction::SetAmmoType => {
-            ship.reload_station(interaction.station_id, interaction.value as u8);
-        }
+            StationAction::SetAmmoType => {
+                // Bug №192: the value arrived as an `f32` and went through a bare
+                // `as u8`. That cast saturates rather than rejecting, so `-3.0`
+                // and `NaN` both became ammo type 0 — a *valid* cannonball — and
+                // an out-of-range byte became 255, which the old `_ => Cannonball`
+                // catch-all silently fired anyway. So the range is checked on the
+                // float, before the cast, and it has to be a whole number: `5.5`
+                // is not a shell.
+                if !interaction.value.is_finite() || interaction.value.fract() != 0.0 {
+                    return Some(format!(
+                        "ammo type {:?} is not a whole number",
+                        interaction.value
+                    ));
+                }
+                let requested = interaction.value as i64;
+                if !(0..=255).contains(&requested) || !Station::is_valid_ammo_type(requested as u8)
+                {
+                    return Some(format!("unknown ammo type {requested}"));
+                }
+                ship.reload_station(interaction.station_id, requested as u8);
+            }
         // Bug №157: engineering controls were a dead `_ => {}` — a pump
         // station could never pump, damage control never repaired nor
         // extinguished, bulkheads could not be opened or sealed.
@@ -456,10 +689,26 @@ fn handle_station_interaction(
             }
         }
         StationAction::Repair => {
-            ship.repair_station(interaction.station_id, interaction.value.max(0.0));
+            // Bug №604 (analysis 3.1.3): `interaction.value.max(0.0)` let
+            // `f32::INFINITY` reach `.min(max_health)`, and one packet produced
+            // a full repair. Non-finite is refused (and reported, №196 style);
+            // finite values are clamped to the same per-action ceiling the
+            // command path uses.
+            if !interaction.value.is_finite() {
+                return Some(format!("repair amount {:?} is not finite", interaction.value));
+            }
+            ship.repair_station(
+                interaction.station_id,
+                interaction.value.clamp(0.0, MAX_REPAIR_PER_ACTION),
+            );
         }
         StationAction::ExtinguishFire => {
-            ship.extinguish_compartment(station_compartment());
+            // Bug №607: `extinguish_compartment` used to return `true` for any
+            // existing compartment, so this path acked nothing. It now reports
+            // the cold case, and this names it instead of swallowing it.
+            if !ship.extinguish_compartment(station_compartment()) {
+                return Some("nothing is burning there".into());
+            }
         }
     }
     None
@@ -530,6 +779,15 @@ fn handle_command(
                     });
                 }
             }
+            // Bug №607: broadcast the extinguish moment, matching how the
+            // occupancy commands above announce theirs. `FireStarted` is pushed
+            // from the tick (it is a collision outcome); the extinguish is a
+            // command, so it is announced here where the command succeeded.
+            ServerCommand::ExtinguishFire { compartment } => {
+                net.broadcast_event(CoreGameEvent::FireExtinguished {
+                    compartment: *compartment,
+                });
+            }
             _ => {}
         }
     }
@@ -550,6 +808,17 @@ fn translate_command(sim: &TickSystem, ship: &Ship, player_id: EntityId, command
     let stance = || {
         let helm = current_helm_occupant(ship);
         helm.is_none() || helm == Some(player_id)
+    };
+    // Bug №604 (analysis 3.1.2 + 3.1.4): the six engineering commands checked
+    // nothing — not occupancy, not the type of the station the player sat at,
+    // so the helmsman could seal bulkheads, run pumps and repair the ship. Each
+    // action now demands the authenticated player be the occupant of a station
+    // whose type can actually perform it.
+    let commands_engineering = |allowed: &[StationType]| {
+        ship.get_state()
+            .station_states
+            .values()
+            .any(|s| s.occupant == Some(player_id) && allowed.contains(&s.station_type))
     };
 
     match command {
@@ -609,6 +878,15 @@ fn translate_command(sim: &TickSystem, ship: &Ship, player_id: EntityId, command
         ServerCommand::ReloadWeapon { station, ammo_type } => {
             if !commands_station(station) {
                 (false, Some("station not occupied by you".into()))
+            } else if !Station::is_valid_ammo_type(*ammo_type) {
+                // Bug №192: an unknown ammo type used to be accepted and then
+                // fired as a cannonball by the mapping's catch-all. Reporting it
+                // here is the point: an ack that says "ok" for a request that
+                // loaded nothing is how this stayed invisible.
+                (
+                    false,
+                    Some(format!("unknown ammo type {ammo_type}")),
+                )
             } else {
                 ship.reload_station(*station, *ammo_type);
                 (true, None)
@@ -618,43 +896,61 @@ fn translate_command(sim: &TickSystem, ship: &Ship, player_id: EntityId, command
         // `_ => "command not implemented"` — flooding could not be repaired,
         // fires not extinguished, bulkheads not sealed/open, pumps not run.
         ServerCommand::SealBulkhead { bulkhead } => {
-            if ship.set_bulkhead_seal(*bulkhead, true) {
+            if !commands_engineering(&[StationType::DamageControl]) {
+                (false, Some("not at a damage-control station".into()))
+            } else if ship.set_bulkhead_seal(*bulkhead, true) {
                 (true, None)
             } else {
                 (false, Some("bulkhead not found".into()))
             }
         }
         ServerCommand::OpenBulkhead { bulkhead } => {
-            if ship.set_bulkhead_seal(*bulkhead, false) {
+            if !commands_engineering(&[StationType::DamageControl]) {
+                (false, Some("not at a damage-control station".into()))
+            } else if ship.set_bulkhead_seal(*bulkhead, false) {
                 (true, None)
             } else {
                 (false, Some("bulkhead not found".into()))
             }
         }
         ServerCommand::ActivatePump { pump } => {
-            if ship.set_station_pump(*pump, true) {
+            if !commands_engineering(&[StationType::Pump]) {
+                (false, Some("not at a pump station".into()))
+            } else if ship.set_station_pump(*pump, true) {
                 (true, None)
             } else {
                 (false, Some("pump not found".into()))
             }
         }
         ServerCommand::DeactivatePump { pump } => {
-            if ship.set_station_pump(*pump, false) {
+            if !commands_engineering(&[StationType::Pump]) {
+                (false, Some("not at a pump station".into()))
+            } else if ship.set_station_pump(*pump, false) {
                 (true, None)
             } else {
                 (false, Some("pump not found".into()))
             }
         }
         ServerCommand::RepairStation { station } => {
-            if ship.repair_station(*station, 25.0) {
+            if !commands_engineering(&[StationType::DamageControl]) {
+                (false, Some("not at a damage-control station".into()))
+            } else if ship.repair_station(*station, MAX_REPAIR_PER_ACTION) {
                 (true, None)
             } else {
                 (false, Some("station not found".into()))
             }
         }
         ServerCommand::ExtinguishFire { compartment } => {
-            if ship.extinguish_compartment(*compartment) {
+            if !commands_engineering(&[StationType::DamageControl]) {
+                (false, Some("not at a damage-control station".into()))
+            } else if ship.extinguish_compartment(*compartment) {
                 (true, None)
+            } else if ship.get_state().compartment_states.contains_key(compartment) {
+                // Bug №607: the compartment exists but was not on fire, so the
+                // old "compartment not found" reason was both wrong and hid the
+                // fact that nothing happened. `extinguish_compartment` now
+                // reports the cold case as a failure; name it.
+                (false, Some("nothing is burning there".into()))
             } else {
                 (false, Some("compartment not found".into()))
             }
@@ -725,6 +1021,16 @@ fn core_game_event(event: &SimGameEvent) -> CoreGameEvent {
             station: *station,
             player: *player,
         },
+        SimGameEvent::FireStarted {
+            compartment,
+            intensity,
+        } => CoreGameEvent::FireStarted {
+            compartment: *compartment,
+            intensity: *intensity,
+        },
+        SimGameEvent::FireExtinguished { compartment } => CoreGameEvent::FireExtinguished {
+            compartment: *compartment,
+        },
     }
 }
 
@@ -738,18 +1044,20 @@ async fn main() -> Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    let ship_count = args
-        .iter()
-        .position(|a| a == "--ships")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, 64);
+    // Bug №609: the default was 1, so the declared 15-40 ship scenario was
+    // unreachable without knowing the flag, and a typo in the flag silently
+    // produced the same one-ship match as no flag at all. Both are reported now.
+    let ship_count = resolve_ship_count(&args)?;
 
     let config = ServerConfig::default();
     let net = Arc::new(NetServer::new(config).await?);
     let mut events = net.get_event_receiver().expect("server event receiver");
     let interest = net.interest_manager();
+
+    // The world is loaded before anything is placed in it, so every ship spawn
+    // can be checked against it and nothing runs in an empty universe by
+    // accident.
+    let world = load_world(&args, ship_count)?;
 
     struct ShipEntry {
         id: EntityId,
@@ -757,6 +1065,7 @@ async fn main() -> Result<()> {
     }
 
     let mut sim = TickSystem::new();
+    sim.set_world(world.clone()).context("map validation failed")?;
     let mut ships: Vec<ShipEntry> = Vec::with_capacity(ship_count);
     // Plan §19.1: several ships so bots spread across crews instead of one point.
     for i in 0..ship_count {
@@ -765,11 +1074,25 @@ async fn main() -> Result<()> {
         let ship_config: ShipConfig = class.into();
         let ship = Ship::new(ship_config, ship_id, Arc::new(DamageSystem::new()));
         let mut initial_state = ship.get_state();
-        initial_state.transform = Transform::new(
-            Vec3f::new(i as f32 * SHIP_SPACING, 0.0, 0.0),
-            Quatf::IDENTITY,
-            Vec3f::ONE,
-        );
+        let wanted = Vec3f::new(i as f32 * SHIP_SPACING, 0.0, 0.0);
+        // Clamped, not trusted: the spawn line is generated, and a map smaller
+        // than the line would leave the tail ships outside the world. `moved`
+        // says whether that happened instead of letting the tick's boundary
+        // clamp hide it a few frames later.
+        let (spawn, moved) = world.clamp_point(wanted);
+        if moved {
+            warn!(
+                "ship {:?} wanted to spawn at {:?}, outside the world; clamped to {:?}",
+                ship_id, wanted, spawn
+            );
+        }
+        if let Some(blocking) = spawn_is_blocked(&world, spawn) {
+            warn!(
+                "ship {:?} spawns inside obstacle {} at {:?}",
+                ship_id, blocking, spawn
+            );
+        }
+        initial_state.transform = Transform::new(spawn, Quatf::IDENTITY, Vec3f::ONE);
         ship.apply_state(initial_state);
 
         let tracked = TrackedShip::capture(&ship);
@@ -798,6 +1121,23 @@ async fn main() -> Result<()> {
     let mut tick_interval = tokio::time::interval(Duration::from_millis(TICK_DURATION_MS));
     tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Bug №610 (analysis 3.6.4, plan step 6): the loop below had no exit at
+    // all, so Ctrl-C killed the process outright — `NetServer::stop()` existed,
+    // disconnected every client with `ServerShutdown`, and was called from
+    // tests only. In production that path was dead: a stopping server dropped
+    // its UDP socket without a word, so every client saw a transport error
+    // rather than a shutdown, and nothing logged that the match ended. The
+    // signal is awaited once and reused, not re-registered every tick.
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    // Bug №614: `MissedTickBehavior::Skip` drops a late deadline silently, so
+    // the loop now asks `TickCadence` how many it ran against how many were due
+    // and reports the difference instead of leaving it to be inferred from a
+    // `loop avg` that cannot tell "slow" from "never happened".
+    let mut cadence = TickCadence::new();
+    let tick_period = Duration::from_millis(TICK_DURATION_MS);
+
     let mut players: HashMap<u32, PlayerMeta> = HashMap::new();
     let mut projectile_ids: HashSet<EntityId> = HashSet::new();
     // Plan §19.1: measure tick cost as bots scale up.
@@ -825,9 +1165,28 @@ async fn main() -> Result<()> {
     // two can be compared instead of assumed equal.
     let mut last_rounds = 0u64;
     let mut last_packets = 0u64;
+    // Bug №614: the skipped total is monotonic, so the per-report figure is the
+    // difference against the last one. Same shape as the round/packet counters
+    // above, which is why it reads the same way in the log.
+    let mut last_skipped = 0u64;
 
     loop {
-        tick_interval.tick().await;
+        // Bug №610: the shutdown signal is raced against the tick instead of
+        // being awaited after it. Awaiting the tick first would mean a Ctrl-C
+        // still waits out a whole 33 ms iteration before anything happens, and
+        // on a busy tick — the case where stopping matters most — that is the
+        // iteration that is already over budget.
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("shutdown signal received; stopping the match");
+                break;
+            }
+            deadline = tick_interval.tick() => {
+                // Bug №614: the deadline is the interval's own, not `now()` — it
+                // is the value that reveals the skips.
+                cadence.observe(deadline, tick_period);
+            }
+        }
         // Bug №265: the `perf:` line below starts its timer at `sim.tick()`,
         // which is AFTER the event drain and input handling above. So it timed
         // "sim+sync" at 0.7 ms while the loop only reached 23 Hz against a
@@ -978,6 +1337,23 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Bug №605: `remove_entity_from_interest` existed but had zero callers,
+        // so a ship the sim had already dropped (sunk, removed) stayed in the
+        // interest grids — and therefore in every player's visible set —
+        // forever and was replicated every tick as a ghost. Take the hull and
+        // its compartments and stations out as soon as the simulation no
+        // longer knows the ship. Players on it were already respawned/dropped
+        // just above, so this pass only clears the wreckage.
+        for entry in &ships {
+            if sim.get_ship(entry.id).is_some() {
+                continue;
+            }
+            let compartments: Vec<EntityId> =
+                entry.tracked.compartments.keys().copied().collect();
+            let stations: Vec<EntityId> = entry.tracked.stations.keys().copied().collect();
+            net.remove_entity_from_interest(entry.id, &compartments, &stations);
+        }
+
         let mut next_ids: HashSet<EntityId> = HashSet::new();
         for projectile in sim.get_active_projectiles() {
             let entity = ProjectileEntity {
@@ -1071,8 +1447,15 @@ async fn main() -> Result<()> {
             let sent_by_layer = net.sent_deltas_by_layer();
             let rounds_delta = rounds.saturating_sub(std::mem::replace(&mut last_rounds, rounds));
             let packets_delta = packets.saturating_sub(std::mem::replace(&mut last_packets, packets));
+            // Bug №614: the skipped count is reported next to the average, not
+            // instead of it. `loop avg` over budget says the iteration was slow;
+            // it cannot say whether the missing ticks were slow or skipped, and
+            // those two have different fixes.
+            let ran_this_report = cadence.ran();
+            let skipped_this_report = cadence.skipped().saturating_sub(last_skipped);
+            last_skipped = cadence.skipped();
             info!(
-                "perf: tick={} sim+sync avg={:.2}ms max={:.2}ms | phases events={event_drain_ms:.2}ms sim={sim_ms:.2}ms entity_sync={entity_sync_ms:.2}ms interest={interest_ms:.2}ms broadcast={broadcast_ms:.2}ms | loop avg={loop_avg_ms:.2}ms max={:.2}ms budget={:.2}ms | publish rounds={rounds_delta} packets={packets_delta} rounds_per_tick={:.2} packets_per_round={:.2} sent_deltas_by_layer={sent_by_layer:?} ships={} players={} entities={{ships:{},players:{},stations:{},compartments:{},projectiles:{}}}",
+                "perf: tick={} sim+sync avg={:.2}ms max={:.2}ms | phases events={event_drain_ms:.2}ms sim={sim_ms:.2}ms entity_sync={entity_sync_ms:.2}ms interest={interest_ms:.2}ms broadcast={broadcast_ms:.2}ms | loop avg={loop_avg_ms:.2}ms max={:.2}ms budget={:.2}ms | ticks ran={ran_this_report} skipped={skipped_this_report} | publish rounds={rounds_delta} packets={packets_delta} rounds_per_tick={:.2} packets_per_round={:.2} sent_deltas_by_layer={sent_by_layer:?} ships={} players={} entities={{ships:{},players:{},stations:{},compartments:{},projectiles:{}}}",
                 result.tick.0,
                 avg_ms,
                 tick_time_max.as_secs_f64() * 1000.0,
@@ -1088,6 +1471,27 @@ async fn main() -> Result<()> {
                 stats.compartments,
                 stats.projectiles,
             );
+            if skipped_this_report > 0 {
+                // Bug №614: `MissedTickBehavior::Skip` drops these by
+                // definition. Until now the only trace was an average over
+                // budget, which reads the same whether the loop was slow or the
+                // ticks were never run — and a server quietly at 23 Hz against a
+                // 30 Hz contract looks like a network fault from every client.
+                warn!(
+                    "perf: {skipped_this_report} tick(s) skipped in {} ticks — the loop is not \
+                     keeping up with its own budget, and clients cannot observe ticks that \
+                     were never published",
+                    ran_this_report,
+                );
+            }
+            // A shell that hit a rock leaves no trace anywhere else: obstacle
+            // health is not modelled, and the projectile is gone from the entity
+            // list by the time this line runs. Without a running count, a map
+            // full of asteroids swallows every shot aimed at one and the log looks
+            // identical to a world where nothing was ever fired.
+            if sim.obstacle_hits() > 0 {
+                info!("map: {} projectile(s) spent on obstacles", sim.obstacle_hits());
+            }
             if (rounds_delta as f64 / tick_time_count.max(1) as f64) < 0.95 {
                 // A client cannot learn about a tick the server never published,
                 // so this is the server-side half of an observed-tick shortfall
@@ -1148,5 +1552,440 @@ async fn main() -> Result<()> {
             event_drain_time_sum = Duration::ZERO;
             tick_time_count = 0;
         }
+    }
+
+    // Bug №610: `stop()` was only ever called from tests, so the one line that
+    // disconnects clients with a `ServerShutdown` reason and closes the socket
+    // cleanly never ran in a real server. Falling off the end of `main` without
+    // it means every client sees a transport error instead of a shutdown, and
+    // the match's end leaves no trace in the log. The graceful variant also
+    // gives the outbox a window to actually deliver the farewells.
+    net.stop_gracefully().await;
+    info!("match stopped after {} ships", ships.len());
+    Ok(())
+}
+
+#[cfg(test)]
+mod engineering_command_tests {
+    use super::*;
+
+    fn ship() -> Ship {
+        let ship_config: ShipConfig = create_default_frigate().into();
+        Ship::new(ship_config, EntityId::new(SHIP_ID), Arc::new(DamageSystem::new()))
+    }
+
+    fn station_of(ship: &Ship, kind: StationType) -> EntityId {
+        ship.get_state()
+            .station_states
+            .iter()
+            .find(|(_, s)| s.station_type == kind)
+            .map(|(id, _)| *id)
+            .expect("the default frigate has one of each station type")
+    }
+
+    fn some_bulkhead(ship: &Ship) -> EntityId {
+        ship.get_state()
+            .compartment_states
+            .values()
+            .flat_map(|c| c.bulkhead_states.iter())
+            .map(|b| b.entity_id)
+            .next()
+            .expect("the default frigate has bulkheads")
+    }
+
+    /// Sits the fixture player at a seat of `kind`, then runs the command
+    /// exactly the way `handle_command` does. The player is vacated first
+    /// because the ship keeps the one-player-one-station invariant.
+    fn seated_command(
+        ship: &Ship,
+        kind: StationType,
+        command: &ServerCommand,
+    ) -> (bool, Option<String>) {
+        let sim = TickSystem::new();
+        let player = EntityId::new(42);
+        for (id, s) in ship.get_state().station_states {
+            if s.occupant == Some(player) {
+                ship.vacate_station(id);
+            }
+        }
+        let station = station_of(ship, kind);
+        assert!(ship.occupy_station(station, player), "fixture could not sit at {kind:?}");
+        translate_command(&sim, ship, player, command)
+    }
+
+    /// Bug №604 (3.1.2): the six engineering commands checked nothing, so a
+    /// player seated at no station at all could seal bulkheads.
+    #[test]
+    fn a_player_at_no_station_cannot_seal_a_bulkhead() {
+        let ship = ship();
+        let sim = TickSystem::new();
+        let bulkhead = some_bulkhead(&ship);
+        let (ok, reason) = translate_command(
+            &sim,
+            &ship,
+            EntityId::new(42),
+            &ServerCommand::SealBulkhead { bulkhead },
+        );
+        assert!(!ok, "an unseated player sealed a bulkhead");
+        assert_eq!(reason.as_deref(), Some("not at a damage-control station"));
+    }
+
+    /// Bug №604 (3.1.4): occupancy alone was never the point — the type of the
+    /// seat has to matter, or the helmsman runs the whole damage-control
+    /// routine.
+    #[test]
+    fn the_helmsman_cannot_seal_a_bulkhead() {
+        let ship = ship();
+        let bulkhead = some_bulkhead(&ship);
+        let (ok, reason) =
+            seated_command(&ship, StationType::Helm, &ServerCommand::SealBulkhead { bulkhead });
+        assert!(!ok, "the helmsman sealed a bulkhead");
+        assert_eq!(reason.as_deref(), Some("not at a damage-control station"));
+    }
+
+    /// The fix must not cost the feature: the seat built for the job still
+    /// works on every one of its commands.
+    #[test]
+    fn damage_control_still_seals_repairs_and_extinguishes() {
+        let ship = ship();
+        let bulkhead = some_bulkhead(&ship);
+        let gun = station_of(&ship, StationType::Gun);
+        let compartment = *ship
+            .get_state()
+            .compartment_states
+            .keys()
+            .next()
+            .expect("the default frigate has compartments");
+
+        // Bug №607: extinguishing only succeeds if something was burning, so
+        // the fixture lights the compartment first. This case used to pass on a
+        // cold compartment — that was the defect, not the feature.
+        assert!(
+            ship.ignite_compartment(compartment, 0.5),
+            "the fixture could not light the compartment"
+        );
+
+        let cases = [
+            ("seal", ServerCommand::SealBulkhead { bulkhead }),
+            ("open", ServerCommand::OpenBulkhead { bulkhead }),
+            ("repair", ServerCommand::RepairStation { station: gun }),
+            ("extinguish", ServerCommand::ExtinguishFire { compartment }),
+        ];
+        for (label, command) in cases {
+            let (ok, reason) = seated_command(&ship, StationType::DamageControl, &command);
+            assert!(ok, "damage control lost {label}: {reason:?}");
+        }
+    }
+
+    /// A pump runs only from a pump seat, not from any other engineering seat.
+    #[test]
+    fn only_a_pump_station_runs_a_pump() {
+        let ship = ship();
+        let pump = station_of(&ship, StationType::Pump);
+
+        let (ok, reason) =
+            seated_command(&ship, StationType::Pump, &ServerCommand::ActivatePump { pump });
+        assert!(ok, "the pump seat lost its own pump: {reason:?}");
+
+        let (ok, reason) = seated_command(
+            &ship,
+            StationType::DamageControl,
+            &ServerCommand::ActivatePump { pump },
+        );
+        assert!(!ok, "damage control ran a pump");
+        assert_eq!(reason.as_deref(), Some("not at a pump station"));
+    }
+
+    /// A seat at 10 / max_health health, so any repair — honest or infinite —
+    /// is visible as a number that moved.
+    fn damaged_ship() -> (Ship, EntityId) {
+        let ship = ship();
+        let station = station_of(&ship, StationType::DamageControl);
+        let mut state = ship.get_state();
+        state.station_states.get_mut(&station).expect("seat exists").health = 10.0;
+        ship.apply_state(state);
+        (ship, station)
+    }
+
+    /// Bug №604 (3.1.3): `f32::INFINITY` arrived as `interaction.value`, sailed
+    /// through `.max(0.0)`, and `.min(max_health)` handed out a full repair for
+    /// one packet. The refusal shows up twice: as the returned reason, and as
+    /// health that did not move.
+    #[test]
+    fn an_infinite_repair_amount_is_refused_and_fills_nothing() {
+        let (ship, station) = damaged_ship();
+        let sim = TickSystem::new();
+        let player = EntityId::new(42);
+        assert!(ship.occupy_station(station, player));
+
+        let reason = handle_station_interaction(
+            &sim,
+            &ship,
+            player,
+            &StationInteraction {
+                station_id: station,
+                action: StationAction::Repair,
+                value: f32::INFINITY,
+            },
+        );
+
+        assert_eq!(
+            reason.as_deref(),
+            Some("repair amount inf is not finite"),
+            "the infinite repair was not refused"
+        );
+        assert_eq!(
+            ship.get_state().station_states[&station].health,
+            10.0,
+            "the infinite repair still moved health"
+        );
+    }
+
+    /// A finite-but-absurd value is clamped to the one ceiling both paths use.
+    #[test]
+    fn a_huge_finite_repair_amount_is_clamped_to_the_ceiling() {
+        let (ship, station) = damaged_ship();
+        let sim = TickSystem::new();
+        let player = EntityId::new(42);
+        assert!(ship.occupy_station(station, player));
+
+        let reason = handle_station_interaction(
+            &sim,
+            &ship,
+            player,
+            &StationInteraction {
+                station_id: station,
+                action: StationAction::Repair,
+                value: 1.0e9,
+            },
+        );
+
+        assert_eq!(reason, None, "a finite repair was refused");
+        assert_eq!(
+            ship.get_state().station_states[&station].health,
+            10.0 + MAX_REPAIR_PER_ACTION,
+            "the value was not clamped to MAX_REPAIR_PER_ACTION"
+        );
+    }
+
+    fn some_compartment(ship: &Ship) -> EntityId {
+        *ship
+            .get_state()
+            .compartment_states
+            .keys()
+            .next()
+            .expect("the default frigate has compartments")
+    }
+
+    /// Bug №607: `extinguish_compartment` returned `true` for any existing
+    /// compartment, so a damage-control seat acked a successful extinguishing
+    /// on a compartment that was not on fire. The command path now names the
+    /// cold case instead of claiming success.
+    #[test]
+    fn an_extinguish_on_a_cold_compartment_is_refused() {
+        let ship = ship();
+        let compartment = some_compartment(&ship);
+
+        let (ok, reason) = seated_command(
+            &ship,
+            StationType::DamageControl,
+            &ServerCommand::ExtinguishFire { compartment },
+        );
+        assert!(!ok, "a cold compartment was acked as extinguished");
+        assert_eq!(reason.as_deref(), Some("nothing is burning there"));
+    }
+
+    /// The other half of the same test: a real fire must still go out. Without
+    /// this, refusing everything would also be green.
+    #[test]
+    fn extinguishing_puts_out_a_burning_compartment() {
+        let ship = ship();
+        let compartment = some_compartment(&ship);
+        assert!(
+            ship.ignite_compartment(compartment, 0.5),
+            "the fixture could not light the compartment"
+        );
+
+        let (ok, reason) = seated_command(
+            &ship,
+            StationType::DamageControl,
+            &ServerCommand::ExtinguishFire { compartment },
+        );
+        assert!(ok, "damage control could not put out a fire: {reason:?}");
+        assert_eq!(
+            ship.get_state().compartment_states[&compartment].fire_intensity,
+            0.0,
+            "the fire was acked but not put out"
+        );
+    }
+
+    /// The continuous input path carries the same truth, not the old silent
+    /// success.
+    #[test]
+    fn the_input_path_also_refuses_a_cold_extinguish() {
+        let ship = ship();
+        let sim = TickSystem::new();
+        let player = EntityId::new(42);
+        let station = station_of(&ship, StationType::DamageControl);
+        assert!(ship.occupy_station(station, player));
+
+        let reason = handle_station_interaction(
+            &sim,
+            &ship,
+            player,
+            &StationInteraction {
+                station_id: station,
+                action: StationAction::ExtinguishFire,
+                value: 0.0,
+            },
+        );
+
+        assert_eq!(reason.as_deref(), Some("nothing is burning there"));
+    }
+}
+
+/// Bug №614 (analysis 3.6.4): the skipped-tick arithmetic, separated from the
+/// loop so it can be driven with deadlines no test can actually wait for.
+#[cfg(test)]
+mod tick_cadence_tests {
+    use super::*;
+
+    const PERIOD: Duration = Duration::from_millis(TICK_DURATION_MS);
+
+    /// The headline case: a loop that keeps up skips nothing, and the counter
+    /// saying otherwise would send someone hunting a bug that is not there.
+    #[test]
+    fn a_loop_that_keeps_up_skips_nothing() {
+        let mut cadence = TickCadence::new();
+        let start = tokio::time::Instant::now();
+        for i in 0..30u32 {
+            cadence.observe(start + PERIOD * i, PERIOD);
+        }
+        assert_eq!(cadence.ran(), 29, "the origin deadline is not a run");
+        assert_eq!(
+            cadence.skipped(),
+            0,
+            "a perfectly paced loop reported {} skipped ticks",
+            cadence.skipped()
+        );
+    }
+
+    /// The defect itself: one wake-up that arrives three periods late has
+    /// swallowed two ticks, and the old code reported nothing at all.
+    #[test]
+    fn a_late_iteration_reports_the_ticks_it_swallowed() {
+        let mut cadence = TickCadence::new();
+        let start = tokio::time::Instant::now();
+        cadence.observe(start, PERIOD);
+        // One iteration, but the deadline is three periods on: two were skipped.
+        cadence.observe(start + PERIOD * 3, PERIOD);
+        assert_eq!(cadence.ran(), 1);
+        assert_eq!(cadence.skipped(), 2, "the swallowed ticks were not counted");
+    }
+
+    /// Recovery must not manufacture skips or erase real ones: the counter is
+    /// absolute against the first deadline, so returning to pace only adds
+    /// future catches up, never rewrites history.
+    #[test]
+    fn recovering_does_not_rewrite_what_was_already_skipped() {
+        let mut cadence = TickCadence::new();
+        let start = tokio::time::Instant::now();
+        cadence.observe(start, PERIOD);
+        cadence.observe(start + PERIOD * 4, PERIOD);
+        assert_eq!(cadence.skipped(), 3);
+        // Back on pace for the next two deadlines.
+        cadence.observe(start + PERIOD * 5, PERIOD);
+        cadence.observe(start + PERIOD * 6, PERIOD);
+        assert_eq!(
+            cadence.skipped(),
+            3,
+            "the tally changed while the loop was back on schedule"
+        );
+        assert_eq!(cadence.ran(), 3);
+    }
+
+    /// A zero period must not divide by zero: this number exists to explain a
+    /// tick-rate problem, and panicking inside it would be reported as one.
+    #[test]
+    fn a_zero_period_does_not_panic() {
+        let mut cadence = TickCadence::new();
+        let start = tokio::time::Instant::now();
+        cadence.observe(start, Duration::ZERO);
+        cadence.observe(start + Duration::from_millis(100), Duration::ZERO);
+        assert_eq!(cadence.skipped(), 0);
+    }
+}
+
+/// Bug №609 (analysis 3.7.3/4.1, plan step 3): the ship count used to be
+/// `…unwrap_or(1)`, so the default match was one ship while the declared
+/// scenario is 15-40. These pin both halves of the decision: the default has to
+/// be a number the plan names, and a malformed flag must not be indistinguishable
+/// from an absent one — the old code turned `--ships banana` into the same match
+/// as no flag at all.
+#[cfg(test)]
+mod ship_count_args {
+    use super::{
+        resolve_ship_count, world_radius_for, DEFAULT_SHIP_COUNT, MAX_SHIP_COUNT, SHIP_SPACING,
+    };
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        std::iter::once("server".to_string())
+            .chain(parts.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn no_flag_gives_a_count_the_plan_declares() {
+        let count = resolve_ship_count(&args(&[])).expect("the default is a number");
+        assert_eq!(count, DEFAULT_SHIP_COUNT);
+        assert!(
+            (15..=40).contains(&count),
+            "the default {count} is outside the declared 15-40 range, so the \
+             documented scenario is still not what a bare run produces"
+        );
+    }
+
+    #[test]
+    fn an_explicit_count_is_honoured() {
+        assert_eq!(
+            resolve_ship_count(&args(&["--ships", "40"])).expect("40 is valid"),
+            40
+        );
+        assert_eq!(
+            resolve_ship_count(&args(&["--ships", "1"])).expect("1 is valid"),
+            1,
+            "asking for one ship must still be possible"
+        );
+    }
+
+    /// The flag is a claim about the match. Silently running a different match
+    /// than the one that was asked for is the defect, so every unusable value is
+    /// refused loudly.
+    #[test]
+    fn an_unusable_count_is_refused_instead_of_defaulted() {
+        for bad in [
+            args(&["--ships"]),
+            args(&["--ships", "banana"]),
+            args(&["--ships", "-3"]),
+            args(&["--ships", "0"]),
+            args(&["--ships", "1000"]),
+        ] {
+            assert!(
+                resolve_ship_count(&bad).is_err(),
+                "{bad:?} was accepted as a ship count"
+            );
+        }
+    }
+
+    /// The world is sized from the count, so a count the plan does not allow
+    /// must not be able to generate a 3 000 km spawn line. This ties the two
+    /// decisions together instead of trusting the clamp to still hold later.
+    #[test]
+    fn the_world_is_big_enough_for_the_accepted_range() {
+        let radius = world_radius_for(MAX_SHIP_COUNT);
+        assert!(
+            radius >= MAX_SHIP_COUNT as f32 * SHIP_SPACING * 0.5,
+            "at the ceiling the spawn line runs past the map face: {radius} m"
+        );
     }
 }

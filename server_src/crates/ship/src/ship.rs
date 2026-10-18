@@ -551,7 +551,7 @@ impl Ship {
         self.state.write().rudder_angle = angle.clamp(-turn_limit, turn_limit);
     }
 
-    pub fn apply_damage(&self, damage: f32, position: Vec3f) {
+    pub fn apply_damage(&self, damage: f32, position: Vec3f) -> Vec<(EntityId, f32)> {
         let local_pos = {
             let state = self.state.read();
             state.transform.inverse().transform_point(position)
@@ -562,19 +562,23 @@ impl Ship {
         // made a ship flood. The graph now returns every compartment that just
         // breached; mirror it into the real state so Compartment::update starts
         // the water intake.
-        let breached = self.damage_system.apply_damage_to_ship(self, local_pos, damage);
-        if breached.is_empty() {
-            return;
-        }
-        let mut state = self.state.write();
-        for comp_id in breached {
-            if let (Some(compartment), Some(cs)) = (
-                self.compartments.get(&comp_id),
-                state.compartment_states.get_mut(&comp_id),
-            ) {
-                compartment.breach(cs);
+        let report = self.damage_system.apply_damage_to_ship(self, local_pos, damage);
+        if !report.breached.is_empty() {
+            let mut state = self.state.write();
+            for comp_id in &report.breached {
+                if let (Some(compartment), Some(cs)) = (
+                    self.compartments.get(comp_id),
+                    state.compartment_states.get_mut(comp_id),
+                ) {
+                    compartment.breach(cs);
+                }
             }
         }
+        // Bug №607: hand back every compartment the blast reached, so an
+        // explosive hit can light the one it struck. The impact point alone
+        // names no compartment — the hull collision box a shell stops on is far
+        // larger than any compartment inside it.
+        report.inflicted
     }
 
     pub fn get_compartment(&self, comp_id: EntityId) -> Option<&Compartment> {
@@ -644,13 +648,19 @@ impl Ship {
         station.fire(station_state, ammo_type)
     }
 
-    pub fn reload_station(&self, station_id: EntityId, ammo_type: u8) {
+    /// Loads a round of `ammo_type` into `station_id`.
+    ///
+    /// Returns whether the shell was loaded. `false` covers both an unknown
+    /// station and a rejected request (Bug №192: an ammo type that is not a
+    /// real shell).
+    pub fn reload_station(&self, station_id: EntityId, ammo_type: u8) -> bool {
         let Some(station) = self.stations.get(&station_id) else {
-            return;
+            return false;
         };
         let mut state = self.state.write();
-        if let Some(station_state) = state.station_states.get_mut(&station_id) {
-            station.reload(station_state, ammo_type);
+        match state.station_states.get_mut(&station_id) {
+            Some(station_state) => station.reload(station_state, ammo_type),
+            None => false,
         }
     }
 
@@ -736,12 +746,43 @@ impl Ship {
             return false;
         };
         let mut state = self.state.write();
-        if let Some(cs) = state.compartment_states.get_mut(&compartment_id) {
-            compartment.extinguish_fire(cs);
-            true
-        } else {
-            false
+        let Some(cs) = state.compartment_states.get_mut(&compartment_id) else {
+            return false;
+        };
+        // Bug №607 (analysis 4.5): this used to return `true` whenever the
+        // compartment existed, so `ExtinguishFire` acked success on a
+        // compartment that was never on fire — the ship-state fire stayed 0.0
+        // and the command went into the void. Report honestly: nothing
+        // burning means nothing was extinguished.
+        if cs.fire_intensity <= 0.0 {
+            return false;
         }
+        compartment.extinguish_fire(cs);
+        true
+    }
+
+    /// Lights a fire in `compartment_id`. Returns `true` only when the
+    /// compartment was not already burning, so the caller can emit a single
+    /// `FireStarted` instead of one per shell that lands on a live fire.
+    ///
+    /// Bug №607 (analysis 4.5): the fire model, its spread and its decay were
+    /// all written and ticked every frame, but nothing on the live path ever
+    /// raised `fire_intensity` above zero — the only ignition calls lived in
+    /// tests. This is that missing source, driven from explosive hits.
+    pub fn ignite_compartment(&self, compartment_id: EntityId, intensity: f32) -> bool {
+        if !intensity.is_finite() || intensity <= 0.0 {
+            return false;
+        }
+        let Some(compartment) = self.compartments.get(&compartment_id) else {
+            return false;
+        };
+        let mut state = self.state.write();
+        let Some(cs) = state.compartment_states.get_mut(&compartment_id) else {
+            return false;
+        };
+        let was_burning = cs.fire_intensity > 0.0;
+        compartment.set_fire(cs, intensity);
+        !was_burning && cs.fire_intensity > 0.0
     }
 
     pub fn bounds(&self) -> CoreBounds {
@@ -772,9 +813,9 @@ impl Ship {
     /// `EntityId` derives no `Ord`, so the sort is on its public `u64` rather
     /// than on the wrapper.
     pub fn get_compartment_at(&self, local_pos: Vec3f) -> Option<EntityId> {
-        let mut ids: Vec<EntityId> = self.compartments.keys().copied().collect();
-        ids.sort_unstable_by_key(|id| id.0);
-        ids.into_iter().find(|id| {
+            let mut ids: Vec<EntityId> = self.compartments.keys().copied().collect();
+            ids.sort_unstable_by_key(|id| id.0);
+            ids.into_iter().find(|id| {
             self.compartments
                 .get(id)
                 .is_some_and(|comp| comp.bounds().contains(local_pos))
@@ -1368,5 +1409,85 @@ mod tests {
         hurt(&s, 50.0);
         let after = s.get_state();
         assert!(after.has_sunk, "a late hit cleared has_sunk");
+    }
+
+    /// Bug №607: fire had no live source — `set_fire` was only ever called from
+    /// tests, so `fire_intensity` stayed zero in a real match. This is that
+    /// source. It reports a *new* fire: the first shell lights a compartment, a
+    /// second into an existing fire does not report a fresh start.
+    #[test]
+    fn igniting_reports_only_a_new_fire() {
+        let (s, _) = ship_with_station();
+        let compartment = EntityId::new(1001);
+
+        assert!(
+            s.ignite_compartment(compartment, 0.5),
+            "the first ignite reported nothing"
+        );
+        assert_eq!(
+            s.get_state().compartment_states[&compartment].fire_intensity,
+            0.5
+        );
+        assert!(
+            !s.ignite_compartment(compartment, 0.5),
+            "a second ignite on a burning compartment reported a new fire"
+        );
+    }
+
+    /// The same shape as `set_fire`'s guard (Bug №198): garbage must neither
+    /// light a fire nor be reported as one.
+    #[test]
+    fn igniting_refuses_non_finite_and_non_positive_intensity() {
+        let (s, _) = ship_with_station();
+        let compartment = EntityId::new(1001);
+
+        for bad in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            assert!(
+                !s.ignite_compartment(compartment, bad),
+                "{bad} reported a successful ignite"
+            );
+        }
+        assert_eq!(
+            s.get_state().compartment_states[&compartment].fire_intensity,
+            0.0
+        );
+    }
+
+    /// Bug №607: extinguish returned `true` for any existing compartment, so a
+    /// cold one was acked as put out. It now reports the cold case — and must
+    /// still clear a real fire.
+    #[test]
+    fn extinguish_reports_the_cold_case_and_clears_a_fire() {
+        let (s, _) = ship_with_station();
+        let compartment = EntityId::new(1001);
+
+        assert!(
+            !s.extinguish_compartment(compartment),
+            "a cold compartment reported extinguished"
+        );
+
+        assert!(s.ignite_compartment(compartment, 0.5));
+        assert!(
+            s.extinguish_compartment(compartment),
+            "a burning compartment was not extinguished"
+        );
+        assert_eq!(
+            s.get_state().compartment_states[&compartment].fire_intensity,
+            0.0
+        );
+        assert!(
+            !s.extinguish_compartment(compartment),
+            "extinguishing an already-cold compartment reported success"
+        );
+    }
+
+    /// A compartment that is not there is refused by both, so a bad id cannot
+    /// light or douse anything.
+    #[test]
+    fn ignite_and_extinguish_refuse_an_unknown_compartment() {
+        let (s, _) = ship_with_station();
+        let missing = EntityId::new(9999);
+        assert!(!s.ignite_compartment(missing, 0.5));
+        assert!(!s.extinguish_compartment(missing));
     }
 }

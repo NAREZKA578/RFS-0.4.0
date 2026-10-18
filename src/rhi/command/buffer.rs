@@ -1,7 +1,6 @@
 //! Command Buffer
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use super::commands::Command;
 use super::pool::CommandPool;

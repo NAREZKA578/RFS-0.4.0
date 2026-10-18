@@ -70,6 +70,8 @@ impl MemoryAllocator {
             size: vk::WHOLE_SIZE,
             ..Default::default()
         };
+        // SAFETY: device valid; `memory` is a valid allocation owned by this device and must be
+        // currently mapped by the caller (Vulkan requires the range to be host-mapped).
         unsafe { self.device.flush_mapped_memory_ranges(&[range]) }
             .map_err(|e| vk_fail(e, "flush mapped memory"))
     }
@@ -86,6 +88,8 @@ impl MemoryAllocator {
             size: vk::WHOLE_SIZE,
             ..Default::default()
         };
+        // SAFETY: device valid; `memory` is a valid allocation owned by this device and must be
+        // currently mapped by the caller (Vulkan requires the range to be host-mapped).
         unsafe { self.device.invalidate_mapped_memory_ranges(&[range]) }
             .map_err(|e| vk_fail(e, "invalidate mapped memory"))
     }
@@ -112,6 +116,8 @@ impl MemoryAllocator {
             memory_type_index: index,
             ..Default::default()
         };
+        // SAFETY: device valid; size > 0 (checked above) and index came from find_memory_type,
+        // so it names a memory type allowed by the caller's memory_type_bits.
         let memory = unsafe { self.device.allocate_memory(&allocate_info, None) }
             .map_err(|e| vk_fail(e, "allocate device memory"))?;
         Ok((memory, index))
@@ -127,6 +133,8 @@ impl MemoryAllocator {
         memory: vk::DeviceMemory,
         size: u64,
     ) -> RhiResult<*mut u8> {
+        // SAFETY: device valid; `memory` is valid, offset 0 + size is within the allocation (caller
+        // passes an allocation size it owns); memory must not already be mapped.
         let ptr = unsafe { self.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()) }
             .map_err(|e| vk_fail(e, "map device memory"))?;
         Ok(ptr as *mut u8)
@@ -137,6 +145,8 @@ impl MemoryAllocator {
     /// Infallible in practice: `vkUnmapMemory` has no return value, so there is
     /// nothing here to report and nothing to get wrong.
     pub(crate) fn unmap(&self, memory: vk::DeviceMemory) {
+        // SAFETY: device valid; `memory` is a valid allocation owned by this device that was
+        // previously mapped by `map` and has not yet been unmapped or freed.
         unsafe { self.device.unmap_memory(memory) }
     }
 }

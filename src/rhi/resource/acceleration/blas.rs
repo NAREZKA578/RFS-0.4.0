@@ -1,7 +1,6 @@
 //! Bottom-Level Acceleration Structure (BLAS)
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use crate::resource::buffer::Buffer;
 use crate::types::*;

@@ -134,11 +134,16 @@ impl UiShaderManager {
     }
 
     /// The module for `shader_type`, or an error naming what is missing.
+    ///
+    /// The message lists what *did* load, not only what did not. Without that
+    /// the same error appears whether the manager has no shaders at all or every
+    /// one but this, and the two want different fixes.
     pub fn module(&self, shader_type: UiShaderType) -> UiResult<&ShaderModule> {
         self.modules.get(&shader_type).ok_or_else(|| {
             UiError::ShaderCompilationFailed(format!(
-                "{} has not been loaded into the UI shader manager",
-                shader_type.source_filename()
+                "{} has not been loaded into the UI shader manager; loaded: {}",
+                shader_type.source_filename(),
+                describe_loaded(&self.sources),
             ))
         })
     }
@@ -154,5 +159,59 @@ impl UiShaderManager {
 
     pub fn loaded_count(&self) -> usize {
         self.modules.len()
+    }
+}
+
+/// Names the shaders that did load, so an error can say what was expected
+/// alongside what was missing.
+///
+/// Sorted, because a `HashMap` iterates in an unspecified order and an error
+/// message that reorders itself between runs is hard to compare against a log.
+fn describe_loaded(sources: &HashMap<UiShaderType, UiShaderSource>) -> String {
+    if sources.is_empty() {
+        return "none".to_string();
+    }
+    let mut names: Vec<String> = sources
+        .values()
+        .map(|s| {
+            format!(
+                "{} ({} bytes)",
+                s.shader_type.source_filename(),
+                s.spirv_len
+            )
+        })
+        .collect();
+    names.sort();
+    names.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sourced(shader_type: UiShaderType, spirv_len: usize) -> UiShaderSource {
+        UiShaderSource {
+            shader_type,
+            spirv_len,
+        }
+    }
+
+    #[test]
+    fn an_empty_source_table_says_none() {
+        assert_eq!(describe_loaded(&HashMap::new()), "none");
+    }
+
+    #[test]
+    fn loaded_sources_are_named_with_their_size() {
+        let mut sources = HashMap::new();
+        sources.insert(
+            UiShaderType::Geometry,
+            sourced(UiShaderType::Geometry, 2048),
+        );
+        sources.insert(UiShaderType::Text, sourced(UiShaderType::Text, 512));
+        assert_eq!(
+            describe_loaded(&sources),
+            "ui_geom.wgsl (2048 bytes), ui_text.wgsl (512 bytes)"
+        );
     }
 }

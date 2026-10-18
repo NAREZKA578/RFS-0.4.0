@@ -1,7 +1,6 @@
 //! Compute Pass
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 /// Compute pass (placeholder)
 pub struct ComputePass {

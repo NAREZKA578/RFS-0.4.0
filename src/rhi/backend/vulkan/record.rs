@@ -214,14 +214,18 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
             Command::ClearColor { texture, value, rects } => {
                 // A clear needs the image itself, not a view of it: Vulkan's
                 // clear commands take a VkImage and a subresource range, and the
-                // rects are expressed through the range rather than through a
-                // view. The view is still the only handle the command carries, so
-                // the image is reached through it.
+                // rects are refused below rather than through a view. The view is
+                // still the only handle the command carries, so the image is
+                // reached through it.
+                refuse_partial_clear("ClearColor", rects)?;
                 let image = ash::vk::Image::from_raw(Translated::handle(
                     "color clear target",
                     texture.texture().backend(),
                 )?);
-                let ranges = subresource_ranges(rects, texture.mip_level_count());
+                let ranges = subresource_ranges(
+                    texture.mip_level_count(),
+                    clear_aspect_for(texture.texture().desc().format),
+                );
                 let raw = match value {
                     crate::types::ClearValue::Color { r, g, b, a } => {
                         ash::vk::ClearColorValue { float32: [*r, *g, *b, *a] }
@@ -247,15 +251,25 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
             }
 
             Command::ClearDepthStencil { texture, depth, stencil, rects } => {
+                refuse_partial_clear("ClearDepthStencil", rects)?;
                 let image = ash::vk::Image::from_raw(Translated::handle(
                     "depth clear target",
                     texture.texture().backend(),
                 )?);
-                let ranges = subresource_ranges(rects, texture.mip_level_count());
+                let ranges = subresource_ranges(
+                    texture.mip_level_count(),
+                    clear_aspect_for(texture.texture().desc().format),
+                );
                 device.cmd_clear_depth_stencil_image(
                     cb,
                     image,
-                    ash::vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    // Clearing a depth/stencil image accepts only
+                    // TRANSFER_DST_OPTIMAL or GENERAL
+                    // (`VUID-vkCmdClearDepthStencilImage-imageLayout-00012`).
+                    // DEPTH_STENCIL_ATTACHMENT_OPTIMAL reads as the natural
+                    // choice — it is where a depth image usually lives — and is
+                    // exactly the value the spec refuses.
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &ash::vk::ClearDepthStencilValue {
                         depth: *depth,
                         stencil: *stencil,
@@ -378,27 +392,48 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
                         "barrier texture",
                         b.texture.backend(),
                     )?);
-                    // Each layout change is also a barrier, so the full
-                    // subresource range has to be covered: leaving a mip level
-                    // behind means it keeps the old layout while its siblings move
-                    // on, which is undefined behaviour rather than a slow path.
-                    tex.push(ash::vk::ImageMemoryBarrier {
-                        src_access_mask: convert::access_flags(b.src_access),
-                        dst_access_mask: convert::access_flags(b.dst_access),
-                        old_layout: convert::texture_layout(b.old_layout),
-                        new_layout: convert::texture_layout(b.new_layout),
-                        src_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
-                        dst_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
-                        image,
-                        subresource_range: ash::vk::ImageSubresourceRange {
-                            aspect_mask: ash::vk::ImageAspectFlags::COLOR
-                                | ash::vk::ImageAspectFlags::DEPTH
-                                | ash::vk::ImageAspectFlags::STENCIL,
-                            base_mip_level: 0,
-                            level_count: ash::vk::REMAINING_MIP_LEVELS,
-                            base_array_layer: 0,
-                            layer_count: ash::vk::REMAINING_ARRAY_LAYERS,
-                        },
+                // The aspect mask must name exactly the aspects the image has, and
+                // the *format* is what decides that, not the usage. Bug №290: this
+                // used to always pass COLOR|DEPTH|STENCIL, which names aspects the
+                // image does not have — `VUID-VkImageMemoryBarrier-aspectMask`.
+                //
+                // Keying off the usage bit instead looks equivalent and is not: a
+                // texture created with `DEPTH_STENCIL_ATTACHMENT` and format
+                // `D32_SFLOAT` has depth only, so `DEPTH|STENCIL` is itself a
+                // violation —
+                // `VUID-VkImageMemoryBarrier-subresourceRange-09601`. That was
+                // caught by running this under the validator, not by reading it.
+                //
+                // Depth-only formats take DEPTH alone, dual-purpose ones take both,
+                // and anything with neither is a colour image.
+                let format = b.texture.desc().format;
+                let aspect_mask = match (format.is_depth(), format.is_stencil()) {
+                    (true, true) => {
+                        ash::vk::ImageAspectFlags::DEPTH | ash::vk::ImageAspectFlags::STENCIL
+                    }
+                    (true, false) => ash::vk::ImageAspectFlags::DEPTH,
+                    (false, true) => ash::vk::ImageAspectFlags::STENCIL,
+                    (false, false) => ash::vk::ImageAspectFlags::COLOR,
+                };
+                // Each layout change is also a barrier, so the full subresource
+                // range is covered: leaving a mip level behind means it keeps the old
+                // layout while its siblings move on, which is undefined behaviour
+                // rather than a slow path.
+                tex.push(ash::vk::ImageMemoryBarrier {
+                    src_access_mask: convert::access_flags(b.src_access),
+                    dst_access_mask: convert::access_flags(b.dst_access),
+                    old_layout: convert::texture_layout(b.old_layout),
+                    new_layout: convert::texture_layout(b.new_layout),
+                    src_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
+                    image,
+                    subresource_range: ash::vk::ImageSubresourceRange {
+                        aspect_mask,
+                        base_mip_level: 0,
+                        level_count: ash::vk::REMAINING_MIP_LEVELS,
+                        base_array_layer: 0,
+                        layer_count: ash::vk::REMAINING_ARRAY_LAYERS,
+                    },
                         ..Default::default()
                     });
                 }
@@ -467,28 +502,69 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
     Ok(())
 }
 
+/// Refuse a clear that names 2D rects, loudly, instead of clearing everything.
+///
+/// `vkCmdClearColorImage` and `vkCmdClearDepthStencilImage` take a subresource
+/// range and have no per-rect form. Honouring a partial clear needs a render
+/// pass whose attachment is cleared with `vkCmdClearAttachments` and
+/// `VkClearRect` — and the render pass and framebuffer it needs must outlive
+/// the submission that recorded them, which means a frame-lifetime retirement
+/// queue this backend does not have.
+///
+/// Refusing beats the previous behaviour, which ignored the rects and cleared
+/// the whole image: a caller that asked for a quarter of a texture and got all
+/// of it, with the command succeeding, is a corruption that surfaces as a wrong
+/// pixel much later and cannot be traced back here.
+fn refuse_partial_clear(
+    command: &str,
+    rects: &[crate::types::Rect2D],
+) -> RhiResult<()> {
+    if rects.is_empty() {
+        return Ok(());
+    }
+    Err(RhiError::BackendError(format!(
+        "{command} was given {} rect(s): a per-rect clear needs a render pass with \
+         ClearAttachments, which this backend does not build yet; refusing rather \
+         than clearing the whole image silently",
+        rects.len()
+    )))
+}
+
 /// One subresource range per mip level of a clear.
 ///
 /// Vulkan clears per `ImageSubresourceRange`, and a clear that only covered mip 0
 /// would leave the rest of a mipped texture uninitialised, so the clear is emitted
 /// once per level.
 ///
-/// **The rects are not applied.** `Command::ClearColor` carries `rects`, and this
-/// translator ignores them: Vulkan's clear commands have no per-rect form, they take
-/// a subresource range only. Honouring a partial clear needs either a render pass
-/// with a clear value and a scissor, or a compute shader writing the region. Doing
-/// it wrong here would silently clear the whole image, which is worse than not
-/// clearing, so the argument is named `_rects` to record that it is known-unused
-/// rather than accidentally dropped. This is registered as an open defect.
+/// The aspects a clear's subresource range is allowed to name, derived from the
+/// **format** rather than from the usage.
+///
+/// A colour image has colour aspect only, so `cmd_clear_color_image` rejects a
+/// range naming DEPTH or STENCIL
+/// (`VUID-vkCmdClearColorImage-aspectMask-02498`), and a depth-only format
+/// rejects STENCIL for the same reason. Emitting `COLOR|DEPTH|STENCIL` because
+/// "it's the image's aspects, broadly speaking" is not a superset that happens
+/// to work — it is a claim about aspects the format does not have, and the call
+/// is refused.
+///
+/// Same reasoning as the barrier path (Bug №290), where the identical mistake
+/// was already corrected: the format decides, and keying off the usage bit
+/// instead of it is itself the violation.
+fn clear_aspect_for(format: crate::types::Format) -> ash::vk::ImageAspectFlags {
+    match (format.is_depth(), format.is_stencil()) {
+        (true, true) => ash::vk::ImageAspectFlags::DEPTH | ash::vk::ImageAspectFlags::STENCIL,
+        (true, false) => ash::vk::ImageAspectFlags::DEPTH,
+        (false, true) => ash::vk::ImageAspectFlags::STENCIL,
+        (false, false) => ash::vk::ImageAspectFlags::COLOR,
+    }
+}
+
 fn subresource_ranges(
-    _rects: &[crate::types::Rect2D],
     mip_levels: u32,
+    aspect_mask: ash::vk::ImageAspectFlags,
 ) -> Vec<ash::vk::ImageSubresourceRange> {
-    let aspects = ash::vk::ImageAspectFlags::COLOR
-        | ash::vk::ImageAspectFlags::DEPTH
-        | ash::vk::ImageAspectFlags::STENCIL;
     let sub = ash::vk::ImageSubresourceRange {
-        aspect_mask: aspects,
+        aspect_mask,
         base_mip_level: 0,
         level_count: 1,
         base_array_layer: 0,

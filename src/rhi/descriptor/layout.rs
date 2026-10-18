@@ -1,7 +1,6 @@
 //! Descriptor Set Layout
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
-//! **TODO: Full implementation required**
 
 use crate::resource::sampler::Sampler;
 use crate::resource::GpuResource;

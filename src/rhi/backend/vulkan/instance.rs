@@ -28,11 +28,14 @@ pub const DEBUG_UTILS_EXT: &CStr = c"VK_EXT_debug_utils";
 pub const SURFACE_EXTENSIONS: [&CStr; 2] =
     [c"VK_KHR_surface", c"VK_KHR_win32_surface"];
 
-pub(crate) fn vk_fail(result: vk::Result, context: &str) -> RhiError {
+/// Takes anything displayable rather than `&str`, so a caller with a slot number
+/// in the message does not have to allocate a `String` just to borrow it.
+pub(crate) fn vk_fail(result: vk::Result, context: impl std::fmt::Display) -> RhiError {
     RhiError::BackendError(format!("{context}: {result:?}"))
 }
 
 pub(crate) fn load_loader() -> RhiResult<ash::Entry> {
+    // SAFETY: ash::Entry::load finds and dlopens the system Vulkan loader; no user pointers involved.
     unsafe { ash::Entry::load() }
         .map_err(|e| RhiError::NoBackendForApi(format!("Vulkan loader unavailable: {e}")))
 }
@@ -50,6 +53,8 @@ pub(crate) struct DestroyableInstance {
 
 impl Drop for DestroyableInstance {
     fn drop(&mut self) {
+        // SAFETY: instance and optional debug_messenger are valid handles owned by this struct;
+        // Arc-based sharing guarantees this runs only when no other owner (e.g. a device) still needs it.
         unsafe {
             if let (Some(debug_utils), Some(messenger)) =
                 (self.debug_utils.as_ref(), self.debug_messenger.take())
@@ -73,6 +78,10 @@ fn has_extension(names: &[&CStr], wanted: &CStr) -> bool {
     names.contains(&wanted)
 }
 
+// SAFETY: Vulkan guarantees `callback_data` and its `p_message`/`p_message_id_name` are valid
+// (non-null when this callback is invoked by the debug utils dispatcher) for the duration of
+// this call; we only read them (via CStr::from_ptr) and never retain the pointers. Returning
+// VK_FALSE is required so validation proceeds (returning TRUE would abort the call).
 unsafe extern "system" fn debug_messenger_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _message_types: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -91,6 +100,9 @@ unsafe extern "system" fn debug_messenger_callback(
     };
     if !callback_data.is_null() {
         let data = &*callback_data;
+        if message_severity.contains(Severity::ERROR) {
+            VALIDATION_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let message = CStr::from_ptr(data.p_message).to_string_lossy();
         if data.p_message_id_name.is_null() {
             eprintln!("[Vulkan {level}] {message}");
@@ -100,6 +112,69 @@ unsafe extern "system" fn debug_messenger_callback(
         }
     }
     vk::FALSE
+}
+
+/// Whether the loader really gave us the validation layer. Bug №297.
+static VALIDATION_LAYER_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Number of validation messages of severity `ERROR` seen so far.
+///
+/// Bug №292. The messenger callback only prints to stderr, and a Vulkan call with
+/// a validation error still returns `vk::Success` — the driver has no reason to
+/// fail the call, it just reports the misuse alongside it. So before this counter,
+/// **no test in the project could detect a validation error**: assertions on
+/// return values stayed green whether the API use was correct or not, and the
+/// report scrolled past in captured output where nobody read it.
+///
+/// That is not a theoretical gap. It is why bug №290's hardcoded aspect mask
+/// survived: the barrier translator was exercised by no test at all, and when the
+/// first test did execute it, the negative control — the same test with the defect
+/// deliberately reintroduced — passed too.
+///
+/// Read with [`validation_error_count`]. Intended for tests and for a debug
+/// overlay; not a hot path, since it is only written when the layer reports an
+/// error.
+static VALIDATION_ERROR_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many validation `ERROR` messages have been reported.
+///
+/// See [`VALIDATION_ERROR_COUNT`] for why this exists. Intended usage is to sample
+/// before and after the operation under test:
+///
+/// ```ignore
+/// let before = rhi::validation_error_count();
+/// device.submit_recorded(&commands).unwrap();
+/// assert_eq!(rhi::validation_error_count(), before, "the validator reported an error");
+/// ```
+///
+/// The layer must actually be enabled for this to see anything, and
+/// `RhiConfig::validation` is `false` by default, so a test using this has to turn
+/// it on — otherwise it asserts against a counter that can never move. Even then,
+/// check [`validation_layer_active`]: enabling the flag in the config is a request,
+/// and the loader may decline it.
+pub fn validation_error_count() -> usize {
+    VALIDATION_ERROR_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the validation layer is actually loaded. Bug №297.
+///
+/// `true` only if the loader found `VK_LAYER_KHRONOS_validation` and it was enabled
+/// on the instance. A `false` result next to [`validation_error_count`] reading zero
+/// means the count is zero because nobody is watching — which is exactly the state
+/// that made a whole session's "validation is clean" statements meaningless.
+///
+/// **Only meaningful once an instance exists.** The flag is set inside
+/// `create_instance`, so reading it *before* a `VulkanBackend` has been built reports
+/// `false` whatever the config says. I hit exactly this while verifying a sweep and
+/// concluded the layer was missing when it was present — one level below the mistake
+/// the flag was added to prevent. So: create the backend first, then ask.
+///
+/// Not per-thread and not per-instance: the loader answers once per process, and a
+/// second instance cannot disagree with the first about what the loader offers.
+pub fn validation_layer_active() -> bool {
+    VALIDATION_LAYER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn create_instance(config: &RhiConfig) -> RhiResult<Arc<DestroyableInstance>> {
@@ -114,10 +189,14 @@ pub(crate) fn create_instance(config: &RhiConfig) -> RhiResult<Arc<DestroyableIn
         ..Default::default()
     };
 
+    // SAFETY: entry is a valid ash::Entry (just loaded); the returned vector is owned by us,
+    // no pointers returned to caller that outlive this block.
     let extension_properties = unsafe { entry.enumerate_instance_extension_properties(None) }
         .map_err(|e| vk_fail(e, "enumerate instance extensions"))?;
     let available_extensions: Vec<&CStr> = extension_properties
         .iter()
+        // SAFETY: p.extension_name is a valid null-terminated C string provided by Vulkan
+        // for this enumeration; its lifetime is that of the owning `extension_properties` vec.
         .map(|p| unsafe { CStr::from_ptr(p.extension_name.as_ptr()) })
         .collect();
 
@@ -140,13 +219,55 @@ pub(crate) fn create_instance(config: &RhiConfig) -> RhiResult<Arc<DestroyableIn
 
     let mut enabled_layers: Vec<&CStr> = Vec::new();
     if config.validation {
+        // SAFETY: entry is a valid ash::Entry; returned vector is owned by us, no lifetime issue.
         let layer_properties = unsafe { entry.enumerate_instance_layer_properties() }
             .map_err(|e| vk_fail(e, "enumerate instance layers"))?;
         let has_validation = layer_properties
             .iter()
+            // SAFETY: p.layer_name is a valid null-terminated C string from Vulkan enumeration,
+            // lifetime tied to the owning layer_properties vec.
             .any(|p| unsafe { CStr::from_ptr(p.layer_name.as_ptr()) } == VALIDATION_LAYER);
         if has_validation {
             enabled_layers.push(VALIDATION_LAYER);
+            VALIDATION_LAYER_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            // Bug №297, requested by AGENT-SBF2.
+            //
+            // This used to fall through silently, and it is the worst possible
+            // failure mode for a validator: the caller asked for validation, did not
+            // get it, and heard nothing at all. Every downstream conclusion then
+            // inverts — "validation is clean" means "nothing is watching". On this
+            // machine it was reached because the layer's own JSON advertised
+            // `"api_version": "1.3.204.0"`, which does not exist, so the loader
+            // reported the layer as absent.
+            //
+            // Loud, not fatal: a missing layer is a diagnostics problem, not a reason
+            // to refuse to create a device, and refusing would make the whole class
+            // of bug undebuggable on a machine without the SDK. But it cannot be
+            // silent, and the message says what to do about it.
+            //
+            // The available names are listed, because the common cause is a `VK_LAYER_PATH`
+            // that points at the wrong directory, and "not found" alone does not tell
+            // anyone where to look.
+            let available: Vec<String> = layer_properties
+                .iter()
+                // SAFETY: p.layer_name is a valid null-terminated C string from Vulkan
+                // enumeration, lifetime tied to the owning layer_properties vec.
+                .map(|p| unsafe { CStr::from_ptr(p.layer_name.as_ptr()) }.to_string_lossy())
+                .map(|name| name.into_owned())
+                .collect();
+            eprintln!(
+                "[rhi] validation was requested but the layer {:?} is not available. \
+                 Validation is OFF, and a clean run then means nothing was checked. \
+                 Check VK_LAYER_PATH (the loader searches that directory only) and the \
+                 layer's own JSON api_version. Layers the loader can see: [{}]",
+                VALIDATION_LAYER.to_string_lossy(),
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            );
         }
     }
 
@@ -162,6 +283,8 @@ pub(crate) fn create_instance(config: &RhiConfig) -> RhiResult<Arc<DestroyableIn
         ..Default::default()
     };
 
+    // SAFETY: entry is valid; create_info references live extension/layer name arrays that
+    // outlive the call (extension_ptrs/layer_ptrs built above); p_next chain empty.
     let instance = unsafe { entry.create_instance(&create_info, None) }
         .map_err(|e| vk_fail(e, "create instance"))?;
 
@@ -182,6 +305,9 @@ pub(crate) fn create_instance(config: &RhiConfig) -> RhiResult<Arc<DestroyableIn
                 pfn_user_callback: Some(debug_messenger_callback),
                 ..Default::default()
             };
+            // SAFETY: debug_utils is a valid loader over the live instance; messenger_info's
+            // callback pointer refers to the free function `debug_messenger_callback`, which is
+            // valid for the process lifetime; no allocator used (None).
             let messenger = unsafe { debug_utils.create_debug_utils_messenger(&messenger_info, None) }
                 .map_err(|e| vk_fail(e, "create debug messenger"))?;
             Some(messenger)
@@ -203,6 +329,8 @@ pub(crate) fn create_instance(config: &RhiConfig) -> RhiResult<Arc<DestroyableIn
 pub(crate) fn enumerate_physical_devices(
     instance: &ash::Instance,
 ) -> RhiResult<Vec<vk::PhysicalDevice>> {
+    // SAFETY: instance is a valid live VkInstance; returned vector of handles is owned by the
+    // caller, no pointers returned that outlive the call.
     unsafe { instance.enumerate_physical_devices() }
         .map_err(|e| vk_fail(e, "enumerate physical devices"))
 }
@@ -393,6 +521,8 @@ pub(crate) fn physical_device_report(
     instance: &ash::Instance,
     handle: vk::PhysicalDevice,
 ) -> PhysicalDevice {
+    // SAFETY: instance and physical device handle are valid; the returned structs/vectors are
+    // owned copies (properties, features, memory, queue_families) — no dangling pointers.
     let (properties, features, memory, queue_families) = unsafe {
         (
             instance.get_physical_device_properties(handle),
@@ -401,6 +531,8 @@ pub(crate) fn physical_device_report(
             instance.get_physical_device_queue_family_properties(handle),
         )
     };
+    // SAFETY: properties.device_name is a valid null-terminated C array inside the properties
+    // struct returned (and owned) above; to_string_lossy copies out before it goes out of scope.
     let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
         .to_string_lossy()
         .into_owned();

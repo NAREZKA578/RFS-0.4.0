@@ -72,6 +72,25 @@ impl InterestManager {
         self.entity_layers.write().remove(&entity_id);
     }
 
+    /// Bug №605: a hull the simulation dropped must leave together with the
+    /// interior that hangs off it. Removing the hull alone left every
+    /// compartment and station of the wreck in the grids, where they kept
+    /// replicating to every player forever.
+    pub fn retire_ship(
+        &self,
+        ship_id: EntityId,
+        compartment_ids: &[EntityId],
+        station_ids: &[EntityId],
+    ) {
+        self.remove_ship(ship_id);
+        for id in compartment_ids {
+            self.remove_compartment(*id);
+        }
+        for id in station_ids {
+            self.remove_station(*id);
+        }
+    }
+
     pub fn update_ship(&self, ship: ShipEntity) {
         self.ship_grid.write().insert(ship);
     }
@@ -337,6 +356,29 @@ impl InterestManager {
         } else {
             false
         }
+    }
+
+    /// The same answer as `should_replicate_entity`, with one carve-out: an id
+    /// this manager does not track is *not* suppressed.
+    ///
+    /// Bug №635. `broadcast_event` used to send every event to every connection
+    /// while snapshots were built per interest, so a ship at the far end of the
+    /// map was invisible in a client's snapshot yet fully described by its
+    /// events. Events now go through the same gate.
+    ///
+    /// The carve-out is what keeps that gate from silencing whole categories of
+    /// event. `entity_layers` only ever holds ships, players, stations,
+    /// projectiles and compartments — bulkheads, pumps and match/team state are
+    /// never entered — so a plain `should_replicate_entity` here would drop every
+    /// `BulkheadStateChanged` and `PumpStateChanged` the moment this shipped,
+    /// with nothing to show for it in the tests. Sending an event about an id we
+    /// do not track is the cheap mistake; losing one silently is the expensive
+    /// one.
+    pub fn should_replicate_subject(&self, viewer_player_id: u32, subject: EntityId) -> bool {
+        if !self.entity_layers.read().contains_key(&subject) {
+            return true;
+        }
+        self.should_replicate_entity(viewer_player_id, subject)
     }
 
     pub fn get_replication_mask(&self, viewer_player_id: u32, target_entity_id: EntityId) -> InterestMask {
@@ -678,5 +720,66 @@ mod tests {
             !mgr.should_replicate_entity(VIEWER, EntityId::new(station_id)),
             "a player without a ship must not receive its stations"
         );
+    }
+
+    fn make_compartment(id: u64) -> CompartmentEntity {
+        use rfs_core::entity::Bounds;
+        let bounds =
+            Bounds::new(Vec3f::new(-5.0, -3.0, -10.0), Vec3f::new(5.0, 3.0, 10.0));
+        CompartmentEntity {
+            entity_id: EntityId::new(id),
+            ship_id: EntityId::new(SHIP_ID),
+            name: "bay".into(),
+            local_bounds: bounds,
+            world_bounds: bounds,
+            water_level: 0.0,
+            max_water_level: 100.0,
+            is_sealed: true,
+            is_breached: false,
+            fire_intensity: 0.0,
+            pump_active: false,
+            connected_compartments: SmallVec::new(),
+            stations: SmallVec::new(),
+            pump_capacity: 0.0,
+            bulkheads: SmallVec::new(),
+        }
+    }
+
+    /// Bug №605, negative control for the child pass: the old entry point
+    /// removed only the hull (and was in fact never called at all), so the
+    /// wreck's compartments and stations stayed in the grids and kept
+    /// replicating to every player forever. Drop the children from
+    /// `retire_ship` and the middle two assertions go red.
+    #[test]
+    fn retiring_a_ship_takes_its_interior_with_it() {
+        let mgr = InterestManager::new(InterestConfig::default());
+        let compartment_id = 600u64;
+        let station_id = 601u64;
+        mgr.add_ship(make_ship());
+        mgr.add_compartment(make_compartment(compartment_id));
+        mgr.add_station(make_station(station_id));
+        mgr.add_player(make_player(), EntityId::new(SHIP_ID));
+        mgr.compute_interest(VIEWER);
+
+        assert_eq!(mgr.stats().compartments, 1, "fixture must be in the grid");
+        assert_eq!(mgr.stats().stations, 1, "fixture must be in the grid");
+
+        mgr.retire_ship(
+            EntityId::new(SHIP_ID),
+            &[EntityId::new(compartment_id)],
+            &[EntityId::new(station_id)],
+        );
+
+        let stats = mgr.stats();
+        assert_eq!(stats.ships, 0, "the hull must go");
+        assert_eq!(stats.compartments, 0, "the wreck's compartments must go with it");
+        assert_eq!(stats.stations, 0, "the wreck's stations must go with it");
+
+        mgr.compute_interest(VIEWER);
+        assert!(
+            !mgr.should_replicate_entity(VIEWER, EntityId::new(compartment_id)),
+            "an orphaned compartment must not be replicable"
+        );
+        assert!(!mgr.should_replicate_entity(VIEWER, EntityId::new(station_id)));
     }
 }

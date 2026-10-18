@@ -9,6 +9,16 @@ pub const AIR_DENSITY: f32 = 1.225;
 pub const DRAG_COEFFICIENT_SPHERE: f32 = 0.47;
 pub const DRAG_COEFFICIENT_STREAM: f32 = 0.04;
 
+/// Below this speed a projectile is at rest and is spent (Bug №608).
+///
+/// The integrators used to hold this as a bare `0.1` in two places and the tick
+/// knew nothing about it, so a shell that lost its speed to drag stopped moving
+/// and was never retired: it sat at one point for the rest of its 12 s life and
+/// was replicated to every client the whole time. One named constant, because
+/// "asleep" has to mean the same thing to the integrator and to the loop that
+/// decides what still exists.
+pub const RESTING_SPEED: f32 = 0.1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BallisticsConfig {
     pub gravity: f32,
@@ -281,7 +291,7 @@ impl BallisticsCalculator {
         dt: f32,
     ) -> (Vec3f, Vec3f) {
         let speed = velocity.length();
-        if speed < 0.1 {
+        if speed < RESTING_SPEED {
             return (position, velocity);
         }
 
@@ -446,7 +456,7 @@ impl BallisticsCalculator {
         dt: f32,
     ) -> (Vec3f, Vec3f) {
         let speed = velocity.length();
-        if speed < 0.1 {
+        if speed < RESTING_SPEED {
             return (position, Vec3f::ZERO);
         }
         

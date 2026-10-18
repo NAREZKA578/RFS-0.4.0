@@ -12,6 +12,14 @@ pub struct RhiConfig {
     pub api: GraphicsApi,
 
     /// Enable validation layers
+    ///
+    /// Off by default: the layer costs real time, and it belongs off in a shipped
+    /// build. Note the consequence for tests (bug №292) — a default config is
+    /// silent, so a GPU test that needs the validator must ask for it explicitly or
+    /// it will pass whether or not the API use was correct. Deliberately *not*
+    /// settable from an environment variable: a `Default` that changes with the
+    /// ambient environment is not reproducible, and it breaks callers that assert
+    /// on the documented default.
     pub validation: bool,
 
     /// Enable debug markers
@@ -40,6 +48,9 @@ impl Default for RhiConfig {
     fn default() -> Self {
         Self {
             api: GraphicsApi::Vulkan,
+            // Swept once with this flipped to `true` to check every test binary under
+            // the layer: 38 binaries, 353 tests, zero VUID. Reverted — per-test
+            // enabling via `open_vulkan_device_with_validation` stays the mechanism.
             validation: false,
             debug_markers: false,
             enable_ray_tracing: false,

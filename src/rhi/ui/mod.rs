@@ -15,7 +15,7 @@
 //! The UI system is designed to work with all RHI backends (Vulkan, D3D12, D3D11, OpenGL).
 //! It provides both immediate mode (for simple debugging) and retained mode (for complex UIs).
 
-pub mod context;
+pub mod bitmap_font;
 pub mod elements;
 pub mod input;
 pub mod layout;
@@ -24,7 +24,18 @@ pub mod renderer;
 pub mod shaders;
 pub mod text;
 
-pub use context::{UiContext, UiModifiers, UiState};
+/// NVIDIA GeForce Experience styling. Was written, and never connected — the
+/// same failure as the module itself once being absent from `lib.rs`, one level
+/// down. A theme nothing can reach is indistinguishable from no theme at all,
+/// except that it still shows up in line counts.
+///
+/// Connected now, and `tests/module_tree_reachability.rs` fails if it is ever
+/// orphaned again.
+pub mod theme;
+
+pub use theme::{AnimationEasing, ButtonState, InputState, NvidiaStyle, ThemeManager, UiTheme};
+
+pub use input::UiModifiers;
 pub use elements::{
     SliderOrientation, UiElement, UiElementBuilder, UiElementData, UiElementId, UiElementType,
     UiVisualStyle,
@@ -33,7 +44,7 @@ pub use input::{
     draw_order, hit_test, next_focusable, update as update_input, UiClick, UiInputEvent,
     UiInputState, UiInteraction, UiKey,
 };
-pub use layout::{UiAnchor, UiConstraints, UiLayout, UiLayoutResult};
+pub use layout::{UiAnchor, UiConstraints, UiLayout, UiLayoutMode, UiLayoutResult};
 pub use pass::{ui_ortho_projection, UiRenderPass};
 pub use renderer::{UiRenderStats, UiRenderTarget, UiRenderer, UiRendererConfig, UiVertex};
 pub use shaders::{UiShaderManager, UiShaderSource, UiShaderType};
