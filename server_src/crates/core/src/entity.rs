@@ -1,5 +1,7 @@
-pub use crate::math::{Vec3f, Bounds, Transform};
-pub use crate::packet::{EntityId, EntityType, EntityFlags, StationType, PlayerPosture, ProjectileType};
+pub use crate::math::{Bounds, Transform, Vec3f};
+pub use crate::packet::{
+    EntityFlags, EntityId, EntityType, PlayerPosture, ProjectileType, StationType,
+};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 

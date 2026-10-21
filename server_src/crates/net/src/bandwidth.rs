@@ -85,7 +85,8 @@ impl BandwidthTracker {
         }
         let now = Instant::now();
         let cutoff = now - self.window;
-        let total: usize = history.iter()
+        let total: usize = history
+            .iter()
             .filter(|(t, _)| *t >= cutoff)
             .map(|(_, b)| *b)
             .sum();
@@ -99,30 +100,35 @@ impl BandwidthTracker {
         }
         let now = Instant::now();
         let cutoff = now - self.window;
-        let total: usize = history.iter()
+        let total: usize = history
+            .iter()
             .filter(|(t, _)| *t >= cutoff)
             .map(|(_, b)| *b)
             .sum();
         total as f64 / self.window.as_secs_f64()
     }
 
-    pub fn sent_bytes_total(&self) -> u64 {
+    /// Bug №671: totals and averages were public getters nobody ever called
+    /// from outside — the only consumer is `stats()`. They stay as helpers,
+    /// off the public surface, so the counters have exactly one way out:
+    /// `BandwidthStats`.
+    fn sent_bytes_total(&self) -> u64 {
         *self.sent_bytes.lock()
     }
 
-    pub fn received_bytes_total(&self) -> u64 {
+    fn received_bytes_total(&self) -> u64 {
         *self.received_bytes.lock()
     }
 
-    pub fn sent_packets_total(&self) -> u64 {
+    fn sent_packets_total(&self) -> u64 {
         *self.sent_packets.lock()
     }
 
-    pub fn received_packets_total(&self) -> u64 {
+    fn received_packets_total(&self) -> u64 {
         *self.received_packets.lock()
     }
 
-    pub fn avg_packet_size_sent(&self) -> f64 {
+    fn avg_packet_size_sent(&self) -> f64 {
         let packets = *self.sent_packets.lock();
         if packets == 0 {
             0.0
@@ -131,7 +137,7 @@ impl BandwidthTracker {
         }
     }
 
-    pub fn avg_packet_size_received(&self) -> f64 {
+    fn avg_packet_size_received(&self) -> f64 {
         let packets = *self.received_packets.lock();
         if packets == 0 {
             0.0
@@ -225,12 +231,12 @@ impl BandwidthLimiter {
         let now = Instant::now();
         let elapsed = now - bucket.last_update;
         bucket.last_update = now;
-        
+
         bucket.tokens += elapsed.as_secs_f64() * bucket.max_bps;
         if bucket.tokens > bucket.max_tokens {
             bucket.tokens = bucket.max_tokens;
         }
-        
+
         let cost = bytes as f64;
         if bucket.tokens >= cost {
             bucket.tokens -= cost;
@@ -244,11 +250,11 @@ impl BandwidthLimiter {
         let bucket = self.bucket.lock();
         let tokens = bucket.tokens;
         let cost = bytes as f64;
-        
+
         if tokens >= cost {
             return Duration::ZERO;
         }
-        
+
         let needed = cost - tokens;
         let seconds = needed / bucket.max_bps;
         Duration::from_secs_f64(seconds)
@@ -317,6 +323,62 @@ mod limiter_tests {
         BandwidthLimiter::new(bps)
     }
 
+    /// Bug №671: `with_window` existed with zero callers — the live trackers
+    /// were all built with the default second. The configured window is now
+    /// the tracker's own contract: it is stored as passed and drives how long
+    /// samples live in the rate.
+    #[test]
+    fn a_configured_window_is_stored_and_drives_the_rate() {
+        let tracker = BandwidthTracker::with_window(Duration::from_millis(30));
+        assert_eq!(tracker.window, Duration::from_millis(30));
+
+        tracker.record_sent(1200);
+        let fresh = tracker.sent_bps();
+        assert!(fresh > 0.0, "a fresh sample must show up in the rate");
+
+        // After a full window every sample has aged out of the 30 ms slice:
+        // the rate is zero, totality is untouched, and nothing divides by
+        // the tiny window into something unbounded on the way.
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            tracker.sent_bps(),
+            0.0,
+            "after a full window the old samples must be gone"
+        );
+        assert_eq!(tracker.sent_bytes_total(), 1200);
+    }
+
+    /// The guard itself: a window of literally zero would make the rate a
+    /// division by zero (bug history backs this shape). It must sanitize to
+    /// something finite and usable instead.
+    #[test]
+    fn a_zero_window_is_sanitised_instead_of_used() {
+        let tracker = BandwidthTracker::with_window(Duration::ZERO);
+        assert_eq!(
+            tracker.window,
+            Duration::from_secs(1),
+            "the guard's rewrite"
+        );
+        tracker.record_sent(100);
+        let rate = tracker.sent_bps();
+        assert!(rate.is_finite(), "the zero window guard failed: {rate}");
+    }
+
+    /// The counters' only exit is `stats()`: totals, packet counts and the
+    /// average must agree with what was recorded.
+    #[test]
+    fn the_stats_treat_the_counters() {
+        let tracker = BandwidthTracker::new();
+        tracker.record_sent(100);
+        tracker.record_sent(300);
+        let stats = tracker.stats();
+        assert_eq!(stats.sent_bytes_total, 400);
+        assert_eq!(stats.sent_packets_total, 2);
+        assert_eq!(stats.avg_packet_size_sent, 200.0);
+        assert_eq!(stats.received_packets_total, 0);
+        assert_eq!(stats.avg_packet_size_received, 0.0);
+    }
+
     #[test]
     fn an_unreliable_packet_may_be_dropped() {
         // Bug №171: this is the old behaviour and it is fine for unreliable
@@ -350,6 +412,27 @@ mod limiter_tests {
         assert!(
             (0.4..0.6).contains(&secs),
             "expected roughly half a second, got {secs}"
+        );
+    }
+
+    /// Bug №39: rate changes must reach the tempo, not just the bucket size.
+    /// At 1 000 B/s a 1 100 B packet waits ~1.1 s; at the new 100 B/s rate it
+    /// must wait ~11 s. Bumping `max_tokens` alone would leave the old tempo
+    /// in force and the wait would barely move — this test is the guard.
+    #[test]
+    fn a_rate_change_takes_effect_for_the_next_packet() {
+        let l = limiter(1_000.0);
+        assert!(l.try_consume(1_000), "drain the unmetered start bucket");
+        l.set_max_bps(100.0);
+        let Admission::Retry(wait) = l.admit(1_100, true) else {
+            panic!("the drained bucket must refuse the packet");
+        };
+        // 1 100 B at 100 B/s is 11 s minus the one token still in the bucket
+        // at the moment of the check: the window is wide on purpose.
+        let secs = wait.as_secs_f64();
+        assert!(
+            (9.0..11.5).contains(&secs),
+            "the new rate must drive the wait, got {secs}"
         );
     }
 

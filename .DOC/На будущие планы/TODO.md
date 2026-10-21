@@ -25,7 +25,7 @@
 | A1 | **Шейдеры: один исходник (HLSL → DXC → DXIL + SPIR-V) или раздельные под каждый API?** | Весь рендер: компилятор, шейдеры, пайплайны. Сейчас файлов шейдеров нет вообще | не решено |
 | A2 | **Личный бой игрок-против-игрока** — не спроектирован вообще | Абордаж непригоден без него | не спроектирован |
 | A3 | **Управление тягой: непрерывный газ или дискретный машинный телеграф?** | Физика корабля | открыт |
-| A4 | **Физика столкновения при таране: отскок / потеря хода / сцепка?** | Таран (сейчас есть только урон) | открыт |
+| A4 | **Физика столкновения при таране: отскок / потеря хода / сцепка?** | Таран | **решено владельцем 2026-10-21: потеря хода, сцепка не нужна, величина потери зависит от угла удара. Реализовано (GLM_1): каждый корпус теряет НОРМАЛЬНУЮ составляющую своей скорости, доля потери — по массе партнёра (k = m_партнёра/(m_своя+m_партнёра)), поэтому тяжёлый почти не замечает удара, лёгкий останавливается почти намертво, а при скользящем ударе нормальная составляющая мала и ход почти не теряется. Ни отскока (нормальная компонента не переходит в другую сторону), ни сцепки (корабли разводятся). Урон — из потерянной кинетической энергии, поэтому асимметрия та же. Числа: RAM_DAMAGE_PER_JOULE, RAM_MAX_HEALTH_SHARE (sim/tick.rs)** |
 | A5 | **Огонь: общее свойство любого отсека или частный случай только погреба?** | Распространение огня | открыт |
 | A6 | **Мировая вертикаль или палуба при крене?** | Ждёт практики, старту не блокирует | открыт |
 | A7 | **Абордаж: числа не заданы** (дистанция стыковки, скорость) | Абордаж | геймдизайн подтверждён, чисел нет |
@@ -48,7 +48,7 @@
 ## Фаза 1 — Доказать масштаб на 200 игроков
 
 - [~] Headless бот-харнесс — `server_src/crates/stress` есть, боты подключаются и шлют ввод. Но боты не распределены по кораблям, а полагаются на `interest_manager`. Дефекты харнесса: №72, №175.
-- [ ] Метрики времени тика и трафика при росте 20 → 200 ботов. Известная проблема: тик деградирует (замер §19.1 давал 46-119 мс при бюджете 33 мс, зафиксировано в №75).
+- [~] Метрики времени тика и трафика при росте 20 → 200 ботов — ИЗМЕРЕНО 2026-10-21 (GLM_1), release-сборка, сервер + стресс на одном хосте: 20 ботов — 29.87 Гц наблюдаемо, застоя 0; 50 — 30.26 Гц, застоя 0; 100 — 12.41 Гц, stalled_deltas 8322 (100/100 ботов), RTT p95 720 мс; 200 — 6.24 Гц, stalled_deltas 14648 (175/200), RTT max 4262 мс. Сервер при этом держит бюджет: loop avg 2.69 мс из 33 мс при 100 ботах, rounds_per_tick = 1.00, skipped = 0, packets_per_round = 377. ИТОГ: «тик деградирует до 46-119 мс» (§19.1, debug) на текущем коде НЕ воспроизводится, и гипотеза «узкое место — per-client сериализация в send_snapshots» (№267) ОПРОВЕРГНУТА: просадка идёт от задержки и потерь на пути доставки/потребления. Подробности и кандидаты — в реестре, **№697**.
 - [~] Метрики встроены через `tracing` — есть в сети и в sim, но полноценной инструментации тика нет.
 
 ## Фаза 2 — Система координат
@@ -69,7 +69,7 @@
 - [~] Граф отсеков — Торричелли, плавучесть, пожаротушение есть, но есть критичные дефекты: NaN в `add_water`/`pump_water` мгновенно топит или осушает отсек (№197), `clamp` пропускает NaN и пожар зажигает всех соседей на максимум (№198), синтетические переборки создаются `is_sealed: true`, поэтому вода не течёт вообще.
 - [~] Три пути гибели корабля — затопление и `has_sunk` есть, но таймер перезапускается на каждом попадании, поэтому корабль **не удаляется** (№191). Ополрокидывание и взрыв погреба не реализованы.
 - [~] Руль, инерция, устойчивость, крен — есть; `ShipPhysics` использует компоненты кватерниона как углы и целиком мёртв (№195).
-- [ ] **Таран — физики столкновения нет** (есть только урон). **[БЛОК A4]**
+- [~] **Таран — сделано 2026-10-21 (GLM_1)**: столкновение корпусов в общей фазе тика (импульс по нормали с учётом масс, разведение корпусов), урон из кинетической энергии изменения скорости — асимметрия тяжёлый/лёгкий вытекает из физики, а не написана сверху; тот же граф отсеков, отдельный источник повреждения (`GameEvent::ShipRam`). Корабли также отталкиваются от структур мира («прислоняются»), мир для кораблей стал твёрдым. Не сделано: полноценная модель контакта «остановился снаружи» (нужна для границы мира) — вопрос владельцу. **[БЛОК A4]**
 - [ ] **Абордаж не реализован** — стыковка есть только архитектурно. **[БЛОК A2, A6, A7]**
 
 ## Фаза 5 — Сеть
@@ -564,12 +564,34 @@
 
 ## Server structure (blocks everything else on the server)
 
-- [ ] Split `crates/server/src/main.rs` (963 lines, binary-only) into the four
-      modules the plan calls for: `tick/`, `net/`, `match_`, `control/`.
-- [ ] Add `[lib]` to `rfs_server`. Without it nothing can drive the tick loop
+- [x] Split `crates/server/src/main.rs` (was 2171 lines, binary-only) into the four
+      modules the plan calls for: `tick/`, `net/`, `match_`, `control/` (2026-10-19,
+      GLM_1: lib-based split `src/{match_,tick,net,control}.rs` + `lib.rs`, the
+      binary keeps only imports + `main()`; verbatim move, workspace 207/0, clippy
+      clean; tests moved into the lib target — 19 tests, bin target has 0).
+- [x] Add `[lib]` to `rfs_server`. Without it nothing can drive the tick loop
       without a socket and without tokio, so the tick cannot be measured or
-      tested headlessly.
+      tested headlessly (2026-10-19, GLM_1: `[lib] name = "rfs_server"` in
+      crates/server/Cargo.toml; see the split entry above).
 - [ ] Track server memory. The plan names it explicitly and it is absent.
+
+## Server management API (админ-интерфейс управления сервером)
+
+- [ ] Owner request (2026-10-19): implement an API for the server
+      management/admin interface. Scope as the owner picks: server status
+      (tick rate, applied-rate counters, players, match state), start/stop/
+      restart a match, kick/ban a connection, live log feed, config reload.
+      Two decisions before code, both not ours to make: (1) transport —
+      in-process HTTP endpoint vs local console/IPC; (2) auth — token in the
+      same family as №216 (G2 UDP authentication), since a management API is
+      the highest-value spoofing target on the server. Structure prerequisite:
+      the `[lib]` split above with the `control/` module (satisfied 2026-10-19),
+      so the API drives
+      the same `TickSystem`/`NetServer` handles headlessly instead of
+      shelling into the binary. Every management action acks with a reason
+      and is rate-limited — same trust-boundary shape as chat (№634) and
+      repair (№633).
+
 
 ## Stress test, remaining from the plan
 
@@ -604,11 +626,16 @@ Highest priority because none of them announce themselves:
 
 ## Render, the rest
 
-- [ ] Six of seven passes are stubs: gbuffer, shadow, lighting, transparent,
-      water, ui. Only `geometry` is implemented.
-- [ ] `core/resource_manager.rs` is `unimplemented!()` тАФ any call panics.
-- [ ] Remaining shaders: GBuffer, shadow, lighting PBR, transparent, water, UI,
-      and post-processing (bloom, motion blur, DoF, HDR, FXAA).
+- [ ] Three passes are still stubs: shadow, transparent, water. `gbuffer`,
+      `lighting` and `resolve` are real now, and `geometry` was real before
+      that. The shadow shader, the transparent shader and the water shader
+      exist as SPIR-V; what is missing is the pipelines that use them, and
+      for the transparent pass the whole drawing loop (its loop over the
+      objects is a literal placeholder).
+- [ ] `core/resource_manager.rs` is `unimplemented!()` → any call panics.
+- [ ] Remaining *pipelines* (the shaders themselves are written and compiled):
+      shadow, transparent, water. Plus the post-processing passes: bloom,
+      motion blur, DoF, HDR, FXAA.
 - [ ] RHI core: `command/buffer.rs` `end()` panics (тДЦ181);
       `copy_texture`/`bind_texture` are stubs (тДЦ204); `clear_depth` and
       `clear_stencil` are dropped (тДЦ205); `Fence::wait` and
@@ -623,6 +650,219 @@ Highest priority because none of them announce themselves:
       ping-pong writes into the input view (тДЦ147, тДЦ213).
 - [ ] UI/HUD: the plan says not started. Minimap inverse is not the inverse of
       the forward map (тДЦ188).
+
+## Render: the Forward+ plan, agreed 2026-10-20 (SBF1)
+
+The owner chose **Forward+** (clustered forward) over deferred: the game has a
+lot of transparency — water, smoke, interference, fog — and that is where pure
+deferred is weak. So the deferred chain (GBuffer → lighting → resolve) is the
+ballast №316 named, and it goes. But it goes **after** the replacement works
+and has been checked with pixels, not before.
+
+What is not wasted: the infrastructure the deferred chain needed is exactly
+what Forward+ needs — real pipelines, per-item uniform buffers and descriptor
+sets, real graph resources, an honest instrument ("the pass was called" vs
+"the pass contributed"), and a presentation path that does not lie. The RHI
+can now bind a depth texture too (§683), which the shadow map needs.
+
+The order below is the order of execution. Every step ends in something
+visible or provable.
+
+### Step 1. The shadow pass (`src/render/passes/shadow.rs`)
+
+`shadow.wgsl` exists and is already written for a per-item uniform
+(`light_space_matrix` + `model`) — the same shape the geometry pass uses.
+
+- [x] GPU resources instead of CPU-side descriptions. Through the device: a
+      `D32_SFLOAT` texture with `DEPTH_STENCIL_ATTACHMENT | SAMPLED |
+      TRANSFER_SRC`, a render pass with one depth attachment and no colour at
+      all, a framebuffer. (№685)
+- [x] The pipeline: the mesh's five vertex attributes and a fragment stage
+      that writes `frag_depth`, depth-only, with no colour blend state — a
+      pipeline whose blend state disagrees with a render pass that has no
+      colour attachments is not a pipeline. (№685)
+- [x] Per-item uniform buffers and descriptor sets, as in the geometry pass.
+      (№685)
+- [x] The light-space matrix: `light_view_projection` — a perspective frustum
+      from a point light towards the target, 90°, so the map's texels stay
+      square. (№685)
+- [x] A test that reads the shadow map back and shows the geometry in it.
+      (№685)
+- [x] The two defects the test exposed: the shader wrote `z / w` where the
+      framebuffer's `w` is the reciprocal of the clip w, so the depth was
+      larger than one and the depth test rejected every fragment (№686); and
+      the RHI's readback barrier had no arm for a depth image in the
+      read-only layout, so it did not wait for the depth write it was
+      reading (№687).
+- [x] **The consumer.** The forward lighting shader reads the map: the
+      fragment's depth in the light's space against the map's, with a
+      comparison sampler, a bias that grows with the distance, and a barrier
+      before the read. `Tool/client_tests/tests/forward_pixels.rs` renders the
+      same scene twice, with the light in front of the cube and behind it, and
+      requires the centre to be bright in the first and dark in the second —
+      the two renders differ in one thing, so the difference can only have
+      come from the map. (№691)
+- [ ] Cascades for a directional light. The fields were removed from the
+      configuration rather than left in it: a field nobody can use is an
+      invitation to write code that does not exist. Orthographic projection,
+      `cascade_distances` as the slice boundaries, one map per cascade.
+
+### Step 2. Forward lighting without clustering (one light, shadows work)
+
+- [x] Прямой шейдер света, читающий карту теней ✓ (пасс `ForwardPass` ✓, шейдер
+      ✓, тест ✓: сцена освещена ✓, и тень читается ✓ — тёмный рендер в три раза
+      темнее светлого ✓).
+- [x] Каскады ✓ (№695 ✓): математика — чистая функция ✓, карта на каскад ✓, сцена
+      рисуется в каждый ✓, куски растут ✓.
+- [x] Кластеризация света ✓ (№693 ✓): compute-пасс ✓, буферы ✓, тест ✓, который
+      требует источник **в ожидаемом** кластере ✓ (номер кластера сходится ✓).
+- [x] Формула глубины — по конвенции Vulkan ✓ (№696 ✓): OpenGL-формула давала
+      расстояние 4.7 вместо 2.5 ✓, и фрагмент попадал не в тот срез ✓.
+- [ ] **Шейдер прямого рендера, читающий кластеры и каскады** ✓ (№696 ✓): выбор
+      кластера в шейдере **проверен измерением** ✓ (совпадает с CPU ✓), тень читается
+      ✓, источник в кластере находится ✓ — но сцена остаётся тёмной ✓, потому что
+      числа самого источника приходят неверные ✓ (см. тест данных источника выше ✓).
+      Собранный вариант откачен ✓: непроверяемый код в дереве хуже его отсутствия ✓,
+      всё найденное записано в №696 ✓.
+
+- [x] A direct lighting shader in the geometry pass: per pixel, the light's
+      contribution, multiplied by the shadow map's lookup. The light is
+      positional — a point with a radius — and the attenuation falls off with
+      the square of the distance and fades out at the radius, or the light
+      lights the whole world. This is the new `ForwardPass`, not a change to
+      the geometry pass: the uniform layouts differ, and the forward shader
+      needs the light's position where the geometry shader has a direction.
+      (№691)
+- [x] The light buffer needs the light-space matrix per light, so `struct
+      Light` grows and the shader and the buffer must agree — the same trap
+      that was already sprung once, by the 48-byte stride of a `vec3` inside
+      a struct. **Not done in this form**: the matrix lives in the forward
+      pass's own uniform block, and the forward path lights the scene with
+      *one* light for now. The clustered path is where the per-light matrix
+      belongs.
+- [x] A barrier before the shadow map is read: depth writes and sampled reads
+      need an explicit dependency, exactly as in the lighting and resolve
+      passes.
+- [x] The comparison sampler: the RHI can create one now
+      (`Device::create_sampler_from_desc`), and a depth image may only be
+      filtered by a comparison sampler (§683).
+
+**What step 2 does not have**: many lights. The forward pass lights the scene
+with one light from its own uniform block. The scene's light list is not read
+by it yet — that is what the clustering is for.
+
+### Step 3. Clustering
+
+- [ ] A depth pre-pass. Forward+ needs the depth buffer to build the
+      clusters, and the GBuffer's depth goes away with the GBuffer.
+- [ ] A compute pass that bins the lights: a grid of tiles (say 16×9) by
+      depth slices (say 24), each cluster holding the indices of the lights
+      that touch it. The test is a sphere against the cluster's AABB (frustum
+      plus slice). The RHI already has compute pipelines, storage buffers and
+      `Dispatch`.
+- [ ] The forward shader reads its own cluster instead of all the lights.
+
+### First, before the forward pass is rebuilt: a test for the light's own numbers
+
+- [x] **Тест данных источника.** Сделан ✓: новый `Tool/client_tests/tests/light_layout.rs` ✓ и шейдер
+      `lightprobe.wgsl` ✓, который читает буфер источников и выводит числа первого
+      источника в цвет ✓. Тест **проходит** ✓ — значит раскладка `struct Light` и запись
+      в буфер **согласованы** ✓: позиция по 0 ✓, цвет по 16 ✓, интенсивность по
+      **28** ✓, радиус по **32** ✓ (член выравнивается по своему выравниванию ✓, а `f32` —
+      это 4 ✓, тогда как `vec3` занимает 12 байт при выравнивании 16 ✓), шаг массива 48 ✓.
+      Проверено **чтением чисел из шейдера** ✓, а не предположением ✓.
+      **Первый подозреваемый в чёрной картинке прямого пасса отпадает** ✓: вопрос остаётся
+      к записи в буфер в самом прямом пассе ✓ и к тому, какой буфер читается ✓. Тест остаётся
+      в репозитории ✓ и в следующий раз поймает раскладку за секунды ✓.
+
+### Step 4. Transparency, water, and the removal of the deferred chain
+- [ ] `TransparentPass` is a skeleton: the `pipelines` map is created empty
+      and the loop over the objects is a literal placeholder ("actual
+      rendering would go here"). It needs the blend pipelines for the four
+      blend modes (alpha: `SrcAlpha`/`OneMinusSrcAlpha`; additive: `One`/`One`;
+      multiplicative: `DstColor`/`Zero`; screen: `OneMinusDstColor`/`One`),
+      the per-object uniforms (`mvp`, `model`, `normal_matrix` = 192 bytes,
+      the layout `transparent.wgsl` already expects), the meshes, and the
+      sorting that it already computes. The scene side exists:
+      `Entity::is_transparent()` and `Entity::blend_mode()`.
+- [ ] `WaterPass`: the shader exists, the pipeline does not.
+- [ ] Then, and only then, delete the deferred chain. What goes with it:
+      `src/render/passes/gbuffer.rs`, `pub mod gbuffer` and the re-export in
+      `passes/mod.rs`, the four `gbuffer_*` resources in `graph.rs`, the
+      `GBufferPass` entry in the `pass_reachability` allowlist, the mentions
+      in the doctrine of `lib.rs` and `passes/mod.rs`, and the string
+      `add_dependency("gbuffer", ...)` in `lighting.rs`, `transparent.rs` and
+      `water.rs`. The allowlist entry is checked by exact name, so removing it
+      is part of the work, not a detail. The check that the removal is correct
+      is a pixel test: the same scene, the same picture, one path instead of
+      two.
+
+### Process, worth fixing before more code
+
+- [x] ~~**Шейдеры должны пересобираться обычным прогоном.~~** Сделано иначе и
+      лучше: обычный прогон теперь **проверяет**, что закоммиченный `.spv` байт в
+      байт совпадает с тем, во что компилируется его `.wgsl` ✓
+      (`committed_spirv_matches_its_source` ✓). Устаревший шейдер **ломает обычный
+      прогон** ✓, а пересборка по-прежнему запускается явно ✓ (обычный прогон не
+      должен молча переписывать закоммиченные файлы ✓). Тот случай, который стоил
+      двух ложных выводов, теперь виден сразу ✓.
+- [ ] Остальное из того же места: прибор, который **сам** проверяет, что `.spv`
+      пересобирался (размер/время файла ✓), чтобы отладочный вывод в шейдере
+      нельзя было измерить, не заметив, что шейдер не тот ✓. Пока это держится на
+      том, что новый тест ломает прогон ✓ — а измерение может остаться в
+      «зелёном» прогоне, если тест не запускали ✓.
+
+### RHI, still open
+
+- [ ] §692: the RHI creates a graphics pipeline whose colour blend state
+      declares a different number of attachments than the render pass has, and
+      does not refuse it. `vkCreateGraphicsPipelines` returns the invalid
+      pipeline as a success, and it draws nothing — the symptom is a dark
+      scene with no message. `create_graphics_pipeline` must refuse; the test
+      in `Tool/client_tests/tests/rhi_pipeline.rs` does not exist yet.
+- [ ] §642: five creators (`create_sampler`, `create_texture`, `create_buffer`,
+      `create_shader_module`, `create_descriptor_set_layout`) still return a
+      CPU-side stand-in when the backend refuses. The refusal is now printed,
+      but the caller still receives an object that looks created. The fix is
+      to change the signatures to `RhiResult` — the callers are about sixty,
+      of which nine are in `src/rhi/ui/`, which is now open.
+- [ ] §663: the `BackendResource` trait mentions `vulkan::WindowSurface` and
+      `vulkan::Swapchain` in its signatures, so a backend other than Vulkan
+      cannot be implemented at all — the D3D12/D3D11/OpenGL support in
+      `Cargo.toml` is not merely unimplemented, it is unimplementable. The fix
+      changes the public surface of the RHI: either move the presentation
+      types into a neutral layer, or take presentation out of the trait.
+- [ ] §682: the graph's screen-sized resources (the GBuffer's four targets,
+      the lit image, the depth) are created once in `RenderGraph::initialize`
+      and never recreated, and `gbuffer`, `lighting` and `resolve` do not
+      override `resize` at all. After a window resize the chain draws into
+      targets of the old size — and the validator does not see it, because the
+      render area ends up smaller than the framebuffer, which is legal. The
+      check that closes it must be a pixel one: after a resize the cube must
+      occupy the same share of the frame, not a corner. The forward and
+      transparent passes do not have this defect — they read the size from the
+      target's own descriptor — so it goes away with the deferred chain.
+
+### Examples and checks
+
+- [ ] The resize self-check in `examples/cube.rs` changes only the logical
+      size, so the chain is rebuilt at the old size and the real resize path
+      is never walked. `examples/deferred.rs` does it properly
+      (`request_inner_size`); `cube` should follow.
+- [ ] The deferred example's resize self-check must become a pixel check
+      (see §682): the validator is quiet while the picture is wrong.
+- [ ] `pass_reachability.rs`: the allowlist reasons must stay honest. They
+      are checked for staleness, and the reason for each of the three passes
+      is "the pipeline was never written" — the shaders exist, the pipelines
+      do not, and the wording should say which is missing.
+
+### Decision still open
+
+- [ ] §316 says the deferred chain is to be deleted. The work above keeps it
+      alive until Forward+ is proven, and the deletion is the last step. If
+      the owner prefers to keep the deferred chain instead, steps 1 to 3 are
+      the same work — the shadow map and the forward shader are not
+      deferred-specific — but step 4 disappears.
 
 ## Decisions needed from the owner
 

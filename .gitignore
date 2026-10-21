@@ -21,3 +21,11 @@ Thumbs.db
 # 968 075 "lines" - it drowns out the ~11 500 lines of real source that are
 # untracked and therefore one `git checkout` away from gone.
 Model/
+
+# A stray file named "-1" in the repository root, ten bytes long, containing
+# the text "-1". It is the output of a shell redirect that lost its target
+# (`... > -1` instead of `... 2>&1`). Kept on disk rather than deleted - the
+# rule is that dead code is not removed - but it is not source and has no
+# business in the repository.
+/-1
+

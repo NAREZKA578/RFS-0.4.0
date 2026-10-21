@@ -162,6 +162,40 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
                 );
             }
 
+            Command::BindComputeDescriptorSets { pipeline, first_set, sets } => {
+                let mut raw = Vec::with_capacity(sets.len());
+                for set in sets {
+                    raw.push(ash::vk::DescriptorSet::from_raw(Translated::handle(
+                        "descriptor set",
+                        set.backend(),
+                    )?));
+                }
+                // The compute pipeline's layout is in the same `memory` field
+                // as the graphics pipeline's: the backend stores the pipeline
+                // layout next to the pipeline when it creates it. Without the
+                // layout Vulkan would need a null one, which is a crash.
+                let Some(pipeline_gpu) = pipeline.backend() else {
+                    return Err(RhiError::BackendError(
+                        "compute pipeline has no GPU backing".into(),
+                    ));
+                };
+                if pipeline_gpu.memory == 0 {
+                    return Err(RhiError::BackendError(
+                        "compute pipeline carries no pipeline layout; \
+                         descriptor sets cannot be bound"
+                            .into(),
+                    ));
+                }
+                device.cmd_bind_descriptor_sets(
+                    cb,
+                    ash::vk::PipelineBindPoint::COMPUTE,
+                    ash::vk::PipelineLayout::from_raw(pipeline_gpu.memory),
+                    *first_set,
+                    &raw,
+                    &[],
+                );
+            }
+
             Command::BindVertexBuffers { first_binding, buffers } => {
                 if buffers.is_empty() {
                     return Ok(());
@@ -222,10 +256,8 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
                     "color clear target",
                     texture.texture().backend(),
                 )?);
-                let ranges = subresource_ranges(
-                    texture.mip_level_count(),
-                    clear_aspect_for(texture.texture().desc().format),
-                );
+                let aspect = clear_aspect_for(texture.texture().desc().format);
+                let ranges = subresource_ranges(texture.mip_level_count(), aspect);
                 let raw = match value {
                     crate::types::ClearValue::Color { r, g, b, a } => {
                         ash::vk::ClearColorValue { float32: [*r, *g, *b, *a] }
@@ -241,6 +273,7 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
                         ));
                     }
                 };
+                transition_whole_image_to_transfer_dst(device, cb, image, aspect);
                 device.cmd_clear_color_image(
                     cb,
                     image,
@@ -256,10 +289,9 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
                     "depth clear target",
                     texture.texture().backend(),
                 )?);
-                let ranges = subresource_ranges(
-                    texture.mip_level_count(),
-                    clear_aspect_for(texture.texture().desc().format),
-                );
+                let aspect = clear_aspect_for(texture.texture().desc().format);
+                let ranges = subresource_ranges(texture.mip_level_count(), aspect);
+                transition_whole_image_to_transfer_dst(device, cb, image, aspect);
                 device.cmd_clear_depth_stencil_image(
                     cb,
                     image,
@@ -339,6 +371,16 @@ fn replay(t: &Translated<'_>, command: &Command) -> RhiResult<()> {
                          the copy extent is still 2D"
                     );
                 }
+                // The barrier's aspect comes from the format like every other
+                // image barrier here; the copy itself declares COLOR because it
+                // was written for colour uploads, and a depth-format upload is a
+                // separate pre-existing mismatch this does not worsen.
+                transition_whole_image_to_transfer_dst(
+                    device,
+                    cb,
+                    image,
+                    clear_aspect_for(dst.desc().format),
+                );
                 device.cmd_copy_buffer_to_image(
                     cb,
                     src_raw,
@@ -530,11 +572,83 @@ fn refuse_partial_clear(
     )))
 }
 
+/// Put an image into `TRANSFER_DST_OPTIMAL` for a writer that overwrites it whole.
+///
+/// `ClearColor`, `ClearDepthStencil` and `CopyBufferToTexture` name
+/// `TRANSFER_DST_OPTIMAL` in the command itself, so the image must be in that
+/// layout when the command executes
+/// (`VUID-vkCmdClearColorImage-imageLayout-00012`,
+/// `VUID-vkCmdClearDepthStencilImage-imageLayout-00012`, and the copy's
+/// counterpart). Nothing used to put it there: the only transition in the system
+/// was an explicit `PipelineBarrier` command, and a clear that never goes
+/// through one failed validation before writing a single pixel — the second of
+/// the two `VUID`s behind `a_registered_image_is_actually_sampled_and_drawn`.
+///
+/// `oldLayout` is `UNDEFINED` deliberately. All three commands discard the
+/// image's previous contents from end to end, so there is nothing to preserve
+/// and no availability to arrange for the content itself — and
+/// `UNDEFINED -> TRANSFER_DST_OPTIMAL` is a legal transition from *any* real
+/// layout, which makes it the one statement about the past that cannot be
+/// stated wrongly. Execution order against earlier accesses in the same command
+/// buffer is still owed, so the barrier waits on everything before it
+/// (`ALL_COMMANDS` + `MEMORY_READ | MEMORY_WRITE`) instead of `TOP_OF_PIPE`:
+/// a texture copied, cleared and cleared again in one buffer otherwise risks
+/// finishing in the wrong order, and these commands are rare enough that the
+/// wider wait costs nothing. The other half of the contract — sampling a
+/// `TRANSFER_DST` image — is the UI's barrier before the render pass, kept on
+/// its side by AGENT-SBF2; neither side must add the other's, or the second
+/// barrier would name a stale `oldLayout`.
+fn transition_whole_image_to_transfer_dst(
+    device: &ash::Device,
+    cb: ash::vk::CommandBuffer,
+    image: ash::vk::Image,
+    aspect_mask: ash::vk::ImageAspectFlags,
+) {
+    let barriers = [ash::vk::ImageMemoryBarrier {
+        src_access_mask: ash::vk::AccessFlags::MEMORY_READ
+            | ash::vk::AccessFlags::MEMORY_WRITE,
+        dst_access_mask: ash::vk::AccessFlags::TRANSFER_WRITE,
+        old_layout: ash::vk::ImageLayout::UNDEFINED,
+        new_layout: ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        src_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: ash::vk::QUEUE_FAMILY_IGNORED,
+        image,
+        subresource_range: ash::vk::ImageSubresourceRange {
+            aspect_mask,
+            base_mip_level: 0,
+            level_count: ash::vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: ash::vk::REMAINING_ARRAY_LAYERS,
+        },
+        ..Default::default()
+    }];
+    unsafe {
+        // SAFETY: `barriers` is a local array living across the call ash
+        // borrows it for; the image handle was resolved by the caller from a
+        // live resource; the stage/access pair matches the writer that follows.
+        device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
+        );
+    }
+}
+
 /// One subresource range per mip level of a clear.
 ///
 /// Vulkan clears per `ImageSubresourceRange`, and a clear that only covered mip 0
 /// would leave the rest of a mipped texture uninitialised, so the clear is emitted
-/// once per level.
+/// once per level — and each of those ranges has to name **its own** level.
+///
+/// Bug #639: the ranges were all the same range with `base_mip_level: 0` and
+/// `level_count: 1`, repeated `mip_levels` times. So the clear covered mip 0
+/// `mip_levels` times and mips 1..N-1 not at all: the levels above the first
+/// kept whatever they had — uninitialised memory for a fresh texture — and the
+/// repetitions were redundant work inside the render pass.
 ///
 /// The aspects a clear's subresource range is allowed to name, derived from the
 /// **format** rather than from the usage.
@@ -547,7 +661,7 @@ fn refuse_partial_clear(
 /// to work — it is a claim about aspects the format does not have, and the call
 /// is refused.
 ///
-/// Same reasoning as the barrier path (Bug №290), where the identical mistake
+/// Same reasoning as the barrier path (Bug #290), where the identical mistake
 /// was already corrected: the format decides, and keying off the usage bit
 /// instead of it is itself the violation.
 fn clear_aspect_for(format: crate::types::Format) -> ash::vk::ImageAspectFlags {
@@ -563,20 +677,23 @@ fn subresource_ranges(
     mip_levels: u32,
     aspect_mask: ash::vk::ImageAspectFlags,
 ) -> Vec<ash::vk::ImageSubresourceRange> {
-    let sub = ash::vk::ImageSubresourceRange {
-        aspect_mask,
-        base_mip_level: 0,
-        level_count: 1,
-        base_array_layer: 0,
-        layer_count: 1,
-    };
-    (0..mip_levels.max(1)).map(|_| sub).collect()
+    (0..mip_levels.max(1))
+        .map(|mip| ash::vk::ImageSubresourceRange {
+            aspect_mask,
+            base_mip_level: mip,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .collect()
 }
 
 fn clear_value(value: &crate::types::ClearValue) -> ash::vk::ClearValue {
     match value {
         crate::types::ClearValue::Color { r, g, b, a } => ash::vk::ClearValue {
-            color: ash::vk::ClearColorValue { float32: [*r, *g, *b, *a] },
+            color: ash::vk::ClearColorValue {
+                float32: [*r, *g, *b, *a],
+            },
         },
         crate::types::ClearValue::DepthStencil { depth, stencil } => ash::vk::ClearValue {
             depth_stencil: ash::vk::ClearDepthStencilValue {
@@ -584,5 +701,69 @@ fn clear_value(value: &crate::types::ClearValue) -> ash::vk::ClearValue {
                 stencil: *stencil,
             },
         },
+    }
+}
+
+// At the end of the file on purpose: clippy's `items_after_test_module` fires when
+// anything follows a `mod tests`, and a warning here is a warning every future
+// contributor learns to ignore.
+
+#[cfg(test)]
+mod clear_subresources {
+    use super::subresource_ranges;
+    use ash::vk;
+
+    /// Bug #639: a clear has to name every mip level it covers, and each range
+    /// has to name **its own** level.
+    ///
+    /// The ranges used to be the same range repeated: `base_mip_level: 0` and
+    /// `level_count: 1`, once per level. So the clear covered mip 0 N times
+    /// and mips 1..N-1 not at all — the levels above the first kept
+    /// uninitialised memory, and the repetitions were redundant work inside the
+    /// render pass.
+    #[test]
+    fn every_mip_level_gets_its_own_range() {
+        let ranges = subresource_ranges(4, vk::ImageAspectFlags::COLOR);
+        assert_eq!(ranges.len(), 4, "one range per mip level");
+        for (mip, range) in ranges.iter().enumerate() {
+            let mip = mip as u32;
+            assert_eq!(
+                range.base_mip_level, mip,
+                "range {mip} clears mip {} instead of mip {mip}",
+                range.base_mip_level
+            );
+            assert_eq!(
+                range.level_count, 1,
+                "range {mip} covers {} levels; a clear covers one level at a time",
+                range.level_count
+            );
+            assert_eq!(range.aspect_mask, vk::ImageAspectFlags::COLOR);
+        }
+    }
+
+    /// A texture with no mips still has to be cleared, so the range list is
+    /// never empty. An empty list would make `vkCmdClearColorImage` a no-op
+    /// at best and a validation error at worst.
+    #[test]
+    fn a_texture_without_mips_still_gets_one_range() {
+        let ranges = subresource_ranges(0, vk::ImageAspectFlags::COLOR);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].base_mip_level, 0);
+        assert_eq!(ranges[0].level_count, 1);
+    }
+
+    /// The aspect comes from the format, not from the usage. A colour image
+    /// has colour aspect only, and naming DEPTH or STENCIL for it is refused
+    /// by the driver (`VUID-vkCmdClearColorImage-aspectMask-02498`).
+    ///
+    /// This is a property of the caller's choice of aspect, checked here so
+    /// that the range builder stays a pure function of (levels, aspect) and
+    /// nobody widens it by accident.
+    #[test]
+    fn the_aspect_is_carried_through_unchanged() {
+        let ranges = subresource_ranges(2, vk::ImageAspectFlags::DEPTH);
+        for range in &ranges {
+            assert_eq!(range.aspect_mask, vk::ImageAspectFlags::DEPTH);
+        }
     }
 }

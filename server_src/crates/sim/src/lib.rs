@@ -1,10 +1,10 @@
-pub mod tick;
 pub mod ballistics;
+pub mod collision;
 pub mod map;
 pub mod physics;
-pub mod collision;
+pub mod tick;
 
-pub use tick::*;
 pub use ballistics::*;
-pub use physics::*;
 pub use collision::*;
+pub use physics::*;
+pub use tick::*;

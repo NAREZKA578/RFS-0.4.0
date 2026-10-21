@@ -28,6 +28,14 @@ use ash::khr::win32_surface::Instance as Win32SurfaceLoader;
 use ash::vk;
 use std::sync::Arc;
 
+/// How long to wait for a semaphore that should already be signalled.
+///
+/// Bug #648. Used when draining the image-acquired semaphore after an acquire
+/// that returned SUBOPTIMAL: the spec guarantees the signal is there, so the
+/// timeout should never expire, but a hang is worse than a semaphore left
+/// pending and the difference is not worth a frozen application.
+const DRAIN_TIMEOUT_NS: u64 = 1_000_000_000;
+
 /// A window surface, plus the loaders that can create and destroy it.
 pub struct WindowSurface {
     pub handle: vk::SurfaceKHR,
@@ -389,6 +397,19 @@ impl Swapchain {
             // Still safe to render into for one more frame, but the chain no
             // longer matches the surface, so tell the caller to rebuild rather
             // than letting it present a stale image.
+            //
+            // Bug #648: the acquire did hand over an image, and the semaphore it
+            // was given is signalled — Vulkan signals it as part of a successful
+            // acquire, a suboptimal one included. Reporting out-of-date without
+            // draining it leaves the semaphore signalled with nothing left to
+            // wait on it, and the next acquire of that slot fails
+            // `VUID-vkAcquireNextImageKHR-semaphore-01779` ("must not have any
+            // pending operations").
+            //
+            // The drain belongs here rather than in the caller: the caller does
+            // not know which slot was signalled, and this function is the one
+            // that handed the semaphore over.
+            self.drain_acquired_semaphore(image_acquired);
             return Err(RhiError::SwapchainOutOfDate);
         }
 
@@ -442,6 +463,40 @@ impl Swapchain {
     /// frame is on screen: presentation is asynchronous, and the wait semaphore is
     /// consumed by it. That consumption is what releases the image for the next
     /// acquire, which is exactly the signal that was missing.
+    /// Wait out a semaphore the acquire signalled, so it is not left pending.
+    ///
+    /// Bug #648. A semaphore cannot be reset, only waited on, so consuming the
+    /// signal is the only way back to a state where the slot can be acquired
+    /// again.
+    ///
+    /// The wait is bounded rather than infinite. The spec guarantees the
+    /// semaphore is signalled when the acquire returned SUBOPTIMAL, so the
+    /// timeout should never expire — but a hang is a worse failure than a
+    /// semaphore left pending, and the difference between the two is not worth
+    /// a frozen application.
+    fn drain_acquired_semaphore(&self, semaphore: vk::Semaphore) {
+        if semaphore == vk::Semaphore::null() {
+            return;
+        }
+        let values: [u64; 1] = [1];
+        let semaphores = [semaphore];
+        let wait = vk::SemaphoreWaitInfo {
+            semaphore_count: 1,
+            p_semaphores: semaphores.as_ptr(),
+            p_values: values.as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: the semaphore belongs to this device and is not in use by a
+        // pending submit; the wait info points at arrays that live across the
+        // call.
+        if let Err(e) = unsafe { self.device.wait_semaphores(&wait, DRAIN_TIMEOUT_NS) } {
+            eprintln!(
+                "[vulkan] could not drain the image-acquired semaphore after a \
+                 suboptimal acquire: {e}"
+            );
+        }
+    }
+
     pub fn present(&self, image_index: u32, render_finished: vk::Semaphore) -> RhiResult<()> {
         if image_index as usize >= self.images.len() {
             return Err(RhiError::BackendError(format!(
@@ -465,9 +520,18 @@ impl Swapchain {
         // (when non-null) is a semaphore that was signalled by a prior submit on this queue; pointers
         // in `present` reference locals that live for the duration of the call.
         match unsafe { self.loader.queue_present(self.queue, &present) } {
-            // `Ok(true)` means SUBOPTIMAL: the frame was shown but the chain
-            // no longer matches the surface.
-            Ok(_) => Ok(()),
+            // `Ok(true)` means SUBOPTIMAL: the frame was shown, but the chain no
+            // longer matches the surface.
+            //
+            // Bug #640: the flag used to be thrown away here — the comment above
+            // described exactly what the `bool` carried, and the `Ok(_)` arm
+            // discarded it. The acquire path already treats the same flag as
+            // out-of-date (`acquire`, a few hundred lines up), and it should: a
+            // chain that no longer matches the surface is going to present
+            // images the surface will not show, and the first sign of it is
+            // this flag. Reporting it as success means the chain is never
+            // rebuilt, so the window keeps presenting a stale image.
+            Ok(suboptimal) => present_outcome(suboptimal),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Err(RhiError::SwapchainOutOfDate),
             Err(e) => Err(RhiError::BackendError(format!("queue present: {e}"))),
         }
@@ -636,4 +700,56 @@ fn pick_composite_alpha(caps: &vk::SurfaceCapabilitiesKHR) -> vk::CompositeAlpha
     .into_iter()
     .find(|a| caps.supported_composite_alpha.contains(*a))
     .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE)
+}
+
+/// What a `queue_present` result means for the caller. Bug #640.
+///
+/// `ash` reports SUBOPTIMAL as `Ok(true)`: the frame was shown, but the chain
+/// no longer matches the surface. The acquire path treats the same flag as
+/// out-of-date, and so does this one — a chain that no longer matches the
+/// surface is going to present images the surface will not show, and the
+/// caller has to be told so it can rebuild.
+///
+/// The flag used to be discarded here, which meant the first sign of a
+/// surface that changed was never acted on.
+fn present_outcome(suboptimal: bool) -> RhiResult<()> {
+    if suboptimal {
+        Err(RhiError::SwapchainOutOfDate)
+    } else {
+        Ok(())
+    }
+}
+
+// At the end of the file on purpose: clippy's `items_after_test_module` fires when
+// anything follows a `mod tests`, and a warning here is a warning every future
+// contributor learns to ignore.
+
+#[cfg(test)]
+mod present_result {
+    use super::present_outcome;
+    use crate::error::RhiError;
+
+    /// Bug #640: a suboptimal present is out-of-date, not success.
+    ///
+    /// The frame was shown, but the chain no longer matches the surface. The
+    /// caller has to rebuild it — which it can only do if it is told. Reporting
+    /// success here means the window keeps presenting a stale image, and the
+    /// first sign of it (a resize, a minimised window, a fullscreen switch) is
+    /// swallowed.
+    #[test]
+    fn a_suboptimal_present_is_reported_as_out_of_date() {
+        let outcome = present_outcome(true);
+        assert!(
+            matches!(outcome, Err(RhiError::SwapchainOutOfDate)),
+            "a suboptimal present must be reported as out-of-date, got {outcome:?}"
+        );
+    }
+
+    /// The normal case still has to be success, or the fix would be to report
+    /// every present as out-of-date — which would rebuild the chain on every
+    /// frame.
+    #[test]
+    fn an_ordinary_present_is_success() {
+        assert!(present_outcome(false).is_ok());
+    }
 }

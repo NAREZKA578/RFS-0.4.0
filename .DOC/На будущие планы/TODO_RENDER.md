@@ -5,6 +5,16 @@
 > **Status:** Architecture Complete, Implementation Started  
 > **NOT CONNECTED TO SERVER CODE**
 
+> **Read this first.** This file is the original skeleton of the render module
+> and it is out of date: it still lists work that has been done and work that
+> has been decided differently. The **current, concrete work list** is in
+> `.DOC/На будущие планы/TODO.md`, section "Render: the Forward+ plan, agreed
+> 2026-10-20" — the shadow pass, forward lighting, clustering, transparency,
+> water, and the removal of the deferred chain. The state of every defect is
+> in `.DOC/BUGS.md` (379 entries), and the warnings in `.DOC/WARN.md`.
+>
+> What is below is kept for the structure it gives, not for its content.
+
 ---
 
 ## Priority Legend
@@ -66,27 +76,34 @@
 - [ ] Implement pass resize handling
 
 ### GBuffer Pass
-- [ ] Complete `passes/gbuffer.rs` - GBuffer pass implementation
-- [ ] Create GBuffer textures (position, normal, albedo, material)
-- [ ] Create GBuffer render pass
-- [ ] Create GBuffer pipeline
-- [ ] Implement GBuffer rendering
+- [x] Complete `passes/gbuffer.rs` - GBuffer pass implementation
+- [x] Create GBuffer textures (position, normal, albedo, material)
+- [x] Create GBuffer render pass
+- [x] Create GBuffer pipeline
+- [x] Implement GBuffer rendering
+- [ ] The GBuffer is scheduled for removal: the owner chose Forward+ (§316).
+      See the Forward+ plan in `TODO.md` — it goes after the forward path works.
 
 ### Shadow Pass
 - [ ] Complete `passes/shadow.rs` - Shadow pass implementation
 - [ ] Implement cascaded shadow maps
-- [ ] Create shadow map textures
+- [x] Create shadow map textures (the textures are built, but as CPU-side
+      descriptions without a native handle — they have to go through the device)
 - [ ] Create shadow render pass
 - [ ] Create shadow pipeline
 - [ ] Implement shadow matrix calculation
+- [ ] Per-item uniform buffers and descriptor sets, as in the geometry pass
+- [ ] A test that reads the shadow map back
 
 ### Lighting Pass
-- [ ] Complete `passes/lighting.rs` - Lighting pass implementation
-- [ ] Implement PBR lighting
-- [ ] Implement multiple light types
+- [x] Complete `passes/lighting.rs` - Lighting pass implementation
+- [ ] Implement PBR lighting (the shader is positional: a point with a radius)
+- [x] Implement multiple light types
 - [ ] Implement SSAO (optional)
 - [ ] Implement SSR (optional)
-- [ ] Create lighting pipeline
+- [x] Create lighting pipeline
+- [ ] The lighting pass is scheduled for removal with the GBuffer (§316): the
+      forward shader replaces it.
 
 ### Transparent Pass
 - [ ] Complete `passes/transparent.rs` - Transparent pass implementation

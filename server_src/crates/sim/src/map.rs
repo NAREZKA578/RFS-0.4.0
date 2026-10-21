@@ -66,12 +66,11 @@ pub const MAX_OBSTACLES: usize = 65_536;
 /// `Structure` is what the design note means by "твёрдые препятствия создают
 /// радиолокационную тень", and it is the only kind an open-sea map is ever
 /// expected to contain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ObstacleKind {
-    /// Built structure. The only kind an open-sea map is expected to contain.
-    #[default]
-    Structure,
-}
+///
+/// Bug №699: the kind lives in `rfs_core` now, because it travels on the
+/// wire — the client is told about the structures, and it has to know what
+/// kind each one is. One definition, two users.
+pub use rfs_core::world::ObstacleKind;
 
 /// One solid volume in the world.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -142,7 +141,11 @@ pub enum MapError {
     #[error("obstacle {id} is not finite")]
     NonFiniteObstacle { id: u64 },
     #[error("obstacle {id} has an inverted box (min={min:?}, max={max:?})")]
-    InvertedObstacle { id: u64, min: [f32; 3], max: [f32; 3] },
+    InvertedObstacle {
+        id: u64,
+        min: [f32; 3],
+        max: [f32; 3],
+    },
     #[error("obstacle {id} sticks out of the map (it spans {min:?}..{max:?}, map is {map:?}..{map_max:?})")]
     ObstacleOutsideMap {
         id: u64,
@@ -216,8 +219,8 @@ pub fn clamp_point_into(bounds: &Bounds, point: Vec3f) -> (Vec3f, bool) {
 impl WorldMap {
     /// Parses and validates a map from JSON.
     pub fn from_json(name: &str, json: &str) -> Result<Self, MapError> {
-        let parsed: WorldMap =
-            serde_json::from_str(json).map_err(|e| MapError::Malformed(name.to_string(), e.to_string()))?;
+        let parsed: WorldMap = serde_json::from_str(json)
+            .map_err(|e| MapError::Malformed(name.to_string(), e.to_string()))?;
         parsed.validated(name)?;
         Ok(parsed)
     }
@@ -225,26 +228,30 @@ impl WorldMap {
     /// Checks everything a map has to satisfy, naming the offending field.
     pub fn validated(&self, name: &str) -> Result<(), MapError> {
         if !check_box(self.bounds.min, self.bounds.max) {
-            return Err(if self.bounds.min.x.is_finite()
-                && self.bounds.min.y.is_finite()
-                && self.bounds.min.z.is_finite()
-                && self.bounds.max.x.is_finite()
-                && self.bounds.max.y.is_finite()
-                && self.bounds.max.z.is_finite()
-            {
-                MapError::InvertedBounds {
-                    min: triplet(self.bounds.min),
-                    max: triplet(self.bounds.max),
-                }
-            } else {
-                MapError::NonFiniteBounds {
-                    min: triplet(self.bounds.min),
-                    max: triplet(self.bounds.max),
-                }
-            });
+            return Err(
+                if self.bounds.min.x.is_finite()
+                    && self.bounds.min.y.is_finite()
+                    && self.bounds.min.z.is_finite()
+                    && self.bounds.max.x.is_finite()
+                    && self.bounds.max.y.is_finite()
+                    && self.bounds.max.z.is_finite()
+                {
+                    MapError::InvertedBounds {
+                        min: triplet(self.bounds.min),
+                        max: triplet(self.bounds.max),
+                    }
+                } else {
+                    MapError::NonFiniteBounds {
+                        min: triplet(self.bounds.min),
+                        max: triplet(self.bounds.max),
+                    }
+                },
+            );
         }
         if self.obstacles.len() > MAX_OBSTACLES {
-            return Err(MapError::TooManyObstacles { count: self.obstacles.len() });
+            return Err(MapError::TooManyObstacles {
+                count: self.obstacles.len(),
+            });
         }
 
         let mut seen = std::collections::HashSet::with_capacity(self.obstacles.len());
@@ -264,7 +271,8 @@ impl WorldMap {
                     MapError::NonFiniteObstacle { id: obstacle.id }
                 });
             }
-            if !self.bounds.contains(obstacle.bounds.min) || !self.bounds.contains(obstacle.bounds.max)
+            if !self.bounds.contains(obstacle.bounds.min)
+                || !self.bounds.contains(obstacle.bounds.max)
             {
                 return Err(MapError::ObstacleOutsideMap {
                     id: obstacle.id,
@@ -293,20 +301,46 @@ impl WorldMap {
         clamp_point_into(&self.bounds, point)
     }
 
-    /// Builds an open-sea map, with `count` structures scattered through it.
+    /// The wire description of this world.
     ///
-    /// **The default is `count = 0`, and that is the only correct default for
-    /// this project.** `TODO.md` part G, «Погода, мир, обнаружение»: the map is
-    /// 50×50 km of open sea with no land. Structures exist because the same
-    /// section says hard obstacles cast a radar shadow, and a mechanism with no
-    /// content is not a reason to invent content.
+    /// Bug №699: the client has to be told what the world holds. The world is
+    /// static, so this is a one-off description rather than a layer — and this
+    /// is the one place where the simulation's boxes become the plain data the
+    /// client stores.
+    pub fn to_description(&self) -> rfs_core::world::MapDescription {
+        rfs_core::world::MapDescription {
+            name: self.name.clone(),
+            bounds_min: self.bounds.min,
+            bounds_max: self.bounds.max,
+            obstacles: self
+                .obstacles
+                .iter()
+                .map(|obstacle| rfs_core::world::MapObstacleDescription {
+                    id: obstacle.id,
+                    kind: obstacle.kind,
+                    min: obstacle.bounds.min,
+                    max: obstacle.bounds.max,
+                })
+                .collect(),
+        }
+    }
+
+    /// Builds an open-sea map: no obstacles at all, at any seed.
+    ///
+    /// `TODO.md` part G, «Погода, мир, обнаружение»: the map is 50×50 km of
+    /// open sea with no land. Structures exist because the same section says
+    /// hard obstacles cast a radar shadow, and a mechanism with no content is
+    /// not a reason to invent content. The seed is still part of the signature
+    /// so a caller's `--map-seed` argument stays meaningful and the procedural
+    /// generator remains available for tests that do need a target to hit —
+    /// a test says so instead of relying on the world happening to contain one.
     ///
     /// Deterministic: the same seed gives the same world, every time and on every
     /// machine. That is what makes it usable as a stand-in in tests and in
     /// development, and it costs one small PRNG rather than a dependency whose
     /// output could change between versions.
-    pub fn open_sea(name: &str, radius: f32) -> Result<Self, MapError> {
-        Self::procedural(name, 0, radius, 0)
+    pub fn open_sea(name: &str, seed: u64, radius: f32) -> Result<Self, MapError> {
+        Self::procedural(name, seed, radius, 0)
     }
 
     /// Builds a map with `count` structures scattered through it.
@@ -349,12 +383,12 @@ impl WorldMap {
             obstacles.push(MapObstacle {
                 // Ids live in their own band, clear of the ranges the server
                 // hands out: ships from 10, projectiles from 5_000_000, players
-// from 1_000_000. A collision target has to be unambiguous, or
-                  // "what did I hit" resolves to a ship that happens to share a
-                  // number with a structure.
-                  id: 100_000 + index as u64,
+                // from 1_000_000. A collision target has to be unambiguous, or
+                // "what did I hit" resolves to a ship that happens to share a
+                // number with a structure.
+                id: 100_000 + index as u64,
                 bounds: Bounds::new(centre - size * 0.5, centre + size * 0.5),
-kind: ObstacleKind::Structure,
+                kind: ObstacleKind::Structure,
             });
         }
 
@@ -434,7 +468,9 @@ struct SmallRng {
 impl SmallRng {
     fn new(seed: u64) -> Self {
         // Avoid the zero state, which is a fixed point for this generator.
-        Self { state: seed ^ 0x9E37_79B9_7F4A_7C15 }
+        Self {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -457,6 +493,31 @@ impl SmallRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bug №699: the description the client is told about must carry the
+    /// whole world — the volume and every structure in it, with its identity
+    /// and its kind. A description that lost the obstacles would leave the
+    /// client with an empty sea and a shell that vanishes for no reason.
+    #[test]
+    fn a_world_describes_itself_for_the_client() {
+        let world = WorldMap::from_json("test-water", AUTHORED).expect("the authored map is valid");
+        let description = world.to_description();
+
+        assert_eq!(description.name, "test-water");
+        assert_eq!(description.bounds_min, world.bounds.min);
+        assert_eq!(description.bounds_max, world.bounds.max);
+        assert_eq!(
+            description.obstacles.len(),
+            world.obstacles.len(),
+            "every structure must reach the client"
+        );
+        for (described, obstacle) in description.obstacles.iter().zip(world.obstacles.iter()) {
+            assert_eq!(described.id, obstacle.id);
+            assert_eq!(described.kind, obstacle.kind);
+            assert_eq!(described.min, obstacle.bounds.min);
+            assert_eq!(described.max, obstacle.bounds.max);
+        }
+    }
 
     /// A hand-written map, so the tests exercise the parse path and not the
     /// generator. Numbers are chosen so that every rock is inside the volume —
@@ -489,6 +550,30 @@ mod tests {
 
     fn authored() -> WorldMap {
         WorldMap::from_json("test-water", AUTHORED).expect("the fixture map is not valid")
+    }
+
+    /// `open_sea` forces the obstacle count to zero no matter what its seed is:
+    /// part G says an open sea has no land, and a generator that sprays
+    /// structures would quietly move the point of the whole helper.
+    #[test]
+    fn an_open_sea_map_is_open_at_any_seed() {
+        for seed in [0u64, 12345, 77777] {
+            let sea = WorldMap::open_sea("seed-echo", seed, 25_000.0)
+                .expect("open_sea rejects a radius it accepts elsewhere");
+            assert!(sea.obstacles.is_empty(), "seed {seed} produced obstacles");
+            assert_eq!(sea.bounds.min, from_components([-25_000.0; 3]));
+            assert_eq!(sea.bounds.max, from_components([25_000.0; 3]));
+        }
+    }
+
+    /// A radius that `procedural` refuses cannot be accepted by public helper
+    /// either: it is the same guard, reached through a narrower call.
+    #[test]
+    fn an_open_sea_refuses_an_invalid_radius() {
+        match WorldMap::open_sea("seed-echo", 1, -1.0) {
+            Err(MapError::InvalidRadius { radius }) => assert_eq!(radius, -1.0),
+            other => panic!("open_sea accepted an invalid radius, got {other:?}"),
+        }
     }
 
     /// A rock that pokes through the map face is broken authoring data. The
@@ -572,12 +657,17 @@ mod tests {
         };
         let map = WorldMap {
             name: "too-many".into(),
-            bounds: Bounds::new(Vec3f::new(-10.0, -10.0, -10.0), Vec3f::new(10.0, 10.0, 10.0)),
+            bounds: Bounds::new(
+                Vec3f::new(-10.0, -10.0, -10.0),
+                Vec3f::new(10.0, 10.0, 10.0),
+            ),
             obstacles: vec![rock; MAX_OBSTACLES + 1],
         };
         assert_eq!(
             map.validated("too-many"),
-            Err(MapError::TooManyObstacles { count: MAX_OBSTACLES + 1 })
+            Err(MapError::TooManyObstacles {
+                count: MAX_OBSTACLES + 1
+            })
         );
     }
 
@@ -657,7 +747,10 @@ mod tests {
         let square = rock.penetration_depth(centre);
         let graze = rock.penetration_depth(Vec3f::new(centre.x - 19.0, centre.y, centre.z));
         assert!((square - 1.0).abs() < 1e-6, "a centre hit scored {square}");
-        assert!(graze > 0.0 && graze < square, "a graze scored {graze} against {square}");
+        assert!(
+            graze > 0.0 && graze < square,
+            "a graze scored {graze} against {square}"
+        );
     }
 
     /// The penetration a hit reports has to describe the hit. A shell that
@@ -689,7 +782,10 @@ mod tests {
 
         let outside = Vec3f::new(5000.0, 0.0, 0.0);
         let (clamped, moved) = map.clamp_point(outside);
-        assert!(moved && clamped.x <= 1000.0, "a point outside was not clamped");
+        assert!(
+            moved && clamped.x <= 1000.0,
+            "a point outside was not clamped"
+        );
 
         let broken = Vec3f::new(f32::NAN, 0.0, 0.0);
         let (repaired, moved) = map.clamp_point(broken);
@@ -745,7 +841,11 @@ mod tests {
         let dir = shipped_maps();
         let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("shipped maps are unreadable at {}: {e}", dir.display()))
-            .map(|entry| entry.expect("a map directory entry could not be read").path())
+            .map(|entry| {
+                entry
+                    .expect("a map directory entry could not be read")
+                    .path()
+            })
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
             .collect();
 
@@ -781,7 +881,8 @@ mod tests {
     fn the_beta_map_is_open_sea() {
         let path = shipped_maps().join("open-water-50km.json");
         let json = std::fs::read_to_string(&path).expect("the beta map is missing");
-        let map = WorldMap::from_json("open-water-50km", &json).expect("the beta map does not load");
+        let map =
+            WorldMap::from_json("open-water-50km", &json).expect("the beta map does not load");
         assert!(
             map.obstacles.is_empty(),
             "the beta world is open sea, but it carries {} obstacle(s): {:?}",

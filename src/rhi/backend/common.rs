@@ -285,6 +285,21 @@ fn render_finished_semaphore(&self) -> crate::ash::vk::Semaphore {
              crate::ash::vk::Semaphore::null()
          }
 
+    /// The swapchain image the frame being recorded will be presented into.
+    ///
+    /// The present waits on the semaphore of *that* image, so the backend has to
+    /// know it. A backend with no presentation path has no images and ignores
+    /// this.
+    fn set_present_image(&self, _image_index: u32) {}
+
+    /// Tell the backend how many swapchain images there are.
+    ///
+    /// A backend that keeps one present semaphore per image needs a semaphore
+    /// for each of them. The count is known only after the chain is built, and
+    /// a rebuilt chain may have a different one, so the backend is told rather
+    /// than guessing.
+    fn ensure_presentation_images(&self, _count: usize) {}
+
          /// The semaphore `vkAcquireNextImageKHR` should signal for the next frame.
          ///
          /// Bug №282: `acquire` used to block the CPU on a fence instead, which is
@@ -295,18 +310,33 @@ fn render_finished_semaphore(&self) -> crate::ash::vk::Semaphore {
              crate::ash::vk::Semaphore::null()
          }
 
-         /// Give back a presentation frame that will not be submitted.
-         ///
-         /// Bug №282: `vkAcquireNextImageKHR` was given a semaphore to signal, and
-         /// if no submit follows, nothing ever waits on it. The semaphore stays
-         /// signalled forever, and the next `acquire` of that slot is then
-         /// VUID-vkAcquireNextImageKHR-semaphore-01779 — "must not have any pending
-         /// operations" — which is what happened on every frame that recorded no
-         /// commands.
-         ///
-         /// A backend with per-frame semaphores drains the signal here. One without
-         /// them has nothing pending and needs nothing.
-         fn cancel_presentation_frame(&self) {}
+          /// Give back a presentation frame that will not be submitted.
+          ///
+          /// Bug №282: `vkAcquireNextImageKHR` was given a semaphore to signal, and
+          /// if no submit follows, nothing ever waits on it. The semaphore stays
+          /// signalled forever, and the next `acquire` of that slot is then
+          /// VUID-vkAcquireNextImageKHR-semaphore-01779 — "must not have any pending
+          /// operations" — which is what happened on every frame that recorded no
+          /// commands.
+          ///
+          /// A backend with per-frame semaphores drains the signal here. One without
+          /// them has nothing pending and needs nothing.
+          fn cancel_presentation_frame(&self) {}
+
+    /// The layout the backend believes the image behind `image` is in. Bug #644.
+    ///
+    /// `None` means the backend does not track that image, which is the honest
+    /// answer for an image it did not create — a swapchain image, whose layout
+    /// belongs to whoever owns it. Guessing there is what made the readback
+    /// wrong in the first place: a barrier that claims `UNDEFINED` for an image
+    /// whose contents are still wanted declares them discarded.
+    ///
+    /// The default is `None`, which is the right answer for a backend with no
+    /// layout tracking.
+    fn image_layout(&self, _image: u64) -> Option<crate::resource::TextureLayout> {
+        None
+    }
+
 
     /// Release a texture early instead of at device teardown. Bug №289.
     ///

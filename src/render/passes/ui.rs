@@ -24,7 +24,7 @@
 //! and the NDC mapping agree by construction rather than by coincidence.
 
 use crate::render::core::RenderContext;
-use crate::render::graph::node::{PassDependency, RenderPass};
+use crate::render::graph::node::{PassDependency, PassOutcome, RenderPass};
 use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
@@ -211,7 +211,12 @@ impl RenderPass for UIPass {
         self.base.outputs()
     }
 
-    fn initialize(&mut self, _device: &crate::rhi::core::Device, _context: &RenderContext) {
+    fn initialize(
+        &mut self,
+        _device: &crate::rhi::core::Device,
+        _context: &RenderContext,
+        _resources: &mut HashMap<String, GraphResource>,
+    ) {
         // Nothing is built here on purpose. The surface format is only known once
         // presentation is attached, and `UiRenderer` wants an `Arc<Device>` while
         // this hook is handed a `&Device` — so the renderer is built on the first
@@ -224,25 +229,27 @@ impl RenderPass for UIPass {
         context: &mut RenderContext,
         _scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
-    ) {
+    ) -> PassOutcome {
+        // Bug №653: the pass reports what it did, so the graph can tell "was
+        // called" from "contributed to the frame".
         let Some((width, height)) = Self::drawable_extent(context) else {
             // A minimised window reports a zero-sized swapchain; drawing into it
             // is not a valid operation, so the frame is skipped rather than
             // recorded against a zero-sized viewport.
-            return;
+            return PassOutcome::skipped("no drawable extent");
         };
         if width == 0 || height == 0 {
-            return;
+            return PassOutcome::skipped("zero-sized extent");
         }
 
         let Some(format) = context.presentation_format else {
-            return;
+            return PassOutcome::skipped("no presentation format");
         };
 
         self.ensure_built(context.device(), format, width, height);
 
         let Some(ui) = self.ui.as_mut() else {
-            return;
+            return PassOutcome::skipped("the UI renderer was not built");
         };
 
         // The acquired image's *typed* view, not a raw handle and not a pinned
@@ -262,7 +269,7 @@ impl RenderPass for UIPass {
             .presentation_texture_views
             .get(context.swapchain_image_index as usize)
         else {
-            return;
+            return PassOutcome::skipped("no typed view for the acquired image");
         };
 
         // What is actually drawn this frame. Kept minimal on purpose — see
@@ -329,9 +336,13 @@ impl RenderPass for UIPass {
                         stats.skipped
                     );
                 }
+                PassOutcome::recorded()
             }
-            Ok(false) => {}
-            Err(e) => eprintln!("[ui] record failed: {e}"),
+            Ok(false) => PassOutcome::skipped("nothing to draw"),
+            Err(e) => {
+                eprintln!("[ui] record failed: {e}");
+                PassOutcome::skipped(format!("record failed: {e}"))
+            }
         }
     }
 
@@ -340,7 +351,18 @@ impl RenderPass for UIPass {
             ui.resize(width, height);
         }
         // Force a rebuild: the baked extent inside `UiRenderPass` is stale now.
-        self.built_for = Some((width, height));
+        //
+        // Bug №655: this used to set `built_for = Some((width, height))` — that
+        // is, it recorded the *new* size as the size the pass was built for.
+        // `needs_build` compares `built_for` with the size it is being asked
+        // for, so after a resize the two were equal and `needs_build` was
+        // false: the rebuild the comment demands was exactly the thing the
+        // code prevented.
+        //
+        // The correct invalidation is to forget what the pass was built for.
+        // `None` is not a size, so it never equals the size being asked for,
+        // and the next `execute` rebuilds.
+        self.built_for = None;
     }
 
     fn is_enabled(&self) -> bool {
@@ -351,17 +373,11 @@ impl RenderPass for UIPass {
 impl UIPass {
     /// The size to draw at, in physical pixels.
     ///
-    /// Physical extent first. See the module comment: `context.resolution` is the
-    /// window's *logical* size and disagrees with the swapchain at any scale
-    /// factor other than 100%, and it is absent entirely on a headless context.
+    /// Delegates to [`RenderContext::drawable_extent`], which is where the rule
+    /// lives now. It used to be written out here as well, which is how it ended
+    /// up written out wrongly in five other places (Bug №651): a rule that is
+    /// copied is a rule that drifts.
     fn drawable_extent(context: &RenderContext) -> Option<(u32, u32)> {
-        let extent = context.presentation_extent;
-        if extent.width != 0 && extent.height != 0 {
-            return Some((extent.width, extent.height));
-        }
-        if context.resolution.width != 0 && context.resolution.height != 0 {
-            return Some((context.resolution.width, context.resolution.height));
-        }
-        None
+        context.drawable_extent()
     }
 }

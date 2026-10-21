@@ -1,0 +1,15 @@
+[package]
+name = "wireaudit"
+version = "0.1.0"
+edition = "2021"
+
+# A reporting tool, not a test. It answers "is this line ever called", which a
+# green test cannot: the suite passes just as happily when a whole subsystem is
+# never entered.
+#
+# No dependencies on purpose. It has to keep working when the crates it audits
+# do not, which is exactly when it is most useful.
+
+[[bin]]
+name = "wireaudit"
+path = "src/main.rs"

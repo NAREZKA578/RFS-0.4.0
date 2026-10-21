@@ -65,8 +65,9 @@ impl BloomEffect {
 
     /// Initialize the effect
     pub fn initialize(&mut self, device: &Arc<Device>, context: &RenderContext, _input_format: Format) {
-        let width = context.resolution.width;
-        let height = context.resolution.height;
+        // Bug №651: the size comes from the presentation extent, not from
+        // `context.resolution` — see `RenderContext::drawable_extent`.
+        let (width, height) = context.drawable_size();
 
         // Create bright pass texture
         self.bright_pass_texture = Some(device.create_texture(
@@ -135,8 +136,10 @@ impl BloomEffect {
             return;
         }
 
-        let width = context.resolution.width;
-        let height = context.resolution.height;
+        // Bug №651: the effect's targets have to be the size of the frame they
+        // work on — the logical window size covers a corner at any scale
+        // factor other than 100%.
+        let (width, height) = context.drawable_size();
 
         // Step 1: Bright pass
         self.bright_pass(encoder, input, width, height);

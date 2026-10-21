@@ -1,20 +1,27 @@
-use crate::connection::{channel_from_u8, is_reliable_channel, smooth_rtt, Connection, ConnectionConfig, ConnectionState, ConnectionError, OutgoingPacket};
-use crate::snapshot::{Snapshot, SnapshotBuffer, SnapshotInterpolator, EntitySnapshot, ProjectileSnapshot, LAYER_COUNT, LAYER_PROJECTILE, entity_layer, MAX_ENTITIES_PER_SNAPSHOT, MAX_PROJECTILES_PER_SNAPSHOT};
-use crate::bandwidth::{Admission, BandwidthTracker, BandwidthLimiter, BandwidthStats};
-use rfs_core::packet::*;
-use rfs_core::time::{Tick, TICK_RATE, TICK_DURATION};
+use crate::bandwidth::{Admission, BandwidthLimiter, BandwidthStats, BandwidthTracker};
+use crate::connection::{
+    channel_from_u8, is_reliable_channel, smooth_rtt, Connection, ConnectionConfig,
+    ConnectionError, ConnectionState, OutgoingPacket, ReliableArrival,
+};
+use crate::snapshot::{
+    entity_layer, EntitySnapshot, ProjectileSnapshot, Snapshot, SnapshotBuffer,
+    SnapshotInterpolator, LAYER_COUNT, LAYER_PROJECTILE, MAX_ENTITIES_PER_SNAPSHOT,
+    MAX_PROJECTILES_PER_SNAPSHOT,
+};
 use bytes::BytesMut;
 use parking_lot::{Mutex, RwLock};
+use rfs_core::packet::*;
+use rfs_core::time::{Tick, TICK_DURATION, TICK_RATE};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Connect retransmit cadence (bug №74).
@@ -37,7 +44,12 @@ const WIRE_LIMIT: u64 = 1024 * 1024;
 /// Returns whether the clock moved. Note the guard is on the tick alone: the
 /// time is a derived quantity, so it is only taken when the tick advances and
 /// can never drift out of step with it.
-pub fn advance_world_clock(current: &mut Tick, current_time: &mut f64, incoming: u64, incoming_time: f64) -> bool {
+pub fn advance_world_clock(
+    current: &mut Tick,
+    current_time: &mut f64,
+    incoming: u64,
+    incoming_time: f64,
+) -> bool {
     if incoming > current.value() {
         *current = Tick(incoming);
         *current_time = incoming_time;
@@ -73,7 +85,9 @@ const CLIENT_EVENT_QUEUE: usize = 4096;
 /// `CLIENT_EVENT_QUEUE` because state updates legitimately queue in bursts.
 const CLIENT_OUTBOX_QUEUE_LIMIT: usize = 8192;
 
-fn deserialize_limited<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, bincode::Error> {
+fn deserialize_limited<T: serde::de::DeserializeOwned>(
+    payload: &[u8],
+) -> Result<T, bincode::Error> {
     use bincode::Options;
     bincode::DefaultOptions::new()
         .with_limit(WIRE_LIMIT)
@@ -82,7 +96,9 @@ fn deserialize_limited<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result
         .deserialize(payload)
 }
 
-fn deserialize_full_state<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, bincode::Error> {
+fn deserialize_full_state<T: serde::de::DeserializeOwned>(
+    payload: &[u8],
+) -> Result<T, bincode::Error> {
     use bincode::Options;
     bincode::DefaultOptions::new()
         .with_limit(FULL_STATE_LIMIT)
@@ -143,7 +159,11 @@ struct EventSink {
 
 impl EventSink {
     fn new(tx: mpsc::Sender<ClientEvent>, dropped: Arc<AtomicU64>) -> Self {
-        Self { tx, dropped, closed: Arc::new(AtomicU64::new(0)) }
+        Self {
+            tx,
+            dropped,
+            closed: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Delivers an event, waiting for room in the bounded channel.
@@ -321,12 +341,84 @@ pub struct NetClient {
     /// outside: the one number that would have shown the stall was never
     /// taken.
     stale_full_state_drops: Arc<AtomicU64>,
+    /// Bug №267 (A): armed resync requests waiting for the receive loop.
+    resync_requests: ResyncRequestChannel,
+    /// Bug №267 (A): requests actually sent, so the harness can compare the
+    /// asks with the server's resync behaviour.
+    resync_requests_sent: Arc<AtomicU64>,
+    /// Bug №699: the world's static description, as the server told it.
+    ///
+    /// The layers carry ships, players, stations, compartments and
+    /// projectiles — and no structure, so without this the client could not
+    /// draw the world and could not explain a shell vanishing at a rock it
+    /// had never heard of.
+    map_description: Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
 }
 
 /// One queued client datagram awaiting the writer task.
 struct OutboxItem {
     header: PacketHeader,
     payload: Vec<u8>,
+}
+
+/// Bug №267 (A): the client-side channel for "this layer is stalled, ask the
+/// server for an immediate resync". The apply site arms a per-layer bit (a
+/// cooldown keeps a long stall from asking once per rejected delta); the
+/// receive loop drains the bitmask and puts the tiny packets on the wire.
+#[derive(Clone)]
+struct ResyncRequestChannel {
+    /// Bit `layer` set means: a resync request for that layer is due out.
+    bitmask: Arc<AtomicU32>,
+    /// Per-arm cooldown state, one slot per layer.
+    last_arm: Arc<std::sync::Mutex<Vec<Instant>>>,
+}
+
+/// A stalled layer waits half a second before it asks again — the server's
+/// resync pass runs every 33 ms, so a lost request resolves on the next arm
+/// long before the scheduled cadence would have healed the layer.
+const RESYNC_REQUEST_COOLDOWN: Duration = Duration::from_millis(500);
+
+impl ResyncRequestChannel {
+    fn new() -> Self {
+        // The minus-cooldown start makes the first arm fire immediately: a
+        // fresh client with no slots should not wait half a second after the
+        // very first mismatch to ask for the recovery it already needs.
+        let epoch = Instant::now()
+            .checked_sub(RESYNC_REQUEST_COOLDOWN)
+            .unwrap_or_else(Instant::now);
+        Self {
+            bitmask: Arc::new(AtomicU32::new(0)),
+            last_arm: Arc::new(std::sync::Mutex::new(vec![epoch; LAYER_COUNT])),
+        }
+    }
+
+    /// Arms the layer's bit if the cooldown allows; reports whether it fired.
+    fn arm(&self, layer: usize) -> bool {
+        if layer >= LAYER_COUNT {
+            return false;
+        }
+        let mut last = self.last_arm.lock().unwrap();
+        let now = Instant::now();
+        let due = last
+            .get(layer)
+            .map(|t| now.duration_since(*t) >= RESYNC_REQUEST_COOLDOWN)
+            .unwrap_or(true);
+        if due {
+            if let Some(slot) = last.get_mut(layer) {
+                *slot = now;
+            }
+            self.bitmask.fetch_or(1u32 << layer, Ordering::Relaxed);
+        }
+        due
+    }
+
+    /// Drains the bitmask and lists the layers owed a request.
+    fn take_due(&self) -> Vec<usize> {
+        let bits = self.bitmask.swap(0, Ordering::Relaxed);
+        (0..LAYER_COUNT)
+            .filter(|layer| bits & (1u32 << layer) != 0)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +432,9 @@ pub struct ClientConfig {
     pub enable_bandwidth_limit: bool,
     pub player_name: String,
     pub build_version: String,
+    /// Bug №216: the secret this client proves with. `None` means "this client
+    /// has no secret" — a server that asks for one will refuse the connection.
+    pub auth_token: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -354,6 +449,9 @@ impl Default for ClientConfig {
             enable_bandwidth_limit: false,
             player_name: "Player".to_string(),
             build_version: "0.1.0".to_string(),
+            // Bug №216: no secret by default — a server without one accepts
+            // everyone, and a server WITH one refuses a client that has none.
+            auth_token: None,
         }
     }
 }
@@ -367,20 +465,55 @@ impl Default for ClientConfig {
 // dense arrays. The lint is real and deliberately not acted on.
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
-    Connected { connection_id: u32, server_tick: u64, match_id: Uuid },
-    Disconnected { reason: DisconnectReason },
-    ConnectionFailed { reason: ConnectRejectReason },
-    StateUpdate { snapshot: Snapshot },
-    EntityUpdate { entity_id: EntityId, snapshot: EntitySnapshot },
-    EntityRemoved { entity_id: EntityId },
-    ProjectileUpdate { projectile_id: EntityId, snapshot: ProjectileSnapshot },
-    ProjectileRemoved { projectile_id: EntityId },
-    GameEvent { event: GameEvent },
-    CommandAck { command_id: u64, success: bool, error: Option<String> },
-    InputAck { tick: u32, accepted: bool },
-    BandwidthStats { stats: BandwidthStats },
-    RttUpdate { rtt: Duration },
-    Error { error: String },
+    Connected {
+        connection_id: u32,
+        server_tick: u64,
+        match_id: Uuid,
+    },
+    Disconnected {
+        reason: DisconnectReason,
+    },
+    ConnectionFailed {
+        reason: ConnectRejectReason,
+    },
+    StateUpdate {
+        snapshot: Snapshot,
+    },
+    EntityUpdate {
+        entity_id: EntityId,
+        snapshot: EntitySnapshot,
+    },
+    EntityRemoved {
+        entity_id: EntityId,
+    },
+    ProjectileUpdate {
+        projectile_id: EntityId,
+        snapshot: ProjectileSnapshot,
+    },
+    ProjectileRemoved {
+        projectile_id: EntityId,
+    },
+    GameEvent {
+        event: GameEvent,
+    },
+    CommandAck {
+        command_id: u64,
+        success: bool,
+        error: Option<String>,
+    },
+    InputAck {
+        tick: u32,
+        accepted: bool,
+    },
+    BandwidthStats {
+        stats: BandwidthStats,
+    },
+    RttUpdate {
+        rtt: Duration,
+    },
+    Error {
+        error: String,
+    },
 }
 
 impl NetClient {
@@ -406,7 +539,9 @@ impl NetClient {
             connection_id: Arc::new(Mutex::new(None)),
             connect_attempt: Arc::new(Mutex::new(None)),
             snapshot_buffer: Arc::new(SnapshotBuffer::new(config.snapshot_history)),
-            snapshot_interpolator: Arc::new(Mutex::new(SnapshotInterpolator::new(config.snapshot_history))),
+            snapshot_interpolator: Arc::new(Mutex::new(SnapshotInterpolator::new(
+                config.snapshot_history,
+            ))),
             bandwidth_tracker: Arc::new(BandwidthTracker::new()),
             bandwidth_limiter: Arc::new(BandwidthLimiter::new(config.max_bandwidth_bps)),
             current_tick: Arc::new(Mutex::new(Tick(0))),
@@ -431,8 +566,8 @@ impl NetClient {
             entity_states: Arc::new(RwLock::new(HashMap::new())),
             projectile_states: Arc::new(RwLock::new(HashMap::new())),
             last_applied_layer: Arc::new(Mutex::new([0; LAYER_COUNT])),
-        applied_delta_count: Arc::new(AtomicU64::new(0)),
-        applied_delta_count_by_layer: Arc::new(std::sync::Mutex::new(vec![0u64; LAYER_COUNT])),
+            applied_delta_count: Arc::new(AtomicU64::new(0)),
+            applied_delta_count_by_layer: Arc::new(std::sync::Mutex::new(vec![0u64; LAYER_COUNT])),
             base_mismatch_drops: Arc::new(AtomicU64::new(0)),
             base_mismatch_drops_by_layer: Arc::new(std::sync::Mutex::new(vec![0u64; LAYER_COUNT])),
             stall_logged: Arc::new(std::sync::Mutex::new(vec![false; LAYER_COUNT])),
@@ -440,8 +575,11 @@ impl NetClient {
             match_id: Arc::new(Mutex::new(None)),
             session_resets: Arc::new(AtomicU64::new(0)),
             stale_full_state_drops: Arc::new(AtomicU64::new(0)),
+            resync_requests: ResyncRequestChannel::new(),
+            resync_requests_sent: Arc::new(AtomicU64::new(0)),
+            map_description: Arc::new(RwLock::new(None)),
         };
-        
+
         Ok(client)
     }
 
@@ -485,7 +623,10 @@ impl NetClient {
                     let mut header = PacketHeader::new(
                         PacketType::Disconnect,
                         ChannelType::ReliableOrdered,
-                        0, 0, 0, 0,
+                        0,
+                        0,
+                        0,
+                        0,
                     );
                     header.payload_size = len;
                     match bincode::serialize(&header) {
@@ -494,8 +635,7 @@ impl NetClient {
                             if total > MAX_PACKET_SIZE {
                                 warn!("disconnect: {total} exceeds the MTU, not sending");
                             } else {
-                                let mut buffer =
-                                    BytesMut::with_capacity(total);
+                                let mut buffer = BytesMut::with_capacity(total);
                                 buffer.extend_from_slice(&head);
                                 buffer.extend_from_slice(&payload);
                                 match self.socket.try_send(&buffer) {
@@ -548,8 +688,8 @@ impl NetClient {
         let handle = tokio::spawn(async move {
             while let Some(OutboxItem { header, payload }) = rx.recv().await {
                 let out = OutgoingPacket { header, payload };
-                if let Err(e) = Self::send_raw(&socket, &bandwidth, &limiter, limit_enabled, &out)
-                    .await
+                if let Err(e) =
+                    Self::send_raw(&socket, &bandwidth, &limiter, limit_enabled, &out).await
                 {
                     warn!("client outbox send failed: {e}");
                 }
@@ -562,7 +702,10 @@ impl NetClient {
     /// bincode body; the writer frames it with the header.
     fn enqueue(&self, mut header: PacketHeader, payload: Vec<u8>) {
         let Ok(len) = u16::try_from(payload.len()) else {
-            warn!("outbox: payload {} exceeds the u16 header size", payload.len());
+            warn!(
+                "outbox: payload {} exceeds the u16 header size",
+                payload.len()
+            );
             return;
         };
         header.payload_size = len;
@@ -599,7 +742,10 @@ impl NetClient {
         let header = PacketHeader::new(
             PacketType::Connect,
             ChannelType::ReliableOrdered,
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
         );
 
         let socket = self.socket.clone();
@@ -624,12 +770,22 @@ impl NetClient {
                 first = false;
                 if attempt.lock().map(|t| t.elapsed()).unwrap_or_default() > CONNECT_TIMEOUT {
                     *attempt.lock() = None;
-                    event_sender.send_critical(ClientEvent::Error {
-                        error: "connect timeout: no ConnectAccept".into(),
-                    }).await;
+                    event_sender
+                        .send_critical(ClientEvent::Error {
+                            error: "connect timeout: no ConnectAccept".into(),
+                        })
+                        .await;
                     break;
                 }
-                let _ = Self::send_packet_static(&socket, &bandwidth, &limiter, limit_enabled, &header, &packet).await;
+                let _ = Self::send_packet_static(
+                    &socket,
+                    &bandwidth,
+                    &limiter,
+                    limit_enabled,
+                    &header,
+                    &packet,
+                )
+                .await;
             }
         });
     }
@@ -792,6 +948,12 @@ impl NetClient {
         let match_id = self.match_id.clone();
         let session_resets = self.session_resets.clone();
         let stale_full_state_drops = self.stale_full_state_drops.clone();
+        // Bug №267 (A): the apply site arms per-layer requests, the receive
+        // loop takes them out to the wire.
+        let resync_requests = self.resync_requests.clone();
+        let resync_requests_sent = self.resync_requests_sent.clone();
+        // Bug №699: the world description, stored as it arrives.
+        let map_description = self.map_description.clone();
         let connect_attempt = self.connect_attempt.clone();
 
         let handle = tokio::spawn(async move {
@@ -833,17 +995,26 @@ impl NetClient {
                             &match_id,
                             &session_resets,
                             &stale_full_state_drops,
+                            // Bug №267 (A): the arm/drain funnel.
+                            &resync_requests,
+                            &resync_requests_sent,
+                            // Bug №699: the world description lands here.
+                            &map_description,
                             &running,
                             &bandwidth_tracker,
                             &limiter,
                             limit_enabled,
                             &connect_attempt,
                             data,
-                        ).await {
+                        )
+                        .await
+                        {
                             warn!("Error handling packet: {}", e);
-                            event_sender.send_critical(ClientEvent::Error {
-                                error: e.to_string(),
-                            }).await;
+                            event_sender
+                                .send_critical(ClientEvent::Error {
+                                    error: e.to_string(),
+                                })
+                                .await;
                         }
 
                         // The event receiver is gone, so nothing this loop
@@ -864,7 +1035,7 @@ impl NetClient {
                 }
             }
         });
-        
+
         *self.recv_handle.lock() = Some(handle);
     }
 
@@ -905,6 +1076,12 @@ impl NetClient {
         // Bug №636: same accounting for the full-state twin of the stale-delta
         // guard below.
         stale_full_state_drops: &Arc<AtomicU64>,
+        // Bug №267 (A): the apply site arms a layer's resync request here; the
+        // receive loop drains and wires it out.
+        resync_requests: &ResyncRequestChannel,
+        resync_requests_sent: &Arc<AtomicU64>,
+        // Bug №699: where the world's static description is stored.
+        map_description: &Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
         running: &Arc<Mutex<bool>>,
         bandwidth: &BandwidthTracker,
         // Bug №169: the HeartbeatAck answer leaves through the limiter too.
@@ -927,13 +1104,17 @@ impl NetClient {
         // Bug №167: also feed the reliable tracker, otherwise our own outbound
         // acks would keep claiming the last-seen sequence and the server could
         // never retire anything.
-        {
+        // Bug №215: the verdict is kept — the dispatch below gates reliable
+        // payloads on it (see the CommandAck branch).
+        let reliable_arrival: Option<ReliableArrival> = {
             let guard = connection.lock();
             if let Some(conn) = guard.as_ref() {
                 conn.record_remote(header.sequence, header.ack, header.ack_bitfield);
-                conn.track_received_reliable(header.sequence, channel_from_u8(header.channel));
+                conn.track_received_reliable(header.sequence, channel_from_u8(header.channel))
+            } else {
+                None
             }
-        }
+        };
 
         let packet_type = match PacketType::from_u8(header.packet_type) {
             Some(packet_type) => packet_type,
@@ -941,7 +1122,7 @@ impl NetClient {
         };
 
         match packet_type {
-PacketType::ConnectAccept => {
+            PacketType::ConnectAccept => {
                 let accept: ConnectAcceptPacket = deserialize_limited(payload)?;
                 // Duplicate Accept (we retried, both got answered): refresh
                 // state but emit Connected only once per session.
@@ -953,7 +1134,11 @@ PacketType::ConnectAccept => {
                 {
                     let mut conn_guard = connection.lock();
                     let conn = conn_guard.take().unwrap_or_else(|| {
-                        Connection::new(accept.assigned_client_id, config.server_addr, config.connection_config.clone())
+                        Connection::new(
+                            accept.assigned_client_id,
+                            config.server_addr,
+                            config.connection_config.clone(),
+                        )
                     });
                     conn.set_state(ConnectionState::Connected);
                     conn.set_client_id(Some(accept.assigned_client_id));
@@ -996,7 +1181,11 @@ PacketType::ConnectAccept => {
                     // Per-session diagnostics reset with the world they
                     // measured, otherwise the next session starts with a
                     // "stalled" latch it never earned.
-                    stall_logged.lock().unwrap().iter_mut().for_each(|f| *f = false);
+                    stall_logged
+                        .lock()
+                        .unwrap()
+                        .iter_mut()
+                        .for_each(|f| *f = false);
                     applied_delta_count.store(0, Ordering::Relaxed);
                     applied_delta_count_by_layer.lock().unwrap().fill(0);
                     base_mismatch_drops.store(0, Ordering::Relaxed);
@@ -1013,22 +1202,68 @@ PacketType::ConnectAccept => {
                 }
 
                 if !already {
-                    event_sender.send_critical(ClientEvent::Connected {
-                        connection_id: accept.assigned_client_id,
-                        server_tick: accept.server_tick,
-                        match_id: accept.match_id,
-                    }).await;
+                    event_sender
+                        .send_critical(ClientEvent::Connected {
+                            connection_id: accept.assigned_client_id,
+                            server_tick: accept.server_tick,
+                            match_id: accept.match_id,
+                        })
+                        .await;
+                }
+
+                // Bug №216: the secret, right after the accept. A server that
+                // requires one holds the world back until it arrives; a server
+                // that does not ignores the packet.
+                if let Some(token) = config.auth_token.as_ref() {
+                    if !token.is_empty() {
+                        let auth = AuthPacket { token: token.clone() };
+                        let (seq, ack, ack_bitfield) = {
+                            let conn_guard = connection.lock();
+                            match conn_guard.as_ref() {
+                                Some(conn) => {
+                                    let (ack, ack_bitfield) = conn.ack_info();
+                                    (conn.next_sequence(), ack, ack_bitfield)
+                                }
+                                None => (0, 0, 0),
+                            }
+                        };
+                        let auth_header = PacketHeader::new(
+                            PacketType::Auth,
+                            ChannelType::ReliableOrdered,
+                            seq,
+                            ack,
+                            ack_bitfield,
+                            0,
+                        );
+                        let _ = Self::send_packet_static(
+                            socket,
+                            bandwidth,
+                            limiter,
+                            limit_enabled,
+                            &auth_header,
+                            &auth,
+                        )
+                        .await;
+                    }
                 }
             }
             PacketType::ConnectReject => {
                 let reject: ConnectRejectPacket = deserialize_limited(payload)?;
                 *connect_attempt.lock() = None;
-                event_sender.send_critical(ClientEvent::ConnectionFailed { reason: reject.reason }).await;
+                event_sender
+                    .send_critical(ClientEvent::ConnectionFailed {
+                        reason: reject.reason,
+                    })
+                    .await;
             }
             PacketType::Disconnect => {
                 let disconnect: DisconnectPacket = deserialize_limited(payload)?;
                 *running.lock() = false;
-                event_sender.send_critical(ClientEvent::Disconnected { reason: disconnect.reason }).await;
+                event_sender
+                    .send_critical(ClientEvent::Disconnected {
+                        reason: disconnect.reason,
+                    })
+                    .await;
             }
             PacketType::Heartbeat => {
                 let _hb: HeartbeatPacket = deserialize_limited(payload)?;
@@ -1051,16 +1286,32 @@ PacketType::ConnectAccept => {
                 let ack_header = PacketHeader::new(
                     PacketType::HeartbeatAck,
                     ChannelType::ReliableOrdered,
-                    ack_seq, ack, ack_bitfield, 0,
+                    ack_seq,
+                    ack,
+                    ack_bitfield,
+                    0,
                 );
-                let ack_packet = HeartbeatPacket { client_time: 0.0, server_time: 0.0 };
-                let _ = Self::send_packet_static(socket, bandwidth, limiter, limit_enabled, &ack_header, &ack_packet).await;
+                let ack_packet = HeartbeatPacket {
+                    client_time: 0.0,
+                    server_time: 0.0,
+                };
+                let _ = Self::send_packet_static(
+                    socket,
+                    bandwidth,
+                    limiter,
+                    limit_enabled,
+                    &ack_header,
+                    &ack_packet,
+                )
+                .await;
             }
             PacketType::HeartbeatAck => {
                 // Bug №12: measure RTT against the last heartbeat WE sent
                 // (stamped in start_send_loop), never Instant::now().elapsed()
                 // which is always ~0. No nested lock: conn and rtt are distinct.
-                let sample = connection.lock().as_ref()
+                let sample = connection
+                    .lock()
+                    .as_ref()
                     .map(|conn| conn.last_heartbeat.lock().elapsed());
                 if let Some(sample) = sample {
                     // Read under the lock, send outside it — the guard is not
@@ -1071,7 +1322,9 @@ PacketType::ConnectAccept => {
                         *current = smooth_rtt(*current, sample);
                         *current
                     };
-                    event_sender.send_critical(ClientEvent::RttUpdate { rtt: smoothed }).await;
+                    event_sender
+                        .send_critical(ClientEvent::RttUpdate { rtt: smoothed })
+                        .await;
                 }
             }
             PacketType::State | PacketType::StateDelta | PacketType::StateFull => {
@@ -1088,16 +1341,18 @@ PacketType::ConnectAccept => {
                     entity_states,
                     projectile_states,
                     last_applied_layer,
-                                // Bug №274: same as the direct path — a
-                                // fragmented delta is applied the same way.
-                                applied_delta_count,
-                                applied_delta_count_by_layer,
-                                base_mismatch_drops,
-                                base_mismatch_drops_by_layer,
-                                stall_logged,
-                                stale_delta_drops,
-                                stale_full_state_drops,
-                            )?;
+                    // Bug №274: same as the direct path — a
+                    // fragmented delta is applied the same way.
+                    applied_delta_count,
+                    applied_delta_count_by_layer,
+                    base_mismatch_drops,
+                    base_mismatch_drops_by_layer,
+                    stall_logged,
+                    stale_delta_drops,
+                    stale_full_state_drops,
+                    // Bug №267 (A): the drop site arms the request.
+                    resync_requests,
+                )?;
             }
             PacketType::Fragment => {
                 let reassembled = {
@@ -1121,7 +1376,7 @@ PacketType::ConnectAccept => {
                                 server_time,
                                 entity_states,
                                 projectile_states,
-last_applied_layer,
+                                last_applied_layer,
                                 // Bug №274: threaded through so the apply site
                                 // can count deltas instead of inferring it from
                                 // the coalescing slot.
@@ -1132,6 +1387,8 @@ last_applied_layer,
                                 stall_logged,
                                 stale_delta_drops,
                                 stale_full_state_drops,
+                                // Bug №267 (A): the drop site arms the request.
+                                resync_requests,
                             )?;
                         }
                         // Bug №163: these were dropped with a debug!(), so any
@@ -1142,18 +1399,39 @@ last_applied_layer,
                                 Self::dispatch_events(&packet, event_sender);
                             }
                         }
+                        // Bug №699: a map with many structures does not fit a
+                        // datagram, so the description can arrive fragmented —
+                        // exactly like a full state.
+                        PacketType::MapDescription => {
+                            if let Ok(packet) = deserialize_limited::<MapDescriptionPacket>(&bytes)
+                            {
+                                *map_description.write() = Some(rfs_core::world::MapDescription {
+                                    name: packet.name,
+                                    bounds_min: packet.bounds_min,
+                                    bounds_max: packet.bounds_max,
+                                    obstacles: packet.obstacles,
+                                });
+                            }
+                        }
                         PacketType::CommandAck => {
                             if let Ok(ack) = deserialize_limited::<CommandAckPacket>(&bytes) {
-                                event_sender.send_critical(ClientEvent::CommandAck {
-                                    command_id: ack.command_id,
-                                    success: ack.success,
-                                    error: ack.error,
-                                }).await;
+                                event_sender
+                                    .send_critical(ClientEvent::CommandAck {
+                                        command_id: ack.command_id,
+                                        success: ack.success,
+                                        error: ack.error,
+                                    })
+                                    .await;
                             }
                         }
                         PacketType::InputAck => {
                             if let Ok(ack) = deserialize_limited::<InputAckPacket>(&bytes) {
-                                Self::apply_input_ack(&ack, pending_inputs, last_ack_tick, event_sender);
+                                Self::apply_input_ack(
+                                    &ack,
+                                    pending_inputs,
+                                    last_ack_tick,
+                                    event_sender,
+                                );
                             }
                         }
                         other => {
@@ -1166,33 +1444,100 @@ last_applied_layer,
                 let event_packet: EventPacket = deserialize_limited(payload)?;
                 Self::dispatch_events(&event_packet, event_sender);
             }
+            PacketType::MapDescription => {
+                // Bug №699: the world's static description. It is stored, not
+                // interpreted: what to do with it is the client's business
+                // (draw it, collide against it), and the network layer's job
+                // is to make sure the client HAS it.
+                let packet: MapDescriptionPacket = deserialize_limited(payload)?;
+                *map_description.write() = Some(rfs_core::world::MapDescription {
+                    name: packet.name,
+                    bounds_min: packet.bounds_min,
+                    bounds_max: packet.bounds_max,
+                    obstacles: packet.obstacles,
+                });
+            }
             PacketType::InputAck => {
                 let ack: InputAckPacket = deserialize_limited(payload)?;
                 Self::apply_input_ack(&ack, pending_inputs, last_ack_tick, event_sender);
             }
             PacketType::CommandAck => {
+                // Bug №215: only a genuinely NEW reliable datagram applies — a
+                // retransmit means our receipt ack was lost, and firing the
+                // same command result twice is worse than its (now bounded)
+                // delay.
+                if reliable_arrival != Some(ReliableArrival::New) {
+                    return Ok(());
+                }
                 let ack: CommandAckPacket = deserialize_limited(payload)?;
-                event_sender.send_critical(ClientEvent::CommandAck {
-                    command_id: ack.command_id,
-                    success: ack.success,
-                    error: ack.error,
-                }).await;
+                event_sender
+                    .send_critical(ClientEvent::CommandAck {
+                        command_id: ack.command_id,
+                        success: ack.success,
+                        error: ack.error,
+                    })
+                    .await;
             }
             _ => {
                 debug!("Unhandled packet type: {:?}", packet_type);
             }
         }
-        
+
+        // Bug №267 (A): the stalled layers armed above want their request out
+        // now, not on some later tick. The request itself is unreliable on
+        // purpose: losing it costs one cooldown (half a second) of asking
+        // again, while a reliable variant would spend the reliable window and
+        // its admission budget on a packet the next input stream re-arms for
+        // free.
+        for layer in resync_requests.take_due() {
+            let seq = connection.lock().as_ref().map(|c| c.next_sequence());
+            let Some(seq) = seq else {
+                break;
+            };
+            let (ack, ack_bitfield) = connection
+                .lock()
+                .as_ref()
+                .map(|c| c.ack_info())
+                .unwrap_or((0, 0));
+            let header = PacketHeader::new(
+                PacketType::ResyncRequest,
+                ChannelType::UnreliableSequenced,
+                seq,
+                ack,
+                ack_bitfield,
+                0,
+            );
+            let request = ResyncRequestPacket { layer: layer as u8 };
+            match Self::send_packet_static(
+                socket,
+                bandwidth,
+                limiter,
+                limit_enabled,
+                &header,
+                &request,
+            )
+            .await
+            {
+                Ok(_) => {
+                    resync_requests_sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // A failed admission just re-arms on the next cooldown
+                    // pass; not worth an error report per attempt.
+                    debug!("resync request for layer {layer} not admitted: {e}");
+                }
+            }
+        }
+
         Ok(())
     }
 
     /// Bug №163: shared by the direct and the fragmented receive paths.
-    fn dispatch_events(
-        packet: &EventPacket,
-        event_sender: &EventSink,
-    ) {
+    fn dispatch_events(packet: &EventPacket, event_sender: &EventSink) {
         for event in &packet.events {
-            event_sender.send_delta(ClientEvent::GameEvent { event: event.clone() });
+            event_sender.send_delta(ClientEvent::GameEvent {
+                event: event.clone(),
+            });
         }
     }
 
@@ -1213,7 +1558,10 @@ last_applied_layer,
                 *guard = ack.tick;
             }
         }
-        event_sender.send_delta(ClientEvent::InputAck { tick: ack.tick, accepted: ack.accepted });
+        event_sender.send_delta(ClientEvent::InputAck {
+            tick: ack.tick,
+            accepted: ack.accepted,
+        });
     }
 
     /// Bug №171: record an input and keep the map bounded. The server acks
@@ -1265,13 +1613,16 @@ last_applied_layer,
         stall_logged: &Arc<std::sync::Mutex<Vec<bool>>>,
         stale_delta_drops: &Arc<AtomicU64>,
         stale_full_state_drops: &Arc<AtomicU64>,
+        // Bug №267 (A): armed here when a layer stalls on a base mismatch.
+        resync_requests: &ResyncRequestChannel,
     ) -> Result<(), ConnectionError> {
         if packet_type == PacketType::State || packet_type == PacketType::StateFull {
             // Bug №168: full states may be up to MAX_REASSEMBLED_SIZE.
             let state: StatePacket = deserialize_full_state(payload)?;
             // Bug №20: refuse absurd states before they balloon client memory.
             if state.entities.len() > MAX_ENTITIES_PER_SNAPSHOT
-                || state.projectiles.len() > MAX_PROJECTILES_PER_SNAPSHOT {
+                || state.projectiles.len() > MAX_PROJECTILES_PER_SNAPSHOT
+            {
                 warn!(
                     "dropping oversized state: {} entities, {} projectiles",
                     state.entities.len(),
@@ -1381,7 +1732,8 @@ last_applied_layer,
                 || delta.destroyed.len() > MAX_ENTITIES_PER_SNAPSHOT
                 || delta.projectile_created.len() > MAX_PROJECTILES_PER_SNAPSHOT
                 || delta.projectile_updated.len() > MAX_PROJECTILES_PER_SNAPSHOT
-                || delta.projectile_destroyed.len() > MAX_PROJECTILES_PER_SNAPSHOT {
+                || delta.projectile_destroyed.len() > MAX_PROJECTILES_PER_SNAPSHOT
+            {
                 warn!("dropping oversized delta for layer {}", layer);
                 return Ok(());
             }
@@ -1432,6 +1784,11 @@ last_applied_layer,
                 if let Some(c) = base_mismatch_drops_by_layer.lock().unwrap().get_mut(layer) {
                     *c += 1;
                 }
+                // Bug №267 (A): the stalled layer asks the server for an
+                // immediate resync instead of waiting out the scheduled
+                // cadence. `arm` rate-limits itself; the receive loop drains
+                // the arm right after this handler returns.
+                resync_requests.arm(layer);
                 return Ok(());
             }
             // Bug №269: these two are the client's view of "where the world
@@ -1486,7 +1843,8 @@ last_applied_layer,
                     // Full layer replace: drop everything this layer previously
                     // held so entities destroyed while we were desynced do not
                     // linger as ghosts.
-                    base.entities.retain(|e| entity_layer(e.entity_type) as usize != layer);
+                    base.entities
+                        .retain(|e| entity_layer(e.entity_type) as usize != layer);
                     if layer == LAYER_PROJECTILE as usize {
                         base.projectiles.clear();
                     }
@@ -1519,12 +1877,14 @@ last_applied_layer,
 
                 // Bug №36: emit events only for entities this delta actually
                 // carried, never re-emit the whole buffer.
-                let changed: HashSet<EntityId> = delta.created
+                let changed: HashSet<EntityId> = delta
+                    .created
                     .iter()
                     .map(|e| e.entity_id)
                     .chain(delta.updated.iter().map(|u| u.entity_id))
                     .collect();
-                let changed_projectiles: HashSet<EntityId> = delta.projectile_created
+                let changed_projectiles: HashSet<EntityId> = delta
+                    .projectile_created
                     .iter()
                     .map(|p| p.entity_id)
                     .chain(delta.projectile_updated.iter().map(|u| u.entity_id))
@@ -1533,7 +1893,8 @@ last_applied_layer,
                 if delta.is_resync {
                     let dead: Vec<EntityId> = {
                         let states = entity_states.read();
-                        states.iter()
+                        states
+                            .iter()
                             .filter(|(id, ent)| {
                                 entity_layer(ent.entity_type) as usize == layer
                                     && !target.entities.iter().any(|e| &e.entity_id == *id)
@@ -1561,19 +1922,23 @@ last_applied_layer,
                 }
                 for entity_id in &delta.destroyed {
                     entity_states.write().remove(entity_id);
-                    event_sender.send_delta(ClientEvent::EntityRemoved { entity_id: *entity_id });
+                    event_sender.send_delta(ClientEvent::EntityRemoved {
+                        entity_id: *entity_id,
+                    });
                 }
 
                 {
                     let mut states = projectile_states.write();
                     if delta.is_resync && layer == LAYER_PROJECTILE as usize {
-                        let dead: Vec<EntityId> = states.keys()
+                        let dead: Vec<EntityId> = states
+                            .keys()
                             .copied()
                             .filter(|id| !target.projectiles.iter().any(|p| &p.entity_id == id))
                             .collect();
                         for id in dead {
                             states.remove(&id);
-                            event_sender.send_delta(ClientEvent::ProjectileRemoved { projectile_id: id });
+                            event_sender
+                                .send_delta(ClientEvent::ProjectileRemoved { projectile_id: id });
                         }
                     }
                     for id in &changed_projectiles {
@@ -1588,7 +1953,9 @@ last_applied_layer,
                 }
                 for entity_id in &delta.projectile_destroyed {
                     projectile_states.write().remove(entity_id);
-                    event_sender.send_delta(ClientEvent::ProjectileRemoved { projectile_id: *entity_id });
+                    event_sender.send_delta(ClientEvent::ProjectileRemoved {
+                        projectile_id: *entity_id,
+                    });
                 }
 
                 *latest_state.lock() = Some(ClientEvent::StateUpdate { snapshot: target });
@@ -1614,18 +1981,23 @@ last_applied_layer,
         let tick_rate = self.config.tick_rate.clamp(1, 1000);
 
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(1000 / tick_rate as u64));
-            
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(1000 / tick_rate as u64));
+
             while *running.lock() {
                 interval.tick().await;
-                
+
                 let tick = {
                     let mut ct = current_tick.lock();
                     *ct = ct.next();
                     *ct
                 };
-                
-                let (pending, heartbeat): (Option<(PacketHeader, InputPacket)>, Option<OutgoingPacket>) = {
+
+                let (pending, heartbeat, retransmits): (
+                    Option<(PacketHeader, InputPacket)>,
+                    Option<OutgoingPacket>,
+                    Vec<OutgoingPacket>,
+                ) = {
                     let conn_guard = connection.lock();
                     match conn_guard.as_ref() {
                         Some(conn) if conn.state() == ConnectionState::Connected => {
@@ -1652,7 +2024,9 @@ last_applied_layer,
                                 PacketType::Input,
                                 ChannelType::UnreliableSequenced,
                                 seq,
-                                ack, ack_bitfield, 0,
+                                ack,
+                                ack_bitfield,
+                                0,
                             );
 
                             // Bug №12: the client pings the server itself and
@@ -1665,31 +2039,70 @@ last_applied_layer,
                                     PacketType::Heartbeat,
                                     ChannelType::ReliableOrdered,
                                     hseq,
-                                    ack, ack_bitfield, 0,
+                                    ack,
+                                    ack_bitfield,
+                                    0,
                                 );
                                 OutgoingPacket::new(
                                     hb_header,
-                                    HeartbeatPacket { client_time: 0.0, server_time: 0.0 },
+                                    HeartbeatPacket {
+                                        client_time: 0.0,
+                                        server_time: 0.0,
+                                    },
                                 )
                             } else {
                                 None
                             };
 
-                            (Some((header, input)), heartbeat)
+                            // Bug №215: mirror the just-built heartbeat into
+                            // the ledger — the payload here is exactly what
+                            // the wire sees.
+                            if let Some(hb) = heartbeat.as_ref() {
+                                conn.register_reliable_send(&hb.header, &hb.payload);
+                            }
+
+                            // Bug №215: retransmit pass on the same cadence as
+                            // the input send; the ledger clamps per-pass count.
+                            let retransmits = conn.collect_retransmits();
+
+                            (Some((header, input)), heartbeat, retransmits)
                         }
-                        _ => (None, None),
+                        _ => (None, None, Vec::new()),
                     }
                 };
 
                 if let Some((header, input)) = pending {
-                    let _ = Self::send_packet_static(&socket, &bandwidth_tracker, &limiter, limit_enabled, &header, &input).await;
+                    let _ = Self::send_packet_static(
+                        &socket,
+                        &bandwidth_tracker,
+                        &limiter,
+                        limit_enabled,
+                        &header,
+                        &input,
+                    )
+                    .await;
                 }
                 if let Some(hb) = heartbeat {
-                    let _ = Self::send_raw(&socket, &bandwidth_tracker, &limiter, limit_enabled, &hb).await;
+                    let _ =
+                        Self::send_raw(&socket, &bandwidth_tracker, &limiter, limit_enabled, &hb)
+                            .await;
+                }
+                // Bug №215: retransmits go through the plain raw path — the
+                // ledger entry already exists, so no registration on this
+                // side; `collect_retransmits` stamped the send itself.
+                for packet in &retransmits {
+                    let _ = Self::send_raw(
+                        &socket,
+                        &bandwidth_tracker,
+                        &limiter,
+                        limit_enabled,
+                        packet,
+                    )
+                    .await;
                 }
             }
         });
-        
+
         *self.send_handle.lock() = Some(handle);
     }
 
@@ -1732,7 +2145,9 @@ last_applied_layer,
             PacketType::Input,
             ChannelType::UnreliableSequenced,
             seq,
-            ack, ack_bitfield, 0,
+            ack,
+            ack_bitfield,
+            0,
         );
 
         // Bug №172: queue instead of spawning a task per input.
@@ -1749,7 +2164,10 @@ last_applied_layer,
             let seq = conn.next_sequence();
             let command_id = seq as u64;
 
-            let packet = CommandPacket { command_id, command };
+            let packet = CommandPacket {
+                command_id,
+                command,
+            };
             // Bug №77: ack the server's sequence high-water mark too.
             // Bug №167: real SACK state.
             let (ack, ack_bitfield) = conn.ack_info();
@@ -1757,12 +2175,20 @@ last_applied_layer,
                 PacketType::Command,
                 ChannelType::ReliableOrdered,
                 seq,
-                ack, ack_bitfield, 0,
+                ack,
+                ack_bitfield,
+                0,
             );
 
             // Bug №172: queue instead of spawning a task per command.
             match bincode::serialize(&packet) {
-                Ok(payload) => self.enqueue(header, payload),
+                Ok(payload) => {
+                    // Bug №215: the command rides ReliableOrdered — mirror it
+                    // into the ledger BEFORE the queue serializes the send, so
+                    // a burst cannot strand an un-mirrored command.
+                    conn.register_reliable_send(&header, &payload);
+                    self.enqueue(header, payload);
+                }
                 Err(e) => warn!("send_command: serialize failed: {e}"),
             }
         }
@@ -1792,6 +2218,21 @@ last_applied_layer,
     /// Per-layer breakdown of `base_mismatch_drops`.
     pub fn base_mismatch_drops_by_layer(&self) -> Vec<u64> {
         self.base_mismatch_drops_by_layer.lock().unwrap().clone()
+    }
+
+    /// Bug №267 (A): resync requests this client put on the wire. Compare
+    /// with `base_mismatch_drops`: every stalled layer should generate one
+    /// request per cooldown, and the count shows the mechanism is live.
+    pub fn resync_requests_sent(&self) -> u64 {
+        self.resync_requests_sent.load(Ordering::Relaxed)
+    }
+
+    /// Bug №699: the world's static description, as the server told it.
+    ///
+    /// `None` until the server's description arrives — which it does right
+    /// after the accept, before the first snapshot.
+    pub fn map_description(&self) -> Option<rfs_core::world::MapDescription> {
+        self.map_description.read().clone()
     }
 
     /// The last tick applied per layer. Both drop counters measure zero, so the
@@ -1865,7 +2306,11 @@ last_applied_layer,
     }
 
     pub fn is_connected(&self) -> bool {
-        self.connection.lock().as_ref().map(|c| c.state() == ConnectionState::Connected).unwrap_or(false)
+        self.connection
+            .lock()
+            .as_ref()
+            .map(|c| c.state() == ConnectionState::Connected)
+            .unwrap_or(false)
     }
 
     pub fn get_event_receiver(&self) -> Option<mpsc::Receiver<ClientEvent>> {
@@ -1906,6 +2351,329 @@ last_applied_layer,
 
     pub fn last_acknowledged_tick(&self) -> u32 {
         *self.last_acknowledged_tick.lock()
+    }
+}
+
+#[cfg(test)]
+mod resync_request_tests {
+    //! Bug №267 (A): the client-side arming of a resync request.
+    //!
+    //! A stalled layer must ask once (not once per rejected delta), the ask
+    //! must survive until the receive loop drains it, and the drain must hand
+    //! back exactly the layers that were armed.
+
+    use super::*;
+
+    #[test]
+    fn the_first_arm_fires_immediately() {
+        let channel = ResyncRequestChannel::new();
+        assert!(
+            channel.arm(0),
+            "a fresh client must not wait out the cooldown before its first ask"
+        );
+    }
+
+    #[test]
+    fn the_cooldown_blocks_an_immediate_re_arm() {
+        let channel = ResyncRequestChannel::new();
+        assert!(channel.arm(0));
+        assert!(
+            !channel.arm(0),
+            "a long stall must ask once per cooldown, not once per rejected delta"
+        );
+        assert!(channel.arm(1), "the cooldown is per layer");
+    }
+
+    #[test]
+    fn an_armed_layer_is_due_exactly_once() {
+        let channel = ResyncRequestChannel::new();
+        channel.arm(2);
+        assert_eq!(channel.take_due(), vec![2]);
+        assert!(
+            channel.take_due().is_empty(),
+            "a drained arm must not come back on its own"
+        );
+    }
+
+    #[test]
+    fn a_layer_outside_the_range_cannot_be_armed() {
+        let channel = ResyncRequestChannel::new();
+        assert!(!channel.arm(LAYER_COUNT));
+        assert!(!channel.arm(usize::MAX));
+        assert!(channel.take_due().is_empty());
+    }
+
+    #[test]
+    fn several_layers_can_be_due_at_once() {
+        let channel = ResyncRequestChannel::new();
+        channel.arm(0);
+        channel.arm(3);
+        let mut due = channel.take_due();
+        due.sort_unstable();
+        assert_eq!(due, vec![0, 3]);
+    }
+}
+
+#[cfg(test)]
+mod input_ack_tests {
+    //! Bug №71: the client frees a pending input only when the server answers.
+    //! A REJECTED input (unknown player, missing ship) must free it too —
+    //! otherwise the pending map grows for every input the server refused.
+
+    use super::*;
+
+    fn input_packet(tick: u32) -> InputPacket {
+        InputPacket {
+            tick,
+            delta_time: 0.033,
+            move_forward: 0.0,
+            move_right: 0.0,
+            move_up: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            actions: InputActions::NONE,
+            station_interaction: None,
+        }
+    }
+
+    fn sink() -> (EventSink, mpsc::Receiver<ClientEvent>) {
+        let (tx, rx) = mpsc::channel(16);
+        (EventSink::new(tx, Arc::new(AtomicU64::new(0))), rx)
+    }
+
+    #[test]
+    fn a_rejected_input_ack_clears_the_pending_entry() {
+        let pending: Arc<Mutex<HashMap<u32, InputPacket>>> = Arc::new(Mutex::new(HashMap::new()));
+        let last_ack: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let (sink, _rx) = sink();
+        pending.lock().insert(5, input_packet(5));
+
+        NetClient::apply_input_ack(
+            &InputAckPacket {
+                tick: 5,
+                accepted: false,
+            },
+            &pending,
+            &last_ack,
+            &sink,
+        );
+
+        assert!(
+            pending.lock().is_empty(),
+            "a rejected input must not stay pending — the map grows without bound"
+        );
+    }
+
+    #[test]
+    fn a_rejected_ack_does_not_move_the_high_water_mark() {
+        let pending: Arc<Mutex<HashMap<u32, InputPacket>>> = Arc::new(Mutex::new(HashMap::new()));
+        let last_ack: Arc<Mutex<u32>> = Arc::new(Mutex::new(100));
+        let (sink, _rx) = sink();
+        pending.lock().insert(7, input_packet(7));
+
+        NetClient::apply_input_ack(
+            &InputAckPacket {
+                tick: 7,
+                accepted: false,
+            },
+            &pending,
+            &last_ack,
+            &sink,
+        );
+
+        assert_eq!(
+            *last_ack.lock(),
+            100,
+            "a rejection must not move the acknowledged high-water mark"
+        );
+    }
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    //! Bug №68: a client that goes away must free its slot at once.
+    //!
+    //! The bug had two halves: the client sent the Disconnect in a spawned
+    //! task that was aborted microseconds later (so the datagram almost never
+    //! left), and the server dropped the Disconnect into the `_ => {}` arm —
+    //! refreshing only `last_received`, which EXTENDED the timeout instead of
+    //! ending the session. The slot was then released only by the 10 s sweep,
+    //! and the comment claiming an immediate release was a lie.
+
+    use super::*;
+    use crate::{NetServer, ServerConfig};
+    use std::time::Duration;
+
+    async fn connected_pair() -> (NetServer, NetClient, mpsc::Receiver<ClientEvent>) {
+        let server = NetServer::new(ServerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("server bind");
+        let addr = server.local_addr().expect("server local_addr");
+        server.start();
+
+        let client = NetClient::new(ClientConfig {
+            server_addr: addr,
+            player_name: "disconnect-test".to_string(),
+            ..ClientConfig::default()
+        })
+        .await
+        .expect("client create");
+        client.connect();
+        let rx = client.get_event_receiver().expect("event receiver");
+        (server, client, rx)
+    }
+
+    async fn wait_until_connected(rx: &mut mpsc::Receiver<ClientEvent>, client: &NetClient) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!left.is_zero(), "Connected: timed out");
+            match tokio::time::timeout(left, rx.recv()).await {
+                Ok(Some(ClientEvent::Connected { .. })) => return,
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("Connected: event channel closed"),
+                Err(_) => panic!("Connected: timed out, dropped={}", client.events_dropped()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_disconnect_frees_the_slot_without_waiting_for_the_timeout() {
+        let (server, client, mut rx) = connected_pair().await;
+        wait_until_connected(&mut rx, &client).await;
+
+        // The server registers the session only after the handshake, so wait
+        // for it instead of assuming it is already there.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.connection_count() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the server never registered the session"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.connection_count(), 1);
+
+        client.disconnect(DisconnectReason::ClientQuit);
+
+        // The 10 s connection timeout must not be the mechanism here: the
+        // Disconnect has to do it, and it has to do it now.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.connection_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slot was not freed by the Disconnect — it is waiting for the timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.connection_count(),
+            0,
+            "a disconnected client must not hold a slot"
+        );
+    }
+}
+
+#[cfg(test)]
+mod map_description_tests {
+    //! Bug №699: the server loads a map, but the client never heard of it —
+    //! the layers carry ships, players, stations, compartments and projectiles,
+    //! and no structure. A client that does not know the world cannot draw it
+    //! and cannot explain a shell vanishing at an invisible rock.
+
+    use super::*;
+    use crate::{NetServer, ServerConfig};
+    use rfs_core::math::Vec3f;
+
+    fn world_with_one_structure() -> rfs_core::world::MapDescription {
+        rfs_core::world::MapDescription {
+            name: "test-world".into(),
+            bounds_min: Vec3f::new(-1000.0, -1000.0, -1000.0),
+            bounds_max: Vec3f::new(1000.0, 1000.0, 1000.0),
+            obstacles: vec![rfs_core::world::MapObstacleDescription {
+                id: 7,
+                kind: rfs_core::world::ObstacleKind::Structure,
+                min: Vec3f::new(10.0, -10.0, -10.0),
+                max: Vec3f::new(30.0, 10.0, 10.0),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_is_told_about_the_world_when_it_connects() {
+        let server = NetServer::new(ServerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("server bind");
+        let addr = server.local_addr().expect("server local_addr");
+        server.set_world_description(world_with_one_structure());
+        server.start();
+
+        let client = NetClient::new(ClientConfig {
+            server_addr: addr,
+            player_name: "map-test".to_string(),
+            ..ClientConfig::default()
+        })
+        .await
+        .expect("client create");
+        client.connect();
+        let _rx = client.get_event_receiver().expect("event receiver");
+
+        // The description arrives right after the accept, so it is there as
+        // soon as the client is connected — no polling loop, just a moment
+        // for the datagram to land.
+        let mut description = None;
+        for _ in 0..200 {
+            if let Some(found) = client.map_description() {
+                description = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let description = description.expect("the client was never told about the world");
+        assert_eq!(description.name, "test-world");
+        assert_eq!(description.obstacles.len(), 1);
+        assert_eq!(description.obstacles[0].id, 7);
+        assert_eq!(
+            description.bounds_min,
+            Vec3f::new(-1000.0, -1000.0, -1000.0),
+            "the playable volume must come with the description"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_world_just_has_none() {
+        let server = NetServer::new(ServerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("server bind");
+        let addr = server.local_addr().expect("server local_addr");
+        server.start();
+
+        let client = NetClient::new(ClientConfig {
+            server_addr: addr,
+            player_name: "no-map-test".to_string(),
+            ..ClientConfig::default()
+        })
+        .await
+        .expect("client create");
+        client.connect();
+        let _rx = client.get_event_receiver().expect("event receiver");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            client.map_description().is_none(),
+            "a server with no world must not invent one"
+        );
     }
 }
 
@@ -1966,14 +2734,21 @@ mod event_delivery_tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(!left.is_zero(), "{what}: timed out, dropped={}", client.events_dropped());
+            assert!(
+                !left.is_zero(),
+                "{what}: timed out, dropped={}",
+                client.events_dropped()
+            );
             match tokio::time::timeout(left, rx.recv()).await {
                 Ok(Some(ev)) => {
                     if want(&ev) {
                         return ev;
                     }
                 }
-                Ok(None) => panic!("{what}: event channel closed, dropped={}", client.events_dropped()),
+                Ok(None) => panic!(
+                    "{what}: event channel closed, dropped={}",
+                    client.events_dropped()
+                ),
                 Err(_) => panic!("{what}: timed out, dropped={}", client.events_dropped()),
             }
         }
@@ -1997,7 +2772,11 @@ mod event_delivery_tests {
             }
             other => panic!("expected Connected, got {other:?}"),
         }
-        assert_eq!(client.events_dropped(), 0, "nothing should be dropped on a clean connect");
+        assert_eq!(
+            client.events_dropped(),
+            0,
+            "nothing should be dropped on a clean connect"
+        );
         server.stop();
     }
 
@@ -2023,7 +2802,11 @@ mod event_delivery_tests {
 
         match wait_for(&mut rx, &client, "Disconnected", is_disconnected).await {
             ClientEvent::Disconnected { reason } => {
-                assert_eq!(reason, DisconnectReason::Kicked, "the reason must survive the wire");
+                assert_eq!(
+                    reason,
+                    DisconnectReason::Kicked,
+                    "the reason must survive the wire"
+                );
             }
             other => panic!("expected Disconnected, got {other:?}"),
         }
@@ -2069,21 +2852,47 @@ mod event_delivery_tests {
         let sink = EventSink::new(tx, dropped.clone());
 
         // One event fits.
-        assert_eq!(sink.try_send(ClientEvent::Error { error: "first".into() }), Disposition::Delivered);
+        assert_eq!(
+            sink.try_send(ClientEvent::Error {
+                error: "first".into()
+            }),
+            Disposition::Delivered
+        );
         // The next has nowhere to go: transient backpressure.
-        assert_eq!(sink.try_send(ClientEvent::Error { error: "second".into() }), Disposition::Full);
-        assert!(!sink.channel_is_closed(), "a full queue is not a closed channel");
+        assert_eq!(
+            sink.try_send(ClientEvent::Error {
+                error: "second".into()
+            }),
+            Disposition::Full
+        );
+        assert!(
+            !sink.channel_is_closed(),
+            "a full queue is not a closed channel"
+        );
         assert_eq!(sink.closed.load(Ordering::Relaxed), 0);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
 
         // Draining proves the consumer was alive all along.
         assert!(matches!(rx.recv().await, Some(ClientEvent::Error { .. })));
-        assert_eq!(sink.try_send(ClientEvent::Error { error: "third".into() }), Disposition::Delivered);
+        assert_eq!(
+            sink.try_send(ClientEvent::Error {
+                error: "third".into()
+            }),
+            Disposition::Delivered
+        );
 
         // Drop the consumer: now, and only now, it is terminal.
         drop(rx);
-        assert_eq!(sink.try_send(ClientEvent::Error { error: "fourth".into() }), Disposition::Closed);
-        assert!(sink.channel_is_closed(), "a dropped receiver must be reported as closed");
+        assert_eq!(
+            sink.try_send(ClientEvent::Error {
+                error: "fourth".into()
+            }),
+            Disposition::Closed
+        );
+        assert!(
+            sink.channel_is_closed(),
+            "a dropped receiver must be reported as closed"
+        );
     }
 
     /// Bug №636 harness: a client driven by hand-crafted packets from a fake
@@ -2091,10 +2900,17 @@ mod event_delivery_tests {
     /// (`match_id`) is fully under test control — that identity is exactly what
     /// the session-reset decision in the accept handler keys off, so a real
     /// server would hide the one thing being tested.
-    type CraftedSession = (NetClient, UdpSocket, mpsc::Receiver<ClientEvent>, SocketAddr);
+    type CraftedSession = (
+        NetClient,
+        UdpSocket,
+        mpsc::Receiver<ClientEvent>,
+        SocketAddr,
+    );
 
     async fn crafted_session() -> CraftedSession {
-        let server = UdpSocket::bind("127.0.0.1:0").await.expect("fake server bind");
+        let server = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("fake server bind");
         let server_addr = server.local_addr().expect("fake server addr");
         let client = NetClient::new(ClientConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2117,9 +2933,17 @@ mod event_delivery_tests {
 
     /// Hand-crafted UDP datagram in the exact wire format `deserialize_packet`
     /// expects: bincode header (with payload_size), then the bincode body.
-    fn craft<T: Serializable>(packet_type: PacketType, channel: ChannelType, sequence: u32, packet: &T) -> Vec<u8> {
-        serialize_packet(packet, PacketHeader::new(packet_type, channel, sequence, 0, 0, 0))
-            .expect("serialize crafted packet")
+    fn craft<T: Serializable>(
+        packet_type: PacketType,
+        channel: ChannelType,
+        sequence: u32,
+        packet: &T,
+    ) -> Vec<u8> {
+        serialize_packet(
+            packet,
+            PacketHeader::new(packet_type, channel, sequence, 0, 0, 0),
+        )
+        .expect("serialize crafted packet")
     }
 
     /// One entity, enough for the state path: a full state is authoritative,
@@ -2165,7 +2989,10 @@ mod event_delivery_tests {
     }
 
     async fn send_to(server: &UdpSocket, client_addr: SocketAddr, bytes: &[u8]) {
-        server.send_to(bytes, client_addr).await.expect("send crafted packet");
+        server
+            .send_to(bytes, client_addr)
+            .await
+            .expect("send crafted packet");
     }
 
     /// Bug №636: a reconnect to a *different* session must throw the previous
@@ -2191,7 +3018,17 @@ mod event_delivery_tests {
             match_id: m1,
             tick_rate: 30,
         };
-        send_to(&server, client_addr, &craft(PacketType::ConnectAccept, ChannelType::ReliableOrdered, next_seq(&seq), &accept1)).await;
+        send_to(
+            &server,
+            client_addr,
+            &craft(
+                PacketType::ConnectAccept,
+                ChannelType::ReliableOrdered,
+                next_seq(&seq),
+                &accept1,
+            ),
+        )
+        .await;
         let connected = wait_for(&mut rx, &client, "Connected(session1)", is_connected).await;
         match connected {
             ClientEvent::Connected { match_id, .. } => {
@@ -2201,36 +3038,107 @@ mod event_delivery_tests {
         }
         assert_eq!(client.get_match_id(), Some(m1));
 
-        send_to(&server, client_addr, &craft(PacketType::StateFull, ChannelType::Unreliable, next_seq(&seq), &craft_full_state(12, &[777]))).await;
-        wait_until("full state 12 applied", || client.applied_layer_ticks().iter().all(|&t| t == 12)).await;
-        assert_eq!(client.get_session_resets(), 1, "the first session counts as one reset");
+        send_to(
+            &server,
+            client_addr,
+            &craft(
+                PacketType::StateFull,
+                ChannelType::Unreliable,
+                next_seq(&seq),
+                &craft_full_state(12, &[777]),
+            ),
+        )
+        .await;
+        wait_until("full state 12 applied", || {
+            client.applied_layer_ticks().iter().all(|&t| t == 12)
+        })
+        .await;
+        assert_eq!(
+            client.get_session_resets(),
+            1,
+            "the first session counts as one reset"
+        );
 
         // A retransmitted Accept for the SAME session must not wipe the world.
-        send_to(&server, client_addr, &craft(PacketType::ConnectAccept, ChannelType::ReliableOrdered, next_seq(&seq), &accept1)).await;
+        send_to(
+            &server,
+            client_addr,
+            &craft(
+                PacketType::ConnectAccept,
+                ChannelType::ReliableOrdered,
+                next_seq(&seq),
+                &accept1,
+            ),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             client.applied_layer_ticks().iter().all(|&t| t == 12),
             "a duplicate Accept for the same session must preserve the applied world"
         );
-        assert_eq!(client.get_session_resets(), 1, "a duplicate Accept must not count as a reset");
+        assert_eq!(
+            client.get_session_resets(),
+            1,
+            "a duplicate Accept must not count as a reset"
+        );
 
         // Session 2: a *new* match id. The accept carries no world of its own —
         // the old world (ticks pinned at 12) must be discarded here, not by the
         // next full state.
         let m2 = Uuid::new_v4();
-        let accept2 = ConnectAcceptPacket { server_tick: 5, server_time: 0.1, assigned_client_id: 7, match_id: m2, tick_rate: 30 };
-        send_to(&server, client_addr, &craft(PacketType::ConnectAccept, ChannelType::ReliableOrdered, next_seq(&seq), &accept2)).await;
+        let accept2 = ConnectAcceptPacket {
+            server_tick: 5,
+            server_time: 0.1,
+            assigned_client_id: 7,
+            match_id: m2,
+            tick_rate: 30,
+        };
+        send_to(
+            &server,
+            client_addr,
+            &craft(
+                PacketType::ConnectAccept,
+                ChannelType::ReliableOrdered,
+                next_seq(&seq),
+                &accept2,
+            ),
+        )
+        .await;
         wait_until("session 2 accepted", || client.get_match_id() == Some(m2)).await;
-        wait_until("layer clocks reset to zero", || client.applied_layer_ticks().iter().all(|&t| t == 0)).await;
-        assert_eq!(client.get_session_resets(), 2, "accepting a second session resets the world once");
+        wait_until("layer clocks reset to zero", || {
+            client.applied_layer_ticks().iter().all(|&t| t == 0)
+        })
+        .await;
+        assert_eq!(
+            client.get_session_resets(),
+            2,
+            "accepting a second session resets the world once"
+        );
 
         // The proof that the world really moved: session 2's low-tick full
         // state now applies. Pre-fix this is a ghost: tick 8 loses to the
         // session-1 clock (12), every state is dropped, stale_full_state_drops
         // climbs, and the client listens to the dead session forever.
-        send_to(&server, client_addr, &craft(PacketType::StateFull, ChannelType::Unreliable, next_seq(&seq), &craft_full_state(8, &[888]))).await;
-        wait_until("session 2 full state 8 applied", || client.applied_layer_ticks().iter().all(|&t| t == 8)).await;
-        assert_eq!(client.get_stale_full_state_drops(), 0, "session 2 states must not be dropped as stale");
+        send_to(
+            &server,
+            client_addr,
+            &craft(
+                PacketType::StateFull,
+                ChannelType::Unreliable,
+                next_seq(&seq),
+                &craft_full_state(8, &[888]),
+            ),
+        )
+        .await;
+        wait_until("session 2 full state 8 applied", || {
+            client.applied_layer_ticks().iter().all(|&t| t == 8)
+        })
+        .await;
+        assert_eq!(
+            client.get_stale_full_state_drops(),
+            0,
+            "session 2 states must not be dropped as stale"
+        );
     }
 
     /// Bug №636: the stale-guard for full states used to `return Ok(())` in
@@ -2250,20 +3158,87 @@ mod event_delivery_tests {
             match_id: Uuid::new_v4(),
             tick_rate: 30,
         };
-        send_to(&server, client_addr, &craft(PacketType::ConnectAccept, ChannelType::ReliableOrdered, next_seq(&seq), &accept)).await;
+        send_to(
+            &server,
+            client_addr,
+            &craft(
+                PacketType::ConnectAccept,
+                ChannelType::ReliableOrdered,
+                next_seq(&seq),
+                &accept,
+            ),
+        )
+        .await;
         wait_for(&mut rx, &client, "Connected", is_connected).await;
 
-        send_to(&server, client_addr, &craft(PacketType::StateFull, ChannelType::Unreliable, next_seq(&seq), &craft_full_state(500, &[77]))).await;
-        wait_until("full state 500 applied", || client.applied_layer_ticks().iter().all(|&t| t == 500)).await;
+        send_to(
+            &server,
+            client_addr,
+            &craft(
+                PacketType::StateFull,
+                ChannelType::Unreliable,
+                next_seq(&seq),
+                &craft_full_state(500, &[77]),
+            ),
+        )
+        .await;
+        wait_until("full state 500 applied", || {
+            client.applied_layer_ticks().iter().all(|&t| t == 500)
+        })
+        .await;
 
         // Tick 100 arrived after 500 was applied: genuinely stale, must be
         // refused — but every other drop path on this stream counts its
         // refusals, and so does this one.
-        send_to(&server, client_addr, &craft(PacketType::StateFull, ChannelType::Unreliable, next_seq(&seq), &craft_full_state(100, &[78]))).await;
-        wait_until("stale full state counted", || client.get_stale_full_state_drops() == 1).await;
+        send_to(
+            &server,
+            client_addr,
+            &craft(
+                PacketType::StateFull,
+                ChannelType::Unreliable,
+                next_seq(&seq),
+                &craft_full_state(100, &[78]),
+            ),
+        )
+        .await;
+        wait_until("stale full state counted", || {
+            client.get_stale_full_state_drops() == 1
+        })
+        .await;
         assert!(
             client.applied_layer_ticks().iter().all(|&t| t == 500),
             "a stale full state must not rewind the applied world"
         );
+    }
+
+    /// Bug №34 residual, closed by №269's `advance_world_clock`: an older
+    /// tick from a slower layer arriving after a newer one must not rewind
+    /// the shared clock — neither the tick nor the derived time.
+    #[test]
+    fn an_older_tick_never_rewinds_the_world_clock() {
+        let mut tick = Tick(100);
+        let mut time = 100.5;
+
+        assert!(
+            !advance_world_clock(&mut tick, &mut time, 90, 90.25),
+            "an older tick is refused, not applied"
+        );
+        assert_eq!(tick, Tick(100), "the tick stays put");
+        assert_eq!(time, 100.5, "the derived time must not drift either");
+
+        // Equal ticks are also refused: the guard is strictly-greater.
+        assert!(!advance_world_clock(&mut tick, &mut time, 100, 100.5));
+        assert_eq!(tick, Tick(100));
+        assert_eq!(time, 100.5);
+    }
+
+    #[test]
+    fn a_newer_tick_moves_the_clock_and_its_time_together() {
+        let mut tick = Tick(0);
+        let mut time = 0.0;
+
+        assert!(advance_world_clock(&mut tick, &mut time, 12, 41.0));
+        assert_eq!(tick, Tick(12));
+        assert_eq!(time, 41.0);
     }
 }

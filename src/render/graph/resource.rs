@@ -116,8 +116,19 @@ impl GraphResource {
         }
     }
 
-    /// Create the actual RHI resource
-    pub fn create(&mut self, _device: &crate::rhi::Device) {
+    /// Create the actual RHI resource.
+    ///
+    /// Bug №652: this used to build CPU-side descriptions and never call the
+    /// backend, so every graph resource was a descriptor with `texture: None`.
+    /// The passes that look resources up at execute time — `transparent` asks
+    /// for "depth", `water` for "depth" and "lighting", `lighting` binds every
+    /// view it can find — found nothing, and the graph's resource map never fed
+    /// a single pass.
+    ///
+    /// The resource is created through the device, so a failure is a failure
+    /// and not a stand-in that looks like a texture. The size comes from the
+    /// declaration, which is sized from the physical extent (Bug №651).
+    pub fn create(&mut self, device: &crate::rhi::Device) {
         match self.resource_type {
             ResourceType::Texture => {
                 // Bug №102: this used to be a `match` over `ResourceUsage`, which only worked
@@ -163,8 +174,17 @@ impl GraphResource {
                 {
                     rhi_usage |= TextureUsage::SAMPLED;
                 }
+                // Transfer source, so a frame can be read back.
+                //
+                // Without it, reading a graph resource is a validation error
+                // (`VUID-vkCmdCopyImageToBuffer-srcImage-00186`: the image was
+                // created without TRANSFER_SRC) rather than a read. And reading a
+                // frame is not a test-only luxury: the offscreen PNG path
+                // exists to capture frames, and a screenshot of the final image
+                // is exactly this.
+                rhi_usage |= TextureUsage::TRANSFER_SRC;
 
-                self.texture = Some(Texture::new(TextureDesc {
+                let desc = TextureDesc {
                     width: self.width,
                     height: self.height,
                     depth: self.depth,
@@ -176,26 +196,30 @@ impl GraphResource {
                     dimensions: TextureDimensions::D2,
                     sharing_mode: SharingMode::Exclusive,
                     queue_family_indices: vec![],
-                }));
-
-                // Create view if needed
-                //
-                // Bug №186: a RenderTarget deliberately gets no view, and the
-                // `!=` guard above honours that — but for every other usage the
-                // texture was unwrapped, so a failed `create_texture` aborted
-                // the process. Build the view from the value we hold.
-                if self.usage != ResourceUsage::RenderTarget {
-                    let tex = self.texture.take();
-                    match tex {
-                        Some(tex) => {
-                            self.view =
-                                Some(tex.create_view(crate::rhi::TextureViewDesc::default()));
-                            self.texture = Some(tex);
+                };
+                match device.create_texture_from_desc(&desc) {
+                    Ok(texture) => {
+                        // A render target deliberately gets no view: the
+                        // producer builds the framebuffer, and the view it
+                        // needs. Every other usage is read back later, so it
+                        // needs one.
+                        if self.usage != ResourceUsage::RenderTarget {
+                            match device
+                                .create_texture_view(&texture, texture.create_default_view().desc())
+                            {
+                                Ok(view) => self.view = Some(view),
+                                Err(e) => eprintln!(
+                                    "[render] graph: resource {:?} has no view: {e}",
+                                    self.name
+                                ),
+                            }
                         }
-                        None => {
-                            eprintln!("[render] graph: texture creation failed; resource has no view");
-                        }
+                        self.texture = Some(texture);
                     }
+                    Err(e) => eprintln!(
+                        "[render] graph: resource {:?} could not be created: {e}",
+                        self.name
+                    ),
                 }
             }
             ResourceType::Buffer => {
@@ -236,11 +260,17 @@ impl GraphResource {
                     return;
                 }
 
-                self.buffer = Some(Buffer::new(BufferDesc {
+                match device.create_buffer_from_desc(&BufferDesc {
                     size: self.size,
                     usage: rhi_usage,
                     ..Default::default()
-                }));
+                }) {
+                    Ok(buffer) => self.buffer = Some(buffer),
+                    Err(e) => eprintln!(
+                        "[render] graph: buffer {:?} could not be created: {e}",
+                        self.name
+                    ),
+                }
             }
             ResourceType::Sampler => {
                 // Samplers are created separately

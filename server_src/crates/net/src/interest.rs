@@ -1,7 +1,9 @@
-use rfs_core::spatial::{SpatialGrid, EntityId, InterestMask, InterestLayer, InterestConfig};
-use rfs_core::entity::{ShipEntity, PlayerEntity, StationEntity, ProjectileEntity, CompartmentEntity, SpatialEntity};
-use rfs_core::math::Vec3f;
 use parking_lot::RwLock;
+use rfs_core::entity::{
+    CompartmentEntity, PlayerEntity, ProjectileEntity, ShipEntity, SpatialEntity, StationEntity,
+};
+use rfs_core::math::Vec3f;
+use rfs_core::spatial::{EntityId, InterestConfig, InterestLayer, InterestMask, SpatialGrid};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 
@@ -63,7 +65,9 @@ impl InterestManager {
 
     pub fn add_ship(&self, ship: ShipEntity) {
         let entity_id = ship.entity_id();
-        self.entity_layers.write().insert(entity_id, InterestLayer::SHIP);
+        self.entity_layers
+            .write()
+            .insert(entity_id, InterestLayer::SHIP);
         self.ship_grid.write().insert(ship);
     }
 
@@ -99,22 +103,27 @@ impl InterestManager {
         let entity_id = player.entity_id();
         let player_id = player.player_id;
         let position = player.position();
-        self.entity_layers.write().insert(entity_id, InterestLayer::PLAYER);
+        self.entity_layers
+            .write()
+            .insert(entity_id, InterestLayer::PLAYER);
         self.player_grid.write().insert(player);
         self.player_ships.write().insert(entity_id, ship_id);
-        
+
         let mut interests = self.player_interests.write();
-        interests.insert(player_id, PlayerInterest {
+        interests.insert(
             player_id,
-            ship_id,
-            position,
-            visible_ships: HashSet::new(),
-            visible_stations: HashSet::new(),
-            visible_players: HashSet::new(),
-            visible_projectiles: HashSet::new(),
-            visible_compartments: HashSet::new(),
-            last_update: std::time::Instant::now(),
-        });
+            PlayerInterest {
+                player_id,
+                ship_id,
+                position,
+                visible_ships: HashSet::new(),
+                visible_stations: HashSet::new(),
+                visible_players: HashSet::new(),
+                visible_projectiles: HashSet::new(),
+                visible_compartments: HashSet::new(),
+                last_update: std::time::Instant::now(),
+            },
+        );
     }
 
     pub fn remove_player(&self, player_id: u32, entity_id: EntityId) {
@@ -133,16 +142,16 @@ impl InterestManager {
         // stored `ship_id` kept pointing at the ship they just left, and they
         // went on seeing that ship's compartments, stations and crew forever.
         let ship_id = player.current_ship.unwrap_or(EntityId::nil());
-        
+
         self.player_grid.write().insert(player.clone());
-        
+
         if let Some(interests) = self.player_interests.write().get_mut(&player_id) {
             interests.position = position;
             // Assign unconditionally, including the nil case: leaving a ship
             // must clear the interest, not preserve it.
             interests.ship_id = ship_id;
         }
-        
+
         self.player_ships.write().insert(entity_id, ship_id);
     }
 
@@ -155,7 +164,9 @@ impl InterestManager {
         // by accident, whenever a player happened to be a member of that ship,
         // and `get_replication_mask` reported the wrong layer to the rest of
         // the stack. Stations have their own layer.
-        self.entity_layers.write().insert(station.entity_id(), InterestLayer::COMPARTMENTS);
+        self.entity_layers
+            .write()
+            .insert(station.entity_id(), InterestLayer::COMPARTMENTS);
         self.station_grid.write().insert(station);
     }
 
@@ -169,7 +180,9 @@ impl InterestManager {
     }
 
     pub fn add_projectile(&self, projectile: ProjectileEntity) {
-        self.entity_layers.write().insert(projectile.entity_id(), InterestLayer::PROJECTILES);
+        self.entity_layers
+            .write()
+            .insert(projectile.entity_id(), InterestLayer::PROJECTILES);
         self.projectile_grid.write().insert(projectile);
     }
 
@@ -183,7 +196,9 @@ impl InterestManager {
     }
 
     pub fn add_compartment(&self, compartment: CompartmentEntity) {
-        self.entity_layers.write().insert(compartment.entity_id(), InterestLayer::COMPARTMENTS);
+        self.entity_layers
+            .write()
+            .insert(compartment.entity_id(), InterestLayer::COMPARTMENTS);
         self.compartment_grid.write().insert(compartment);
     }
 
@@ -271,7 +286,8 @@ impl InterestManager {
             }
             {
                 let compartment_grid = self.compartment_grid.read();
-                for comp in compartment_grid.query_radius(position, self.config.compartments_radius) {
+                for comp in compartment_grid.query_radius(position, self.config.compartments_radius)
+                {
                     if comp.ship_id == ship_id {
                         visible_compartments.push(comp.entity_id());
                     }
@@ -330,7 +346,11 @@ impl InterestManager {
         self.player_interests.read().contains_key(&player_id)
     }
 
-    pub fn should_replicate_entity(&self, viewer_player_id: u32, target_entity_id: EntityId) -> bool {
+    pub fn should_replicate_entity(
+        &self,
+        viewer_player_id: u32,
+        target_entity_id: EntityId,
+    ) -> bool {
         let interests = self.player_interests.read();
         if let Some(interest) = interests.get(&viewer_player_id) {
             let layers = self.entity_layers.read();
@@ -346,7 +366,9 @@ impl InterestManager {
                             || interest.visible_stations.contains(&target_entity_id)
                     }
                     InterestLayer::PLAYER => interest.visible_players.contains(&target_entity_id),
-                    InterestLayer::PROJECTILES => interest.visible_projectiles.contains(&target_entity_id),
+                    InterestLayer::PROJECTILES => {
+                        interest.visible_projectiles.contains(&target_entity_id)
+                    }
                     InterestLayer::ALL => true,
                     InterestLayer(_) => false,
                 }
@@ -381,7 +403,11 @@ impl InterestManager {
         self.should_replicate_entity(viewer_player_id, subject)
     }
 
-    pub fn get_replication_mask(&self, viewer_player_id: u32, target_entity_id: EntityId) -> InterestMask {
+    pub fn get_replication_mask(
+        &self,
+        viewer_player_id: u32,
+        target_entity_id: EntityId,
+    ) -> InterestMask {
         let interests = self.player_interests.read();
         if let Some(interest) = interests.get(&viewer_player_id) {
             let layers = self.entity_layers.read();
@@ -427,7 +453,11 @@ impl InterestManager {
         }
     }
 
-    pub fn get_visible_entities(&self, player_id: u32, layer: InterestLayer) -> SmallVec<[EntityId; 32]> {
+    pub fn get_visible_entities(
+        &self,
+        player_id: u32,
+        layer: InterestLayer,
+    ) -> SmallVec<[EntityId; 32]> {
         let interests = self.player_interests.read();
         if let Some(interest) = interests.get(&player_id) {
             match layer {
@@ -445,18 +475,20 @@ impl InterestManager {
                     result.extend(interest.visible_players.iter().copied());
                     result
                 }
-                InterestLayer::PROJECTILES => interest.visible_projectiles.iter().copied().collect(),
-InterestLayer::ALL => {
-                        let mut result = SmallVec::new();
-                        result.extend(interest.visible_ships.iter().copied());
-                        result.extend(interest.visible_compartments.iter().copied());
-                        result.extend(interest.visible_players.iter().copied());
-                        result.extend(interest.visible_stations.iter().copied());
-                        result.extend(interest.visible_projectiles.iter().copied());
-                        result
-                    }
-                    InterestLayer(_) => SmallVec::new(),
+                InterestLayer::PROJECTILES => {
+                    interest.visible_projectiles.iter().copied().collect()
                 }
+                InterestLayer::ALL => {
+                    let mut result = SmallVec::new();
+                    result.extend(interest.visible_ships.iter().copied());
+                    result.extend(interest.visible_compartments.iter().copied());
+                    result.extend(interest.visible_players.iter().copied());
+                    result.extend(interest.visible_stations.iter().copied());
+                    result.extend(interest.visible_projectiles.iter().copied());
+                    result
+                }
+                InterestLayer(_) => SmallVec::new(),
+            }
         } else {
             SmallVec::new()
         }
@@ -617,7 +649,11 @@ mod tests {
             .get_visible_entities(VIEWER, InterestLayer::SHIP)
             .into_iter()
             .collect();
-        assert_eq!(visible, vec![EntityId::new(SHIP_ID)], "the first full must not be empty");
+        assert_eq!(
+            visible,
+            vec![EntityId::new(SHIP_ID)],
+            "the first full must not be empty"
+        );
     }
 
     fn make_station(id: u64) -> StationEntity {
@@ -651,7 +687,10 @@ mod tests {
         mgr.add_ship(make_ship());
         mgr.add_player(make_player(), EntityId::new(SHIP_ID));
         mgr.compute_interest(VIEWER);
-        assert_eq!(mgr.get_interest(VIEWER).unwrap().ship_id, EntityId::new(SHIP_ID));
+        assert_eq!(
+            mgr.get_interest(VIEWER).unwrap().ship_id,
+            EntityId::new(SHIP_ID)
+        );
 
         // Player boards nothing: `current_ship` is None.
         let mut detached = make_player();
@@ -696,8 +735,10 @@ mod tests {
             "a station on the viewer's ship must replicate"
         );
 
-        let compartments =
-            mgr.get_visible_entities(VIEWER, InterestLayer::COMPARTMENTS).into_iter().collect::<Vec<_>>();
+        let compartments = mgr
+            .get_visible_entities(VIEWER, InterestLayer::COMPARTMENTS)
+            .into_iter()
+            .collect::<Vec<_>>();
         assert!(
             compartments.contains(&EntityId::new(station_id)),
             "stations belong to the COMPARTMENTS layer, got {compartments:?}"
@@ -724,8 +765,7 @@ mod tests {
 
     fn make_compartment(id: u64) -> CompartmentEntity {
         use rfs_core::entity::Bounds;
-        let bounds =
-            Bounds::new(Vec3f::new(-5.0, -3.0, -10.0), Vec3f::new(5.0, 3.0, 10.0));
+        let bounds = Bounds::new(Vec3f::new(-5.0, -3.0, -10.0), Vec3f::new(5.0, 3.0, 10.0));
         CompartmentEntity {
             entity_id: EntityId::new(id),
             ship_id: EntityId::new(SHIP_ID),
@@ -772,7 +812,10 @@ mod tests {
 
         let stats = mgr.stats();
         assert_eq!(stats.ships, 0, "the hull must go");
-        assert_eq!(stats.compartments, 0, "the wreck's compartments must go with it");
+        assert_eq!(
+            stats.compartments, 0,
+            "the wreck's compartments must go with it"
+        );
         assert_eq!(stats.stations, 0, "the wreck's stations must go with it");
 
         mgr.compute_interest(VIEWER);

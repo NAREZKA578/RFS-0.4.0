@@ -315,8 +315,8 @@ impl VulkanLogicalDeviceResource {
 
     /// Update the per-image layout tracker from the barriers in this submit. Bug №299.
     ///
-    /// Done at submit time rather than inside the translator, because that is the
-    /// earliest moment a new layout is a fact rather than a request. Updating it
+    /// Done at submit time rather than inside the translator, because that is
+    /// the earliest moment a new layout is a fact rather than a request. Updating it
     /// during translation would let the tracker change even if the submit later
     /// failed, leaving it confidently wrong.
     ///
@@ -330,18 +330,42 @@ impl VulkanLogicalDeviceResource {
     /// transition through a render pass must not rely on the tracker. Stated rather
     /// than hidden because the failure it produces is a validation error with no
     /// useful message.
+    ///
+    /// Bug #644: the commands that *overwrite* an image do their own transition
+    /// (`transition_whole_image_to_transfer_dst`, Bug #638) and never appear as
+    /// a `PipelineBarrier`, so the tracker used to keep saying `UNDEFINED` for
+    /// an image that had just been cleared or copied into. The next barrier
+    /// that read the tracker then named a stale `oldLayout`, and
+    /// `download_texture` read the image with `oldLayout = UNDEFINED` — which
+    /// discards the contents, so the readback returned nothing at all.
+    ///
+    /// The contract is the one Bug #638 established: after a clear or a copy
+    /// into an image, the image is in `TRANSFER_DST_OPTIMAL`.
     pub(crate) fn note_layout_transitions(&self, commands: &[crate::command::commands::Command]) {
+        use crate::command::commands::Command;
         for command in commands {
-            let crate::command::commands::Command::PipelineBarrier { texture_barriers, .. } =
-                command
-            else {
-                continue;
-            };
-            for barrier in texture_barriers {
-                let Some(gpu) = barrier.texture.backend() else {
-                    continue;
-                };
-                self.note_image_layout(gpu.handle, convert::texture_layout(barrier.new_layout));
+            match command {
+                Command::PipelineBarrier { texture_barriers, .. } => {
+                    for barrier in texture_barriers {
+                        let Some(gpu) = barrier.texture.backend() else {
+                            continue;
+                        };
+                        self.note_image_layout(gpu.handle, convert::texture_layout(barrier.new_layout));
+                    }
+                }
+                // The clear commands carry a view; the image is reached
+                // through it, the same way the translator reaches it.
+                Command::ClearColor { texture, .. } | Command::ClearDepthStencil { texture, .. } => {
+                    if let Some(gpu) = texture.texture().backend() {
+                        self.note_image_layout(gpu.handle, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                    }
+                }
+                Command::CopyBufferToTexture { dst, .. } => {
+                    if let Some(gpu) = dst.backend() {
+                        self.note_image_layout(gpu.handle, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -538,8 +562,37 @@ command_pool: vk::CommandPool,
         /// CPU could reuse it, and therefore capped the whole renderer at one
         /// frame in flight.
         command_buffers: Vec<vk::CommandBuffer>,
-        /// The semaphore `vkQueuePresentKHR` waits on, one per frame slot. Bug №282.
-        pub render_finished: Vec<vk::Semaphore>,
+        /// The semaphore `vkQueuePresentKHR` waits on — **one per swapchain
+        /// image**, not one per frame slot.
+        ///
+        /// Bug: it was one per frame slot, and a slot comes round again after
+        /// `FRAMES_IN_FLIGHT` frames, while the present that consumed the
+        /// semaphore may still be pending. Re-signalling it then is
+        /// `VUID-vkQueueSubmit-pSignalSemaphores-00067` — "may still be in use
+        /// by VkSwapchainKHR" — and the frame it invalidates is a frame whose
+        /// image is shown before the rendering that produced it.
+        ///
+        /// One per *image* is the arrangement that cannot have that problem: an
+        /// image is only handed out again by `vkAcquireNextImageKHR` after its
+        /// present completed, so the semaphore belonging to that image is free
+        /// by then. The slot-based scheme had no such guarantee: the slot and
+        /// the image were unrelated.
+        ///
+        /// The pool only grows, and nothing is ever destroyed before the
+        /// device goes away. A semaphore that a pending present of a retired
+        /// chain still holds must not be destroyed, and a chain can be replaced
+        /// at any moment by a resize.
+        pub render_finished: std::sync::Mutex<Vec<vk::Semaphore>>,
+        /// The swapchain image the frame being recorded will be presented into.
+        ///
+        /// Set by the renderer right after the acquire and before the graph
+        /// records, because only the renderer knows which image was acquired.
+        present_image: std::sync::atomic::AtomicU32,
+        /// The swapchain image the most recent submit signalled for.
+        ///
+        /// The present asks for the semaphore immediately after the submit that
+        /// signals it, so the submit has to record which image it used.
+        last_present_image: std::sync::atomic::AtomicU32,
         /// Signalled by `vkAcquireNextImageKHR`, waited by the submit that first
         /// touches the image. One per slot, for the same reason as above: a
         /// semaphore cannot be re-signalled while a previous wait is pending.
@@ -571,6 +624,18 @@ command_pool: vk::CommandPool,
 /// Bug №177: guards `command_pool` and the per-slot command buffers for the
       /// whole record-and-submit window. See `submit_recorded`.
       submit_lock: std::sync::Mutex<()>,
+      /// Whether the poisoning of the submit lock has already been reported.
+      ///
+      /// Bug №662: a poisoned mutex means the previous holder panicked, and the
+      /// submit lock covers the whole record-and-submit window — so that panic
+      /// happened in the middle of recording, which is exactly the place where
+      /// the device could be left in an undefined state. The work continues
+      /// anyway (a renderer that stops drawing is a renderer with a black
+      /// screen), but the fact is reported once: "everything is fine" and "we
+      /// survived a panic" look identical from outside, and only one of them is
+      /// true. The report is once, because on every frame after it the log
+      /// would say the same thing again and drown everything else.
+      submit_lock_poison_reported: std::sync::atomic::AtomicBool,
       /// One fence per frame slot, created once with the device and reset on reuse.
       ///
       /// Bug №282. These used to be a single fence waited on with `u64::MAX` at the
@@ -594,6 +659,28 @@ command_pool: vk::CommandPool,
       /// at that point would return the *next* frame's semaphore, and the present
       /// would wait on a semaphore nothing has signalled.
       last_submitted_slot: std::sync::atomic::AtomicUsize,
+      /// Whether the frame currently on screen was actually submitted.
+      ///
+      /// Bug №649: `render_finished_semaphore` used to return the semaphore of
+      /// the last submit *ever*, which is the wrong answer whenever the current
+      /// frame submitted nothing — the graph recorded no commands, or the submit
+      /// failed. Then the present waited on a semaphore that had already been
+      /// consumed by the previous present, or on one nothing had ever signalled,
+      /// and the chain stalled.
+      ///
+      /// The arming flag cannot answer this on its own: it is cleared both by a
+      /// submit and by a cancel, and "cancelled" and "submitted" need opposite
+      /// answers.
+      frame_submitted: std::sync::atomic::AtomicBool,
+      /// Whether `samplerAnisotropy` is enabled on this device.
+      ///
+      /// A sampler that asks for anisotropy on a device without the feature is
+      /// `VUID-VkSamplerCreateInfo-anisotropyEnable-01070`, so the sampler
+      /// creation has to know. The feature is the caller's choice and is off
+      /// unless asked for, which means a sampler asking for anisotropy is
+      /// clamped rather than refused — the sampler is legal, it just samples
+      /// once.
+      sampler_anisotropy: bool,
     /// Keeps the owning `VkInstance` alive for as long as this device lives.
     instance_guard: Arc<DestroyableInstance>,
 }
@@ -604,6 +691,7 @@ impl VulkanLogicalDeviceResource {
         memory: &MemoryProperties,
         queue_family_index: u32,
         physical_device: vk::PhysicalDevice,
+        sampler_anisotropy: bool,
         instance_guard: Arc<DestroyableInstance>,
     ) -> RhiResult<Self> {
         let allocator = MemoryAllocator::new(device.clone(), memory);
@@ -696,7 +784,9 @@ let allocate_info = vk::CommandPoolCreateInfo {
 
         Ok(Self {
             device,
-            render_finished,
+            render_finished: std::sync::Mutex::new(render_finished),
+            present_image: std::sync::atomic::AtomicU32::new(0),
+            last_present_image: std::sync::atomic::AtomicU32::new(0),
             image_acquired,
             presentation_signal_armed: std::sync::atomic::AtomicBool::new(false),
             tracked: std::sync::Mutex::new(Vec::new()),
@@ -707,9 +797,17 @@ let allocate_info = vk::CommandPoolCreateInfo {
             command_pool,
             command_buffers,
             submit_lock: std::sync::Mutex::new(()),
+            submit_lock_poison_reported: std::sync::atomic::AtomicBool::new(false),
             submit_fences,
             next_frame: std::sync::atomic::AtomicUsize::new(0),
             last_submitted_slot: std::sync::atomic::AtomicUsize::new(0),
+            frame_submitted: std::sync::atomic::AtomicBool::new(false),
+            // The device was created with exactly the features the caller
+            // asked for, so this is the same flag that went into the
+            // `DeviceCreateInfo` — and if the physical device did not support
+            // it, the device creation would have failed rather than silently
+            // created without it.
+            sampler_anisotropy,
             instance_guard,
         })
     }
@@ -729,10 +827,50 @@ let allocate_info = vk::CommandPoolCreateInfo {
     /// in flight today makes this unobservable, which is exactly why it was
     /// worth fixing now rather than after the race reports itself as visual
     /// corruption nobody can reproduce.
-fn submit_recorded(
+/// Submit one-shot work: an upload, a copy, a readback, a legacy direct draw.
+///
+/// Bug #643: this path must not touch the presentation signal.
+///
+/// It used to swap `presentation_signal_armed` and take the *frame* slot's
+/// semaphores — `image_acquired[frame_slot]` to wait on and
+/// `render_finished[frame_slot]` to signal — while submitting into the
+/// reserved one-shot slot, which is a different slot entirely
+/// (`advances_frame = false`, so the slot is chosen further down).
+///
+/// A one-shot submit between the arm and the frame's submit therefore
+/// consumed the presentation engine's handover signal, so the frame's submit
+/// waited on nothing; it raised the semaphore the present waits on, so the
+/// frame was shown on a signal from an upload rather than from the rendering;
+/// and it cleared the flag, so the frame's submit signalled nothing at all.
+/// The frame could be drawn into an image the compositor had not handed over,
+/// and shown half-drawn.
+///
+/// The frame path is `submit_frame`, and it is the only one that may read the
+/// arming flag. One-shot work has no presentation of its own, so it waits on
+/// nothing and signals nothing.
+fn submit_one_shot(
           &self,
           record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>,
-      ) -> RhiResult<()> {
+) -> RhiResult<()> {
+          let (wait, signal) = submit_semaphores(
+              SubmitKind::OneShot,
+              0,
+              &self.image_acquired,
+              None,
+          );
+          let waits: &[vk::Semaphore] = match &wait {
+              Some(semaphore) => std::slice::from_ref(semaphore),
+              None => &[],
+          };
+          let signal = signal.unwrap_or_else(vk::Semaphore::null);
+          self.submit_recorded_signalling(record, waits, signal, true, false)
+}
+
+      /// Submit the recorded frame without waiting for the GPU.
+      ///
+      /// Bug №282: the only caller that must not block. Everything else on this
+      /// path — uploads, copies, staging helpers — reads its result on return.
+      fn submit_frame(&self, record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>) -> RhiResult<()> {
           use std::sync::atomic::Ordering;
           // `swap` rather than `load`: the flag belongs to exactly one submit, and a
           // `load` would let two consecutive submits both signal the same
@@ -745,40 +883,44 @@ fn submit_recorded(
           let armed = self
               .presentation_signal_armed
               .swap(false, Ordering::AcqRel);
-          let slot = self.next_frame.load(std::sync::atomic::Ordering::Relaxed) % FRAMES_IN_FLIGHT;
-          let (waits, signal): (&[vk::Semaphore], vk::Semaphore) = if armed {
-              // A frame bound for the swapchain must wait until the presentation
-              // engine has actually handed over the image, and must signal the
-              // semaphore that `present` will wait on. Both belong to this slot.
-              (
-                  &[self.image_acquired[slot]],
-                  self.render_finished[slot],
-              )
-          } else {
-              (&[], vk::Semaphore::null())
-          };
-          self.submit_recorded_signalling(record, waits, signal, true, false)
-      }
-
-      /// Submit the recorded frame without waiting for the GPU.
-      ///
-      /// Bug №282: the only caller that must not block. Everything else on this
-      /// path — uploads, copies, staging helpers — reads its result on return.
-      fn submit_frame(&self, record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>) -> RhiResult<()> {
-          use std::sync::atomic::Ordering;
-          let armed = self
-              .presentation_signal_armed
-              .swap(false, Ordering::AcqRel);
           let slot = self.next_frame.load(Ordering::Relaxed) % FRAMES_IN_FLIGHT;
-          let (waits, signal): (&[vk::Semaphore], vk::Semaphore) = if armed {
-              (
-                  &[self.image_acquired[slot]],
-                  self.render_finished[slot],
+          // The present waits on the semaphore of the *image* this frame
+          // renders into, not of the frame slot.
+          //
+          // A frame slot comes round again after `FRAMES_IN_FLIGHT` frames,
+          // while the present that consumed its semaphore may still be
+          // pending — and re-signalling a semaphore the swapchain still holds
+          // is VUID-vkQueueSubmit-pSignalSemaphores-00067. A swapchain image
+          // does not have that problem: it is handed out again only after its
+          // present completed.
+          let image = self.present_image.load(Ordering::Acquire) as usize;
+          // An unarmed frame is not going to the swapchain — an offscreen frame,
+          // or a frame whose presentation was cancelled — so it takes no
+          // semaphore either.
+          let (wait, signal) = if armed {
+              submit_semaphores(
+                  SubmitKind::Frame,
+                  slot,
+                  &self.image_acquired,
+                  self.render_finished_for(image),
               )
           } else {
-              (&[], vk::Semaphore::null())
+              (None, None)
           };
-          self.submit_recorded_signalling(record, waits, signal, false, true)
+          let waits: &[vk::Semaphore] = match &wait {
+              Some(semaphore) => std::slice::from_ref(semaphore),
+              None => &[],
+          };
+          let signal = signal.unwrap_or_else(vk::Semaphore::null);
+          let result = self.submit_recorded_signalling(record, waits, signal, false, true);
+          // The present asks for the semaphore right after this submit, so the
+          // submit has to record which image it signalled for. Only on success:
+          // a failed submit signals nothing, and a present waiting on that
+          // semaphore would wait forever.
+          if result.is_ok() && armed {
+              self.last_present_image.store(image as u32, Ordering::Release);
+          }
+          result
       }
 
     /// Submit and signal an optional semaphore in addition to the submit fence.
@@ -806,7 +948,7 @@ record: impl FnOnce(vk::CommandBuffer) -> RhiResult<()>,
           block_until_complete: bool,
           advances_frame: bool,
       ) -> RhiResult<()> {
-let _guard = self.submit_lock.lock();
+let _guard = lock_submit_lock(&self.submit_lock, &self.submit_lock_poison_reported);
             // Bug #317: one-shot work gets a reserved slot of its own and never advances the
             // frame counter. Sharing the ring's counter let a texture upload steal a
             // frame slot between the acquire and the frame's submit, so the submit
@@ -926,6 +1068,12 @@ let _guard = self.submit_lock.lock();
             if advances_frame {
                 self.last_submitted_slot
                     .store(slot, std::sync::atomic::Ordering::Release);
+                // Bug #649: the frame *was* submitted, so the present may wait
+                // on this slot's render-finished semaphore. Set only after the
+                // submit succeeded: a failed submit signals nothing, and a
+                // present waiting on that semaphore would wait forever.
+                self.frame_submitted
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
 
             // Two kinds of caller share this path, and they need opposite
@@ -974,10 +1122,18 @@ let _guard = self.submit_lock.lock();
             .map_err(|e| vk_fail(e, "create staging buffer"))?;
         // SAFETY: buffer is a valid buffer owned by this device.
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        // The allocation is rounded up to the atom size and the *whole
+        // allocation* is mapped, for the same reason as in `create_buffer`:
+        // a flush with `VK_WHOLE_SIZE` is legal only if the end of the
+        // mapping is a multiple of 64 or is the end of the memory object.
+        // Mapping only the buffer's size ends the mapping mid-object, and a
+        // staging buffer's size is whatever the copy happened to be — 24
+        // bytes for a quad's indices.
+        let allocation_size = align_up(requirements.size, 64);
         let (memory, _) = self
             .allocator
             .allocate(
-                requirements.size,
+                allocation_size,
                 requirements.memory_type_bits,
                 // Host-visible only. Coherence used to be demanded here, which
                 // made staging allocation fail outright on a device whose only
@@ -990,7 +1146,7 @@ let _guard = self.submit_lock.lock();
         // satisfies buffer memory requirements (memory allocated from allocator for this device).
         unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
             .map_err(|e| RhiError::BufferCreationError(format!("bind staging memory: {e:?}")))?;
-        let ptr = self.allocator.map(memory, size)?;
+        let ptr = self.allocator.map(memory, allocation_size)?;
         Ok((buffer, memory, ptr))
     }
 
@@ -1011,8 +1167,18 @@ let _guard = self.submit_lock.lock();
         }
     }
 
-    /// Bytes per texel for a format, used to build staging layouts.
+    /// The present semaphore of a swapchain image, if the pool covers it.
     ///
+    /// `None` means the pool does not reach that image — the chain was built
+    /// with more images than the pool was told about — and the honest answer is
+    /// that there is no semaphore to signal, rather than the semaphore of some
+    /// other image.
+    fn render_finished_for(&self, image: usize) -> Option<vk::Semaphore> {
+        let pool = self.render_finished.lock().ok()?;
+        pool.get(image).copied()
+    }
+
+    /// Bytes per texel for a format, used to build staging layouts.
     /// Bug №182: this used to carry its own hand-maintained table, and it had
     /// drifted: D16_UNORM was 4 (should be 2), RGBA16_* were 4 (should be 8),
     /// D32_SFLOAT_S8_UINT was 4 (should be 8) and S8_UINT was 4 (should be 1).
@@ -1048,13 +1214,69 @@ impl BackendResource for VulkanLogicalDeviceResource {
     fn arm_presentation_signal(&self) {
         self.presentation_signal_armed
             .store(true, std::sync::atomic::Ordering::Release);
+        // Bug #649: a new frame is pending and nothing has been submitted for
+        // it yet. Until a submit says otherwise, the present must not wait on
+        // a render-finished semaphore.
+        self.frame_submitted
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
 fn render_finished_semaphore(&self) -> vk::Semaphore {
         // Bug №282: per slot. This used to return one shared handle, which is
         // only correct while a single frame is in flight — the second frame would
         // re-signal a semaphore the first present is still waiting on.
-        self.render_finished[self.last_submitted_slot.load(std::sync::atomic::Ordering::Acquire)]
+        //
+        // Bug #649: and only when the current frame was actually submitted. If
+        // the graph recorded nothing, or the submit failed, there is no
+        // semaphore to wait on: the last submit's semaphore was already
+        // consumed by the previous present, and waiting on it again is
+        // `VUID-vkQueuePresentKHR-pWaitSemaphores-01271`. A null semaphore
+        // means "present without waiting", which is the honest answer for a
+        // frame that rendered nothing.
+        if !self
+            .frame_submitted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return vk::Semaphore::null();
+        }
+        self.render_finished_for(self.last_present_image.load(std::sync::atomic::Ordering::Acquire) as usize)
+            .unwrap_or_else(vk::Semaphore::null)
+    }
+
+    /// The swapchain image the frame being recorded will be presented into.
+    ///
+    /// Set by the renderer right after the acquire: only the renderer knows
+    /// which image was acquired, and the submit has to signal the semaphore
+    /// belonging to *that* image.
+    fn set_present_image(&self, image_index: u32) {
+        self.present_image
+            .store(image_index, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Make the pool of present semaphores cover `count` swapchain images.
+    ///
+    /// The pool only grows. A semaphore that a pending present of a retired
+    /// chain still holds must not be destroyed, and a chain is replaced by a
+    /// resize at any time; the old semaphores are released with the device.
+    fn ensure_presentation_images(&self, count: usize) {
+        let mut pool = match self.render_finished.lock() {
+            Ok(pool) => pool,
+            Err(_) => return,
+        };
+        while pool.len() < count {
+            // SAFETY: device valid.
+            let semaphore = match unsafe {
+                self.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            } {
+                Ok(semaphore) => semaphore,
+                Err(e) => {
+                    eprintln!("[rhi/vulkan] create render-finished semaphore: {e}");
+                    return;
+                }
+            };
+            pool.push(semaphore);
+        }
     }
 
       /// The semaphore `vkAcquireNextImageKHR` should signal for the next frame.
@@ -1062,8 +1284,31 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
       /// Bug №282: `acquire` used to block on a fence instead, so the CPU never
       /// got ahead of the presentation engine. Passing the semaphore lets the
       /// submit wait for the handover on the GPU timeline.
+      ///
+      /// Bug: the slot's fence is waited on **here**, before the acquire, and
+      /// not only in the submit. The acquire signals `image_acquired[slot]`, and
+      /// the frame that used that slot before is still waiting on it — so
+      /// signalling it again is `VUID-vkAcquireNextImageKHR-semaphore-01779`,
+      /// "semaphore must not have any pending operations". Waiting in the
+      /// submit was too late: the submit happens *after* the acquire.
+      ///
+      /// The wait is on the slot's fence, which is signalled when the frame
+      /// that used the slot finished. The submit resets the fence afterwards,
+      /// so handing it to `queue_submit` is still legal.
       fn image_acquired_semaphore(&self) -> vk::Semaphore {
-          self.image_acquired[self.next_frame.load(std::sync::atomic::Ordering::Relaxed) % FRAMES_IN_FLIGHT]
+          let slot = self.next_frame.load(std::sync::atomic::Ordering::Relaxed) % FRAMES_IN_FLIGHT;
+          // The first turn around the ring has no previous frame, and a fence
+          // that was never submitted to would never be signalled.
+          if self.next_frame.load(std::sync::atomic::Ordering::Relaxed) >= FRAMES_IN_FLIGHT {
+              // SAFETY: the fence belongs to this device and is not in use by a
+              // pending submit, because the frame that used it has finished.
+              unsafe {
+                  self.device
+                      .wait_for_fences(&[self.submit_fences[slot]], true, u64::MAX)
+              }
+              .ok();
+          }
+          self.image_acquired[slot]
       }
 
       /// Bug №282: drain a presentation frame that will not be submitted.
@@ -1072,30 +1317,46 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
       /// wait on it, the semaphore stays signalled, and the slot's next acquire
       /// fails VUID-vkAcquireNextImageKHR-semaphore-01779. Draining is the only
       /// way back: a semaphore cannot be reset, only waited on.
-      fn cancel_presentation_frame(&self) {
+    fn cancel_presentation_frame(&self) {
           let armed = self
               .presentation_signal_armed
               .swap(false, std::sync::atomic::Ordering::AcqRel);
+          // Bug #649: a cancelled frame was not submitted, so the present must
+          // not wait on a render-finished semaphore for it. The arm already
+          // cleared this, but the cancel can also be reached without an arm —
+          // and the answer has to be the same either way.
+          self.frame_submitted
+              .store(false, std::sync::atomic::Ordering::Release);
           if !armed {
               return;
           }
           let slot = self.next_frame.load(std::sync::atomic::Ordering::Relaxed) % FRAMES_IN_FLIGHT;
-          let values: [u64; 1] = [1];
-          let semaphores = [self.image_acquired[slot]];
-          let wait = vk::SemaphoreWaitInfo {
-              semaphore_count: 1,
-              p_semaphores: semaphores.as_ptr(),
-              p_values: values.as_ptr(),
-              ..Default::default()
-          };
-          // SAFETY: semaphore array valid (semaphore owned by this device); wait info points to valid arrays.
-          unsafe {
-              self.device
-                  .wait_semaphores(&wait, u64::MAX)
-                  .map_err(|e| vk_fail(e, "drain unused image-acquired semaphore"))
-          }
-          .ok();
-      }
+          let semaphore = self.image_acquired[slot];
+          // The signal of a **binary** semaphore can only be consumed by a
+          // *submission* that waits on it. `vkWaitSemaphores` is for timeline
+          // semaphores only
+          // (`VUID-VkSemaphoreWaitInfo-pSemaphores-03256`), and so is
+          // `vkCmdWaitSemaphores` — so the drain is a one-shot submission whose
+          // `pWaitSemaphores` names the semaphore, and the one-shot path waits
+          // for its fence, so the drain is finished when this returns.
+          let _ = self.submit_recorded_signalling(
+              |_cb| Ok(()),
+              &[semaphore],
+              vk::Semaphore::null(),
+              true,
+              false,
+          );
+    }
+
+    /// Bug #644: the layout this backend believes the image is in.
+    ///
+    /// Exposed because a stale layout is invisible by construction: the only
+    /// thing that reads it is the readback, and the readback's wrong answer
+    /// looks like a driver that kept the bits.
+    fn image_layout(&self, image: u64) -> Option<crate::resource::TextureLayout> {
+        self.image_layout(image)
+            .map(convert::rhi_texture_layout)
+    }
 
     /// Bug №289: destroy now rather than at `vkDestroyDevice`.
     ///
@@ -1112,9 +1373,17 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
             return;
         };
         // An adopted swapchain image is not ours to destroy.
-        if gpu.memory == 0 && gpu.handle == 0 {
-            return;
-        }
+        //
+        // The guard this used to have was `gpu.memory == 0 && gpu.handle == 0`,
+        // which only catches a completely empty handle — not what "adopted"
+        // means. An adopted image is `GpuResource { handle: image, memory:
+        // image_view }`, so the guard never fired for it, and the comment
+        // described an intent the code did not implement.
+        //
+        // The real protection is the tracking list: `release_many` destroys
+        // only handles this device created and recorded, and an adopted image
+        // was never recorded — `Swapchain` owns it. So the guard is gone and
+        // the reason is stated here, where the next reader will look.
         self.release(ReleaseKind::Image, gpu.handle);
     }
 
@@ -1324,7 +1593,19 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
         let (memory, _) = self
             .allocator
-            .allocate(requirements.size, requirements.memory_type_bits, desc.memory_flags)
+            .allocate(
+                // The allocation is rounded up to the atom size, so the end of
+                // the mapping is a multiple of it. `vkFlushMappedMemoryRanges`
+                // with `VK_WHOLE_SIZE` is legal only if the end of the current
+                // mapping is a multiple of `nonCoherentAtomSize` (64 bytes) or
+                // is the end of the memory object, and a buffer whose size is
+                // not a multiple of 64 — a quad's 224 bytes of vertices, for
+                // one — otherwise fails the flush. The extra bytes are never
+                // read or written.
+                align_up(requirements.size, 64),
+                requirements.memory_type_bits,
+                desc.memory_flags,
+            )
             .map_err(|e| RhiError::BufferCreationError(format!("{e}")))?;
         // SAFETY: buffer and memory are valid handles owned by this device; memory offset 0
         // within allocation, meets buffer memory requirements.
@@ -1333,7 +1614,21 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
 
         let mut mapped = 0usize;
         if desc.is_host_mappable() {
-            let ptr = self.allocator.map(memory, desc.size)?;
+            // The whole **allocation** is mapped, not just the buffer's size.
+            //
+            // `vkFlushMappedMemoryRanges` with `VK_WHOLE_SIZE` is legal only if
+            // the end of the current mapping is a multiple of
+            // `nonCoherentAtomSize` (64 bytes) or is the end of the memory
+            // object. Mapping only `desc.size` gives a mapping that ends
+            // mid-object, so the flush is a validation error for every buffer
+            // whose size is not a multiple of 64 — the 36-byte triangle of a
+            // fullscreen pass, for one.
+            //
+            // Mapping the allocation is safe because the allocator gives every
+            // allocation its own dedicated `vk::DeviceMemory`: there is no
+            // neighbouring live data to disturb, which is the same reason the
+            // flush uses `VK_WHOLE_SIZE` at all.
+            let ptr = self.allocator.map(memory, requirements.size)?;
             mapped = ptr as usize;
         }
 
@@ -1462,6 +1757,27 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
     }
 
     fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
+        // Anisotropy means *more than one* sample, so the predicate is `> 1.0`.
+        //
+        // It used to be `> 0.0`, which meant a sampler asked for one sample
+        // (`max_anisotropy = 1.0`) still had anisotropy switched on — and
+        // `max_anisotropy = 0.0` with anisotropy on is not a legal combination
+        // at all.
+        //
+        // And the feature has to be enabled on the device: `samplerAnisotropy`
+        // is off unless the caller asked for it (`Features::default()` has it
+        // off), and a sampler with anisotropy on a device without the feature
+        // is `VUID-VkSamplerCreateInfo-anisotropyEnable-01070`. So the request
+        // is clamped to what the device can actually do, and the sampler stays
+        // legal either way. Enabling the feature is the caller's decision;
+        // producing an invalid sampler is nobody's.
+        let anisotropy_requested = desc.max_anisotropy > 1.0;
+        let anisotropy_enable = anisotropy_requested && self.sampler_anisotropy;
+        let max_anisotropy = if anisotropy_enable {
+            desc.max_anisotropy
+        } else {
+            1.0
+        };
         let create_info = vk::SamplerCreateInfo {
             mag_filter: convert::filter(desc.mag_filter),
             min_filter: convert::filter(desc.min_filter),
@@ -1470,8 +1786,8 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
             address_mode_v: convert::address_mode(desc.address_mode_v),
             address_mode_w: convert::address_mode(desc.address_mode_w),
             mip_lod_bias: desc.mip_lod_bias,
-            anisotropy_enable: (desc.max_anisotropy > 0.0) as vk::Bool32,
-            max_anisotropy: desc.max_anisotropy,
+            anisotropy_enable: anisotropy_enable as vk::Bool32,
+            max_anisotropy,
             compare_enable: desc.compare_enable as vk::Bool32,
             compare_op: convert::compare_op(desc.compare_op),
             min_lod: desc.min_lod,
@@ -1531,7 +1847,7 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
         }
         self.allocator.flush(staging_memory, data.len() as u64)?;
         let dst = vk::Buffer::from_raw(gpu.handle);
-        let result = self.submit_recorded(|cb| {
+        let result = self.submit_one_shot(|cb| {
             // SAFETY: cb is a valid command buffer in recording state (owned by this device); staging
             // and dst are valid buffers on this device; region covers full valid range of both buffers.
             unsafe {
@@ -1619,7 +1935,7 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
         }
         self.allocator.flush(staging_memory, total)?;
         let sampled = texture.is_sampled();
-        let result = self.submit_recorded(|cb| {
+        let result = self.submit_one_shot(|cb| {
             // SAFETY: cb valid, in recording state; image valid and owned by this device; layout
             // transitions match the copy (UNDEFINED->TRANSFER_DST before copy, ->SHADER_READ after if sampled).
             unsafe {
@@ -1676,6 +1992,28 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
             Ok(())
         });
         self.destroy_staging_buffer(staging, staging_memory);
+        // Bug #644: the tracker has to know where the image ended up.
+        //
+        // The two barriers above are written straight into the command buffer,
+        // so they never pass through `note_layout_transitions` — the tracker
+        // still said `UNDEFINED` for a texture that had just been uploaded.
+        // `download_texture` reads the tracked layout, so a readback right
+        // after an upload built a barrier with `oldLayout = UNDEFINED`, which
+        // discards the contents: the readback returned nothing at all.
+        //
+        // The layout recorded is the one the upload ended in: a sampled image
+        // is left in `SHADER_READ_ONLY_OPTIMAL` for the sampler to read, and
+        // anything else stays in `TRANSFER_DST_OPTIMAL`.
+        if result.is_ok() {
+            self.note_image_layout(
+                gpu.handle,
+                if sampled {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                },
+            );
+        }
         result
     }
 
@@ -1690,6 +2028,29 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
             return Err(RhiError::ShaderCompilationError(format!(
                 "SPIR-V bytecode length {} is not a multiple of 4",
                 desc.code.len()
+            )));
+        }
+        if desc.code.len() < 4 {
+            return Err(RhiError::ShaderCompilationError(format!(
+                "SPIR-V bytecode is {} bytes, too short to hold a magic number",
+                desc.code.len()
+            )));
+        }
+        // The magic number. A length that happens to be a multiple of four is
+        // not evidence that the bytes are SPIR-V: a GLSL source file whose
+        // length is a multiple of four would pass the check above and be
+        // handed to the driver, which rejects it much later and with a message
+        // about the shader rather than about the bytes.
+        //
+        // The repository has a shader compiler that returns GLSL text as
+        // "SPIR-V" (`StubShaderCompiler::compile_to_spirv`), so this is not a
+        // hypothetical input.
+        const SPIRV_MAGIC: u32 = 0x0723_0203;
+        let magic = u32::from_le_bytes([desc.code[0], desc.code[1], desc.code[2], desc.code[3]]);
+        if magic != SPIRV_MAGIC {
+            return Err(RhiError::ShaderCompilationError(format!(
+                "the bytes are not SPIR-V: the magic number is {magic:#010x}, expected \
+                 {SPIRV_MAGIC:#010x}"
             )));
         }
         let words: Vec<u32> = desc
@@ -1861,6 +2222,39 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
                                 "descriptor texture view has no GPU backing".into(),
                             ));
                         };
+                        // A depth or stencil view is not an ordinary texture, and
+                        // treating it as one is what the RHI could not do before.
+                        //
+                        // Two Vulkan rules meet here. The first is about the
+                        // layout: an image with a depth format that is read by a
+                        // shader lives in `DEPTH_STENCIL_READ_ONLY_OPTIMAL`,
+                        // not in the layout every other sampled image uses. The
+                        // second is about the sampler: a depth image may only be
+                        // filtered by a comparison sampler, and a plain
+                        // filtering sampler over it is
+                        // `VUID-vkCmdDraw-None-08611`.
+                        //
+                        // The shadow map is exactly such an image - it is
+                        // written as a depth attachment and read by the
+                        // lighting shader - so without this the RHI had no
+                        // way to express the one thing a shadow map is for.
+                        let format = view.format();
+                        let is_depth = format.is_depth() || format.is_stencil();
+                        let image_layout = if is_depth {
+                            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                        } else {
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        };
+                        if let Some(s) = sampler {
+                            if is_depth && !s.is_comparison() && s.desc().mag_filter == crate::FilterMode::Linear
+                            {
+                                return Err(RhiError::BackendError(
+                                    "a depth texture may only be sampled with a comparison sampler \
+                                     or without filtering (VUID-vkCmdDraw-None-08611)"
+                                        .into(),
+                                ));
+                            }
+                        }
                         let sampler_handle = if let Some(s) = sampler {
                             s.backend()
                                 .ok_or_else(|| {
@@ -1875,7 +2269,7 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
                         image_infos.push(vk::DescriptorImageInfo {
                             sampler: vk::Sampler::from_raw(sampler_handle),
                             image_view: vk::ImageView::from_raw(v.handle),
-                            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            image_layout,
                         });
                         planned.push((write.dst_binding, array_element, ty, usize::MAX, image_infos.len() - 1));
                     }
@@ -2014,7 +2408,7 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
             RhiError::BackendError("bound descriptor set has no GPU backing".into())
         })?;
 
-        self.submit_recorded(|cb| {
+        self.submit_one_shot(|cb| {
             // SAFETY: cb valid and in recording state (owned by this device); vk_pipeline/vk_layout/
             // vk_sets are live handles created on this device; barrier describes compute->compute/transfer hazard.
             unsafe {
@@ -2079,7 +2473,7 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
         }
         let src = vk::Buffer::from_raw(backend.handle);
         let (staging, staging_memory, ptr) = self.create_staging_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
-        let result = self.submit_recorded(|cb| {
+        let result = self.submit_one_shot(|cb| {
             // SAFETY: cb valid, in recording state; src and staging are valid buffers on this device;
             // barrier covers the exact [offset, offset+size) range being copied, which was bounds-checked above.
             unsafe {
@@ -2188,8 +2582,31 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
                 vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
             ),
+            // A depth image that has been read by a shader - the shadow map
+            // after the lighting pass has sampled it - sits in this layout, and
+            // the fallback below claims `SHADER_WRITE` at the fragment stage.
+            // That is the wrong access and the wrong stage: the depth was
+            // written by the depth test, in the late fragment tests, and the
+            // copy could therefore read the depth *before* the write landed.
+            // The symptom is a shadow map that reads back as nothing but the
+            // clear value, with no error anywhere: the barrier is legal, it
+            // just does not wait for what it has to wait for.
+            l if l == vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL => (
+                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ),
             l if l == vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
                 vk::AccessFlags::TRANSFER_WRITE,
+                vk::PipelineStageFlags::TRANSFER,
+            ),
+            l if l == vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
+                // The image was already a transfer source — a previous readback
+                // left it there, and the tracker now says so (Bug #644). Without
+                // this arm the fallback claimed `SHADER_WRITE`, which is both the
+                // wrong access and the wrong stage: the spec wants
+                // `TRANSFER_READ` for a source that was read by a transfer.
+                vk::AccessFlags::TRANSFER_READ,
                 vk::PipelineStageFlags::TRANSFER,
             ),
             l if l == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
@@ -2199,7 +2616,7 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
             _ => (vk::AccessFlags::SHADER_WRITE, vk::PipelineStageFlags::FRAGMENT_SHADER),
         };
 
-        let result = self.submit_recorded(|cb| {
+        let result = self.submit_one_shot(|cb| {
             // SAFETY: cb valid, in recording state; image is a live image on this device;
             // barrier describes the exact mip/layer being downloaded and matches the layout
             // transition (old_layout -> TRANSFER_SRC_OPTIMAL) before the copy below.
@@ -2275,6 +2692,14 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
             self.destroy_staging_buffer(staging, staging_memory);
             return Err(e);
         }
+
+        // Bug #644: the readback moved the image into `TRANSFER_SRC_OPTIMAL`
+        // and did not put it back, so the tracker had to be told or the next
+        // barrier would name a layout the image is no longer in. The old
+        // layout is not restored on purpose — the image really is in
+        // `TRANSFER_SRC_OPTIMAL` now, and a tracker that claimed otherwise
+        // would be the same class of lie this function was fixed for.
+        self.note_image_layout(backend.handle, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
 
         // Same reason as the buffer readback: the device wrote this range, so the host
         // must not read it before the write is made visible.
@@ -2503,6 +2928,36 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
                 "graphics pipeline render pass has no GPU backing".into(),
             ));
         };
+
+        // Bug №692: the colour blend state's attachment count has to match the
+        // render pass's colour attachment count, and Vulkan does not check it
+        // for us: `vkCreateGraphicsPipelines` returns the invalid pipeline as a
+        // success. The pipeline then exists, is invalid, and draws nothing —
+        // a dark frame with no message, while the light, the camera and the
+        // uniforms are all correct.
+        //
+        // The caller knows how many colour attachments it has; the RHI knows
+        // how many the render pass has; and the two have to agree. Checking it
+        // here turns a silent wrong picture into an error that names the
+        // mismatch.
+        let render_pass_colour_attachments = render_pass
+            .desc()
+            .subpasses
+            .first()
+            .map(|subpass| subpass.color_attachments.len())
+            .unwrap_or(0);
+        let blend_attachments = desc
+            .color_blend_state
+            .as_ref()
+            .map(|state| state.attachments.len())
+            .unwrap_or(0);
+        if blend_attachments != render_pass_colour_attachments {
+            return Err(RhiError::PipelineCreationError(format!(
+                "the pipeline declares {} colour attachment(s) and the render pass \
+                 has {}",
+                blend_attachments, render_pass_colour_attachments
+            )));
+        }
 
         let mut module_handles = Vec::with_capacity(desc.shader_stages.len());
         let mut entry_names = Vec::with_capacity(desc.shader_stages.len());
@@ -2945,7 +3400,10 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
 
         commands.push(crate::command::commands::Command::EndRenderPass);
 
-        self.submit_recorded(|cb| record::record(&self.device, cb, &commands))
+        // Bug #643: a legacy direct draw is one-shot work. It has no
+        // presentation of its own, so it must not take the frame's semaphores
+        // — the same rule every other one-shot path follows.
+        self.submit_one_shot(|cb| record::record(&self.device, cb, &commands))
     }
 }
 
@@ -2968,8 +3426,12 @@ impl Drop for VulkanLogicalDeviceResource {
             for fence in &self.submit_fences {
             self.device.destroy_fence(*fence, None);
         }
-        for semaphore in self.render_finished.iter().chain(self.image_acquired.iter()) {
-            self.device.destroy_semaphore(*semaphore, None);
+        // The present semaphores live in a mutex because the pool grows when a
+        // swapchain with more images is built.
+        if let Ok(pool) = self.render_finished.lock() {
+            for semaphore in pool.iter().chain(self.image_acquired.iter()) {
+                self.device.destroy_semaphore(*semaphore, None);
+            }
         }
               // Every per-slot fence and semaphore above is destroyed in the same
               // loop. `device_wait_idle` above has already drained the device, so
@@ -2985,6 +3447,87 @@ fn align_up(value: u64, align: u64) -> u64 {
     (value + (align - 1)) & !(align - 1)
 }
 
+/// Take the submit lock, and say so if the mutex was poisoned. Bug №662.
+///
+/// A poisoned mutex means the previous holder panicked. The submit lock covers
+/// the whole record-and-submit window, so that panic happened in the middle of
+/// recording, and the device may be in a state nobody has checked.
+///
+/// Continuing is better than refusing to work: a renderer that stops drawing
+/// is a renderer with a black screen, and the recording path is a place where
+/// a panic is more likely than in most. But the fact must not be silent —
+/// "everything is fine" and "we survived a panic" look identical from outside,
+/// and only one of them is true.
+///
+/// The report happens once. On every frame after it, the same line would say
+/// the same thing, and the line that matters would be lost among the copies.
+///
+/// Taken as a free function so it can be tested without a device: poisoning a
+/// mutex and then taking it is exactly what a panicking recorder does, and the
+/// test does it in a thread.
+fn lock_submit_lock<'a>(
+    lock: &'a std::sync::Mutex<()>,
+    poison_reported: &std::sync::atomic::AtomicBool,
+) -> std::sync::MutexGuard<'a, ()> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            if !poison_reported.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                eprintln!(
+                    "[rhi/vulkan] the submit lock was poisoned by an earlier panic; the \
+                     device is continuing after an interrupted recording"
+                );
+            }
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// What kind of work a submit carries. Bug #643.
+///
+/// The two kinds differ in whether they take part in presentation at all, and
+/// they used to differ in nothing else — which is how a one-shot upload ended
+/// up waiting on the presentation engine's handover semaphore and raising the
+/// semaphore the present waits on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SubmitKind {
+    /// A frame that will be presented to the swapchain.
+    Frame,
+    /// One-shot work: an upload, a copy, a readback, a legacy direct draw.
+    OneShot,
+}
+
+/// The semaphores a submit waits on and signals. Bug #643.
+///
+/// A frame bound for the swapchain waits on the presentation engine's handover
+/// and signals the semaphore the present waits on; both belong to the frame's
+/// slot, and both are per-slot because one shared semaphore cannot serve two
+/// frames (re-signalling it while the previous present is still waiting is
+/// `VUID-vkQueueSubmit-pSignalSemaphores-00067`).
+///
+/// One-shot work has no presentation of its own, so it takes no semaphore and
+/// signals none. It used to take the frame's: it swapped the arming flag and
+/// used the *frame* slot's semaphores while submitting into the reserved
+/// one-shot slot. A one-shot submit between the arm and the frame's submit
+/// then consumed the handover signal, raised the present's semaphore, and
+/// cleared the flag, so the frame itself waited on nothing and signalled
+/// nothing.
+///
+/// `None` means "no semaphore"; the caller turns that into a null semaphore,
+/// which is what `vkQueueSubmit` wants for "nothing to wait on, nothing to
+/// signal".
+fn submit_semaphores(
+    kind: SubmitKind,
+    slot: usize,
+    image_acquired: &[vk::Semaphore],
+    render_finished: Option<vk::Semaphore>,
+) -> (Option<vk::Semaphore>, Option<vk::Semaphore>) {
+    match kind {
+        SubmitKind::Frame => (Some(image_acquired[slot]), render_finished),
+        SubmitKind::OneShot => (None, None),
+    }
+}
+
 // At the end of the file on purpose: clippy's `items_after_test_module` fires when
 // anything follows a `mod tests`, and a warning here is a warning every future
 // contributor learns to ignore.
@@ -2993,7 +3536,6 @@ fn align_up(value: u64, align: u64) -> u64 {
 mod teardown_coverage {
     use super::{ALL_TRACKED_KINDS, TrackedKind, TEARDOWN_ORDER};
     use crate::backend::common::ReleaseKind;
-
     #[test]
     fn teardown_order_covers_every_tracked_kind() {
         for kind in ALL_TRACKED_KINDS {
@@ -3059,6 +3601,177 @@ mod teardown_coverage {
                 1,
                 "{kind:?} and {duplicates} other release kinds all map to {mapped:?}"
             );
+        }
+    }
+}
+
+// At the end of the file on purpose: clippy's `items_after_test_module` fires when
+// anything follows a `mod tests`, and a warning here is a warning every future
+// contributor learns to ignore.
+
+#[cfg(test)]
+mod poisoned_submit_lock {
+    use super::lock_submit_lock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// A poisoned submit lock must not stop the device, and must be reported.
+    ///
+    /// Bug №662. The submit lock covers the whole record-and-submit window, so
+    /// a poisoned one means a recorder panicked in the middle of recording.
+    /// Two things have to hold at once, and they pull in opposite directions:
+    /// the work must go on (a renderer that stops drawing shows a black
+    /// screen), and the fact must not be silent (a panic that left the device
+    /// in an unknown state looks exactly like a device that is fine).
+    #[test]
+    fn a_poisoned_lock_is_taken_anyway_and_reported_once() {
+        let lock = Arc::new(Mutex::new(()));
+        // Poison it the way a panicking holder would.
+        {
+            let clone = lock.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = clone.lock().unwrap();
+                panic!("the recording panicked");
+            })
+            .join();
+        }
+        assert!(
+            lock.is_poisoned(),
+            "the lock must be poisoned for this test to mean anything"
+        );
+
+        let reported = AtomicBool::new(false);
+        {
+            let guard = lock_submit_lock(&lock, &reported);
+            assert!(
+                lock.try_lock().is_err(),
+                "the lock must actually be held while the guard is alive: taking a \
+                 poisoned mutex and then not holding it would let two recorders in"
+            );
+            drop(guard);
+        }
+        assert!(
+            reported.load(Ordering::Acquire),
+            "a poisoned lock must be reported: a panic that interrupted the \
+             recording looks exactly like a device that is fine"
+        );
+
+        // The second acquisition must not report again: the fact has not
+        // changed, and a log that repeats itself every frame drowns the line
+        // that matters.
+        {
+            let _guard = lock_submit_lock(&lock, &reported);
+        }
+        assert!(
+            reported.load(Ordering::Acquire),
+            "the report flag stays set"
+        );
+    }
+
+    /// A healthy lock is taken silently.
+    ///
+    /// The report is about a panic, and a mutex nobody poisoned is not a
+    /// finding — reporting it would make the first real report the second
+    /// line in the log.
+    #[test]
+    fn a_healthy_lock_is_taken_without_a_report() {
+        let lock = Mutex::new(());
+        let reported = AtomicBool::new(false);
+        {
+            let _guard = lock_submit_lock(&lock, &reported);
+        }
+        assert!(
+            !reported.load(Ordering::Acquire),
+            "a lock nobody poisoned must not be reported as poisoned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod presentation_semaphores {
+    use super::{submit_semaphores, SubmitKind};
+    // `from_raw` is a method of the `Handle` trait, not an inherent one.
+    use ash::vk::{self, Handle};
+
+    /// Bug #643: one-shot work must never take the frame's presentation
+    /// semaphores.
+    ///
+    /// It used to: the one-shot path swapped the arming flag and used the
+    /// *frame* slot's `image_acquired` and `render_finished`, while
+    /// submitting into the reserved one-shot slot. A one-shot submit between
+    /// the arm and the frame's submit therefore consumed the presentation
+    /// engine's handover signal, raised the semaphore the present waits on,
+    /// and cleared the flag — so the frame itself waited on nothing and
+    /// signalled nothing, and could be shown half-drawn.
+    #[test]
+    fn one_shot_work_takes_no_presentation_semaphores() {
+        let image_acquired = [
+            vk::Semaphore::from_raw(0x1000),
+            vk::Semaphore::from_raw(0x2000),
+        ];
+        // One-shot work signals nothing, so there is no present semaphore to
+        // hand it — the call below does not even take one.
+
+        let (wait, signal) =
+            submit_semaphores(SubmitKind::OneShot, 0, &image_acquired, None);
+        assert!(
+            wait.is_none(),
+            "one-shot work must not wait on the presentation engine's handover \
+             semaphore: it would consume the signal the frame's submit is waiting for"
+        );
+        assert!(
+            signal.is_none(),
+            "one-shot work must not signal the semaphore the present waits on: \
+             the frame would be shown on a signal from an upload rather than from \
+             the rendering"
+        );
+    }
+
+    /// The frame path does take them — otherwise the fix would be to switch
+    /// presentation off rather than to separate the two kinds of submit.
+    ///
+    /// The acquire semaphore is per *slot*: the slot is what owns the command
+    /// buffer and the fence, and the frame that used it before has finished by
+    /// the time the slot comes round again.
+    ///
+    /// The present semaphore is per *image*: the present waits on it, and the
+    /// swapchain holds it until the present completes. An image is handed out
+    /// again only after that, so its semaphore is free — while a frame slot
+    /// comes round long before the present of the frame that used it is over,
+    /// and re-signalling then is VUID-vkQueueSubmit-pSignalSemaphores-00067.
+    #[test]
+    fn a_frame_waits_on_its_slot_and_signals_its_image() {
+        let image_acquired = [
+            vk::Semaphore::from_raw(0x1000),
+            vk::Semaphore::from_raw(0x2000),
+        ];
+        // One semaphore per swapchain image, not per frame slot: the two
+        // swapchain images below are not the two frame slots.
+        let render_finished = [
+            vk::Semaphore::from_raw(0x3000),
+            vk::Semaphore::from_raw(0x4000),
+            vk::Semaphore::from_raw(0x5000),
+        ];
+
+        for slot in 0..2 {
+            for image in 0..render_finished.len() {
+                let (wait, signal) = submit_semaphores(
+                    SubmitKind::Frame,
+                    slot,
+                    &image_acquired,
+                    Some(render_finished[image]),
+                );
+                assert_eq!(
+                    wait,
+                    Some(image_acquired[slot]),
+                    "the frame must wait on its own slot's acquire semaphore"
+                );
+                assert_eq!(
+                    signal,
+                    Some(render_finished[image]),
+                    "the frame must signal the semaphore of the image it renders into"
+                );
+            }
         }
     }
 }

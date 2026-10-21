@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use crate::render::core::RenderContext;
-use crate::render::graph::node::{PassDependency, RenderPass};
+use crate::render::graph::node::{PassDependency, PassOutcome, RenderPass};
 use crate::render::graph::resource::GraphResource;
 use crate::render::scene::Scene;
 use crate::rhi::command::commands::Command;
@@ -32,6 +32,7 @@ use crate::rhi::{
 use glam::{Mat4, Vec3};
 
 /// One drawable mesh: its GPU buffers and the pipeline built for it.
+#[derive(Clone)]
 pub struct GeometryItem {
     pub name: String,
     pub vertex_buffer: std::sync::Arc<crate::rhi::Buffer>,
@@ -39,14 +40,47 @@ pub struct GeometryItem {
     pub index_type: crate::render::meshes::IndexType,
     pub index_count: u32,
     pub model: Mat4,
+    /// The scene entity this item came from, when it came from one.
+    ///
+    /// The items are the *meshes*, and they are built once; the transforms
+    /// change every frame. This is the link that lets
+    /// [`GeometryPass::update_models`] refresh the model matrices without
+    /// rebuilding the items — and without rebuilding the uniform buffers and
+    /// descriptor sets that go with them.
+    ///
+    /// `None` for an item the caller built by hand, which is what
+    /// `examples/cube.rs` does. Such an item's model is whatever the caller
+    /// set, and nothing will change it.
+    pub entity_id: Option<crate::render::scene::entity::EntityId>,
+}
+
+/// The entities that can be drawn, and the ones that cannot.
+///
+/// The skipped list is the point of the type. A scene with a hundred entities
+/// and one of them missing its buffers should say so once, with a name —
+/// not draw ninety-nine entities and leave the caller to guess why the frame
+/// is short.
+#[derive(Default)]
+pub struct SceneItems {
+    /// The entities that can be drawn.
+    pub items: Vec<GeometryItem>,
+    /// The entities that cannot, with the reason.
+    pub skipped: Vec<(String, String)>,
 }
 
 /// Everything needed to record the pass, rebuilt when a resource changes.
 pub struct GeometryPassState {
     pub pipeline: GraphicsPipeline,
     pub descriptor_layout: DescriptorSetLayout,
-    pub descriptor_set: DescriptorSet,
-    pub uniform_buffer: crate::rhi::Buffer,
+    /// One descriptor set per item, in the same order as `items`.
+    ///
+    /// Bug №654: this was one set for the whole pass, and the uniform behind
+    /// it held one MVP for every item. The per-item model matrix had nowhere
+    /// to go, so `GeometryItem::model` was a public field that changed
+    /// nothing.
+    pub descriptor_sets: Vec<DescriptorSet>,
+    /// One uniform buffer per item, in the same order as `items`.
+    pub uniform_buffers: Vec<crate::rhi::Buffer>,
     pub render_pass: crate::rhi::RenderPass,
     pub items: Vec<GeometryItem>,
     /// The depth image matching the current target size.
@@ -143,16 +177,16 @@ impl GeometryPassState {
     pub fn with_resources(
         pipeline: GraphicsPipeline,
         descriptor_layout: DescriptorSetLayout,
-        descriptor_set: DescriptorSet,
-        uniform_buffer: crate::rhi::Buffer,
+        descriptor_sets: Vec<DescriptorSet>,
+        uniform_buffers: Vec<crate::rhi::Buffer>,
         render_pass: crate::rhi::RenderPass,
         items: Vec<GeometryItem>,
     ) -> Self {
         Self {
             pipeline,
             descriptor_layout,
-            descriptor_set,
-            uniform_buffer,
+            descriptor_sets,
+            uniform_buffers,
             depth_format: GeometryPass::DEPTH_FORMAT,
             render_pass,
             items,
@@ -176,6 +210,108 @@ pub struct GeometryPass {
 }
 
 impl GeometryPass {
+    /// Build the draw items for the scene's visible entities.
+    ///
+    /// This is the bridge between the scene graph and the GPU: an entity's
+    /// `Transform` becomes the item's model matrix, and its `MeshComponent`
+    /// becomes the vertex and index buffers.
+    ///
+    /// It did not exist, and that is why the product's `Renderer` presented an
+    /// empty frame. `RenderGraph::add_pass` had no caller anywhere in `src/`,
+    /// and the only way to obtain a geometry pass was to build the items by
+    /// hand — which is what `examples/cube.rs` does. Everything the scene
+    /// knows, the entities and their transforms and their meshes, was read by
+    /// nothing at all: the scene was a data structure that no pass consulted.
+    ///
+    /// The model matrix is per item, and each item has its own uniform buffer
+    /// (Bug №654), so two entities at different places really do end up in
+    /// different places on the screen.
+    ///
+    /// An entity is skipped when it has no transform, no mesh component, or a
+    /// mesh whose GPU buffers were never created. The reasons are collected
+    /// rather than printed per entity: a scene with a thousand entities would
+    /// flood the log, and a list nobody reads is the same as no list.
+    pub fn items_for_scene(scene: &Scene) -> SceneItems {
+        let mut items = Vec::new();
+        let mut skipped = Vec::new();
+
+        for entity in scene.entities() {
+            if !entity.is_active() || !entity.is_visible() {
+                continue;
+            }
+            // An entity with no mesh is not a drawable entity — a light or a
+            // camera, most likely — so it is not a failure and not worth a
+            // line in the skipped list. The list is for entities that *want* to
+            // be drawn and cannot be.
+            let Some(mesh_component) = entity.mesh() else {
+                continue;
+            };
+            let Some(transform) = entity.transform() else {
+                skipped.push((entity.name().to_string(), "no transform".into()));
+                continue;
+            };
+            let mesh = &mesh_component.mesh;
+            let (Some(vertex_buffer), Some(index_buffer)) =
+                (mesh.vertex_buffer(), mesh.index_buffer())
+            else {
+                // The mesh exists but its buffers were never created, which
+                // means `Mesh::create_buffers` was never called for it.
+                skipped.push((
+                    entity.name().to_string(),
+                    "the mesh has no GPU buffers".into(),
+                ));
+                continue;
+            };
+            if mesh.index_count() == 0 {
+                skipped.push((entity.name().to_string(), "the mesh is empty".into()));
+                continue;
+            }
+            items.push(GeometryItem {
+                name: entity.name().to_string(),
+                vertex_buffer: vertex_buffer.clone(),
+                index_buffer: index_buffer.clone(),
+                index_type: mesh.index_type(),
+                index_count: mesh.index_count(),
+                model: transform.matrix(),
+                entity_id: Some(entity.id()),
+            });
+        }
+
+        SceneItems { items, skipped }
+    }
+
+    /// Refresh the items' model matrices from the scene.
+    ///
+    /// The items are the *meshes* and they are built once; the transforms move
+    /// every frame. Rebuilding the items per frame would mean rebuilding the
+    /// uniform buffers and the descriptor sets with them, so instead the
+    /// matrices are refreshed in place and the items remember which entity
+    /// they came from.
+    ///
+    /// Returns how many items were updated. An item whose entity has gone, or
+    /// that has no transform any more, keeps the matrix it had — the caller
+    /// is expected to rebuild the items when the *set* of entities changes,
+    /// and this function is for the common case where only the transforms do.
+    pub fn update_models(state: &SharedState, scene: &Scene) -> usize {
+        let Ok(mut state) = state.lock() else {
+            return 0;
+        };
+        let mut updated = 0;
+        for item in state.items.iter_mut() {
+            let Some(entity_id) = item.entity_id else {
+                continue;
+            };
+            let Some(entity) = scene.get_entity(entity_id) else {
+                continue;
+            };
+            let Some(transform) = entity.transform() else {
+                continue;
+            };
+            item.model = transform.matrix();
+            updated += 1;
+        }
+        updated
+    }
     pub fn new() -> Self {
         Self {
             state: None,
@@ -259,7 +395,8 @@ impl GeometryPass {
             RasterizerState, ShaderFormat, ShaderModuleDesc,
         };
 
-        let (uniform_buffer, descriptor_layout, descriptor_set) = build_uniforms(device)?;
+        let (uniform_buffers, descriptor_layout, descriptor_sets) =
+            build_uniforms(device, items.len())?;
 
         let module = device.create_shader_module(&ShaderModuleDesc {
             code: spirv.to_vec(),
@@ -326,8 +463,8 @@ impl GeometryPass {
         Ok(Self::with_state(GeometryPassState::with_resources(
             pipeline,
             descriptor_layout,
-            descriptor_set,
-            uniform_buffer,
+            descriptor_sets,
+            uniform_buffers,
             render_pass,
             items,
         )))
@@ -457,7 +594,13 @@ impl GeometryPass {
                     height,
                     1,
                     state.depth_format,
-                    crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                    // `TRANSFER_SRC` as well: the depth buffer is the one thing
+                    // that says where the geometry actually is, and reading it
+                    // back is the only way to check that — a depth test that
+                    // never fires and a depth test that always fires produce
+                    // the same picture. The shadow map's test needs it too.
+                    crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT
+                        | crate::rhi::TextureUsage::TRANSFER_SRC,
                     1,
                 );
                 // Through the device, not `Texture::create_view`: the latter
@@ -582,7 +725,15 @@ impl GeometryPass {
     /// Takes the device explicitly rather than reading it from the context, so
     /// this is callable from outside a graph execution.
     ///
-    /// Returns whether the GPU now holds this frame's uniforms.
+    /// One uniform buffer is written per item, because the MVP includes the
+    /// item's own model matrix: `mvp = projection * view * model`. With a
+    /// single buffer for the pass, the last item written would be the one
+    /// every draw used, and `GeometryItem::model` would change nothing.
+    /// Bug №654.
+    ///
+    /// Returns whether the GPU now holds this frame's uniforms. A failure on
+    /// one item fails the whole frame: a partial update leaves some items
+    /// drawn with the previous frame's matrix.
     #[must_use]
     pub fn update_uniforms(
         state: &SharedState,
@@ -593,27 +744,41 @@ impl GeometryPass {
         let Ok(state) = state.lock() else {
             return false;
         };
-        let mvp = projection * view;
 
-        // Column-major, so the 16 floats of the matrix go down unchanged.
-        let mut data: [f32; 28] = [0.0; 28];
-        data[..16].copy_from_slice(&mvp.to_cols_array());
         // A directional light in view space, normalised so the shader need not be.
         let light = Vec3::new(0.4, 0.7, 1.0).normalize();
-        data[16..20].copy_from_slice(&[light.x, light.y, light.z, 0.0]);
-        data[20..24].copy_from_slice(&[1.0, 0.96, 0.9, 1.0]);
-        data[24..28].copy_from_slice(&[0.18, 0.2, 0.24, 1.0]);
+        let mut all_ok = true;
 
-// A failed uniform upload leaves the previous frame's MVP on the GPU, which
-        // would draw the mesh under the old camera. Report it rather than
-        // letting the frame go out with transforms nobody asked for.
-        match device.upload_buffer(&state.uniform_buffer, &data) {
-            Ok(_) => true,
-            Err(e) => {
-                eprintln!("[geometry] uniform upload failed: {e}");
-                false
+        for (index, item) in state.items.iter().enumerate() {
+            let Some(buffer) = state.uniform_buffers.get(index) else {
+                eprintln!(
+                    "[geometry] no uniform buffer for item {:?} ({} of {} have one)",
+                    item.name,
+                    state.uniform_buffers.len(),
+                    state.items.len()
+                );
+                all_ok = false;
+                continue;
+            };
+
+            // Column-major, so the 16 floats of the matrix go down unchanged.
+            let mvp = projection * view * item.model;
+            let mut data: [f32; 28] = [0.0; 28];
+            data[..16].copy_from_slice(&mvp.to_cols_array());
+            data[16..20].copy_from_slice(&[light.x, light.y, light.z, 0.0]);
+            data[20..24].copy_from_slice(&[1.0, 0.96, 0.9, 1.0]);
+            data[24..28].copy_from_slice(&[0.18, 0.2, 0.24, 1.0]);
+
+            // A failed uniform upload leaves the previous frame's MVP on the
+            // GPU, which would draw the mesh under the old camera. Report it
+            // rather than letting the frame go out with transforms nobody
+            // asked for.
+            if let Err(e) = device.upload_buffer(buffer, &data) {
+                eprintln!("[geometry] uniform upload failed for {}: {e}", item.name);
+                all_ok = false;
             }
         }
+        all_ok
     }
 }
 
@@ -650,21 +815,26 @@ impl RenderPass for GeometryPass {
         context: &mut RenderContext,
         _scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
-    ) {
+    ) -> PassOutcome {
+        // Bug №653: the pass reports what it did, so the graph can tell "was
+        // called" from "contributed to the frame". Every early exit below
+        // names its reason, because a name on the list cannot tell "no items"
+        // from "no framebuffer".
+        //
         // Held only for the duration of recording: the state is shared with the
         // caller, and holding the lock across the graph's other passes would
         // serialise them behind this one for no reason.
         let Some(shared) = self.state.as_ref() else {
             eprintln!("[geometry] early exit: state is None");
-            return;
+            return PassOutcome::skipped("state is None");
         };
         let Ok(mut state) = shared.lock() else {
             eprintln!("[geometry] early exit: state lock poisoned");
-            return;
+            return PassOutcome::skipped("state lock poisoned");
         };
         if state.items.is_empty() {
             eprintln!("[geometry] early exit: no items");
-            return;
+            return PassOutcome::skipped("no items");
         }
         let Some(framebuffer) = Self::resolve_target(&mut state, context) else {
             eprintln!(
@@ -675,7 +845,7 @@ impl RenderPass for GeometryPass {
                 context.resolution.width,
                 context.resolution.height
             );
-            return;
+            return PassOutcome::skipped("no target framebuffer");
         };
         let framebuffer = framebuffer.clone();
 
@@ -717,7 +887,7 @@ impl RenderPass for GeometryPass {
                 context.resolution.width,
                 context.resolution.height
             );
-            return;
+            return PassOutcome::skipped("no drawable extent");
         }
 
         
@@ -757,13 +927,31 @@ impl RenderPass for GeometryPass {
             extent: Extent2D { width, height },
         }));
         commands.push(Command::BindGraphicsPipeline(state.pipeline.clone()));
-        commands.push(Command::BindDescriptorSets {
-            pipeline: state.pipeline.clone(),
-            first_set: 0,
-            sets: vec![state.descriptor_set.clone()],
-        });
 
-        for item in &state.items {
+        // Bug №654: the descriptor set is bound **per item**, immediately
+        // before that item's draw.
+        //
+        // It used to be bound once for the whole pass, and the set pointed at
+        // one uniform buffer holding one MVP — so every item was drawn with
+        // the same matrix and `GeometryItem::model` was inert. The model
+        // matrix is part of the MVP now, and the MVP lives in the item's own
+        // uniform buffer, so the set has to change with the item.
+        for (index, item) in state.items.iter().enumerate() {
+            let Some(descriptor_set) = state.descriptor_sets.get(index) else {
+                crate::error!(
+                    "geometry",
+                    "no descriptor set for item {:?}: the pass has {} sets for {} items",
+                    item.name,
+                    state.descriptor_sets.len(),
+                    state.items.len()
+                );
+                continue;
+            };
+            commands.push(Command::BindDescriptorSets {
+                pipeline: state.pipeline.clone(),
+                first_set: 0,
+                sets: vec![descriptor_set.clone()],
+            });
             commands.push(Command::BindVertexBuffers {
                 first_binding: 0,
                 buffers: vec![((*item.vertex_buffer).clone(), 0)],
@@ -801,18 +989,22 @@ impl RenderPass for GeometryPass {
             // rather than something to retry.
             if !encoder.record(command) {
                 crate::error!("geometry", "a command was rejected: the encoder is not recording");
-                return;
+                return PassOutcome::skipped("the encoder rejected a command");
             }
         }
+        PassOutcome::recorded()
     }
 }
 
 /// Build the uniform buffer, descriptor layout and set for the geometry shader.
 pub fn build_uniforms(
     device: &crate::rhi::Device,
-) -> crate::rhi::error::RhiResult<(crate::rhi::Buffer, DescriptorSetLayout, DescriptorSet)> {
-    let uniform = device.create_buffer(UNIFORM_SIZE, BufferUsage::UNIFORM, true);
-
+    item_count: usize,
+) -> crate::rhi::error::RhiResult<(
+    Vec<crate::rhi::Buffer>,
+    DescriptorSetLayout,
+    Vec<DescriptorSet>,
+)> {
     // `create_descriptor_set_layout` is infallible: it falls back to a
     // descriptor-less layout when the backend refuses, which is the right
     // behaviour here (a frame with no bindings still draws) but means the
@@ -827,19 +1019,40 @@ pub fn build_uniforms(
         }],
     });
 
-    let set = device.create_descriptor_set(&layout)?;
+    // Bug №654: one uniform buffer and one descriptor set **per item**, not
+    // per pass.
+    //
+    // The uniform holds the MVP, and the MVP includes the item's model matrix.
+    // With one buffer for the whole pass, the last item written would be the
+    // one every draw used — so `GeometryItem::model` could be set to anything
+    // and nothing would move. The field was public, documented, and inert.
+    //
+    // One buffer and one set per item is the fix that needs no new RHI
+    // capability. The alternatives both cost more: push constants are not
+    // implemented in the Vulkan backend at all (only the descriptor types
+    // exist), and a dynamic uniform buffer with a per-draw offset would need
+    // a new command and a new descriptor type.
+    let mut buffers = Vec::with_capacity(item_count);
+    let mut sets = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let uniform = device.create_buffer(UNIFORM_SIZE, BufferUsage::UNIFORM, true);
+        let set = device.create_descriptor_set(&layout)?;
 
-    device.write_descriptors(
-        &set,
-        &[DescriptorWrite {
-            dst_set: set.clone(),
-            dst_binding: 0,
-            dst_array_element: 0,
-            descriptors: vec![DescriptorInfo::Buffer(uniform.clone(), 0, UNIFORM_SIZE)],
-        }],
-    )?;
+        device.write_descriptors(
+            &set,
+            &[DescriptorWrite {
+                dst_set: set.clone(),
+                dst_binding: 0,
+                dst_array_element: 0,
+                descriptors: vec![DescriptorInfo::Buffer(uniform.clone(), 0, UNIFORM_SIZE)],
+            }],
+        )?;
 
-    Ok((uniform, layout, set))
+        buffers.push(uniform);
+        sets.push(set);
+    }
+
+    Ok((buffers, layout, sets))
 }
 
 /// Vertex layout matching the render layer's `Vertex` and `geometry.wgsl`.

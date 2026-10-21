@@ -1,17 +1,17 @@
-pub mod connection;
+pub mod bandwidth;
 pub mod channel;
+pub mod client;
+pub mod connection;
 pub mod fragment;
 pub mod interest;
-pub mod snapshot;
 pub mod server;
-pub mod client;
-pub mod bandwidth;
+pub mod snapshot;
 
-pub use connection::*;
+pub use bandwidth::*;
 pub use channel::*;
+pub use client::*;
+pub use connection::*;
 pub use fragment::*;
 pub use interest::*;
-pub use snapshot::*;
 pub use server::*;
-pub use client::*;
-pub use bandwidth::*;
+pub use snapshot::*;

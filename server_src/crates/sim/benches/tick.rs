@@ -38,7 +38,8 @@ fn sim_with(ships: usize) -> TickSystem {
 fn sim_with_world(ships: usize, obstacles: usize) -> TickSystem {
     let sim = TickSystem::new();
     let world = bench_world(ships, obstacles);
-    sim.set_world(world).expect("the benchmark world was refused");
+    sim.set_world(world)
+        .expect("the benchmark world was refused");
     sim
 }
 
@@ -67,11 +68,7 @@ fn add_shells(sim: &TickSystem, count: u64) {
         let shell = Projectile {
             entity_id: rfs_core::entity::EntityId::new(5_000_000 + i),
             projectile_type: rfs_core::packet::ProjectileType::Cannonball,
-            position: rfs_core::math::Vec3f::new(
-                (i as f32) * 7.0 - 400.0,
-                40.0,
-                (i as f32) * 3.0,
-            ),
+            position: rfs_core::math::Vec3f::new((i as f32) * 7.0 - 400.0, 40.0, (i as f32) * 3.0),
             prev_position: rfs_core::math::Vec3f::new(
                 (i as f32) * 7.0 - 410.0,
                 40.0,
@@ -87,6 +84,7 @@ fn add_shells(sim: &TickSystem, count: u64) {
             damage: 100.0,
             penetration: 50.0,
             explosion_radius: 0.0,
+            ricochet_count: 0,
         };
         sim.fire_projectile(shell)
             .expect("the benchmark shell was accepted");
@@ -119,18 +117,21 @@ fn loaded_tick_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("tick_loaded");
     for (ships, obstacles, shells) in [(16usize, 256usize, 256u64), (64, 256, 256)] {
         group.throughput(criterion::Throughput::Elements(ships as u64));
-        group.bench_function(format!("{ships}_ships_{obstacles}_rocks_{shells}_shells"), |b| {
-            b.iter_batched(
-                || {
-                    let sim = sim_with_world(ships, obstacles);
-                    add_fleet(&sim, ships);
-                    add_shells(&sim, shells);
-                    sim
-                },
-                |mut s| s.tick(),
-                BatchSize::LargeInput,
-            );
-        });
+        group.bench_function(
+            format!("{ships}_ships_{obstacles}_rocks_{shells}_shells"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let sim = sim_with_world(ships, obstacles);
+                        add_fleet(&sim, ships);
+                        add_shells(&sim, shells);
+                        sim
+                    },
+                    |mut s| s.tick(),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }

@@ -189,6 +189,11 @@ struct UiGpu {
     text_pipeline: Option<GraphicsPipeline>,
     text_descriptor_layout: Option<DescriptorSetLayout>,
     text_descriptor_set: Option<DescriptorSet>,
+    /// Full-colour image pipeline. `None` until an image SPIR-V is supplied
+    /// through [`UiRenderer::load_image_shader`]; images then fall back to the
+    /// text (coverage) pipeline, which is what the renderer did before images
+    /// had a pipeline of their own.
+    image_pipeline: Option<GraphicsPipeline>,
     uniform_buffer: Buffer,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
@@ -719,6 +724,39 @@ impl UiRenderer {
         self.initialize_with_pass(pass, format, width, height, geometry_spirv, text_spirv)
     }
 
+    /// Build the full-colour image pipeline from `spirv`.
+    ///
+    /// Kept separate from [`Self::initialize_offscreen`] so callers that only
+    /// draw panels, glyphs and the atlas are unaffected: until this is called,
+    /// images are drawn with the text (coverage) pipeline. The glyph pipeline
+    /// samples only the red channel as coverage, so an image whose red is zero
+    /// is invisible through it — that is the whole reason images need their own
+    /// fragment stage.
+    ///
+    /// The pipeline reuses the textured descriptor layout the glyph pipeline was
+    /// built with, so the per-image descriptor sets (allocated from that same
+    /// layout) are compatible with it and need no rebuilding.
+    pub fn load_image_shader(&mut self, spirv: &[u8]) -> UiResult<()> {
+        self.shaders.load_image(spirv)?;
+        let layout = self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.text_descriptor_layout.clone())
+            .ok_or_else(|| {
+                UiError::BackendError(
+                    "the image pipeline needs the textured descriptor layout; supply a text \
+                     shader to `initialize_offscreen` first"
+                        .into(),
+                )
+            })?;
+        let pass = self.pass.as_ref().ok_or(UiError::RendererNotInitialized)?;
+        let pipeline = self.build_textured_pipeline(UiShaderType::Image, &layout, pass)?;
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.image_pipeline = Some(pipeline);
+        }
+        Ok(())
+    }
+
     fn initialize_with_pass(
         &mut self,
         pass: UiRenderPass,
@@ -749,7 +787,7 @@ impl UiRenderer {
                 let set = self.device
                     .create_descriptor_set(&layout)
                     .map_err(|e| UiError::BackendError(format!("UI text descriptor set: {e}")))?;
-                let pipeline = self.build_text_pipeline(&layout, &pass)?;
+                let pipeline = self.build_textured_pipeline(UiShaderType::Text, &layout, &pass)?;
                 text_descriptor_layout = Some(layout);
                 text_descriptor_set = Some(set);
                 text_pipeline = Some(pipeline);
@@ -772,6 +810,7 @@ impl UiRenderer {
             text_pipeline,
             text_descriptor_layout,
             text_descriptor_set,
+            image_pipeline: None,
             uniform_buffer,
             vertex_buffer,
             index_buffer,
@@ -955,12 +994,18 @@ impl UiRenderer {
         }))
     }
 
-    fn build_text_pipeline(
+    /// Build a pipeline that samples binding 1 with binding 2's sampler.
+    ///
+    /// Glyphs and images share the vertex layout and the descriptor layout; only
+    /// the fragment stage differs, so the two pipelines are built from the same
+    /// code with a different `shader_type`.
+    fn build_textured_pipeline(
         &self,
+        shader_type: UiShaderType,
         layout: &DescriptorSetLayout,
         pass: &UiRenderPass,
     ) -> UiResult<GraphicsPipeline> {
-        let module = self.shaders.module(UiShaderType::Text)?;
+        let module = self.shaders.module(shader_type)?;
         let mut desc = self.pipeline_desc(
             module.clone(),
             UiShaderType::VERTEX_ENTRY,
@@ -973,14 +1018,15 @@ impl UiRenderer {
             sample_count: crate::types::SampleCount::X1,
             ..Default::default()
         };
+        let name = shader_type.source_filename();
         let pipeline = self
             .device
             .create_gpu_graphics_pipeline(&desc, pass.render_pass(), &[layout])
-            .map_err(|e| UiError::BackendError(format!("UI text pipeline: {e}")))?;
+            .map_err(|e| UiError::BackendError(format!("UI {name} pipeline: {e}")))?;
         if !pipeline.has_gpu_backing() {
-            return Err(UiError::BackendError(
-                "the UI text graphics pipeline was not created on the device".into(),
-            ));
+            return Err(UiError::BackendError(format!(
+                "the UI {name} graphics pipeline was not created on the device"
+            )));
         }
         Ok(pipeline)
     }
@@ -2162,10 +2208,7 @@ impl UiRenderer {
                 }
                 if let Some(texture) = self.texture_cache.get(&texture_id) {
                     // A CPU-only texture has no image to move.
-                    if let Some(backend) = texture.backend() {
-                        if std::env::var_os("UI_SPIKE_DUMP").is_some() {
-                            eprintln!("[ui] transitioning texture {texture_id} image=0x{:x}", backend.handle);
-                        }
+                    if texture.backend().is_some() {
                         sample_transitions.push((**texture).clone());
                         self.transitioned_images.insert(texture_id);
                     }
@@ -2476,7 +2519,11 @@ impl UiRenderer {
         // texture. Groups are already contiguous, so consecutive images of the
         // same texture rebind nothing.
         if !image_groups.is_empty() {
-            if let Some(pipeline) = gpu.text_pipeline.as_ref() {
+            // Prefer the full-colour image pipeline. Fall back to the text
+            // (coverage) pipeline for callers that never loaded an image shader,
+            // which is what every caller did before images had their own stage.
+            let pipeline = gpu.image_pipeline.as_ref().or(gpu.text_pipeline.as_ref());
+            if let Some(pipeline) = pipeline {
                 for (set, spans) in &image_groups {
                     commands.push(Command::BindGraphicsPipeline(pipeline.clone()));
                     commands.push(Command::BindDescriptorSets {
@@ -2662,15 +2709,6 @@ fn gpu_texture_view(
             .device
             .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 0.0);
         let view = self.gpu_texture_view(texture)?;
-        if std::env::var_os("UI_SPIKE_DUMP").is_some() {
-            if let Some(backend) = texture.backend() {
-                eprintln!(
-                    "[ui] image descriptor {texture_id} image=0x{:x} view=0x{:x}",
-                    backend.handle,
-                    view.backend().map_or(0, |b| b.handle)
-                );
-            }
-        }
         let uniform = self
             .gpu
             .as_ref()

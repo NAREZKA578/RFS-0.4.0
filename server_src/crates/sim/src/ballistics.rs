@@ -19,6 +19,13 @@ pub const DRAG_COEFFICIENT_STREAM: f32 = 0.04;
 /// decides what still exists.
 pub const RESTING_SPEED: f32 = 0.1;
 
+/// Bug №664 (remainder): how much of its speed a shell keeps reflecting off a
+/// hull plate. The same number the penetration model uses for the ricochet
+/// branch of `post_penetration_velocity` — one meaning, one constant, and the
+/// follow-up flight (`simulate_ricochet`) reads it too, so the bounce the
+/// shell flies and the reflection the model priced cannot drift apart.
+pub const RICOCHET_ELASTICITY: f32 = 0.3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BallisticsConfig {
     pub gravity: f32,
@@ -215,15 +222,24 @@ impl BallisticsCalculator {
     pub fn new(config: BallisticsConfig) -> Self {
         let mut configs = HashMap::new();
         configs.insert(ProjectileType::Cannonball, ProjectileConfig::cannonball());
-        configs.insert(ProjectileType::ExplosiveShell, ProjectileConfig::explosive_shell());
-        configs.insert(ProjectileType::ArmorPiercing, ProjectileConfig::armor_piercing());
+        configs.insert(
+            ProjectileType::ExplosiveShell,
+            ProjectileConfig::explosive_shell(),
+        );
+        configs.insert(
+            ProjectileType::ArmorPiercing,
+            ProjectileConfig::armor_piercing(),
+        );
         configs.insert(ProjectileType::ChainShot, ProjectileConfig::chain_shot());
         configs.insert(ProjectileType::Torpedo, ProjectileConfig::torpedo());
         // Bug №161: register the missing ammo types so they fly by their real
         // ballistics instead of the legacy gravity fallback.
         configs.insert(ProjectileType::GrapeShot, ProjectileConfig::grape_shot());
-        configs.insert(ProjectileType::DepthCharge, ProjectileConfig::depth_charge());
-        
+        configs.insert(
+            ProjectileType::DepthCharge,
+            ProjectileConfig::depth_charge(),
+        );
+
         Self {
             config,
             projectile_configs: configs,
@@ -232,6 +248,14 @@ impl BallisticsCalculator {
 
     pub fn get_config(&self, projectile_type: ProjectileType) -> Option<&ProjectileConfig> {
         self.projectile_configs.get(&projectile_type)
+    }
+
+    /// Read-only view of the ballistics config: `max_ricochets` gates the
+    /// bounce count on the live path (Bug №664 remainder), and the fire-control
+    /// solution shares the very calculator the tick loop flies shells with, so
+    /// the two cannot read different rules.
+    pub fn config(&self) -> &BallisticsConfig {
+        &self.config
     }
 
     pub fn calculate_trajectory(
@@ -246,11 +270,11 @@ impl BallisticsCalculator {
             return Vec::new();
         };
         let mut points = Vec::new();
-        
+
         let mut pos = position;
         let mut vel = direction.normalize() * config.initial_velocity;
         let mut time = 0.0;
-        
+
         while time < max_time && pos.y > -10.0 {
             points.push(TrajectoryPoint {
                 time,
@@ -276,7 +300,7 @@ impl BallisticsCalculator {
             }
             time = next_time;
         }
-        
+
         points
     }
 
@@ -298,16 +322,16 @@ impl BallisticsCalculator {
         let drag_force = self.calculate_drag(speed, config);
         let drag_accel = drag_force / config.mass;
         let drag_dir = -velocity.normalize();
-        
+
         let gravity = Vec3f::new(0.0, -self.config.gravity, 0.0);
         let total_accel = gravity + drag_dir * drag_accel;
-        
+
         // Semi-implicit Euler: the position rides the already-clamped
         // velocity, so a huge drag step can stop the shell but never
         // teleport it.
         let new_vel = self.clamp_no_reverse(velocity, velocity + total_accel * dt);
         let new_pos = position + new_vel * dt;
-        
+
         (new_pos, new_vel)
     }
 
@@ -318,7 +342,7 @@ impl BallisticsCalculator {
         } else {
             self.config.air_density
         };
-        
+
         0.5 * density * speed * speed * config.drag_coefficient * area
     }
 
@@ -333,11 +357,16 @@ impl BallisticsCalculator {
         let impact_speed = impact_velocity.length();
         // normalize() is zero-safe (returns ZERO), but fp rounding can push
         // the dot a hair past 1.0 — clamp before acos or impact_angle is NaN.
-        let cos_angle = impact_velocity.normalize().dot(impact_normal).abs().clamp(0.0, 1.0);
+        let cos_angle = impact_velocity
+            .normalize()
+            .dot(impact_normal)
+            .abs()
+            .clamp(0.0, 1.0);
         let impact_angle = cos_angle.acos();
         let effective_thickness = armor_thickness / armor_angle.cos().max(0.01);
-        
-        let mut penetration = projectile.penetration * (impact_speed / projectile.initial_velocity).sqrt();
+
+        let mut penetration =
+            projectile.penetration * (impact_speed / projectile.initial_velocity).sqrt();
 
         // Bug №156: the "RNG factor" was a nonexistent RNG — the expression
         // `(2*penetration_rng_factor-1)*0.5` with the default 0.1 evaluated to
@@ -345,7 +374,9 @@ impl BallisticsCalculator {
         // Derive a deterministic jitter from the impact itself (keeps replays
         // deterministic, unlike fastrand) and center it on +1.0 so the roll is
         // -factor..+factor around the base value.
-        if self.config.penetration_rng_factor > 0.0 && self.config.penetration_rng_factor.is_finite() {
+        if self.config.penetration_rng_factor > 0.0
+            && self.config.penetration_rng_factor.is_finite()
+        {
             let seed = impact_velocity.x * 0.7243
                 + impact_velocity.y * 0.5129
                 + impact_velocity.z * 0.1967
@@ -355,24 +386,27 @@ impl BallisticsCalculator {
             penetration *= 1.0 + jitter * self.config.penetration_rng_factor;
             penetration = penetration.max(0.0);
         }
-        
-        let ricochet = self.config.enable_ricochet 
-            && impact_angle > self.config.ricochet_angle_threshold 
+
+        let ricochet = self.config.enable_ricochet
+            && impact_angle > self.config.ricochet_angle_threshold
             && projectile.projectile_type != ProjectileType::ExplosiveShell;
-        
+
         let penetrated = penetration > effective_thickness && !ricochet;
         let remaining_penetration = (penetration - effective_thickness).max(0.0);
-        
+
         let post_pen_velocity = if penetrated {
             let speed_loss = effective_thickness / penetration.max(0.01);
             impact_velocity * (1.0 - speed_loss * 0.5)
         } else if ricochet {
-            let reflect = impact_velocity - impact_normal * 2.0 * impact_velocity.dot(impact_normal);
-            reflect * 0.3
+            // Bug №664 (remainder): the reflection is spelled out once, in
+            // `simulate_ricochet` — the same helper the live bounce uses, so
+            // the model's priced velocity and the shell's actual follow-up
+            // flight are the same formula and the same elasticity.
+            self.simulate_ricochet(impact_velocity, impact_normal, RICOCHET_ELASTICITY)
         } else {
             Vec3f::ZERO
         };
-        
+
         PenetrationResult {
             penetrated,
             ricochet,
@@ -391,10 +425,10 @@ impl BallisticsCalculator {
         distance: f32,
     ) -> f32 {
         let mut damage = projectile.damage;
-        
+
         let range_factor = 1.0 - (distance / projectile.max_range).min(1.0) * 0.3;
         damage *= range_factor;
-        
+
         if penetration_result.ricochet {
             damage *= 0.25;
         } else if penetration_result.penetrated {
@@ -402,21 +436,16 @@ impl BallisticsCalculator {
         } else {
             damage *= 0.5;
         }
-        
+
         damage.max(1.0)
     }
 
-    pub fn simulate_ricochet(
-        &self,
-        velocity: Vec3f,
-        normal: Vec3f,
-        elasticity: f32,
-    ) -> Vec3f {
+    pub fn simulate_ricochet(&self, velocity: Vec3f, normal: Vec3f, elasticity: f32) -> Vec3f {
         let dot = velocity.dot(normal);
         if dot >= 0.0 {
             return velocity;
         }
-        
+
         let reflected = velocity - normal * 2.0 * dot;
         reflected * elasticity
     }
@@ -430,13 +459,13 @@ impl BallisticsCalculator {
         if !self.config.enable_water_physics {
             return None;
         }
-        
+
         if position.y > water_level && velocity.y < 0.0 {
             let time_to_water = (position.y - water_level) / -velocity.y;
             if time_to_water > 0.0 && time_to_water < 1.0 {
                 let entry_pos = position + velocity * time_to_water;
                 let entry_vel = velocity;
-                
+
                 return Some(WaterEntryResult {
                     entry_position: entry_pos,
                     entry_velocity: entry_vel,
@@ -444,7 +473,7 @@ impl BallisticsCalculator {
                 });
             }
         }
-        
+
         None
     }
 
@@ -459,17 +488,17 @@ impl BallisticsCalculator {
         if speed < RESTING_SPEED {
             return (position, Vec3f::ZERO);
         }
-        
+
         let drag_force = self.calculate_drag_underwater(speed, config);
         let drag_accel = drag_force / config.mass;
         let drag_dir = -velocity.normalize();
-        
+
         let buoyancy = Vec3f::new(0.0, self.config.water_density * 9.81 * 0.001, 0.0);
         let total_accel = drag_dir * drag_accel + buoyancy / config.mass;
-        
+
         let new_vel = self.clamp_no_reverse(velocity, velocity + total_accel * dt);
         let new_pos = position + new_vel * dt;
-        
+
         (new_pos, new_vel)
     }
 
@@ -504,7 +533,7 @@ impl BallisticsCalculator {
         if v0 <= 0.0 || g <= 0.0 {
             return None;
         }
-        
+
         let dx = to.x - from.x;
         let dz = to.z - from.z;
         let horizontal_dist = (dx * dx + dz * dz).sqrt();
@@ -512,31 +541,35 @@ impl BallisticsCalculator {
             return None;
         }
         let dy = to.y - from.y;
-        
+
         let v0_sq = v0 * v0;
         let v0_quad = v0_sq * v0_sq;
         let discriminant = v0_quad - g * (g * horizontal_dist * horizontal_dist + 2.0 * dy * v0_sq);
-        
+
         if discriminant < 0.0 {
             return None;
         }
-        
+
         let sqrt_disc = discriminant.sqrt();
         let angle1 = (v0_sq + sqrt_disc) / (g * horizontal_dist);
         let angle2 = (v0_sq - sqrt_disc) / (g * horizontal_dist);
-        
-        let angle = if angle1 > 0.0 && angle1 < angle2 { angle1 } else { angle2 };
-        
+
+        let angle = if angle1 > 0.0 && angle1 < angle2 {
+            angle1
+        } else {
+            angle2
+        };
+
         if angle <= 0.0 {
             return None;
         }
-        
+
         let pitch = angle.atan();
         let yaw = dz.atan2(dx);
-        
+
         let time_of_flight = horizontal_dist / (v0 * pitch.cos());
         let max_height = from.y + (v0 * pitch.sin()).powi(2) / (2.0 * g);
-        
+
         Some(BallisticSolution {
             pitch,
             yaw,
@@ -585,11 +618,7 @@ pub struct BallisticSolution {
 impl BallisticSolution {
     pub fn direction(&self) -> Vec3f {
         let cp = self.pitch.cos();
-        Vec3f::new(
-            cp * self.yaw.sin(),
-            self.pitch.sin(),
-            cp * self.yaw.cos()
-        )
+        Vec3f::new(cp * self.yaw.sin(), self.pitch.sin(), cp * self.yaw.cos())
     }
 }
 
@@ -682,9 +711,21 @@ mod tests {
     /// which disagreed with the config on both counts.
     #[test]
     fn blast_radius_comes_from_the_type() {
-        assert_eq!(ProjectileConfig::for_type(ProjectileType::ExplosiveShell).explosion_radius, 10.0);
-        assert_eq!(ProjectileConfig::for_type(ProjectileType::DepthCharge).explosion_radius, 25.0);
-        assert_eq!(ProjectileConfig::for_type(ProjectileType::Cannonball).explosion_radius, 0.0);
-assert_eq!(ProjectileConfig::for_type(ProjectileType::Torpedo).explosion_radius, 20.0);
+        assert_eq!(
+            ProjectileConfig::for_type(ProjectileType::ExplosiveShell).explosion_radius,
+            10.0
+        );
+        assert_eq!(
+            ProjectileConfig::for_type(ProjectileType::DepthCharge).explosion_radius,
+            25.0
+        );
+        assert_eq!(
+            ProjectileConfig::for_type(ProjectileType::Cannonball).explosion_radius,
+            0.0
+        );
+        assert_eq!(
+            ProjectileConfig::for_type(ProjectileType::Torpedo).explosion_radius,
+            20.0
+        );
     }
 }

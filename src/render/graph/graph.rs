@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::{GraphResource, RenderPassNode, ResourceType, ResourceUsage};
 use crate::render::core::RenderContext;
 use crate::render::scene::Scene;
+use crate::rhi::types::Format;
 use crate::rhi::Device;
 
 /// Render Graph that manages render passes and their dependencies
@@ -35,8 +36,34 @@ pub struct RenderGraph {
     /// Not a global, because cargo runs tests in parallel threads in one process and
     /// a process-global registry would attribute one test's passes to another.
     execution_counts: Vec<u64>,
+    /// How many times each node actually contributed to a frame, parallel to
+    /// `nodes`. Bug №653.
+    ///
+    /// `execution_counts` says the graph *reached* the pass. This says the pass
+    /// *did something*. The two are different questions, and the instrument
+    /// that was built to answer "was this subsystem ever really used" could
+    /// only answer the first one — so five passes that dispatched every frame
+    /// and recorded nothing read as "running".
+    recorded_counts: Vec<u64>,
+    /// Why each pass last recorded nothing, by name.
+    ///
+    /// The reason is the actionable part: "no pipeline" and "no framebuffer"
+    /// are two different bugs, and a list of names cannot tell them apart.
+    skip_reasons: HashMap<String, String>,
     /// What the last recorded frame drew. See [`FrameDraws`].
     last_frame_draws: FrameDraws,
+    /// Whether the graph has been initialized.
+    ///
+    /// Bug: the graph could be executed before it was initialized, and then
+    /// every pass did no work — no targets, no pipelines, nothing recorded —
+    /// and the frame was submitted as an empty command buffer. The reason was
+    /// not printed at the level a caller sees: the instrument that knows is an
+    /// *info* line, and the default threshold prints warnings and not info.
+    ///
+    /// The flag lets the renderer initialize the graph on the first frame that
+    /// needs it, so a caller who adds passes and renders does not have to
+    /// remember a separate step to get anything on the screen.
+    initialized: bool,
     /// Dirty flag (needs re-sorting)
     dirty: bool,
 }
@@ -69,9 +96,21 @@ impl RenderGraph {
             resources: HashMap::new(),
             execution_order: Vec::new(),
             execution_counts: Vec::new(),
+            recorded_counts: Vec::new(),
+            skip_reasons: HashMap::new(),
             last_frame_draws: FrameDraws::default(),
+            initialized: false,
             dirty: false,
         }
+    }
+
+    /// Whether the graph has been initialized.
+    ///
+    /// A graph that was never initialized has no resources and no initialized
+    /// passes, so every pass in it does no work. The renderer asks this before
+    /// the first frame, so that "added passes and rendered" is enough.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
     }
 
     /// Add a render pass node to the graph
@@ -81,6 +120,7 @@ impl RenderGraph {
         self.node_indices
             .insert(self.nodes[index].name.clone(), index);
         self.execution_counts.push(0);
+        self.recorded_counts.push(0);
         self.dirty = true;
     }
 
@@ -106,6 +146,22 @@ impl RenderGraph {
         context: &RenderContext,
         _scene: &mut Scene,
     ) {
+        // Bug №651: the size of a screen-sized target is the presentation
+        // extent, not `context.resolution`.
+        //
+        // `resolution` is the window's *logical* size, and until the first
+        // resize it is not even that — it starts as a hard-coded 1920×1080,
+        // because `Renderer::new` takes a window handle and does not use it. The
+        // physical size is the swapchain's extent, and the two disagree at any
+        // scale factor other than 100%: a 1280×720 window at 125% has a
+        // 1600×900 swapchain, so a target sized from `resolution` covers four
+        // fifths of the screen.
+        //
+        // The rule lives in one place now — `RenderContext::drawable_extent` —
+        // because it was written out again in every pass that needed a size,
+        // and written out wrongly in most of them.
+        let (width, height) = context.drawable_size();
+
         // Add default resources
         self.add_resource(
             "swapchain",
@@ -113,68 +169,79 @@ impl RenderGraph {
                 "swapchain".to_string(),
                 ResourceType::Texture,
                 ResourceUsage::RenderTarget,
-                context.resolution.width,
-                context.resolution.height,
+                width,
+                height,
             ),
         );
 
         self.add_resource(
             "depth",
-            GraphResource::new(
+            GraphResource::new_texture(
                 "depth".to_string(),
-                ResourceType::Texture,
-                ResourceUsage::DepthStencil,
-                context.resolution.width,
-                context.resolution.height,
+                width,
+                height,
+                Format::D32_SFLOAT,
+                ResourceUsage::DepthStencil | ResourceUsage::Sampled,
             ),
         );
 
         // Add GBuffer resources
+        //
+        // The formats are the GBuffer's, not a default: the position and normal
+        // targets hold world-space positions and normals, which need 32-bit
+        // floats. A `RGBA8` position target would quantise them to a few
+        // millimetres and the lighting pass would read noise.
         self.add_resource(
             "gbuffer_position",
-            GraphResource::new(
+            GraphResource::new_texture(
                 "gbuffer_position".to_string(),
-                ResourceType::Texture,
+                width,
+                height,
+                Format::RGBA32_SFLOAT,
                 ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-                context.resolution.width,
-                context.resolution.height,
             ),
         );
 
         self.add_resource(
             "gbuffer_normal",
-            GraphResource::new(
+            GraphResource::new_texture(
                 "gbuffer_normal".to_string(),
-                ResourceType::Texture,
+                width,
+                height,
+                Format::RGBA32_SFLOAT,
                 ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-                context.resolution.width,
-                context.resolution.height,
             ),
         );
 
         self.add_resource(
             "gbuffer_albedo",
-            GraphResource::new(
+            GraphResource::new_texture(
                 "gbuffer_albedo".to_string(),
-                ResourceType::Texture,
+                width,
+                height,
+                Format::RGBA8_UNORM,
                 ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-                context.resolution.width,
-                context.resolution.height,
             ),
         );
 
         self.add_resource(
             "gbuffer_material",
-            GraphResource::new(
+            GraphResource::new_texture(
                 "gbuffer_material".to_string(),
-                ResourceType::Texture,
+                width,
+                height,
+                Format::RGBA8_UNORM,
                 ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-                context.resolution.width,
-                context.resolution.height,
             ),
         );
 
         // Add shadow map resource
+        //
+        // A shadow map is not window-sized: it covers the part of the world the
+        // light can see, and its size comes from the shadow configuration. 2048
+        // is the cascade resolution, and it stays as it is — the same reason
+        // `shadow.rs` reads its size from the config rather than from the
+        // resolution.
         self.add_resource(
             "shadow_map",
             GraphResource::new(
@@ -187,14 +254,19 @@ impl RenderGraph {
         );
 
         // Add lighting resource
+        //
+        // HDR, because the lighting sums contributions: an 8-bit target would
+        // clip the result before the tone mapping that comes after it, and
+        // there is no tone mapping yet — which is exactly why the lit image
+        // has to be able to hold more than one.
         self.add_resource(
             "lighting",
-            GraphResource::new(
+            GraphResource::new_texture(
                 "lighting".to_string(),
-                ResourceType::Texture,
+                width,
+                height,
+                Format::RGBA16_SFLOAT,
                 ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-                context.resolution.width,
-                context.resolution.height,
             ),
         );
 
@@ -205,8 +277,8 @@ impl RenderGraph {
                 "postprocess_bloom".to_string(),
                 ResourceType::Texture,
                 ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-                context.resolution.width,
-                context.resolution.height,
+                width,
+                height,
             ),
         );
 
@@ -216,8 +288,8 @@ impl RenderGraph {
                 "final".to_string(),
                 ResourceType::Texture,
                 ResourceUsage::RenderTarget,
-                context.resolution.width,
-                context.resolution.height,
+                width,
+                height,
             ),
         );
 
@@ -235,20 +307,68 @@ impl RenderGraph {
         //
         // The device parameter was named `_device` and unused, which is the same
         // fact stated more quietly.
-        // Bug: the resources above were only ever *declared*. `GraphResource::create`
-        // had no call sites anywhere in the repository, so every entry stayed a
-        // descriptor with `texture: None` — and the passes that look resources up
-        // at execute time (`transparent` asks for "depth", `water` for "depth" and
-        // "lighting", `lighting` binds every view it can find) found nothing, so
-        // the graph's resource map never fed a single pass.
+        // The resources the graph's passes actually ask for.
         //
-        // Created here rather than lazily on first use, because initialize is the
-        // one place that has the device and runs before any pass records. The
-        // guard makes a second `initialize` a no-op instead of a second
-        // allocation.
-        for resource in self.resources.values_mut() {
-            if resource.texture.is_none() && resource.buffer.is_none() {
-                resource.create(device);
+        // Bug №652: the graph declared ten resources and created all of them,
+        // which was wrong twice over. The objects were CPU-side descriptions
+        // that no pass could bind — the passes that look resources up at
+        // execute time (`transparent` asks for "depth", `water` for "depth"
+        // and "lighting", `lighting` binds every view it can find) found
+        // nothing, and the graph's resource map never fed a single pass. And
+        // ten screen-sized textures nobody reads is a hundred megabytes of
+        // video memory for a frame that does not use them.
+        //
+        // So the catalogue stays — it is the render layer's vocabulary, and it
+        // says what a frame *can* have — and the creation follows the demand:
+        // a resource is created when a pass in this frame produces it, or when
+        // a pass in this frame reads it from another pass in this frame.
+        //
+        // The second half of the rule matters: a pass that reads a resource
+        // whose producer is not in the frame is reading from the future, and
+        // creating that resource would allocate a screen-sized texture for a
+        // frame that has nothing to put in it.
+        //
+        // `PassDependency::resource_name` and `outputs` are what say this, and
+        // before this they were never read by anything.
+        let pass_names: std::collections::HashSet<String> = self
+            .nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect();
+
+        let mut wanted: Vec<String> = Vec::new();
+        for node in &self.nodes {
+            for output in &node.outputs {
+                if !output.is_empty() && !wanted.contains(output) {
+                    wanted.push(output.clone());
+                }
+            }
+            for dependency in &node.dependencies {
+                if pass_names.contains(&dependency.pass_name)
+                    && !dependency.resource_name.is_empty()
+                    && !wanted.contains(&dependency.resource_name)
+                {
+                    wanted.push(dependency.resource_name.clone());
+                }
+            }
+        }
+        for name in wanted {
+            // The swapchain is the presentation's. The geometry pass draws into
+            // the image the renderer acquired, not into a texture the graph
+            // made, and a second copy of it would be a full-screen target
+            // nobody reads.
+            if name == "swapchain" {
+                continue;
+            }
+            if width == 0 || height == 0 {
+                // No size, no texture. Creating a zero-sized one is refused by
+                // the driver, and the frame has nothing to draw into anyway.
+                continue;
+            }
+            if let Some(resource) = self.resources.get_mut(&name) {
+                if resource.texture.is_none() && resource.buffer.is_none() {
+                    resource.create(device);
+                }
             }
         }
 
@@ -257,8 +377,9 @@ impl RenderGraph {
         }
         for index in 0..self.nodes.len() {
             let node = &mut self.nodes[index];
-            node.initialize(device, context);
+            node.initialize(device, context, &mut self.resources);
         }
+        self.initialized = true;
     }
 
     /// Tell every pass the target changed size. Bug №311.
@@ -311,6 +432,37 @@ impl RenderGraph {
             }
         }
 
+        // Bug №653: Kahn's algorithm places every node it can and silently
+        // drops the rest. A pass in a dependency cycle — or one that depends on
+        // itself — never reaches in-degree zero, so it never enters the
+        // execution order, and since the counters were read off that order, it
+        // was invisible to the instrument built to find exactly this.
+        //
+        // So the cycle is reported rather than swallowed, and the nodes that
+        // could not be placed are still executed, in the order they were added:
+        // a pass that cannot be ordered is still a pass the caller asked for,
+        // and dropping it silently is how a frame ends up empty with no
+        // explanation.
+        if self.execution_order.len() < self.nodes.len() {
+            let unplaced: Vec<&str> = self
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !self.execution_order.contains(i))
+                .map(|(_, node)| node.name.as_str())
+                .collect();
+            crate::error!(
+                "graph",
+                "the pass dependencies contain a cycle, so these passes cannot be \
+                 ordered: {unplaced:?}; they will run in the order they were added"
+            );
+            for i in 0..self.nodes.len() {
+                if !self.execution_order.contains(&i) {
+                    self.execution_order.push(i);
+                }
+            }
+        }
+
         self.dirty = false;
     }
 
@@ -354,12 +506,28 @@ if let Err(e) = buffer.begin() {
                 continue;
             }
 
-            // Execute the pass
-            // Bug №313: counted here, at the one point every pass in a frame goes
-            // through, so "did this subsystem run" becomes a number instead of an
-            // assumption. See `pass_execution_counts`.
+            // Execute the pass.
+            //
+            // Bug №653: the counter was incremented *before* the call, so a
+            // pass that returned early — no framebuffer, no pipeline, no
+            // state — was counted as having run. The doc comment claimed the
+            // counts were "of real executions", and nothing kept that true.
+            //
+            // Two numbers now: how many times the pass was dispatched, and how
+            // many times it actually contributed something to the frame. The
+            // first says the graph reached it; the second says it did the
+            // work. Five of the seven passes were dispatching every frame and
+            // contributing nothing, and the old counter called that "running".
             self.execution_counts[node_index] += 1;
-            node.execute(&mut encoder, context, scene, &self.resources);
+            let outcome = node.execute(&mut encoder, context, scene, &self.resources);
+            if outcome.recorded {
+                self.recorded_counts[node_index] += 1;
+            } else if let Some(reason) = &outcome.reason {
+                // The reason is worth a line, but not a line per frame: the
+                // renderer logs a summary when it changes, and this is the
+                // detail behind it.
+                self.skip_reasons.insert(node.name.clone(), reason.clone());
+            }
         }
 
         let recorded = encoder.command_count();
@@ -436,8 +604,16 @@ if recorded == 0 {
             // Tests drive passes through `record`, and a counter that only moved on
             // `execute` would report every inspected pass as never run — which is
             // worse than having no counter, because it looks like a finding.
+            //
+            // And counted the same way as on the submitting path: dispatched
+            // and recorded are two numbers, not one. Bug №653.
             self.execution_counts[node_index] += 1;
-            node.execute(&mut encoder, context, scene, &self.resources);
+            let outcome = node.execute(&mut encoder, context, scene, &self.resources);
+            if outcome.recorded {
+                self.recorded_counts[node_index] += 1;
+            } else if let Some(reason) = &outcome.reason {
+                self.skip_reasons.insert(node.name.clone(), reason.clone());
+            }
         }
 
         // `finish` moves the commands into the buffer; cloning them out is what
@@ -509,38 +685,115 @@ if recorded == 0 {
         std::mem::take(&mut self.last_frame_draws)
     }
 
-    /// How many times each pass has actually executed, in execution order.
+    /// How many times each pass has been dispatched, in execution order.
     ///
-    /// Bug №313. The question this answers is "did this subsystem run", and nothing
-    /// else in the build can answer it. A pass can be written, compiled, linted,
-    /// documented and exported, and never execute once — which is precisely the
-    /// state five of the seven passes were in: their pipelines were never created,
-    /// their resources never allocated, and every build stayed green because there
-    /// were no commands to object to.
+    /// Bug №313. The question this answers is "did the graph reach this
+    /// subsystem", and nothing else in the build can answer it. A pass can be
+    /// written, compiled, linted, documented and exported, and never execute
+    /// once — which is precisely the state five of the seven passes were in:
+    /// their pipelines were never created, their resources never allocated, and
+    /// every build stayed green because there were no commands to object to.
     ///
-    /// Counts are of real executions, so a node that is disabled or never reached
-    /// reads `0`. Reported in execution order rather than insertion order, because
-    /// the interesting comparison is against the order the frame is supposed to
+    /// **"Dispatched", not "did the work".** A pass that was called and
+    /// returned early is counted here. For the question that actually matters —
+    /// did the pass contribute to a frame — see
+    /// [`passes_without_work`](Self::passes_without_work) and
+    /// [`recorded_counts`](Self::recorded_counts).
+    ///
+    /// Reported in execution order rather than insertion order, because the
+    /// interesting comparison is against the order the frame is supposed to
     /// draw in, and insertion order would hide that two passes claiming to be
     /// sequential are not.
+    ///
+    /// Bug №653: every pass is listed, including one the topological sort
+    /// could not place. The sort used to drop the unplaceable nodes silently,
+    /// and since the counters were read off that order, a pass in a dependency
+    /// cycle was invisible here — to the instrument built to find exactly that.
     pub fn pass_execution_counts(&self) -> Vec<(String, u64)> {
-        self.execution_order
+        let mut counts: Vec<(String, u64)> = self
+            .execution_order
             .iter()
             .map(|&i| {
                 let node = &self.nodes[i];
                 (node.name.clone(), self.execution_counts.get(i).copied().unwrap_or(0))
             })
+            .collect();
+        // Anything the sort could not place, in the order it was added.
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !self.execution_order.contains(&i) {
+                counts.push((
+                    node.name.clone(),
+                    self.execution_counts.get(i).copied().unwrap_or(0),
+                ));
+            }
+        }
+        counts
+    }
+
+    /// How many times each pass actually contributed to a frame, in execution
+    /// order. Bug №653.
+    ///
+    /// The counterpart to [`pass_execution_counts`](Self::pass_execution_counts):
+    /// that one says the graph reached the pass, this one says the pass did
+    /// something. A pass can be dispatched every frame and contribute nothing,
+    /// and that is exactly the state the instrument could not see before.
+    pub fn recorded_counts(&self) -> Vec<(String, u64)> {
+        let mut counts: Vec<(String, u64)> = self
+            .execution_order
+            .iter()
+            .map(|&i| {
+                let node = &self.nodes[i];
+                (node.name.clone(), self.recorded_counts.get(i).copied().unwrap_or(0))
+            })
+            .collect();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !self.execution_order.contains(&i) {
+                counts.push((
+                    node.name.clone(),
+                    self.recorded_counts.get(i).copied().unwrap_or(0),
+                ));
+            }
+        }
+        counts
+    }
+
+    /// Passes that were dispatched but never contributed anything, with the
+    /// reason. Bug №653.
+    ///
+    /// This is the list that answers "which subsystems are written and
+    /// connected to nothing". A name on it is a pass the graph called and the
+    /// pass declined to work — no pipeline, no framebuffer, no state — and the
+    /// reason says which.
+    pub fn passes_without_work(&self) -> Vec<(String, String)> {
+        self.execution_order
+            .iter()
+            .filter_map(|&i| {
+                let dispatched = self.execution_counts.get(i).copied().unwrap_or(0);
+                let recorded = self.recorded_counts.get(i).copied().unwrap_or(0);
+                if dispatched == 0 || recorded >= dispatched {
+                    return None;
+                }
+                let name = self.nodes[i].name.clone();
+                let reason = self
+                    .skip_reasons
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| "recorded nothing".to_string());
+                Some((name, reason))
+            })
             .collect()
     }
 
-    /// Names of passes that have never executed.
+    /// Names of passes that have never been dispatched.
     ///
     /// The same defect class as [`pass_execution_counts`](Self::pass_execution_counts),
     /// narrowed to the part that is actionable: a pass on this list is on this list
-    /// because it was added to the graph and then did not run — either disabled, or
-    /// unreachable through the dependency sort, or its `execute` returned early. All
-    /// three look identical from outside, which is why the name and count are
-    /// reported rather than a diagnosis.
+    /// because it was added to the graph and then not reached — disabled, or
+    /// unreachable through the dependency sort.
+    ///
+    /// A pass that *was* dispatched and declined to work is not on this list; it
+    /// is on [`passes_without_work`](Self::passes_without_work), which says why.
+    /// The two are different failures and the names must not be conflated.
     pub fn never_executed(&self) -> Vec<String> {
         self.pass_execution_counts()
             .into_iter()
@@ -550,16 +803,38 @@ if recorded == 0 {
     }
 
     /// A one-line summary of what actually ran, for a diagnostic overlay or a log.
+    ///
+    /// Bug №653: the summary now says both things the graph knows — how many
+    /// times each pass was dispatched, and how many of those dispatches
+    /// contributed to the frame. A pass dispatched 60 times and recorded 0
+    /// times reads `geometryx60!0`, and the `!` is the finding: the pass is
+    /// being called sixty times a second and doing nothing.
     pub fn execution_summary(&self) -> String {
         if self.nodes.is_empty() {
             return "<no passes>".to_string();
         }
+        // Looked up by name rather than zipped: the two lists are built
+        // separately, and a zip would silently pair the wrong numbers if their
+        // order ever diverged — which is exactly the kind of quiet wrong
+        // answer this instrument exists to avoid.
+        let worked: HashMap<String, u64> = self.recorded_counts().into_iter().collect();
         let parts: Vec<String> = self
             .pass_execution_counts()
             .into_iter()
-            .map(|(name, count)| format!("{name}x{count}"))
+            .map(|(name, count)| match worked.get(&name) {
+                Some(worked) if *worked == count => format!("{name}x{count}"),
+                Some(worked) => format!("{name}x{count}!{worked}"),
+                None => format!("{name}x{count}"),
+            })
             .collect();
-        format!("{} ({} never ran)", parts.join(" "), self.never_executed().len())
+        let idle = self.passes_without_work().len();
+        let never = self.never_executed().len();
+        format!(
+            "{} ({} never ran, {} did no work)",
+            parts.join(" "),
+            never,
+            idle
+        )
     }
 
     /// Mark graph as dirty (needs re-sorting)
@@ -571,5 +846,64 @@ if recorded == 0 {
 impl Default for RenderGraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::rhi::command::commands::Command;
+
+    use super::RenderGraph;
+
+    /// A frame that recorded nothing must count as nothing, not as a busy one:
+    /// the summary line is what says "did this graph do work", and a non-zero
+    /// on an empty list would answer that question with a lie.
+    #[test]
+    fn an_empty_command_list_counts_as_nothing_drawn() {
+        let counts = RenderGraph::count_draws(&[]);
+        assert_eq!(counts.draws, 0);
+        assert_eq!(counts.triangles, 0);
+        assert_eq!(counts.vertices, 0);
+    }
+
+    /// Draw and DrawIndexed are draws; a dispatch is not, and a non-indexed
+    /// draw touches vertices without producing triangles.
+    #[test]
+    fn only_draws_are_counted_and_triangles_come_from_indices() {
+        let counts = RenderGraph::count_draws(&[
+            Command::Dispatch { x: 1, y: 1, z: 1 },
+            Command::Draw {
+                vertex_count: 100,
+                instance_count: 2,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            Command::EndRenderPass,
+            Command::DrawIndexed {
+                index_count: 300,
+                instance_count: 1,
+                first_index: 0,
+                vertex_offset: 0,
+                first_instance: 0,
+            },
+        ]);
+        assert_eq!(counts.draws, 2);
+        assert_eq!(counts.vertices, 100 * 2 + 300);
+        assert_eq!(counts.triangles, 300 / 3);
+    }
+
+    /// Instances multiply, and the multiplication saturates: a wrapped product
+    /// would report a tiny frame from a huge one, and the summary is read by
+    /// humans deciding whether the renderer is doing anything at all.
+    #[test]
+    fn an_overflowing_draw_saturates_instead_of_wrapping_to_a_tiny_number() {
+        let counts = RenderGraph::count_draws(&[Command::Draw {
+            vertex_count: u32::MAX,
+            instance_count: 2,
+            first_vertex: 0,
+            first_instance: 0,
+        }]);
+        assert_eq!(counts.draws, 1);
+        assert_eq!(counts.vertices, u32::MAX);
     }
 }

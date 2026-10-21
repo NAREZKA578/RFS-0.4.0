@@ -1,9 +1,9 @@
+use rayon::prelude::*;
 use rfs_core::entity::EntityId;
-use rfs_core::math::{Vec3f, Transform};
+use rfs_core::math::{Transform, Vec3f};
 use rfs_core::packet::ProjectileType;
 use rfs_core::time::{Tick, FIXED_DT};
 use rfs_ship::ship::{Ship, ShipState};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -11,7 +11,108 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::ballistics::{BallisticsCalculator, BallisticsConfig};
+use crate::ballistics::{BallisticsCalculator, BallisticsConfig, RICOCHET_ELASTICITY};
+
+/// How much of the kinetic energy of a ram becomes hull damage.
+///
+/// The design note asks for real damage, and for it to be asymmetric by mass
+/// and speed. Both follow from the energy, so the only free number is the
+/// conversion. It is sized so that a ramming run at combat speed hurts the
+/// ship that is hit badly (tens of percent of its health) and the ship that
+/// rams barely at all (a few percent) — the asymmetry the note describes —
+/// and so that the cap, not the arithmetic, is what stops a full-speed hit
+/// from ending the fight in one pass.
+pub const RAM_DAMAGE_PER_JOULE: f32 = 2.0e-5;
+
+/// The share of a ship's health one ram may take.
+///
+/// A ram is a blunt instrument, and a fight that ends in a single contact is
+/// not a fight. Without a cap, a destroyer at full speed would erase a
+/// frigate's health in one pass, and the asymmetry the note asks for would
+/// read as "the heavy ship always wins", not as "the heavy ship hurts more".
+pub const RAM_MAX_HEALTH_SHARE: f32 = 0.25;
+
+/// Damage of a ram from the kinetic energy it carried, capped so that one
+/// contact cannot take more than `RAM_MAX_HEALTH_SHARE` of the hull's health.
+fn ram_damage(energy: f32, max_health: f32) -> f32 {
+    if !energy.is_finite() || energy <= 0.0 {
+        return 0.0;
+    }
+    let raw = energy * RAM_DAMAGE_PER_JOULE;
+    let cap = max_health.max(0.0) * RAM_MAX_HEALTH_SHARE;
+    raw.min(cap)
+}
+
+/// A contact between two axis-aligned boxes.
+struct AabbContact {
+    /// Unit normal pointing from the first box to the second.
+    normal: Vec3f,
+    /// The point where the two boxes meet.
+    point: Vec3f,
+    /// How deeply the boxes overlap.
+    penetration: f32,
+}
+
+/// The contact between two boxes, or `None` when they do not overlap.
+///
+/// The normal is the axis of the SHALLOWEST overlap: pushing the hulls apart
+/// along that axis separates them in one step, while any other axis would
+/// leave them still overlapping.
+fn aabb_contact(a: &rfs_core::math::Bounds, b: &rfs_core::math::Bounds) -> Option<AabbContact> {
+    let a_min = [a.min.x, a.min.y, a.min.z];
+    let a_max = [a.max.x, a.max.y, a.max.z];
+    let b_min = [b.min.x, b.min.y, b.min.z];
+    let b_max = [b.max.x, b.max.y, b.max.z];
+
+    let mut normal = [0.0f32; 3];
+    let mut penetration = f32::INFINITY;
+    let mut point = [0.0f32; 3];
+    for axis in 0..3 {
+        let overlap = (a_max[axis].min(b_max[axis])) - (a_min[axis].max(b_min[axis]));
+        if overlap <= 0.0 {
+            return None;
+        }
+        if overlap < penetration {
+            penetration = overlap;
+            // The normal names ONE axis, so the previous candidate has to be
+            // cleared: leaving it behind would push the hull diagonally out of
+            // a box it was never inside on that axis.
+            normal = [0.0; 3];
+            // The direction that separates A from B on this axis: the normal
+            // points FROM A TO B, so it is +1 when A lies on the lower side.
+            normal[axis] = if a_min[axis] + a_max[axis] <= b_min[axis] + b_max[axis] {
+                1.0
+            } else {
+                -1.0
+            };
+        }
+        // The contact point on this axis: the middle of the overlap.
+        point[axis] = (a_min[axis].max(b_min[axis]) + a_max[axis].min(b_max[axis])) * 0.5;
+    }
+    if !penetration.is_finite() {
+        return None;
+    }
+    Some(AabbContact {
+        normal: Vec3f::new(normal[0], normal[1], normal[2]),
+        point: Vec3f::new(point[0], point[1], point[2]),
+        penetration,
+    })
+}
+
+/// How deeply a box overlaps another, and the direction to push it out.
+///
+/// The result is the direction and distance that separates the FIRST box from
+/// the SECOND: `normal * penetration` is the offset that takes the first box
+/// out of the second.
+fn aabb_penetration(
+    a: &rfs_core::math::Bounds,
+    b: &rfs_core::math::Bounds,
+) -> Option<(Vec3f, f32)> {
+    let contact = aabb_contact(a, b)?;
+    // `aabb_contact` points from A to B, so pushing A out means going the
+    // other way.
+    Some((-contact.normal, contact.penetration))
+}
 
 pub struct TickSystem {
     ships: RwLock<HashMap<EntityId, Arc<Ship>>>,
@@ -71,10 +172,32 @@ impl ProjectileRejected {
 /// it is inside `set_fire`'s `[0, 1]` clamp.
 pub const FIRE_INTENSITY_ON_EXPLOSIVE_HIT: f32 = 0.5;
 
+/// Bug №664 (remainder): how far a bouncing shell is pushed back out along the
+/// struck face. Enough that the next tick's flight starts outside the hull (a
+/// sweep that begins on the face reads as a second collision), short enough
+/// that the reflection reads as "came off the armour", not "was teleported".
+pub const RICOCHET_EJECT_OFFSET: f32 = 1.0;
+
+/// Bug №664 (remainder): one hull impact the model priced as a ricochet, with
+/// the shell alive to reflect. Priced in `collect_damage` (where the model
+/// runs), executed in `apply_pending_damage` (where the projectile list can be
+/// mutated). The bounce reuses the same shell, so the client sees one tracer
+/// coming off the plate, not a shell disappearing and another spawning.
+#[derive(Debug, Clone)]
+pub struct RicochetBounce {
+    pub position: Vec3f,
+    pub velocity: Vec3f,
+    pub previous_count: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingDamage {
     pub target: EntityId,
-    pub projectile: EntityId,
+    /// What caused the damage. A shell names the shell; a ram names the ship
+    /// that hit. The two are the same damage system (the same compartment
+    /// graph does the work) but they are different events to a client, and a
+    /// single `projectile` field could not say which.
+    pub source: DamageSource,
     pub damage: f32,
     pub penetration: f32,
     pub position: Vec3f,
@@ -82,6 +205,20 @@ pub struct PendingDamage {
     /// Bug №607: whether the shell that produced this entry was explosive, and
     /// so should set the struck compartment on fire when the damage lands.
     pub incendiary: bool,
+    /// Bug №664 (remainder): when the hit was priced as a ricochet and the
+    /// shell has bounce budget left, this carries the follow-up flight —
+    /// position, velocity, and how many bounces preceded. `None` means the
+    /// shell is spent where it struck.
+    pub ricochet_bounce: Option<RicochetBounce>,
+}
+
+/// What produced a piece of damage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamageSource {
+    /// A shell: the id names the projectile.
+    Projectile(EntityId),
+    /// A ramming ship: the id names the ship that hit.
+    Ram(EntityId),
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +241,11 @@ pub struct Projectile {
     pub damage: f32,
     pub penetration: f32,
     pub explosion_radius: f32,
+    /// Bug №664 (remainder): how many hull bounces this shell already made.
+    /// `BallisticsConfig::max_ricochets` is the ceiling; the count lives on the
+    /// shell rather than in a side table so the bounce rule cannot disagree
+    /// with the visible flight.
+    pub ricochet_count: u32,
 }
 
 /// How far inside the map face a ship's centre is kept.
@@ -163,9 +305,27 @@ impl TickSystem {
         }
     }
 
+    /// Bug №664 (remainder): a TickSystem built with a chosen ballistics
+    /// config. Tests use it to pin flag behaviour (`max_ricochets`); a server
+    /// backend could use the same door later to load the config from data.
+    pub fn with_ballistics(config: BallisticsConfig) -> Self {
+        Self {
+            ballistics: BallisticsCalculator::new(config),
+            ..Self::new()
+        }
+    }
+
+    /// Read access to the calculator the tick loop flies shells with. The
+    /// fire-control solution (`server/src/tick.rs::ballistic_aim`) shares this
+    /// one instance, so the arc it aims along and the integrator the shell
+    /// actually flies cannot read different rules.
+    pub fn ballistics(&self) -> &BallisticsCalculator {
+        &self.ballistics
+    }
+
     pub fn tick(&mut self) -> TickResult {
         self.current_tick = self.current_tick.next();
-        
+
         let mut result = TickResult {
             tick: self.current_tick,
             ship_updates: Vec::new(),
@@ -174,13 +334,20 @@ impl TickSystem {
             events: Vec::new(),
         };
 
-// Stage 2 fallout of the PREVIOUS tick lands first, on a settled state.
+        // Stage 2 fallout of the PREVIOUS tick lands first, on a settled state.
         self.apply_pending_damage(&mut result);
         self.update_ships_parallel(&mut result);
         self.hold_ships_in_bounds();
+        // Bug №308/the design note: in an open sea the only thing a ship can
+        // run into is another ship (or a structure on an authored map). The
+        // contact pass runs in the same phase as the ballistics — the note
+        // asks for it explicitly ("the same general tick phase, not a separate
+        // step") — and before the projectile pass, so a shell fired this tick
+        // already sees the hulls that just moved.
+        self.resolve_ship_contacts(&mut result);
         self.update_projectiles(&mut result);
         self.check_collisions(&mut result);
-        self.collect_damage();
+        self.collect_damage(&mut result);
 
         result
     }
@@ -196,10 +363,12 @@ impl TickSystem {
     /// exactly on the boundary is outside on the next floating-point step, so it
     /// would oscillate.
     ///
-    /// Only ships whose *centre* has left the volume are touched. Pushing the
-    /// hull back in as well would make a wide ship unable to fly along a wall,
-    /// and there is no contact model here that could tell "resting against" from
-    /// "embedded in".
+    /// Bug №308: the clamp looks at the ship's CENTRE, and that is the
+    /// documented model: a hull may cross the face of the world, because
+    /// telling "leaning against the world" from "half out of it" needs a
+    /// contact model this pass does not have, and inventing one is the
+    /// owner's call. A hull that is entirely outside is not a separate case —
+    /// its centre is outside too, and the centre is what gets brought back.
     fn hold_ships_in_bounds(&self) {
         let world = self.world.read();
         let Some(map) = world.as_ref() else {
@@ -225,19 +394,216 @@ impl TickSystem {
             // volume. Done per axis from the raw components because `Vec3f` has no
             // element setter, and rebuilding the whole vector from a copied array
             // is clearer than three conditional assignments to a field.
-            let outside = [state.transform.position.x - position.x,
+            let outside = [
+                state.transform.position.x - position.x,
                 state.transform.position.y - position.y,
-                state.transform.position.z - position.z];
+                state.transform.position.z - position.z,
+            ];
             let v = [state.velocity.x, state.velocity.y, state.velocity.z];
             let mut damped = v;
             for axis in 0..3 {
-                if (outside[axis] > 0.0 && v[axis] > 0.0) || (outside[axis] < 0.0 && v[axis] < 0.0) {
+                if (outside[axis] > 0.0 && v[axis] > 0.0) || (outside[axis] < 0.0 && v[axis] < 0.0)
+                {
                     damped[axis] = 0.0;
                 }
             }
             state.transform.position = position;
             state.velocity = Vec3f::new(damped[0], damped[1], damped[2]);
             ship.apply_state(state);
+        }
+    }
+
+    /// Bug №308 / the design note's ramming: hull against hull, and hull
+    /// against structure.
+    ///
+    /// The design note is explicit about both halves:
+    ///
+    /// * "Open ocean without terrain means a hull collision is the only kind of
+    ///   'ran into something' in the game" — and that it should be REAL damage,
+    ///   not a push: "a breach from a ram is the same Torricelli formula and
+    ///   the same compartment graph, just a different source of damage".
+    /// * The damage is asymmetric by mass and speed: "a heavy fast destroyer
+    ///   rams a light frigate devastatingly and barely notices the hit itself".
+    ///
+    /// So the contact is resolved as an impulse along the contact normal, and
+    /// the damage each side takes is the kinetic energy its own change of
+    /// velocity carries. The asymmetry is not a rule written on top of the
+    /// physics — it falls out of it: the light ship takes a large share of
+    /// the impulse and therefore a large share of the energy, and the heavy
+    /// one barely changes speed.
+    fn resolve_ship_contacts(&self, result: &mut TickResult) {
+        let ships: Vec<Arc<Ship>> = self.ships.read().values().cloned().collect();
+        if ships.len() < 2 {
+            // A single ship still has to respect the world, so the structure
+            // pass runs even with one hull.
+            self.resolve_obstacle_contacts(&ships, result);
+            return;
+        }
+
+        for i in 0..ships.len() {
+            for j in (i + 1)..ships.len() {
+                let a = &ships[i];
+                let b = &ships[j];
+                let Some(contact) = aabb_contact(&a.bounds(), &b.bounds()) else {
+                    continue;
+                };
+                let normal = contact.normal;
+                let position = contact.point;
+
+                // The normal points from A to B, so the closing speed is how
+                // much faster A moves towards B along it. Below zero means the
+                // hulls are already separating — nothing to do.
+                let relative = (a.velocity() - b.velocity()).dot(normal);
+                if relative <= 0.0 {
+                    continue;
+                }
+                let mass_a = a.config().mass.max(1.0);
+                let mass_b = b.config().mass.max(1.0);
+                // Owner decision (2026-10-21): a ram is a LOSS OF WAY, not a
+                // bounce and not a grip. Each hull loses the NORMAL part of
+                // its own velocity, and how much of that loss is its own
+                // depends on the mass of the other hull: the share that
+                // reaches the other side is
+                //
+                //   k_a = m_b / (m_a + m_b),  k_b = m_a / (m_a + m_b)
+                //
+                // so a heavy hull barely notices and a light one is stopped
+                // dead — which is the asymmetry the design note asks for, and
+                // it is the same asymmetry the damage below is priced from.
+                //
+                // The loss is the normal component, so it depends on the
+                // ANGLE: a head-on ram takes the way away almost completely, a
+                // glancing blow takes almost none. Nothing is transferred
+                // back (that would be a bounce), and nothing sticks (that
+                // would be a grip) — the energy of the normal component simply
+                // goes into the hulls.
+                let total_mass = mass_a + mass_b;
+                let k_a = mass_b / total_mass;
+                let k_b = mass_a / total_mass;
+                let into_a = a.velocity().dot(normal);
+                let into_b = b.velocity().dot(normal);
+                let dv_a = into_a * k_a;
+                let dv_b = into_b * k_b;
+
+                // Separate the hulls so they do not stay inside each other:
+                // the overlap is split along the contact normal.
+                let separation = contact.penetration * 0.5;
+                {
+                    let mut state_a = a.get_state();
+                    state_a.transform.position -= normal * separation;
+                    state_a.velocity -= normal * dv_a;
+                    a.apply_state(state_a);
+                }
+                {
+                    let mut state_b = b.get_state();
+                    state_b.transform.position += normal * separation;
+                    state_b.velocity -= normal * dv_b;
+                    b.apply_state(state_b);
+                }
+
+                // Damage: the kinetic energy each hull lost with its normal
+                // velocity. The heavier hull loses far less of it, so the
+                // strike lands where the design note says it should.
+                let damage_a = ram_damage(0.5 * mass_a * dv_a * dv_a, a.config().max_health);
+                let damage_b = ram_damage(0.5 * mass_b * dv_b * dv_b, b.config().max_health);
+                if damage_b > 0.0 {
+                    self.pending_damage.write().push(PendingDamage {
+                        target: b.entity_id(),
+                        source: DamageSource::Ram(a.entity_id()),
+                        damage: damage_b,
+                        penetration: 0.0,
+                        position,
+                        normal,
+                        // A hull is not a shell: nothing catches fire.
+                        incendiary: false,
+                        ricochet_bounce: None,
+                    });
+                }
+                if damage_a > 0.0 {
+                    self.pending_damage.write().push(PendingDamage {
+                        target: a.entity_id(),
+                        source: DamageSource::Ram(b.entity_id()),
+                        damage: damage_a,
+                        penetration: 0.0,
+                        position,
+                        // The normal seen from A's side points the other way.
+                        normal: -normal,
+                        incendiary: false,
+                        ricochet_bounce: None,
+                    });
+                }
+            }
+        }
+
+        self.resolve_obstacle_contacts(&ships, result);
+    }
+
+    /// Hulls against the world's solid volumes.
+    ///
+    /// Bug №308: a shell stopped by a rock while the ship drove through the
+    /// same rock — the world was solid for projectiles and permeable for
+    /// ships. A ship that overlaps a structure is pushed out along the
+    /// shallowest axis and loses the velocity component that was carrying it
+    /// in. No damage: a structure has no health model, and inventing one is a
+    /// protocol decision, not a physics fix.
+    fn resolve_obstacle_contacts(&self, ships: &[Arc<Ship>], _result: &mut TickResult) {
+        let world = self.world.read();
+        let Some(map) = world.as_ref() else {
+            return;
+        };
+        if map.obstacles.is_empty() {
+            return;
+        }
+
+        for ship in ships {
+            for obstacle in &map.obstacles {
+                let Some((normal, penetration)) =
+                    aabb_penetration(&ship.bounds(), &obstacle.bounds)
+                else {
+                    continue;
+                };
+                let mut state = ship.get_state();
+                state.transform.position += normal * penetration;
+
+                // The velocity that was carrying the hull INTO the structure is
+                // removed. "Into" is measured on every axis the hull overlaps
+                // on, not only on the axis it was pushed out along: a hull
+                // that lies lengthwise inside a rock and slides along it must
+                // not keep driving deeper sideways.
+                let hull = ship.bounds();
+                let hull_min = [hull.min.x, hull.min.y, hull.min.z];
+                let hull_max = [hull.max.x, hull.max.y, hull.max.z];
+                let rock_min = [
+                    obstacle.bounds.min.x,
+                    obstacle.bounds.min.y,
+                    obstacle.bounds.min.z,
+                ];
+                let rock_max = [
+                    obstacle.bounds.max.x,
+                    obstacle.bounds.max.y,
+                    obstacle.bounds.max.z,
+                ];
+                let position = [
+                    state.transform.position.x,
+                    state.transform.position.y,
+                    state.transform.position.z,
+                ];
+                let mut velocity = [state.velocity.x, state.velocity.y, state.velocity.z];
+                for axis in 0..3 {
+                    let overlap =
+                        (hull_max[axis].min(rock_max[axis])) - (hull_min[axis].max(rock_min[axis]));
+                    if overlap <= 0.0 {
+                        continue;
+                    }
+                    let centre = (rock_min[axis] + rock_max[axis]) * 0.5;
+                    let towards_centre = centre - position[axis];
+                    if towards_centre * velocity[axis] > 0.0 {
+                        velocity[axis] = 0.0;
+                    }
+                }
+                state.velocity = Vec3f::new(velocity[0], velocity[1], velocity[2]);
+                ship.apply_state(state);
+            }
         }
     }
 
@@ -263,7 +629,8 @@ impl TickSystem {
         // Bug №153: the pre-tick state is captured so flooding/occupancy
         // transitions are detected edge-triggered — the old code never emitted
         // CompartmentFlooded/StationOccupied/StationVacated at all.
-        let updates: Vec<_> = ships.par_iter()
+        let updates: Vec<_> = ships
+            .par_iter()
             .map(|(id, ship)| {
                 let prev = ship.get_state();
                 let mut ship_state = prev.clone();
@@ -347,7 +714,7 @@ impl TickSystem {
         let ballistics = &self.ballistics;
         let mut projectiles = self.projectiles.write();
         let dt = FIXED_DT;
-        
+
         projectiles.retain_mut(|proj| {
             // Non-finite or non-positive lifetime config: expire immediately
             // instead of living forever (NaN comparisons are always false).
@@ -384,8 +751,26 @@ impl TickSystem {
                 Some(config) => {
                     // Strictly below the surface: buoyancy + water drag.
                     // y == 0 is still air (sea-skimmers must not teleport).
+                    //
+                    // Bug №664 (remainder): a diving shell did not see the
+                    // waterline. The air branch dropped it a whole tick length
+                    // (~13 m at 400 m/s) past the surface, and only the next
+                    // tick switched it to the water integrator. `check_water_
+                    // entry` names the crossing; when the step would cross the
+                    // surface this tick, fly air until it and water after it —
+                    // both segments inside this one tick.
                     let step = if proj.position.y < 0.0 {
                         ballistics.simulate_underwater(proj.position, proj.velocity, config, dt)
+                    } else if let Some(entry) =
+                        ballistics.check_water_entry(proj.position, proj.velocity, 0.0)
+                    {
+                        let remaining = (dt - entry.time_to_entry * dt).max(0.0);
+                        ballistics.simulate_underwater(
+                            entry.entry_position,
+                            entry.entry_velocity,
+                            config,
+                            remaining,
+                        )
                     } else {
                         ballistics.integrate_step(proj.position, proj.velocity, config, dt)
                     };
@@ -434,7 +819,9 @@ impl TickSystem {
             // Obstacles first. A shell that reaches a rock before a ship behind it
             // should hit the rock, and testing the world before the fleet is what
             // makes that hold without comparing depths afterwards.
-            let obstacle_hit = map.as_ref().and_then(|m| m.swept_obstacle(proj.prev_position, proj.position));
+            let obstacle_hit = map
+                .as_ref()
+                .and_then(|m| m.swept_obstacle(proj.prev_position, proj.position));
             if let Some((target, kind, position, penetration)) = obstacle_hit {
                 collisions.push(CollisionEvent {
                     tick: self.current_tick,
@@ -462,9 +849,8 @@ impl TickSystem {
                     // box a shell can hit is far larger than the compartments
                     // inside it, so the end of the segment sits outside every
                     // damage falloff radius and the hit would deal nothing.
-                    let impact =
-                        segment_entry_point(proj.prev_position, proj.position, &bounds)
-                            .unwrap_or(proj.position);
+                    let impact = segment_entry_point(proj.prev_position, proj.position, &bounds)
+                        .unwrap_or(proj.position);
                     let normal = Self::calculate_impact_normal(ship, impact);
                     collisions.push(CollisionEvent {
                         tick: self.current_tick,
@@ -546,7 +932,7 @@ impl TickSystem {
         ship.transform().rotation.mul_vec3(local_normal)
     }
 
-    fn collect_damage(&self) {
+    fn collect_damage(&self, result: &mut TickResult) {
         // Snapshot everything first, then mutate: short separate locks in a
         // fixed order (collisions -> projectiles), no nesting. Damage itself
         // is NOT applied here — it lands at the next tick boundary
@@ -561,19 +947,93 @@ impl TickSystem {
         }
 
         let projectiles = self.projectiles.read();
+        // Bug №664: the model needs the struck ship's declared armor, so a
+        // third read guard joins the queue (still only reads, released below
+        // before the projectile write).
+        let ships = self.ships.read();
 
         let mut pending: Vec<PendingDamage> = Vec::new();
         let mut obstacle_hits = 0u64;
         for collision in collisions.iter() {
-            let Some(proj) = projectiles.iter().find(|p| p.entity_id == collision.projectile) else {
+            let Some(proj) = projectiles
+                .iter()
+                .find(|p| p.entity_id == collision.projectile)
+            else {
                 continue;
             };
             match collision.target_kind {
                 CollisionTarget::Ship => {
+                    // Bug №664: the declared shell numbers used to land raw;
+                    // calculate_penetration / calculate_damage existed but only
+                    // the tests called them. The model runs here: the struck
+                    // ship's declared plate, the incidence angle from the
+                    // actual impact geometry, and the flight distance the
+                    // projectile already accumulated. A shell with no
+                    // registered config, or a target whose ship object is gone,
+                    // keeps the raw legacy number.
+                    let armor = ships
+                        .get(&collision.target)
+                        .map(|s| s.config().armor_thickness);
+                    let (damage, ricochet_bounce) =
+                        match (self.ballistics.get_config(proj.projectile_type), armor) {
+                            (Some(config), Some(armor)) => {
+                                // The struck hull face is the armor plate, so
+                                // the incidence angle between the shell path
+                                // and the surface is the plate angle the
+                                // thickness roll divides by.
+                                let impact_angle = collision
+                                    .velocity
+                                    .normalize()
+                                    .dot(collision.normal)
+                                    .abs()
+                                    .clamp(0.0, 1.0)
+                                    .acos();
+                                let penetration = self.ballistics.calculate_penetration(
+                                    config,
+                                    collision.velocity,
+                                    collision.normal,
+                                    armor,
+                                    impact_angle,
+                                );
+                                // Bug №664 (remainder): a shell priced as a
+                                // ricochet is spent as damage but lives on,
+                                // reflected. Two gates beyond the model itself:
+                                // blast shells explode on contact and never
+                                // bounce, and the config caps the count per
+                                // shell (`max_ricochets`).
+                                let bounce = if penetration.ricochet
+                                    && proj.explosion_radius.is_finite()
+                                    && proj.explosion_radius <= 0.0
+                                    && proj.ricochet_count < self.ballistics.config().max_ricochets
+                                {
+                                    Some(RicochetBounce {
+                                        position: collision.position
+                                            + collision.normal * RICOCHET_EJECT_OFFSET,
+                                        velocity: self.ballistics.simulate_ricochet(
+                                            collision.velocity,
+                                            collision.normal,
+                                            RICOCHET_ELASTICITY,
+                                        ),
+                                        previous_count: proj.ricochet_count,
+                                    })
+                                } else {
+                                    None
+                                };
+                                (
+                                    self.ballistics.calculate_damage(
+                                        config,
+                                        &penetration,
+                                        proj.distance_traveled,
+                                    ),
+                                    bounce,
+                                )
+                            }
+                            _ => (proj.damage, None),
+                        };
                     pending.push(PendingDamage {
                         target: collision.target,
-                        projectile: collision.projectile,
-                        damage: proj.damage,
+                        source: DamageSource::Projectile(collision.projectile),
+                        damage,
                         penetration: proj.penetration,
                         position: collision.position,
                         normal: collision.normal,
@@ -581,18 +1041,29 @@ impl TickSystem {
                         // only on the ship it actually struck.
                         incendiary: proj.explosion_radius.is_finite()
                             && proj.explosion_radius > 0.0,
+                        ricochet_bounce,
                     });
                 }
                 CollisionTarget::Obstacle(_) => {
-                    // Not queued. `apply_pending_damage` looks the target up among
-                    // ships and would silently drop it, so queueing it here would
-                    // cost a lookup to achieve nothing - and the silence is the
-                    // problem, not the cost. Nothing tracks asteroid health yet,
-                    // so a rock cannot be hurt; what *is* real is the shell being
-                    // spent on it, and that has to be countable rather than
-                    // invisible. Same lesson as Bug #196, where a missing counter
-                    // made dropped shots impossible to see.
+                    // Not queued as damage. `apply_pending_damage` looks the
+                    // target up among ships and would silently drop it, so
+                    // queueing it here would cost a lookup to achieve nothing
+                    // - and the silence is the problem, not the cost. Nothing
+                    // tracks structure health (the world is static by the
+                    // owner's decision), so a rock cannot be hurt; what *is*
+                    // real is the shell being spent on it, and that has to be
+                    // countable rather than invisible. Same lesson as Bug
+                    // #196, where a missing counter made dropped shots
+                    // impossible to see.
                     obstacle_hits += 1;
+                    // Bug №307: and countable is not enough — the client has to
+                    // see that the shot ended HERE, or the shell simply
+                    // disappears at the rock from the player's side.
+                    result.events.push(GameEvent::ProjectileImpact {
+                        projectile: collision.projectile,
+                        position: collision.position,
+                        normal: collision.normal,
+                    });
                 }
             }
         }
@@ -634,7 +1105,7 @@ impl TickSystem {
                     if splash > 0.0 && splash.is_finite() {
                         pending.push(PendingDamage {
                             target: ship.entity_id(),
-                            projectile: collision.projectile,
+                            source: DamageSource::Projectile(collision.projectile),
                             damage: splash,
                             penetration: 0.0,
                             position: collision.position,
@@ -645,6 +1116,11 @@ impl TickSystem {
                             // a blast lights the ship it hit, not the ones
                             // nearby. (`hit_compartment` would be `None`.)
                             incendiary: false,
+                            // Bug №664 (remainder): the blast's direct hit owns
+                            // the shell's ricochet route, if any — a splash
+                            // entry describes damage to a neighbour, not a
+                            // second flight for the shell.
+                            ricochet_bounce: None,
                         });
                     }
                 }
@@ -658,10 +1134,31 @@ impl TickSystem {
         // produces no damage entry, which is exactly what an obstacle is: no
         // ship to damage, so nothing queued, so the shell survived the rock it
         // had just struck. The early return below made that reachable.
-        let spent: Vec<EntityId> = collisions.iter().map(|c| c.projectile).collect();
+        //
+        // Bug №664 (remainder): the exception is a shell the model priced as
+        // a ricochet with bounce budget left. It is spent as damage but keeps
+        // flying, reflected — removed from the world here, it would read as a
+        // shell vanishing into its own bounce.
+        let bouncing: Vec<EntityId> = pending
+            .iter()
+            .filter_map(|hit| {
+                hit.ricochet_bounce.as_ref()?;
+                match hit.source {
+                    DamageSource::Projectile(id) => Some(id),
+                    // A ram has no shell to keep flying.
+                    DamageSource::Ram(_) => None,
+                }
+            })
+            .collect();
+        let spent: Vec<EntityId> = collisions
+            .iter()
+            .filter(|c| !bouncing.contains(&c.projectile))
+            .map(|c| c.projectile)
+            .collect();
         // Bug №611: the read guards are dropped before the projectile list is
         // mutated, so the write never happens with a read guard on the same
         // lock. `spent` is what the old snapshot was cloned for.
+        drop(ships);
         drop(projectiles);
         drop(collisions);
 
@@ -671,12 +1168,12 @@ impl TickSystem {
                 .retain(|p| !spent.contains(&p.entity_id));
         }
 
-            if pending.is_empty() {
-                return;
-            }
-
-            self.pending_damage.write().extend(pending);
+        if pending.is_empty() {
+            return;
         }
+
+        self.pending_damage.write().extend(pending);
+    }
 
     /// Applies last tick's collision fallout to the settled state and emits
     /// the ShipHit events for THIS tick (plan §5.1).
@@ -686,6 +1183,7 @@ impl TickSystem {
             return;
         }
 
+        let mut bounces: Vec<(EntityId, RicochetBounce)> = Vec::new();
         let ships = self.ships.write();
         for hit in pending {
             if let Some(ship) = ships.get(&hit.target) {
@@ -718,14 +1216,26 @@ impl TickSystem {
                     hit.damage,
                 );
 
-                result.events.push(GameEvent::ShipHit {
-                    target: hit.target,
-                    projectile: hit.projectile,
-                    position: hit.position,
-                    normal: hit.normal,
-                    damage: hit.damage,
-                    penetration: hit.penetration,
-                    hit_compartment,
+                result.events.push(match hit.source {
+                    DamageSource::Projectile(projectile) => GameEvent::ShipHit {
+                        target: hit.target,
+                        projectile,
+                        position: hit.position,
+                        normal: hit.normal,
+                        damage: hit.damage,
+                        penetration: hit.penetration,
+                        hit_compartment,
+                    },
+                    // A ram is the same damage through the same compartment
+                    // graph, but a different source: the client has to be able
+                    // to tell a hull from a shell.
+                    DamageSource::Ram(rammer) => GameEvent::ShipRam {
+                        rammer,
+                        target: hit.target,
+                        position: hit.position,
+                        normal: hit.normal,
+                        damage: hit.damage,
+                    },
                 });
 
                 // Bug №607: an explosive hit lights the compartment the blast
@@ -743,6 +1253,33 @@ impl TickSystem {
                             });
                         }
                     }
+                }
+            }
+
+            // Bug №664 (remainder): the reflection this impact priced. The
+            // bounce is collected here — where the ship write guard is held —
+            // and applied below, after the guard is down: the projectile list
+            // may not be written while `ships` is held (Bug №611's rule).
+            if let Some(bounce) = hit.ricochet_bounce {
+                if let DamageSource::Projectile(id) = hit.source {
+                    bounces.push((id, bounce));
+                }
+            }
+        }
+        drop(ships);
+
+        // The same shell, alive and reflected: restart the sweep from the
+        // eject point with the reflected velocity. `prev_position` follows so
+        // the next tick's hit test sweeps out of the hull, not from inside it,
+        // and the bounce count is bumped against the config's ceiling.
+        if !bounces.is_empty() {
+            let mut projectiles = self.projectiles.write();
+            for (entity_id, bounce) in bounces {
+                if let Some(proj) = projectiles.iter_mut().find(|p| p.entity_id == entity_id) {
+                    proj.position = bounce.position;
+                    proj.prev_position = bounce.position;
+                    proj.velocity = bounce.velocity;
+                    proj.ricochet_count = bounce.previous_count + 1;
                 }
             }
         }
@@ -785,11 +1322,11 @@ impl TickSystem {
         Ok(())
     }
 
-/// How many projectiles have been refused since start-up.
-///
-/// Bug №196: the old comment described exactly this counter, but no such value
-/// was kept — the drop was unobservable.
-pub fn dropped_projectiles(&self) -> u64 {
+    /// How many projectiles have been refused since start-up.
+    ///
+    /// Bug №196: the old comment described exactly this counter, but no such value
+    /// was kept — the drop was unobservable.
+    pub fn dropped_projectiles(&self) -> u64 {
         self.dropped_projectiles.load(Ordering::Relaxed)
     }
 
@@ -807,7 +1344,9 @@ pub fn dropped_projectiles(&self) -> u64 {
     }
 
     pub fn get_collisions_since(&self, since_tick: Tick) -> Vec<CollisionEvent> {
-        self.collisions.read().iter()
+        self.collisions
+            .read()
+            .iter()
             .filter(|c| c.tick > since_tick)
             .cloned()
             .collect()
@@ -817,7 +1356,11 @@ pub fn dropped_projectiles(&self) -> u64 {
 /// Swept point-vs-AABB test over one tick segment (plan §4: the shell must
 /// not tunnel through a thin target between two ticks). Slab method with
 /// explicit parallel-axis handling, so no NaN on zero-length segments.
-pub fn segment_intersects_bounds(prev: Vec3f, curr: Vec3f, bounds: &rfs_core::math::Bounds) -> bool {
+pub fn segment_intersects_bounds(
+    prev: Vec3f,
+    curr: Vec3f,
+    bounds: &rfs_core::math::Bounds,
+) -> bool {
     let dir = curr - prev;
     let mut tmin = 0.0f32;
     let mut tmax = 1.0f32;
@@ -993,6 +1536,31 @@ pub enum GameEvent {
     FireExtinguished {
         compartment: EntityId,
     },
+    /// Two hulls met and the contact did damage.
+    ///
+    /// The design note asks for the ram to be a different SOURCE of damage,
+    /// not a new damage system: the same compartment graph does the work, and
+    /// this event exists so a client can tell a ram from a shell.
+    ShipRam {
+        rammer: EntityId,
+        target: EntityId,
+        position: Vec3f,
+        normal: Vec3f,
+        damage: f32,
+    },
+    /// A shell ended its flight on something.
+    ///
+    /// Bug №307: a shell that struck a structure used to leave no trace at
+    /// all — the shot was spent, the damage was a no-op (a structure has no
+    /// health model, and the world is static by the owner's decision), and the
+    /// client never heard about it. From the player's side the shell simply
+    /// disappeared at the rock. This event is that trace: the shot was spent
+    /// HERE.
+    ProjectileImpact {
+        projectile: EntityId,
+        position: Vec3f,
+        normal: Vec3f,
+    },
 }
 
 #[cfg(test)]
@@ -1015,6 +1583,7 @@ mod tests {
             damage: 100.0,
             penetration: 50.0,
             explosion_radius: 0.0,
+            ricochet_count: 0,
         }
     }
 
@@ -1035,11 +1604,7 @@ mod tests {
             sim.fire_projectile(bad),
             Err(ProjectileRejected::NonFiniteBallistics)
         );
-        assert_eq!(
-            sim.dropped_projectiles(),
-            1,
-            "the refusal was not counted"
-        );
+        assert_eq!(sim.dropped_projectiles(), 1, "the refusal was not counted");
     }
 
     /// An accepted shell must not be counted, or the number means nothing.
@@ -1058,7 +1623,11 @@ mod tests {
         let sim = TickSystem::new();
         const MAX: usize = 8192;
         for i in 0..MAX {
-            assert_eq!(sim.fire_projectile(shell(i as u64 + 1)), Ok(()), "refused early at {i}");
+            assert_eq!(
+                sim.fire_projectile(shell(i as u64 + 1)),
+                Ok(()),
+                "refused early at {i}"
+            );
         }
 
         assert_eq!(
@@ -1095,11 +1664,26 @@ mod tests {
     #[test]
     fn every_non_finite_field_is_rejected() {
         let cases = [
-            Projectile { position: Vec3f::new(f32::NAN, 0.0, 0.0), ..shell(1) },
-            Projectile { position: Vec3f::new(f32::INFINITY, 0.0, 0.0), ..shell(2) },
-            Projectile { velocity: Vec3f::new(f32::NAN, 0.0, 0.0), ..shell(3) },
-            Projectile { velocity: Vec3f::new(0.0, f32::NEG_INFINITY, 0.0), ..shell(4) },
-            Projectile { lifetime: f32::NAN, ..shell(5) },
+            Projectile {
+                position: Vec3f::new(f32::NAN, 0.0, 0.0),
+                ..shell(1)
+            },
+            Projectile {
+                position: Vec3f::new(f32::INFINITY, 0.0, 0.0),
+                ..shell(2)
+            },
+            Projectile {
+                velocity: Vec3f::new(f32::NAN, 0.0, 0.0),
+                ..shell(3)
+            },
+            Projectile {
+                velocity: Vec3f::new(0.0, f32::NEG_INFINITY, 0.0),
+                ..shell(4)
+            },
+            Projectile {
+                lifetime: f32::NAN,
+                ..shell(5)
+            },
         ];
         for (i, bad) in cases.into_iter().enumerate() {
             let sim = TickSystem::new();
@@ -1108,7 +1692,10 @@ mod tests {
                 Err(ProjectileRejected::NonFiniteBallistics),
                 "case {i} was accepted"
             );
-            assert!(sim.get_active_projectiles().is_empty(), "case {i} was stored");
+            assert!(
+                sim.get_active_projectiles().is_empty(),
+                "case {i} was stored"
+            );
         }
     }
 
@@ -1438,7 +2025,11 @@ mod tests {
 
     /// Starts one ship at a position and runs a single tick, returning where it
     /// ended up. The same ship, the same tick, with and without a world.
-    fn ship_after_one_tick(world: Option<crate::map::WorldMap>, position: Vec3f, velocity: Vec3f) -> ShipState {
+    fn ship_after_one_tick(
+        world: Option<crate::map::WorldMap>,
+        position: Vec3f,
+        velocity: Vec3f,
+    ) -> ShipState {
         let mut sim = TickSystem::new();
         if let Some(map) = world {
             sim.set_world(map).expect("the test world is not valid");
@@ -1489,9 +2080,40 @@ mod tests {
     /// tick, so "the position equals what I set" would be false whether or not
     /// the boundary touched it. The only difference between the two runs is the
     /// map, so any difference in the outcome is the map's doing.
+    ///
+    /// Bug №308: the world is now solid for ships too, so the ship has to start
+    /// clear of the test world's structure — a hull inside a rock is pushed out
+    /// (that is the point of the new contact pass), and this test is about the
+    /// BOUNDARY, not about the rock.
+    /// The world holds a ship by its CENTRE, and a hull may cross the face.
+    ///
+    /// Bug №308: the record noticed that the boundary kept the ship by its
+    /// centre only, so a hull 300 m long could sit half out of the world and
+    /// still count as inside. The model is now a decision, not an accident:
+    /// the world holds the CENTRE, the hull may cross the face. Telling
+    /// "leaning against the world" from "half out of it" needs a contact model
+    /// (the same one the hull-to-hull and hull-to-structure contacts still do
+    /// not have), and choosing it is the owner's call — so this test pins the
+    /// decision instead of hiding it.
+    #[test]
+    fn the_world_holds_the_ship_by_its_centre_and_the_hull_may_cross_the_face() {
+        // The test world spans ±1000 and a hull is 300 m long, so a centre at
+        // 990 already puts the stern outside.
+        let after = ship_after_one_tick(
+            Some(test_world()),
+            Vec3f::new(990.0, 0.0, 0.0),
+            Vec3f::new(0.0, 0.0, 0.0),
+        );
+        assert!(
+            after.transform.position.x > 900.0,
+            "the centre must not be dragged in: {:?}",
+            after.transform.position
+        );
+    }
+
     #[test]
     fn a_ship_inside_the_world_is_left_alone() {
-        let start = Vec3f::new(10.0, 20.0, 30.0);
+        let start = Vec3f::new(10.0, 100.0, 30.0);
         let velocity = Vec3f::new(35.0, 0.0, 0.0);
         let with_world = ship_after_one_tick(Some(test_world()), start, velocity);
         let without_world = ship_after_one_tick(None, start, velocity);
@@ -1512,7 +2134,8 @@ mod tests {
     #[test]
     fn a_shell_that_crosses_a_rock_stops_on_it_and_is_spent() {
         let mut sim = TickSystem::new();
-        sim.set_world(test_world()).expect("the test world is not valid");
+        sim.set_world(test_world())
+            .expect("the test world is not valid");
         sim.fire_projectile(Projectile {
             position: Vec3f::new(0.0, 0.0, 0.0),
             prev_position: Vec3f::new(-400.0, 0.0, 0.0),
@@ -1543,6 +2166,56 @@ mod tests {
             "the impact was reported at {:?}, which is not the rock",
             hits[0].position
         );
+    }
+
+    /// Bug №307: a shell that strikes a structure must leave a trace the
+    /// client can see.
+    ///
+    /// The world is static by the owner's decision, so the structure cannot be
+    /// hurt and no damage is dealt — but the shot IS spent, and from the
+    /// player's side the shell used to simply disappear at the rock. The
+    /// impact event is that trace.
+    #[test]
+    fn a_shell_that_strikes_a_structure_reports_the_impact() {
+        let mut sim = TickSystem::new();
+        sim.set_world(test_world())
+            .expect("the test world is not valid");
+        sim.fire_projectile(Projectile {
+            position: Vec3f::new(0.0, 0.0, 0.0),
+            prev_position: Vec3f::new(-400.0, 0.0, 0.0),
+            velocity: Vec3f::new(400.0, 0.0, 0.0),
+            owner: EntityId::new(999),
+            ..shell(500)
+        })
+        .expect("the shell was accepted");
+
+        let result = sim.tick();
+
+        let impacts: Vec<&GameEvent> = result
+            .events
+            .iter()
+            .filter(|e| matches!(e, GameEvent::ProjectileImpact { .. }))
+            .collect();
+        assert_eq!(
+            impacts.len(),
+            1,
+            "the impact must be reported once; events were {:?}",
+            result.events
+        );
+        match impacts[0] {
+            GameEvent::ProjectileImpact {
+                projectile,
+                position,
+                ..
+            } => {
+                assert_eq!(*projectile, EntityId::new(500), "the wrong shell");
+                assert!(
+                    position.x > 0.0 && position.x < 25.0,
+                    "the impact was reported at {position:?}, which is not the rock"
+                );
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
     }
 
     /// The negative control for the test above, in the same binary and the same
@@ -1590,11 +2263,11 @@ mod tests {
             min: Vec3f::new(5.0, 10.0, -10.0),
             max: Vec3f::new(25.0, -10.0, 10.0),
         };
-        assert!(sim.set_world(broken).is_err(), "an inverted rock was accepted");
         assert!(
-            sim.world().is_none(),
-            "a refused map was installed anyway"
+            sim.set_world(broken).is_err(),
+            "an inverted rock was accepted"
         );
+        assert!(sim.world().is_none(), "a refused map was installed anyway");
     }
 
     /// Bug №608: a shell that has lost all its speed freezes — `integrate_step`
@@ -1678,5 +2351,591 @@ mod tests {
             sim.get_active_projectiles().is_empty(),
             "a shell entered at rest must be spent on the following tick"
         );
+    }
+
+    // Bug №664: a live ship for the model tests. The loader's frigate class is
+    // the same production data the server spawns, so the plate these tests face
+    // (armor 50.0) is the plate players face.
+    fn test_frigate(id: u64) -> Ship {
+        use rfs_damage::damage::DamageSystem;
+        use rfs_ship::loader::{create_default_frigate, ShipLoader};
+        let mut loader = ShipLoader::new("tests");
+        loader.register_class(create_default_frigate());
+        loader
+            .create_ship(1, EntityId::new(id), Arc::new(DamageSystem::new()))
+            .expect("the frigate class builds a ship")
+    }
+
+    /// Bug №664: the live damage path models the hit instead of applying the
+    /// declared number.
+    ///
+    /// A chain-shot round (declared damage 50, penetration 10) driven squarely
+    /// into the frigate's plate cannot punch through (10 « armor 50), so the
+    /// model's stopped branch halves the damage: the hull loses ~25 health,
+    /// not the raw 50. Impact angle 0 also means no ricochet, so the number is
+    /// independent of the penetration jitter.
+    #[test]
+    fn a_square_hit_stops_on_the_plate_and_halves_the_damage() {
+        let mut sim = TickSystem::new();
+        sim.add_ship(test_frigate(10));
+        let hull = sim
+            .get_ship(EntityId::new(10))
+            .expect("the frigate sits in the sim");
+        let bounds = hull.bounds();
+        let center = bounds.center();
+        // Spawn outside the +X face, straight at it: the swept segment crosses
+        // the face head-on, so the collision normal is the face normal and the
+        // incidence angle is zero.
+        let spawn = Vec3f::new(bounds.max.x + 4.0, center.y, center.z);
+        sim.fire_projectile(Projectile {
+            position: spawn,
+            prev_position: spawn,
+            velocity: Vec3f::new(-200.0, 0.0, 0.0),
+            projectile_type: ProjectileType::ChainShot,
+            damage: 50.0,
+            penetration: 10.0,
+            ..shell(2)
+        })
+        .expect("the chain shot was accepted");
+
+        // Tick 1 records the collision and prices the damage; tick 2 applies
+        // it at the boundary (plan §5.1). The applied event carries the exact
+        // modelled number, so the assertion is on the model, not on how the
+        // damage graph later splits it across compartments.
+        sim.tick();
+        let applied = sim.tick();
+
+        let hits: Vec<f32> = applied
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::ShipHit { target, damage, .. } if *target == EntityId::new(10) => {
+                    Some(*damage)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "one collision, one hit priced: {hits:?}");
+        assert!(
+            (hits[0] - 25.0).abs() < 0.5,
+            "a stopped plate must halve the damage, got {} (the raw path would land 50)",
+            hits[0]
+        );
+        assert!(
+            10000.0 - hull.health() > 0.5,
+            "the modelled damage never reached the hull"
+        );
+    }
+
+    /// Bug №664: the ricochet branch fires off shallow impacts.
+    ///
+    /// The same chain shot skimming nearly parallel to the plate (|v·n| ≈ 0.32,
+    /// i.e. ~72° off the normal) is past the ricochet threshold (0.707 rad),
+    /// so the model keeps a quarter: ~12.5, not the raw 50 — and not the ~25
+    /// the square hit dealt.
+    #[test]
+    fn a_shallow_hit_ricochets_for_a_quarter() {
+        let mut sim = TickSystem::new();
+        sim.add_ship(test_frigate(10));
+        let hull = sim
+            .get_ship(EntityId::new(10))
+            .expect("the frigate sits in the sim");
+        let bounds = hull.bounds();
+        let center = bounds.center();
+        let half_x = (bounds.max.x - bounds.min.x) * 0.5;
+        // Skim the +X face: mostly parallel drift (z), slight inward creep
+        // (x). The contact point stays near the face middle in z, so the
+        // dominant-axis normal is the face normal.
+        let spawn = Vec3f::new(bounds.max.x + 0.8, center.y, center.z - 0.25 * half_x);
+        sim.fire_projectile(Projectile {
+            position: spawn,
+            prev_position: spawn,
+            velocity: Vec3f::new(-30.0, 0.0, 90.0),
+            projectile_type: ProjectileType::ChainShot,
+            damage: 50.0,
+            penetration: 10.0,
+            ..shell(2)
+        })
+        .expect("the chain shot was accepted");
+
+        sim.tick();
+        let applied = sim.tick();
+
+        let hits: Vec<f32> = applied
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::ShipHit { target, damage, .. } if *target == EntityId::new(10) => {
+                    Some(*damage)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "one collision, one hit priced: {hits:?}");
+        assert!(
+            (hits[0] - 12.5).abs() < 0.5,
+            "a grazing hit must ricochet for a quarter, got {} (raw would be 50)",
+            hits[0]
+        );
+        assert!(
+            10000.0 - hull.health() > 0.5,
+            "the modelled damage never reached the hull"
+        );
+    }
+
+    /// Bug №664 (remainder): a ricochet is a shell that keeps going.
+    ///
+    /// The same grazing chain shot as above, but on a rise (+3 m/s in y) so
+    /// the impact lands on the freeboard — OVER the waterline. This matters:
+    /// gravity drops the flat shot's impact point to y ≈ −0.009, just under
+    /// the surface, and the water integrator then honestly drowns the bounce
+    /// (water drag stops the reflected shell in the same tick). The mechanic
+    /// is tested where it is visible: the hit is still priced once (~12.5),
+    /// and the shell stays in the world, reflected off the plate and with its
+    /// bounce count bumped. The reflected velocity points OUT of the hull
+    /// face (the inbound creep was in -X, so the bounce flips that). The old
+    /// model treated a graze as hit-and-vanish, where nothing would remain in
+    /// flight.
+    #[test]
+    fn a_ricochet_reflects_the_shell_rather_than_vanishing() {
+        let mut sim = TickSystem::new();
+        sim.add_ship(test_frigate(10));
+        let hull = sim
+            .get_ship(EntityId::new(10))
+            .expect("the frigate sits in the sim");
+        let bounds = hull.bounds();
+        let center = bounds.center();
+        let half_x = (bounds.max.x - bounds.min.x) * 0.5;
+        let spawn = Vec3f::new(bounds.max.x + 0.8, center.y, center.z - 0.25 * half_x);
+        sim.fire_projectile(Projectile {
+            position: spawn,
+            prev_position: spawn,
+            velocity: Vec3f::new(-30.0, 3.0, 90.0),
+            projectile_type: ProjectileType::ChainShot,
+            damage: 50.0,
+            penetration: 10.0,
+            ..shell(2)
+        })
+        .expect("the chain shot was accepted");
+
+        sim.tick();
+        let applied = sim.tick();
+
+        let hits: Vec<f32> = applied
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::ShipHit { target, damage, .. } if *target == EntityId::new(10) => {
+                    Some(*damage)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "one collision, one hit priced: {hits:?}");
+        assert!(
+            (hits[0] - 12.5).abs() < 0.5,
+            "the grazing pricing is unchanged by the bounce: {hits:?}"
+        );
+
+        let live = sim.get_active_projectiles();
+        assert_eq!(
+            live.len(),
+            1,
+            "a ricochet keeps the shell in flight, it does not vanish"
+        );
+        assert_eq!(
+            live[0].ricochet_count, 1,
+            "the bounce must be counted on the shell itself"
+        );
+        assert!(
+            live[0].velocity.x > 0.0,
+            "the bounce must push the shell back OFF the +X face, got vx {} (inbound was -30)",
+            live[0].velocity.x
+        );
+        assert!(
+            live[0].position.x > bounds.max.x,
+            "the shell must rest outside the plate it was ejected from, x {}",
+            live[0].position.x
+        );
+
+        // And it flies on without re-colliding with the hull it just left.
+        sim.tick();
+        assert_eq!(
+            sim.get_active_projectiles().len(),
+            1,
+            "a bounced shell must not immediately collide again"
+        );
+    }
+
+    /// Bug №664 (remainder): the config caps the bounces, not just the math.
+    ///
+    /// The same graze with `max_ricochets: 0`: no bounce budget means no
+    /// reflection — the shell is spent where it struck, which is the original
+    /// hit-and-vanish behaviour. A cap that was written but never read would
+    /// not make this difference.
+    #[test]
+    fn the_ricochet_budget_caps_the_bounces() {
+        let mut sim = TickSystem::with_ballistics(BallisticsConfig {
+            max_ricochets: 0,
+            ..BallisticsConfig::default()
+        });
+        sim.add_ship(test_frigate(10));
+        let hull = sim
+            .get_ship(EntityId::new(10))
+            .expect("the frigate sits in the sim");
+        let bounds = hull.bounds();
+        let center = bounds.center();
+        let half_x = (bounds.max.x - bounds.min.x) * 0.5;
+        let spawn = Vec3f::new(bounds.max.x + 0.8, center.y, center.z - 0.25 * half_x);
+        sim.fire_projectile(Projectile {
+            position: spawn,
+            prev_position: spawn,
+            velocity: Vec3f::new(-30.0, 0.0, 90.0),
+            projectile_type: ProjectileType::ChainShot,
+            damage: 50.0,
+            penetration: 10.0,
+            ..shell(2)
+        })
+        .expect("the chain shot was accepted");
+
+        sim.tick();
+        let applied = sim.tick();
+
+        let hits: Vec<f32> = applied
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::ShipHit { target, damage, .. } if *target == EntityId::new(10) => {
+                    Some(*damage)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "the hit is still priced: {hits:?}");
+        assert!(
+            10000.0 - hull.health() > 0.5,
+            "the modelled damage never reached the hull"
+        );
+        assert!(
+            sim.get_active_projectiles().is_empty(),
+            "a zero bounce budget must spend the shell at the impact point"
+        );
+    }
+
+    /// Bug №664 (remainder): a diving shell stops ON the waterline, not past
+    /// it.
+    ///
+    /// A 400 m/s dive from 5 m up crosses the surface 12.5 ms into the tick;
+    /// the old single-step air branch carried the shell the FULL tick (~13 m)
+    /// past the surface and only switched it to the water integrator on the
+    /// next tick. `check_water_entry` names the crossing, so the tick flies
+    /// air until it and water after it — the shell ends THIS tick at the
+    /// surface, and the water drag (2.37·v²) has already stopped it dead, so
+    /// the following tick retires it.
+    #[test]
+    fn a_diving_shell_stops_on_the_waterline_rather_than_tunnelling() {
+        let mut sim = TickSystem::new();
+        sim.fire_projectile(Projectile {
+            position: Vec3f::new(0.0, 5.0, 0.0),
+            prev_position: Vec3f::new(0.0, 5.0, 0.0),
+            velocity: Vec3f::new(0.0, -400.0, 0.0),
+            ..shell(2)
+        })
+        .expect("the diving shell was accepted");
+
+        sim.tick();
+        let live = sim.get_active_projectiles();
+        assert_eq!(live.len(), 1, "the shell survived the entry tick");
+        assert!(
+            live[0].position.y.abs() < 0.5,
+            "the shell must end the entry tick AT the waterline, got y {} (the old air step put it ~13 m under)",
+            live[0].position.y
+        );
+
+        // Dead in the water: the next tick retires it, it does not keep
+        // diving into the sea.
+        sim.tick();
+        assert!(
+            sim.get_active_projectiles().is_empty(),
+            "a shell stopped by water drag must be retired, not left sinking"
+        );
+    }
+}
+
+/// Bug №308 and the design note's ramming: what a hull contact does.
+///
+/// The note is specific: "a heavy fast destroyer rams a light frigate
+/// devastatingly and barely notices the hit itself", and the damage has to be
+/// the same compartment graph a shell uses — a different SOURCE, not a new
+/// damage system.
+#[cfg(test)]
+mod ram_tests {
+    use super::*;
+    use rfs_core::math::Bounds;
+    use rfs_damage::damage::DamageSystem;
+    use rfs_ship::ship::{Ship, ShipConfig};
+
+    const HEAVY: f32 = 2_000_000.0;
+    const LIGHT: f32 = 200_000.0;
+
+    fn ship(id: u64, mass: f32, position: Vec3f, velocity: Vec3f) -> Ship {
+        let config = ShipConfig {
+            mass,
+            ..ShipConfig::default()
+        };
+        let ship = Ship::new(config, EntityId::new(id), Arc::new(DamageSystem::new()));
+        let mut state = ship.get_state();
+        state.transform.position = position;
+        state.velocity = velocity;
+        ship.apply_state(state);
+        ship
+    }
+
+    /// Two hulls on a closing course, one tick of contact, and the tick that
+    /// lands the damage.
+    ///
+    /// The hulls start nose to nose: a ship's box is 50×30×150 around its
+    /// centre, so at ±40 along X they already overlap and the contact
+    /// happens in the first tick.
+    fn ram(heavy_mass: f32, light_mass: f32, speed: f32) -> TickSystem {
+        let mut sim = TickSystem::new();
+        let heavy = ship(
+            1,
+            heavy_mass,
+            Vec3f::new(-40.0, 0.0, 0.0),
+            Vec3f::new(speed, 0.0, 0.0),
+        );
+        let light = ship(
+            2,
+            light_mass,
+            Vec3f::new(40.0, 0.0, 0.0),
+            Vec3f::new(-speed, 0.0, 0.0),
+        );
+        sim.add_ship(heavy);
+        sim.add_ship(light);
+        sim.tick();
+        sim.tick();
+        sim
+    }
+
+    #[test]
+    fn a_ram_damages_the_light_ship_far_more_than_the_heavy_one() {
+        let sim = ram(HEAVY, LIGHT, 12.0);
+        let heavy_health = sim.get_ship(EntityId::new(1)).unwrap().get_state().health;
+        let light_health = sim.get_ship(EntityId::new(2)).unwrap().get_state().health;
+
+        let heavy_loss = ShipConfig::default().max_health - heavy_health;
+        let light_loss = ShipConfig::default().max_health - light_health;
+        assert!(
+            light_loss > heavy_loss * 5.0,
+            "the heavy ship must barely notice the hit: it lost {heavy_loss}, the light one {light_loss}"
+        );
+        assert!(
+            light_loss > 0.0,
+            "a ram at 12 m/s must actually hurt the ship it hits"
+        );
+    }
+
+    #[test]
+    fn a_ram_is_reported_as_a_ram_and_not_as_a_shell_hit() {
+        let mut sim = TickSystem::new();
+        let heavy = ship(
+            1,
+            HEAVY,
+            Vec3f::new(-40.0, 0.0, 0.0),
+            Vec3f::new(12.0, 0.0, 0.0),
+        );
+        let light = ship(
+            2,
+            LIGHT,
+            Vec3f::new(40.0, 0.0, 0.0),
+            Vec3f::new(-12.0, 0.0, 0.0),
+        );
+        sim.add_ship(heavy);
+        sim.add_ship(light);
+        let first = sim.tick();
+        let second = sim.tick();
+
+        let rams: Vec<&GameEvent> = second
+            .events
+            .iter()
+            .filter(|e| matches!(e, GameEvent::ShipRam { .. }))
+            .collect();
+        assert!(
+            !rams.is_empty(),
+            "the ram must be reported; events were {:?}",
+            second.events
+        );
+        assert!(
+            first
+                .events
+                .iter()
+                .all(|e| !matches!(e, GameEvent::ShipRam { .. })),
+            "the damage lands on the next tick, not in the contact tick"
+        );
+    }
+
+    #[test]
+    fn the_ramming_ships_do_not_pass_through_each_other() {
+        let mut sim = TickSystem::new();
+        let heavy = ship(
+            1,
+            HEAVY,
+            Vec3f::new(-40.0, 0.0, 0.0),
+            Vec3f::new(40.0, 0.0, 0.0),
+        );
+        let light = ship(
+            2,
+            LIGHT,
+            Vec3f::new(40.0, 0.0, 0.0),
+            Vec3f::new(-40.0, 0.0, 0.0),
+        );
+        sim.add_ship(heavy);
+        sim.add_ship(light);
+        for _ in 0..5 {
+            sim.tick();
+        }
+        let a = sim.get_ship(EntityId::new(1)).unwrap().get_state();
+        let b = sim.get_ship(EntityId::new(2)).unwrap().get_state();
+        let gap = b.transform.position.x - a.transform.position.x;
+        assert!(
+            gap > 0.0,
+            "the hulls must not end up on the wrong sides of each other, gap={gap}"
+        );
+    }
+
+    /// Owner decision (2026-10-21): the loss of speed depends on the angle of
+    /// the contact — a head-on ram takes the way away, a glancing blow barely
+    /// touches it. No bounce, no grip.
+    #[test]
+    fn a_glancing_ram_costs_little_way_and_a_head_on_ram_costs_a_lot() {
+        let glancing = ram_speed_loss(75.0);
+        let head_on = ram_speed_loss(0.0);
+        assert!(
+            head_on > glancing * 3.0,
+            "a head-on ram must cost far more way than a glancing one: {head_on} vs {glancing}"
+        );
+        assert!(
+            glancing < 1.0,
+            "a glancing blow must barely take the way away, it took {glancing}"
+        );
+    }
+
+    /// How much of its own speed the struck hull loses in a ram, for a
+    /// contact at `angle_degrees` off the head-on direction.
+    ///
+    /// The two hulls start ALREADY overlapping, so the contact happens in the
+    /// first tick whatever their directions are: a glancing blow is a hull
+    /// that slides along another, not one that misses it.
+    fn ram_speed_loss(angle_degrees: f32) -> f32 {
+        let mut sim = TickSystem::new();
+        let speed = 12.0;
+        let angle = angle_degrees.to_radians();
+        let a = ship(
+            1,
+            LIGHT,
+            Vec3f::new(-40.0, 0.0, 0.0),
+            Vec3f::new(speed, 0.0, 0.0),
+        );
+        let b = ship(
+            2,
+            LIGHT,
+            Vec3f::new(40.0, 0.0, 0.0),
+            Vec3f::new(-speed * angle.cos(), -speed * angle.sin(), 0.0),
+        );
+        sim.add_ship(a);
+        sim.add_ship(b);
+        sim.tick();
+        let after = sim.get_ship(EntityId::new(2)).unwrap().get_state();
+        let before = speed;
+        (before - after.velocity.length()).abs()
+    }
+
+    #[test]
+    fn a_ship_inside_a_structure_is_pushed_out_of_it() {
+        // Bug №308: the world was solid for shells and permeable for ships.
+        //
+        // The contact model here is "leaning": a hull that overlaps a solid
+        // volume is pushed out along the shallowest axis and loses the speed
+        // that was carrying it in. A full "stopped outside" model — the hull
+        // never entering the volume at all — is a different decision about
+        // contact, and the record leaves it open; what is NOT open is a hull
+        // that drives deeper into the rock every tick.
+        let mut sim = TickSystem::new();
+        let structure = Bounds::new(
+            Vec3f::new(-100.0, -100.0, -100.0),
+            Vec3f::new(100.0, 100.0, 100.0),
+        );
+        sim.set_world(crate::map::WorldMap {
+            name: "structure-test".into(),
+            bounds: Bounds::new(
+                Vec3f::new(-5000.0, -5000.0, -5000.0),
+                Vec3f::new(5000.0, 5000.0, 5000.0),
+            ),
+            obstacles: vec![crate::map::MapObstacle {
+                id: 1,
+                bounds: structure,
+                kind: crate::map::ObstacleKind::Structure,
+            }],
+        })
+        .expect("the test world is valid");
+
+        let hull = ship(
+            1,
+            LIGHT,
+            Vec3f::new(0.0, 0.0, 0.0),
+            Vec3f::new(-30.0, 0.0, 0.0),
+        );
+        sim.add_ship(hull);
+        sim.tick();
+        let after = sim.get_ship(EntityId::new(1)).unwrap().get_state();
+
+        // The hull was pushed out of the structure: it starts centred in it,
+        // and afterwards it lies on the surface.
+        assert!(
+            after.transform.position.length() > 1.0,
+            "the hull was not pushed out of the structure at all: {:?}",
+            after.transform.position
+        );
+
+        // And it must not sink deeper with every tick: the overlap with the
+        // structure may not grow.
+        let mut previous = structure_overlap(&after.transform.position, &structure);
+        for _ in 0..3 {
+            sim.tick();
+            let state = sim.get_ship(EntityId::new(1)).unwrap().get_state();
+            let depth = structure_overlap(&state.transform.position, &structure);
+            assert!(
+                depth <= previous + 1e-3,
+                "the hull sank deeper into the structure: {previous} -> {depth}"
+            );
+            previous = depth;
+        }
+    }
+
+    /// How deeply a hull overlaps a structure, summed over the axes.
+    fn structure_overlap(position: &Vec3f, structure: &Bounds) -> f32 {
+        let half = Vec3f::new(50.0, 30.0, 150.0);
+        let hull_min = [
+            position.x - half.x,
+            position.y - half.y,
+            position.z - half.z,
+        ];
+        let hull_max = [
+            position.x + half.x,
+            position.y + half.y,
+            position.z + half.z,
+        ];
+        let rock_min = [structure.min.x, structure.min.y, structure.min.z];
+        let rock_max = [structure.max.x, structure.max.y, structure.max.z];
+        let mut total = 0.0;
+        for axis in 0..3 {
+            let overlap =
+                (hull_max[axis].min(rock_max[axis])) - (hull_min[axis].max(rock_min[axis]));
+            if overlap > 0.0 {
+                total += overlap;
+            }
+        }
+        total
     }
 }

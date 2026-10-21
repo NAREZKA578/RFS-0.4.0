@@ -1,7 +1,7 @@
-use glam::{Vec3, Quat, Mat4};
-use serde::{Deserialize, Serialize};
 use bytemuck::{Pod, Zeroable};
-use std::ops::{Add, Sub, Mul, Div, Neg, AddAssign, SubAssign, MulAssign};
+use glam::{Mat4, Quat, Vec3};
+use serde::{Deserialize, Serialize};
+use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize, Pod, Zeroable)]
@@ -297,7 +297,11 @@ impl Transform {
     };
 
     pub fn new(position: Vec3f, rotation: Quatf, scale: Vec3f) -> Self {
-        Self { position, rotation, scale }
+        Self {
+            position,
+            rotation,
+            scale,
+        }
     }
 
     pub fn from_position(position: Vec3f) -> Self {
@@ -435,15 +439,21 @@ impl Bounds {
     }
 
     pub fn contains(&self, point: Vec3f) -> bool {
-        point.x >= self.min.x && point.x <= self.max.x &&
-        point.y >= self.min.y && point.y <= self.max.y &&
-        point.z >= self.min.z && point.z <= self.max.z
+        point.x >= self.min.x
+            && point.x <= self.max.x
+            && point.y >= self.min.y
+            && point.y <= self.max.y
+            && point.z >= self.min.z
+            && point.z <= self.max.z
     }
 
     pub fn intersects(&self, other: &Bounds) -> bool {
-        self.min.x <= other.max.x && self.max.x >= other.min.x &&
-        self.min.y <= other.max.y && self.max.y >= other.min.y &&
-        self.min.z <= other.max.z && self.max.z >= other.min.z
+        self.min.x <= other.max.x
+            && self.max.x >= other.min.x
+            && self.min.y <= other.max.y
+            && self.max.y >= other.min.y
+            && self.min.z <= other.max.z
+            && self.max.z >= other.min.z
     }
 
     pub fn expand(&self, amount: f32) -> Self {
@@ -457,7 +467,7 @@ impl Bounds {
 mod tests {
     use super::{Bounds, Vec3f};
 
-/// Bug №199: a box whose corners arrive swapped used to stay that way, and
+    /// Bug №199: a box whose corners arrive swapped used to stay that way, and
     /// `size()` then reported a negative extent.
     #[test]
     fn an_inverted_axis_is_ordered_on_construction() {
@@ -499,7 +509,10 @@ mod tests {
     fn size_is_never_negative() {
         let b = Bounds::new(Vec3f::new(10.0, -1.0, 0.0), Vec3f::new(-10.0, 1.0, 7.0));
         let s = b.size();
-        assert!(s.x >= 0.0 && s.y >= 0.0 && s.z >= 0.0, "negative size {s:?}");
+        assert!(
+            s.x >= 0.0 && s.y >= 0.0 && s.z >= 0.0,
+            "negative size {s:?}"
+        );
         assert_eq!(s, Vec3f::new(20.0, 2.0, 7.0));
     }
 
@@ -687,6 +700,9 @@ mod tests {
         // that rely on it change meaning.
         let v = Vec3f::new(3.0, 4.0, 0.0);
         let n = v.normalize();
-        assert!((n.x - 0.6).abs() < 1e-6 && (n.y - 0.8).abs() < 1e-6, "got {n:?}");
+        assert!(
+            (n.x - 0.6).abs() < 1e-6 && (n.y - 0.8).abs() < 1e-6,
+            "got {n:?}"
+        );
     }
 }

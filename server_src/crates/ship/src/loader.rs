@@ -1,6 +1,9 @@
-use rfs_core::entity::{ShipClass, CompartmentTemplate, BulkheadTemplate, StationTemplate, StationType, EntityId, Bounds, Vec3f, Transform};
-use rfs_core::math::Quatf;
 use crate::ship::{Ship, ShipConfig};
+use rfs_core::entity::{
+    Bounds, BulkheadTemplate, CompartmentTemplate, EntityId, ShipClass, StationTemplate,
+    StationType, Transform, Vec3f,
+};
+use rfs_core::math::Quatf;
 use rfs_damage::damage::DamageSystem;
 use std::collections::HashMap;
 use std::fs;
@@ -29,7 +32,7 @@ impl ShipLoader {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 self.load_ship_class(&path)?;
             }
@@ -41,17 +44,31 @@ impl ShipLoader {
     pub fn load_ship_class(&mut self, path: &Path) -> Result<(), ShipLoadError> {
         let content = fs::read_to_string(path)?;
         let class: ShipClass = serde_json::from_str(&content)?;
-        
+
         self.ship_classes.insert(class.class_id, class);
         Ok(())
+    }
+
+    /// Bug №667: classes are data, but the built-in defaults exist too — when
+    /// no JSON directory is available they are registered here, so
+    /// `create_ship` stays the single spawn path for built-ins and disk
+    /// classes alike.
+    pub fn register_class(&mut self, class: ShipClass) {
+        self.ship_classes.insert(class.class_id, class);
     }
 
     pub fn get_class(&self, class_id: u32) -> Option<&ShipClass> {
         self.ship_classes.get(&class_id)
     }
 
-    pub fn create_ship(&self, class_id: u32, entity_id: EntityId, damage_system: Arc<DamageSystem>) -> Result<Ship, ShipLoadError> {
-        let class = self.get_class(class_id)
+    pub fn create_ship(
+        &self,
+        class_id: u32,
+        entity_id: EntityId,
+        damage_system: Arc<DamageSystem>,
+    ) -> Result<Ship, ShipLoadError> {
+        let class = self
+            .get_class(class_id)
             .ok_or(ShipLoadError::ClassNotFound(class_id))?;
 
         let config: ShipConfig = class.clone().into();
@@ -99,15 +116,16 @@ pub fn create_default_frigate() -> ShipClass {
                 ),
                 max_water_level: 100.0,
                 pump_capacity: 10.0,
-                connected_compartments: vec!["forward_magazine".to_string(), "crew_quarters".to_string()],
-                bulkheads: vec![
-                    BulkheadTemplate {
-                        name: "forecastle_bulkhead".to_string(),
-                        local_position: Vec3f::new(0.0, 2.5, 25.0),
-                        connects_to: "forward_magazine".to_string(),
-                        seal_strength: 500.0,
-                    },
+                connected_compartments: vec![
+                    "forward_magazine".to_string(),
+                    "crew_quarters".to_string(),
                 ],
+                bulkheads: vec![BulkheadTemplate {
+                    name: "forecastle_bulkhead".to_string(),
+                    local_position: Vec3f::new(0.0, 2.5, 25.0),
+                    connects_to: "forward_magazine".to_string(),
+                    seal_strength: 500.0,
+                }],
                 // Bug №87: "anchor_winch" referenced a StationTemplate that
                 // does not exist anywhere in the tree — the name lookup
                 // produced a nil id and the entity was silently skipped. The
@@ -117,13 +135,14 @@ pub fn create_default_frigate() -> ShipClass {
             },
             CompartmentTemplate {
                 name: "forward_magazine".to_string(),
-                local_bounds: Bounds::new(
-                    Vec3f::new(-8.0, -2.0, 10.0),
-                    Vec3f::new(8.0, 2.0, 30.0),
-                ),
+                local_bounds: Bounds::new(Vec3f::new(-8.0, -2.0, 10.0), Vec3f::new(8.0, 2.0, 30.0)),
                 max_water_level: 80.0,
                 pump_capacity: 15.0,
-                connected_compartments: vec!["forecastle".to_string(), "crew_quarters".to_string(), "engine_room".to_string()],
+                connected_compartments: vec![
+                    "forecastle".to_string(),
+                    "crew_quarters".to_string(),
+                    "engine_room".to_string(),
+                ],
                 bulkheads: vec![
                     BulkheadTemplate {
                         name: "magazine_fore".to_string(),
@@ -148,7 +167,11 @@ pub fn create_default_frigate() -> ShipClass {
                 ),
                 max_water_level: 200.0,
                 pump_capacity: 20.0,
-                connected_compartments: vec!["forward_magazine".to_string(), "engine_room".to_string(), "wardroom".to_string()],
+                connected_compartments: vec![
+                    "forward_magazine".to_string(),
+                    "engine_room".to_string(),
+                    "wardroom".to_string(),
+                ],
                 bulkheads: vec![
                     BulkheadTemplate {
                         name: "quarters_fore".to_string(),
@@ -173,7 +196,11 @@ pub fn create_default_frigate() -> ShipClass {
                 ),
                 max_water_level: 300.0,
                 pump_capacity: 50.0,
-                connected_compartments: vec!["crew_quarters".to_string(), "aft_magazine".to_string(), "steering_gear".to_string()],
+                connected_compartments: vec![
+                    "crew_quarters".to_string(),
+                    "aft_magazine".to_string(),
+                    "steering_gear".to_string(),
+                ],
                 bulkheads: vec![
                     BulkheadTemplate {
                         name: "engine_fore".to_string(),
@@ -198,15 +225,16 @@ pub fn create_default_frigate() -> ShipClass {
                 ),
                 max_water_level: 80.0,
                 pump_capacity: 15.0,
-                connected_compartments: vec!["engine_room".to_string(), "steering_gear".to_string()],
-                bulkheads: vec![
-                    BulkheadTemplate {
-                        name: "magazine_fore".to_string(),
-                        local_position: Vec3f::new(0.0, 0.0, -25.0),
-                        connects_to: "engine_room".to_string(),
-                        seal_strength: 800.0,
-                    },
+                connected_compartments: vec![
+                    "engine_room".to_string(),
+                    "steering_gear".to_string(),
                 ],
+                bulkheads: vec![BulkheadTemplate {
+                    name: "magazine_fore".to_string(),
+                    local_position: Vec3f::new(0.0, 0.0, -25.0),
+                    connects_to: "engine_room".to_string(),
+                    seal_strength: 800.0,
+                }],
                 stations: vec!["gun_3_ammo".to_string(), "gun_4_ammo".to_string()],
             },
             CompartmentTemplate {
@@ -218,34 +246,31 @@ pub fn create_default_frigate() -> ShipClass {
                 max_water_level: 50.0,
                 pump_capacity: 10.0,
                 connected_compartments: vec!["engine_room".to_string(), "aft_magazine".to_string()],
-                bulkheads: vec![
-                    BulkheadTemplate {
-                        name: "steering_fore".to_string(),
-                        local_position: Vec3f::new(0.0, -0.5, -50.0),
-                        connects_to: "engine_room".to_string(),
-                        seal_strength: 300.0,
-                    },
-                ],
+                bulkheads: vec![BulkheadTemplate {
+                    name: "steering_fore".to_string(),
+                    local_position: Vec3f::new(0.0, -0.5, -50.0),
+                    connects_to: "engine_room".to_string(),
+                    seal_strength: 300.0,
+                }],
                 stations: vec!["emergency_tiller".to_string()],
             },
             CompartmentTemplate {
                 name: "wardroom".to_string(),
-                local_bounds: Bounds::new(
-                    Vec3f::new(-8.0, 2.0, -10.0),
-                    Vec3f::new(8.0, 8.0, 10.0),
-                ),
+                local_bounds: Bounds::new(Vec3f::new(-8.0, 2.0, -10.0), Vec3f::new(8.0, 8.0, 10.0)),
                 max_water_level: 50.0,
                 pump_capacity: 5.0,
                 connected_compartments: vec!["crew_quarters".to_string()],
-                bulkheads: vec![
-                    BulkheadTemplate {
-                        name: "wardroom_bulkhead".to_string(),
-                        local_position: Vec3f::new(0.0, 5.0, -10.0),
-                        connects_to: "crew_quarters".to_string(),
-                        seal_strength: 200.0,
-                    },
+                bulkheads: vec![BulkheadTemplate {
+                    name: "wardroom_bulkhead".to_string(),
+                    local_position: Vec3f::new(0.0, 5.0, -10.0),
+                    connects_to: "crew_quarters".to_string(),
+                    seal_strength: 200.0,
+                }],
+                stations: vec![
+                    "captain_chair".to_string(),
+                    "comms".to_string(),
+                    "radar".to_string(),
                 ],
-                stations: vec!["captain_chair".to_string(), "comms".to_string(), "radar".to_string()],
             },
         ],
         stations: vec![
@@ -515,6 +540,66 @@ pub fn create_default_destroyer() -> ShipClass {
     frigate.armor_thickness = 100.0;
     frigate.crew_min = 30;
     frigate.crew_max = 80;
-    
+
     frigate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rfs_damage::damage::DamageSystem;
+
+    /// Bug №667: the ship a player boards must be the one the registry
+    /// describes — `create_ship` is the one door from a class to a ship, and
+    /// the registered compartment list must survive in the live ship.
+    #[test]
+    fn create_ship_builds_the_registered_class() {
+        let mut loader = ShipLoader::new("nonexistent-ships-dir");
+        loader.register_class(create_default_frigate());
+
+        let ship = loader
+            .create_ship(1, EntityId::new(10), Arc::new(DamageSystem::new()))
+            .expect("the registered class must build");
+
+        assert_eq!(ship.class_id(), 1);
+        assert_eq!(
+            ship.get_state().compartment_states.len(),
+            create_default_frigate().compartments.len(),
+            "the built ship carries the registered compartment list"
+        );
+    }
+
+    /// A class the registry does not have is a real error, a not a panic:
+    /// a typo'd id cannot crash the server at spawn time.
+    #[test]
+    fn an_unknown_class_is_refused_by_create_ship() {
+        let loader = ShipLoader::new("nonexistent-ships-dir");
+        assert!(matches!(
+            loader.create_ship(99, EntityId::new(1), Arc::new(DamageSystem::new())),
+            Err(ShipLoadError::ClassNotFound(99))
+        ));
+    }
+
+    /// Classes are data on disk: a JSON file lands in the registry through
+    /// `load_all` and builds a ship with the same ids the file declared.
+    #[test]
+    fn a_ship_class_is_data_on_disk() {
+        let dir = std::env::temp_dir().join("rfs-loader-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("my_class.json");
+        let class = {
+            let mut c = create_default_frigate();
+            c.class_id = 5;
+            c
+        };
+        std::fs::write(&path, serde_json::to_string(&class).unwrap()).expect("json write");
+
+        let mut loader = ShipLoader::new(&dir.display().to_string());
+        loader.load_all().expect("the file must load");
+        let built = loader
+            .create_ship(5, EntityId::new(10), Arc::new(DamageSystem::new()))
+            .expect("the disk class must build");
+        assert_eq!(built.class_id(), 5);
+        std::fs::remove_file(&path).ok();
+    }
 }

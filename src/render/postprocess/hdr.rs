@@ -46,8 +46,9 @@ impl HDREffect {
     }
 
     pub fn initialize(&mut self, device: &Arc<Device>, context: &RenderContext, _input_format: Format) {
-        let width = context.resolution.width;
-        let height = context.resolution.height;
+        // Bug №651: the size comes from the presentation extent, not from
+        // `context.resolution` — see `RenderContext::drawable_extent`.
+        let (width, height) = context.drawable_size();
         self.output_texture = Some(device.create_texture(
             width,
             height,

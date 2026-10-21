@@ -89,6 +89,7 @@ impl Backend for VulkanBackend {
                 &self.reports[index].memory_properties,
                 logical.queues[0].family_index,
                 handle,
+                desc.features.sampler_anisotropy,
                 self.destroyable.clone(),
             )?,
         );

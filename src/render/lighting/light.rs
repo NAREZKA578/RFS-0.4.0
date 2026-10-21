@@ -26,6 +26,16 @@ pub struct Light {
     pub enabled: bool,
     pub casts_shadows: bool,
     pub shadow_resolution: u32,
+    /// How far the light reaches.
+    ///
+    /// The lighting shader's light model is positional: a light is a point with
+    /// a colour, an intensity and a radius, and the falloff is
+    /// `1 - distance / radius`. A directional light has no position and no
+    /// radius, so until the shader grows a light-type field, a directional
+    /// light has to be expressed as a point far enough away that the falloff
+    /// across the scene is negligible — and a light *without* a radius would
+    /// divide by zero, so the default is not zero.
+    pub radius: f32,
 }
 
 impl Light {
@@ -38,7 +48,16 @@ impl Light {
             enabled: true,
             casts_shadows: true,
             shadow_resolution: 1024,
+            // Far enough to cover a scene, and not zero: the shader's falloff
+            // divides by the radius.
+            radius: 100.0,
         }
+    }
+
+    /// How far the light reaches.
+    pub fn with_radius(mut self, radius: f32) -> Self {
+        self.radius = radius;
+        self
     }
 
     pub fn with_color(mut self, color: Vec3) -> Self {

@@ -1,19 +1,34 @@
 use crate::bandwidth::{BandwidthLimiter, BandwidthTracker};
 use crate::channel::{Channel, ChannelConfig};
-use crate::fragment::{FragmentAssembler, FRAGMENT_HEADER_SIZE, make_fragments};
-use rfs_core::packet::*;
-use rfs_core::time::{TICK_RATE};
+use crate::fragment::{make_fragments, FragmentAssembler, FRAGMENT_HEADER_SIZE};
+use crate::snapshot::LAYER_COUNT;
 use parking_lot::Mutex;
+use rfs_core::packet::*;
+use rfs_core::time::TICK_RATE;
 use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
-pub const MAX_PACKET_SIZE: usize = 1400;
+/// Bug №239: this is a re-export of the protocol's single wire budget, not a
+/// second number. The core constant is the one place the MTU is stated; a
+/// restatement here would drift silently the next time someone alters either
+/// copy.
+pub const MAX_PACKET_SIZE: usize = rfs_core::packet::MAX_PACKET_SIZE;
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Bug №215: retransmit cadence. 250 ms is a conservative RTO for the
+/// loopback/LAN profiles this server actually runs; the retry budget bounds
+/// a retransmit storm to ~2.5 s, after which the entry is declared lost and
+/// the connection timeout finishes the session.
+pub const RETRANSMIT_TIMEOUT_MS: u64 = 250;
+pub const RETRANSMIT_MAX_RETRIES: u32 = 10;
+/// Entries one pass may re-emit per connection; the next pass 33 ms later
+/// naturally throttles a burst instead of spending a whole tick socket on it.
+pub const RETRANSMIT_MAX_PER_PASS: usize = 16;
 pub const MAX_RELIABLE_WINDOW: u32 = 32;
 
 /// Bug №167: how many out-of-order reliable sequences the SACK tracker keeps
@@ -73,6 +88,29 @@ pub enum ConnectionState {
     Disconnected,
 }
 
+/// Bug №215: what `track_received_reliable` decided about a reliable sequence.
+/// `Duplicate` is receiver-side suppression: a retransmitted payload whose
+/// first delivery the peer never acked (our ack was lost) must not apply
+/// twice. `None` is "not a reliable channel at all".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliableArrival {
+    New,
+    Duplicate,
+}
+
+/// What `handle_packet` hands back: the reply packets for the transport plus
+/// the arrival verdict the caller's dispatch needs for reliable payloads.
+#[derive(Debug)]
+pub struct PacketOutcome {
+    /// Packets to send back (server.rs `send_packet`, client handler).
+    pub outgoing: Vec<OutgoingPacket>,
+    /// Reliable-arrival verdict for THIS datagram (`None` on unreliable
+    /// channels). Command processing gates on `Some(New)`: a retransmitted
+    /// Command must not run twice just because our ack of the first one was
+    /// lost in transit.
+    pub reliable_arrival: Option<ReliableArrival>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     pub max_packet_size: usize,
@@ -86,6 +124,9 @@ pub struct ConnectionConfig {
     /// connection, so one noisy client spent everyone else's budget. Each
     /// connection now carries its own bucket.
     pub max_bandwidth_bps: f64,
+    /// Bug №671: the connection's own rate tracker lives on this window.
+    /// Default is one second; the server passes its configured value down.
+    pub bandwidth_window: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -98,10 +139,14 @@ impl Default for ConnectionConfig {
             send_buffer_size: 1024 * 1024,
             receive_buffer_size: 1024 * 1024,
             max_bandwidth_bps: 512.0 * 1024.0,
+            bandwidth_window: Duration::from_secs(1),
             channels: vec![
-                ChannelConfig::new(ChannelType::UnreliableSequenced, 100, 100),
-                ChannelConfig::new(ChannelType::ReliableOrdered, 1000, 1000),
-                ChannelConfig::new(ChannelType::ReliableUnordered, 100, 100),
+                ChannelConfig::new(ChannelType::UnreliableSequenced, 100),
+                // Bug №215: the reliable ledgers hold retransmittable payload
+                // bytes. A burst of commands must not evict a queued ack
+                // answer, hence the wider buffer than the unreliable group.
+                ChannelConfig::new(ChannelType::ReliableOrdered, 1000),
+                ChannelConfig::new(ChannelType::ReliableUnordered, 100),
             ],
         }
     }
@@ -138,6 +183,11 @@ pub struct Connection {
     pub last_heartbeat: Mutex<Instant>,
     pub rtt: Mutex<Duration>,
     pub bandwidth: BandwidthTracker,
+    /// Bug №219: when this connection came into being. An in-flight handshake
+    /// cannot be distinguished from a stalled one by `last_received` (a live
+    /// client keeps the heartbeat moving), so the "player never registered"
+    /// reaper needs its own clock anchored at connection creation.
+    connected_since: Instant,
     pub client_id: Mutex<Option<u32>>,
     pub player_entity: Mutex<Option<EntityId>>,
     pub ship_entity: Mutex<Option<EntityId>>,
@@ -153,11 +203,23 @@ pub struct Connection {
     /// Bug №176: this connection's own send budget. A single shared server-wide
     /// limiter let one chatty client starve every other connection.
     bandwidth_limiter: BandwidthLimiter,
+    /// Bug №267 (A): layers this client asked to resync immediately. Consumed
+    /// by the snapshot pass on the next tick, so a stalled layer heals in one
+    /// round trip instead of waiting out the scheduled cadence.
+    resync_requests: Mutex<[bool; LAYER_COUNT]>,
+    /// Bug №216: whether this connection proved it may join. A server with a
+    /// secret configured holds the world back until the client answers with
+    /// it; a server without one authenticates everyone by default.
+    authenticated: AtomicBool,
 }
 
 impl Connection {
     pub fn new(id: u32, addr: SocketAddr, mut config: ConnectionConfig) -> Self {
-        let channels = config.channels.iter().map(|c| Channel::new(c.clone())).collect();
+        let channels = config
+            .channels
+            .iter()
+            .map(|c| Channel::new(c.clone()))
+            .collect();
         // Bug №10: a max_packet_size below the header size would underflow
         // every `max_packet_size - HEADER_SIZE`. Clamp once, loudly.
         if config.max_packet_size <= HEADER_SIZE {
@@ -169,6 +231,7 @@ impl Connection {
         }
 
         let limiter = BandwidthLimiter::new(config.max_bandwidth_bps);
+        let bandwidth_window = config.bandwidth_window;
 
         Self {
             id,
@@ -181,13 +244,14 @@ impl Connection {
             remote_ack: Mutex::new(0),
             remote_ack_bitfield: Mutex::new(0),
             pending_acks: Mutex::new(VecDeque::new()),
-        pending_ack_drops: AtomicU64::new(0),
-        first_pending_ack_drop: Mutex::new(None),
+            pending_ack_drops: AtomicU64::new(0),
+            first_pending_ack_drop: Mutex::new(None),
             last_received: Mutex::new(Instant::now()),
             last_sent: Mutex::new(Instant::now()),
             last_heartbeat: Mutex::new(Instant::now()),
             rtt: Mutex::new(Duration::from_millis(100)),
-            bandwidth: BandwidthTracker::new(),
+            bandwidth: BandwidthTracker::with_window(bandwidth_window),
+            connected_since: Instant::now(),
             client_id: Mutex::new(None),
             player_entity: Mutex::new(None),
             ship_entity: Mutex::new(None),
@@ -196,7 +260,22 @@ impl Connection {
             fragment_assembler: Mutex::new(FragmentAssembler::new()),
             reliable_hcr: Mutex::new(0),
             reliable_gaps: Mutex::new(BTreeSet::new()),
-            bandwidth_limiter: limiter,        }
+            bandwidth_limiter: limiter,
+            resync_requests: Mutex::new([false; LAYER_COUNT]),
+            // Bug №216: a connection starts out authenticated; a server that
+            // requires a secret turns that off until the client proves itself.
+            authenticated: AtomicBool::new(true),
+        }
+    }
+
+    /// Bug №216: whether this connection proved it may join.
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Relaxed)
+    }
+
+    /// Bug №216: mark the connection as having proved itself.
+    pub fn set_authenticated(&self, authenticated: bool) {
+        self.authenticated.store(authenticated, Ordering::Relaxed);
     }
 
     pub fn state(&self) -> ConnectionState {
@@ -209,6 +288,23 @@ impl Connection {
 
     pub fn is_connected(&self) -> bool {
         *self.state.lock() == ConnectionState::Connected
+    }
+
+    /// Bug №267 (A): client asks for an immediate resync of one layer.
+    /// Out-of-range layers are ignored rather than trusted from the wire.
+    pub fn request_resync(&self, layer: u8) {
+        if (layer as usize) < LAYER_COUNT {
+            self.resync_requests.lock()[layer as usize] = true;
+        }
+    }
+
+    /// Consumes a pending resync request: `true` only once, so one request
+    /// drives one resync pass and cannot keep re-arming itself.
+    pub fn take_resync_request(&self, layer: usize) -> bool {
+        if layer >= LAYER_COUNT {
+            return false;
+        }
+        std::mem::replace(&mut self.resync_requests.lock()[layer], false)
     }
 
     pub fn client_id(&self) -> Option<u32> {
@@ -272,13 +368,19 @@ impl Connection {
         }
     }
 
-    pub fn handle_packet(&self, header: PacketHeader, payload: &[u8]) -> Result<Vec<OutgoingPacket>, ConnectionError> {
+    pub fn handle_packet(
+        &self,
+        header: PacketHeader,
+        payload: &[u8],
+    ) -> Result<PacketOutcome, ConnectionError> {
         *self.last_received.lock() = Instant::now();
         self.bandwidth.record_received(payload.len());
 
         // Bug №167: feed the reliable-sequence tracker before building any ack
         // we may send, so the mark reflects this very packet.
-        self.track_received_reliable(header.sequence, channel_from_u8(header.channel));
+        // Bug №215: the verdict doubles as the caller's duplicate gate.
+        let reliable_arrival =
+            self.track_received_reliable(header.sequence, channel_from_u8(header.channel));
 
         {
             let mut remote_sequence = self.remote_sequence.lock();
@@ -296,34 +398,28 @@ impl Connection {
         }
         self.process_acks();
 
-        match PacketType::from_u8(header.packet_type) {
-            Some(PacketType::Heartbeat) => {
-                self.send_heartbeat_ack(header.sequence)
+        // Bug №215: the peer's ack state also clears OUR send ledgers — the
+        // consumer №167 promised and never had.
+        self.note_send_ack();
+
+        let outgoing = match PacketType::from_u8(header.packet_type) {
+            Some(PacketType::Heartbeat) => self.send_heartbeat_ack(header.sequence)?,
+            Some(PacketType::HeartbeatAck) => {
+                // Bug №12: RTT is measured against the last heartbeat WE
+                // sent (stamped in send_heartbeat), not against "now".
+                let rtt = self.last_heartbeat.lock().elapsed();
+                let mut current = self.rtt.lock();
+                *current = smooth_rtt(*current, rtt);
+                Vec::new()
             }
-    Some(PacketType::HeartbeatAck) => {
-        // Bug №12: RTT is measured against the last heartbeat WE
-        // sent (stamped in send_heartbeat), not against "now".
-        let rtt = self.last_heartbeat.lock().elapsed();
-        let mut current = self.rtt.lock();
-        *current = smooth_rtt(*current, rtt);
-        Ok(vec![])
-    }
-            Some(PacketType::Input) => {
-                Ok(vec![])
-            }
+            Some(PacketType::Input) => Vec::new(),
             Some(PacketType::Fragment) => {
                 // Reassembled by the caller via `reassemble_fragment`.
-                Ok(vec![])
+                Vec::new()
             }
-            Some(PacketType::Command) => {
-                Ok(vec![])
-            }
-            Some(PacketType::EventAck) => {
-                Ok(vec![])
-            }
-            Some(PacketType::Rpc) => {
-                Ok(vec![])
-            }
+            Some(PacketType::Command) => Vec::new(),
+            Some(PacketType::EventAck) => Vec::new(),
+            Some(PacketType::Rpc) => Vec::new(),
             Some(PacketType::Disconnect) => {
                 // Bug №272: handled one level up, in
                 // `NetServer::handle_received_packet`, which removes the
@@ -331,20 +427,46 @@ impl Connection {
                 // "Unhandled packet type" for every client that left cleanly —
                 // a warning that fires on the normal shutdown path trains the
                 // reader to ignore the log.
-                Ok(vec![])
+                Vec::new()
             }
             Some(PacketType::Connect) => {
                 // Same: `NetServer` performs the handshake and the version
                 // check. Also on the normal path, once per client.
-                Ok(vec![])
+                Vec::new()
             }
             Some(other) => {
                 warn!("Unhandled packet type in handle_packet: {other:?}");
-                Ok(vec![])
+                Vec::new()
             }
             None => {
                 warn!("Invalid packet type: {:?}", header.packet_type);
-                Ok(vec![])
+                Vec::new()
+            }
+        };
+
+        Ok(PacketOutcome {
+            outgoing,
+            reliable_arrival,
+        })
+    }
+
+    /// Bug №215: feed the peer's (cumulative, SACK) ack state into the send
+    /// ledgers. One truth rule: this is exactly the `(ack, bitfield)` pair
+    /// `process_acks` uses for its own queue, and the bit layout is pinned
+    /// by `bit_layout_agrees_with_the_receiver_across_the_whole_window`.
+    fn note_send_ack(&self) {
+        let ack = *self.remote_ack.lock();
+        if ack == 0 {
+            return; // "nothing ever acked" clears nothing; keep it cheap.
+        }
+        let ack_bitfield = *self.remote_ack_bitfield.lock();
+
+        for channel in &self.channels {
+            if matches!(
+                channel.config().channel_type,
+                ChannelType::ReliableOrdered | ChannelType::ReliableUnordered
+            ) {
+                channel.handle_ack(ack, ack_bitfield);
             }
         }
     }
@@ -416,7 +538,14 @@ impl Connection {
         payload_size: u16,
     ) -> PacketHeader {
         let (ack, ack_bitfield) = self.ack_info();
-        PacketHeader::new(packet_type, channel, sequence, ack, ack_bitfield, payload_size)
+        PacketHeader::new(
+            packet_type,
+            channel,
+            sequence,
+            ack,
+            ack_bitfield,
+            payload_size,
+        )
     }
 
     pub fn send_heartbeat(&self) -> Option<OutgoingPacket> {
@@ -427,8 +556,14 @@ impl Connection {
             server_time: 0.0,
         };
         let header = self.ack_header(PacketType::Heartbeat, ChannelType::ReliableOrdered, seq, 0);
+        // OutgoingPacket::new refuses on serialize failure, so nothing but a
+        // real datagram enters either bookkeeping.
+        let outgoing = OutgoingPacket::new(header, packet)?;
         self.track_reliable(seq);
-        OutgoingPacket::new(header, packet)
+        // Bug №215: a dropped heartbeat never came back before; now the
+        // ledger re-sends it until the ack (or the budget) decides.
+        self.register_reliable_send(&outgoing.header, &outgoing.payload);
+        Some(outgoing)
     }
 
     pub fn send_heartbeat_ack(&self, ack_seq: u32) -> Result<Vec<OutgoingPacket>, ConnectionError> {
@@ -452,7 +587,12 @@ impl Connection {
         Ok(OutgoingPacket::new(header, packet).into_iter().collect())
     }
 
-    pub fn send_connect_accept(&self, server_tick: u64, server_time: f64, match_id: Uuid) -> Option<OutgoingPacket> {
+    pub fn send_connect_accept(
+        &self,
+        server_tick: u64,
+        server_time: f64,
+        match_id: Uuid,
+    ) -> Option<OutgoingPacket> {
         let seq = self.next_sequence();
         let packet = ConnectAcceptPacket {
             server_tick,
@@ -467,8 +607,12 @@ impl Connection {
             seq,
             0,
         );
+        let outgoing = OutgoingPacket::new(header, packet)?;
         self.track_reliable(seq);
-        OutgoingPacket::new(header, packet)
+        // Bug №215: a lost ConnectAccept used to hang the client until it
+        // reconnected from scratch; the ledger restores the accept itself.
+        self.register_reliable_send(&outgoing.header, &outgoing.payload);
+        Some(outgoing)
     }
 
     pub fn send_state(&self, state: StatePacket) -> Vec<OutgoingPacket> {
@@ -550,27 +694,20 @@ impl Connection {
 
         if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
             let seq = self.next_sequence();
-            // Bug №272: events go out UNRELIABLE, and no longer enter the
-            // acknowledgement queue.
+            // Bug №272: events go out UNRELIABLE, and enter no ledger.
             //
-            // `ReliableUnordered` never bought anything here: nothing
-            // retransmits (see bug №215 — the Channel layer is allocated but
-            // never wired into any send path), so the packet was already lost
-            // on a single drop while still occupying an entry in a 32-slot
-            // window. Worse, that window could never be drained: the only
-            // thing that clears it is a peer's ack, and the peer's ack rides
-            // on packets this same path produces, which are themselves
-            // unacknowledged. At 200 bots `broadcast_event` fans every event
-            // out to every client, so the queue churned continuously and each
-            // aged-out entry logged a warning from the tick loop — 20127 lines
-            // in a 30 s run, which measurably ate the tick budget.
+            // Making them reliable was possible once №215 wired the
+            // retransmit layer — it would have bought nothing: events are
+            // notifications, not state. The client puts them on an event
+            // queue and keeps its world state in the layer deltas
+            // (`entity_states`), where every event's content also arrives;
+            // re-deliveries would just fire the notification twice. At 200
+            // bots `broadcast_event` fans every event out to every client, so
+            // a ledger entry per event would have churned continuously.
             //
-            // Events are notifications, not state: the client puts them on an
-            // event queue and keeps its world state in the layer deltas
-            // (`entity_states`), where every event's content also arrives. The
-            // one field that was NOT covered by any layer — the hit normal and
-            // compartment — is now carried in layer 0, so nothing gameplay-
-            // relevant is lost by this change.
+            // The one field that was NOT covered by any layer — the hit
+            // normal and compartment — is now carried in layer 0, so nothing
+            // gameplay-relevant is lost.
             //
             // Per plan §3.4, guaranteed delivery is required for COMMANDS
             // ("seal the bulkhead"), not for events. `CommandAck` and
@@ -581,14 +718,68 @@ impl Connection {
                 seq,
                 serialized.len() as u16,
             );
-            OutgoingPacket::raw(header, serialized).into_iter().collect()
+            OutgoingPacket::raw(header, serialized)
+                .into_iter()
+                .collect()
         } else {
             self.fragment_large_packet(PacketType::Event, serialized)
         }
     }
 
-    pub fn send_command_ack(&self, command_id: u64, success: bool, error: Option<String>) -> Vec<OutgoingPacket> {
-        let packet = CommandAckPacket { command_id, success, error };
+    /// Bug №699: the world's static description, sent once when the client
+    /// connects.
+    ///
+    /// It goes out UNRELIABLE, like the events: the world does not change, and
+    /// a client that missed it can be told again (the server re-sends on the
+    /// next Connect). Making it reliable would put the whole map into the
+    /// retransmit ledger of every client, for a message that is sent once.
+    pub fn send_map_description(
+        &self,
+        description: &rfs_core::world::MapDescription,
+    ) -> Vec<OutgoingPacket> {
+        let packet = MapDescriptionPacket {
+            name: description.name.clone(),
+            bounds_min: description.bounds_min,
+            bounds_max: description.bounds_max,
+            obstacles: description.obstacles.clone(),
+        };
+        let serialized = match bincode::serialize(&packet) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("send_map_description serialize failed, skipping: {e}");
+                return Vec::new();
+            }
+        };
+        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+            let seq = self.next_sequence();
+            let header = self.ack_header(
+                PacketType::MapDescription,
+                ChannelType::UnreliableSequenced,
+                seq,
+                serialized.len() as u16,
+            );
+            OutgoingPacket::raw(header, serialized)
+                .into_iter()
+                .collect()
+        } else {
+            // A map with thousands of structures does not fit a datagram; the
+            // fragmentation path carries it, exactly as it carries a full
+            // state.
+            self.fragment_large_packet(PacketType::MapDescription, serialized)
+        }
+    }
+
+    pub fn send_command_ack(
+        &self,
+        command_id: u64,
+        success: bool,
+        error: Option<String>,
+    ) -> Vec<OutgoingPacket> {
+        let packet = CommandAckPacket {
+            command_id,
+            success,
+            error,
+        };
         let serialized = match bincode::serialize(&packet) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -605,8 +796,17 @@ impl Connection {
                 seq,
                 serialized.len() as u16,
             );
+            let packet = match OutgoingPacket::raw(header, serialized) {
+                Some(packet) => packet,
+                None => return Vec::new(),
+            };
             self.track_reliable(seq);
-            OutgoingPacket::raw(header, serialized).into_iter().collect()
+            // Bug №215: the command result is the "seal the bulkhead"
+            // guarantee from plan §3.4 — the client may re-fire the command if
+            // it never learns the outcome, which is exactly why a lost ack
+            // goes back through the ledger instead of vanishing.
+            self.register_reliable_send(&packet.header, &packet.payload);
+            vec![packet]
         } else {
             self.fragment_large_packet(PacketType::CommandAck, serialized)
         }
@@ -629,24 +829,24 @@ impl Connection {
             // bookkeeping never recorded. That is the worst of both: no
             // delivery guarantee AND a sequence that can never be reclaimed.
             //
-            // Losing one ack is harmless by construction, which is what makes
-            // this safe: the client's `pending_inputs` is capped (bug №171) and
-            // evicts the oldest, so a lost ack delays one slot's release for
-            // up to the cap rather than leaking. `last_acknowledged_tick` is
-            // only ever moved forward, so a lost ack also delays nothing — the
-            // next one carries the same information.
-            //
-            // This has to be settled BEFORE a retransmit layer exists (bug
-            // №215). Under retransmit, a tracked-but-unreclaimed sequence
-            // would be resent on a timer forever: at 30 acks/s per client and
-            // 200 clients that is ~6000 packets/s of pure resend.
+            // Losing one ack is harmless by construction, which is what keeps
+            // it unreliable even now that retransmit exists (№215): the
+            // client's `pending_inputs` is capped (bug №171) and evicts the
+            // oldest, so a lost ack delays one slot's release for up to the
+            // cap rather than leaking. `last_acknowledged_tick` is only ever
+            // moved forward, so a lost ack also delays nothing — the next one
+            // carries the same information. Mirroring it into the ledger
+            // would instead resend ~6000 packets/s of pure staleness at
+            // 30 acks/s and 200 clients.
             let header = self.ack_header(
                 PacketType::InputAck,
                 ChannelType::UnreliableSequenced,
                 seq,
                 serialized.len() as u16,
             );
-            OutgoingPacket::raw(header, serialized).into_iter().collect()
+            OutgoingPacket::raw(header, serialized)
+                .into_iter()
+                .collect()
         } else {
             self.fragment_large_packet(PacketType::InputAck, serialized)
         }
@@ -654,7 +854,9 @@ impl Connection {
 
     fn fragment_large_packet(&self, packet_type: PacketType, data: Vec<u8>) -> Vec<OutgoingPacket> {
         let mut packets = Vec::new();
-        let max_payload = self.config.max_packet_size
+        let max_payload = self
+            .config
+            .max_packet_size
             .saturating_sub(HEADER_SIZE)
             .saturating_sub(FRAGMENT_HEADER_SIZE);
         if max_payload == 0 {
@@ -670,29 +872,49 @@ impl Connection {
             *id
         };
 
-        for payload in make_fragments(packet_type, &data, msg_id, max_payload + FRAGMENT_HEADER_SIZE) {
+        for payload in make_fragments(
+            packet_type,
+            &data,
+            msg_id,
+            max_payload + FRAGMENT_HEADER_SIZE,
+        ) {
             let seq = self.next_sequence();
             // Bug №163: fragments used to always ride UnreliableSequenced, so a
-            // reliable message above the MTU (an Event, a CommandAck) lost its
-            // channel semantics the moment it needed fragmenting. Keep the
-            // original packet's channel, and register the reliable sequences so
-            // the peer's queue can be garbage-collected.
+            // reliable message above the MTU (a CommandAck) lost its channel
+            // semantics the moment it needed fragmenting. Keep the reliable
+            // packet's channel, and register the reliable sequences so the
+            // peer's queue can be garbage-collected.
+            //
+            // Bug №215: `Event` and `InputAck` left this list — №272 made
+            // them unreliable on the small-packet path, and this mapping
+            // quietly resurrected the oversized ones into the reliable
+            // bucket. With the retransmit ledger live that is no longer a
+            // bookkeeping nicety: every dropped chunk of every event would
+            // be re-sent, exactly the churn №272 removed.
             let channel = match packet_type {
-                PacketType::Event => ChannelType::ReliableUnordered,
-                PacketType::Command | PacketType::CommandAck | PacketType::InputAck
-                | PacketType::Connect | PacketType::ConnectAccept => ChannelType::ReliableOrdered,
+                PacketType::Command
+                | PacketType::CommandAck
+                | PacketType::Connect
+                | PacketType::ConnectAccept => ChannelType::ReliableOrdered,
                 _ => ChannelType::UnreliableSequenced,
             };
-            if matches!(channel, ChannelType::ReliableOrdered | ChannelType::ReliableUnordered) {
-                self.track_reliable(seq);
-            }
-            let header = self.ack_header(
-                PacketType::Fragment,
+            let header = self.ack_header(PacketType::Fragment, channel, seq, payload.len() as u16);
+            let outgoing = match OutgoingPacket::raw(header, payload) {
+                Some(packet) => packet,
+                None => continue,
+            };
+            if matches!(
                 channel,
-                seq,
-                payload.len() as u16,
-            );
-            packets.extend(OutgoingPacket::raw(header, payload));
+                ChannelType::ReliableOrdered | ChannelType::ReliableUnordered
+            ) {
+                self.track_reliable(seq);
+                // Bug №215: №167(3) said fragment reordering "relies on the
+                // resend" — now there is one. The ledger holds the fragment
+                // payload; the assembler's msg_id dedup (fragment.rs) swallows
+                // the repeats.
+                self.register_reliable_send(&outgoing.header, &outgoing.payload);
+            }
+            packets.push(outgoing);
         }
         packets
     }
@@ -714,19 +936,37 @@ impl Connection {
     /// out-of-order arrivals above it are remembered and reported as SACK bits.
     /// Unreliable traffic is deliberately ignored — it must not raise the
     /// cumulative mark, that was the original bug.
-    pub fn track_received_reliable(&self, sequence: u32, channel: ChannelType) {
-        if !matches!(channel, ChannelType::ReliableOrdered | ChannelType::ReliableUnordered) {
-            return;
+    ///
+    /// Bug №215: the return value doubles as the duplicate-suppression gate.
+    /// Once retransmits exist, a sequence the peer saw twice (our ack of the
+    /// first copy was lost) would apply twice without this: the contiguous
+    /// mark catches covered sequences, gap membership catches ones the mark
+    /// has not advanced over yet.
+    pub fn track_received_reliable(
+        &self,
+        sequence: u32,
+        channel: ChannelType,
+    ) -> Option<ReliableArrival> {
+        if !matches!(
+            channel,
+            ChannelType::ReliableOrdered | ChannelType::ReliableUnordered
+        ) {
+            return None;
         }
 
         let mut hcr = self.reliable_hcr.lock();
         if !seq_is_newer(sequence, *hcr) {
-            // Already covered cumulatively, or a duplicate: nothing to add.
-            return;
+            // Already covered cumulatively, or a duplicate: nothing to add,
+            // and the caller must not apply the payload again.
+            return Some(ReliableArrival::Duplicate);
         }
 
         let mut gaps = self.reliable_gaps.lock();
-        gaps.insert(sequence);
+        if !gaps.insert(sequence) {
+            // Already queued in a gap: a retransmit of something the peer is
+            // still waiting to see acknowledged contiguous. Same rule applies.
+            return Some(ReliableArrival::Duplicate);
+        }
 
         // Advance the contiguous mark while the next sequence is present.
         while gaps.remove(&hcr.wrapping_add(1)) {
@@ -748,6 +988,8 @@ impl Connection {
                 None => break,
             }
         }
+
+        Some(ReliableArrival::New)
     }
 
     /// The `(ack, ack_bitfield)` pair to advertise in outbound headers.
@@ -773,9 +1015,95 @@ impl Connection {
     }
 
     /// Reset the SACK state — a fresh session must not inherit the old mark.
+    /// Bug №215: the send ledgers belong to this session just as much, so a
+    /// reused connection must not keep re-sending the previous session's
+    /// queue against new sequence space.
     pub fn reset_reliable_tracking(&self) {
         *self.reliable_hcr.lock() = 0;
         self.reliable_gaps.lock().clear();
+        for channel in &self.channels {
+            channel.clear_send_queue();
+        }
+    }
+
+    /// Bug №215: mirror a reliable send into the Channel ledger. The payload
+    /// bytes mirror what the wire helper serializes; retransmit passes of the
+    /// same sequence just refresh the stamp. Unreliable channels are not
+    /// mirrored — their loss is by design, and mirroring them would burn
+    /// ledger space for nothing.
+    pub fn register_reliable_send(&self, header: &PacketHeader, payload: &[u8]) {
+        let channel_type = channel_from_u8(header.channel);
+        if !matches!(
+            channel_type,
+            ChannelType::ReliableOrdered | ChannelType::ReliableUnordered
+        ) {
+            return;
+        }
+        let Some(channel) = self.get_channel(channel_type) else {
+            return; // no ledger configured for this channel type
+        };
+        channel.register_sent(header.sequence, header.packet_type, payload);
+    }
+
+    /// Bug №215: retransmit pass over the reliable ledgers.
+    ///
+    /// The ORIGINAL sequence is preserved — the receiver's SACK accounting
+    /// (№167) is keyed on it, so a retransmit slots into the same hole it
+    /// fell out of — while the header carries OUR CURRENT receive state, so
+    /// the retransmit doubles as fresh ack traffic for the peer's own queue
+    /// GC. Timeout/retries are constants: the RTT is measured already (№12)
+    /// but an adaptive timeout is a tuning knob, not a correctness gap.
+    pub fn collect_retransmits(&self) -> Vec<OutgoingPacket> {
+        self.collect_retransmits_with(
+            Duration::from_millis(RETRANSMIT_TIMEOUT_MS),
+            RETRANSMIT_MAX_RETRIES,
+            RETRANSMIT_MAX_PER_PASS,
+        )
+    }
+
+    /// Bug №215: the same pass with injectable timing. Exposed because the
+    /// fixed cadence above is honest production behaviour but useless for
+    /// tests — sleeping a 250 ms RTO in a unit test would be the test
+    /// writing the poller, not the poller being tested.
+    pub fn collect_retransmits_with(
+        &self,
+        timeout: Duration,
+        max_retries: u32,
+        max_count: usize,
+    ) -> Vec<OutgoingPacket> {
+        const MAX_PER_PASS: usize = RETRANSMIT_MAX_PER_PASS;
+
+        let mut result = Vec::new();
+        for channel in &self.channels {
+            if result.len() >= MAX_PER_PASS {
+                break;
+            }
+            if !matches!(
+                channel.config().channel_type,
+                ChannelType::ReliableOrdered | ChannelType::ReliableUnordered
+            ) {
+                continue;
+            }
+            for (sequence, packet_type, data) in channel.collect_retransmits(
+                timeout,
+                max_retries,
+                max_count.saturating_sub(result.len()).max(1),
+            ) {
+                let Some(ptype) = PacketType::from_u8(packet_type) else {
+                    continue;
+                };
+                let header = self.ack_header(
+                    ptype,
+                    channel.config().channel_type,
+                    sequence,
+                    data.len() as u16,
+                );
+                if let Some(packet) = OutgoingPacket::raw(header, data) {
+                    result.push(packet);
+                }
+            }
+        }
+        result
     }
 
     #[cfg(test)]
@@ -787,6 +1115,27 @@ impl Connection {
         self.last_received.lock().elapsed() > self.config.connection_timeout
     }
 
+    /// Bug №219: how long this connection has existed. Anchored at `new()`,
+    /// not at the first datagram — the gate that waits for the player to be
+    /// registered needs a clock the game layer cannot refresh.
+    pub fn age_connected(&self) -> Duration {
+        self.connected_since.elapsed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_backdated(
+        id: u32,
+        addr: SocketAddr,
+        config: ConnectionConfig,
+        age: Duration,
+    ) -> Self {
+        let mut conn = Self::new(id, addr, config);
+        conn.connected_since = Instant::now()
+            .checked_sub(age)
+            .unwrap_or(conn.connected_since);
+        conn
+    }
+
     pub fn should_send_heartbeat(&self) -> bool {
         self.last_heartbeat.lock().elapsed() >= self.config.heartbeat_interval
     }
@@ -796,7 +1145,9 @@ impl Connection {
     }
 
     pub fn get_channel(&self, channel_type: ChannelType) -> Option<&Channel> {
-        self.channels.iter().find(|c| c.config().channel_type == channel_type)
+        self.channels
+            .iter()
+            .find(|c| c.config().channel_type == channel_type)
     }
 
     /// Bug №176: this connection's own send budget, replacing the single
@@ -831,19 +1182,87 @@ impl OutgoingPacket {
         let len = match u16::try_from(payload.len()) {
             Ok(len) => len,
             Err(_) => {
-                warn!("OutgoingPacket payload {} exceeds u16, dropping", payload.len());
+                warn!(
+                    "OutgoingPacket payload {} exceeds u16, dropping",
+                    payload.len()
+                );
                 return None;
             }
         };
         header.payload_size = len;
-        Some(Self {
-            header,
-            payload,
-        })
+        Some(Self { header, payload })
     }
 
     pub fn total_size(&self) -> usize {
         HEADER_SIZE + self.payload.len()
+    }
+}
+
+#[cfg(test)]
+mod wire_budget_tests {
+    /// Bug №239: the net side of the MTU must be the core constant itself —
+    /// an alias, not a restated number. A change of the core budget that the
+    /// net side failed to follow would silently split the truth about the
+    /// wire again, which is what this guards against by construction.
+    #[test]
+    fn the_wire_budget_is_not_a_second_number() {
+        assert_eq!(
+            super::MAX_PACKET_SIZE,
+            rfs_core::packet::MAX_PACKET_SIZE,
+            "connection::MAX_PACKET_SIZE must alias the core constant"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resync_request_tests {
+    //! Bug №267 (A): the per-connection resync request bits.
+    //!
+    //! A request must survive until the snapshot pass consumes it, must be
+    //! consumed exactly once (a request that re-arms itself would resync the
+    //! layer forever), and must not be settable for a layer that does not
+    //! exist — the index arrives from the wire.
+
+    use super::*;
+
+    fn test_connection() -> Connection {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        Connection::new(1, addr, ConnectionConfig::default())
+    }
+
+    #[test]
+    fn a_request_is_taken_once_and_only_for_its_layer() {
+        let conn = test_connection();
+        conn.request_resync(1);
+        assert!(conn.take_resync_request(1), "the request must be visible");
+        assert!(
+            !conn.take_resync_request(1),
+            "one request must drive exactly one resync pass"
+        );
+        assert!(
+            !conn.take_resync_request(0),
+            "another layer must not inherit the request"
+        );
+    }
+
+    #[test]
+    fn a_request_for_a_layer_outside_the_range_is_ignored() {
+        let conn = test_connection();
+        conn.request_resync(LAYER_COUNT as u8);
+        conn.request_resync(200);
+        for layer in 0..LAYER_COUNT {
+            assert!(
+                !conn.take_resync_request(layer),
+                "a request from the wire must not reach a real layer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_out_of_range_in_the_take_path_is_refused() {
+        let conn = test_connection();
+        assert!(!conn.take_resync_request(LAYER_COUNT));
+        assert!(!conn.take_resync_request(usize::MAX));
     }
 }
 
@@ -892,8 +1311,14 @@ mod sack_tests {
         conn.track_received_reliable(4, ChannelType::ReliableOrdered);
         let (ack, bits) = conn.ack_info();
         assert_eq!(ack, 0);
-        assert!(is_seq_acked(4, ack, bits), "the one reliable packet is still reported");
-        assert!(!is_seq_acked(1, ack, bits), "a packet never seen is not acknowledged");
+        assert!(
+            is_seq_acked(4, ack, bits),
+            "the one reliable packet is still reported"
+        );
+        assert!(
+            !is_seq_acked(1, ack, bits),
+            "a packet never seen is not acknowledged"
+        );
     }
 
     #[test]
@@ -913,7 +1338,11 @@ mod sack_tests {
             .filter(|seq| !is_seq_acked(*seq, ack, bits))
             .collect();
         still_pending.sort_unstable();
-        assert_eq!(still_pending, vec![3], "only the genuinely lost sequence stays");
+        assert_eq!(
+            still_pending,
+            vec![3],
+            "only the genuinely lost sequence stays"
+        );
     }
 
     #[test]
@@ -1026,7 +1455,8 @@ mod sack_tests {
     }
 
     #[test]
-    fn reliable_tracking_survives_the_sequence_wrap() {        let conn = test_connection();
+    fn reliable_tracking_survives_the_sequence_wrap() {
+        let conn = test_connection();
         let start = u32::MAX - 2;
         for seq in start..=u32::MAX {
             conn.track_received_reliable(seq, ChannelType::ReliableOrdered);
@@ -1035,7 +1465,10 @@ mod sack_tests {
         conn.track_received_reliable(0, ChannelType::ReliableOrdered);
         conn.track_received_reliable(1, ChannelType::ReliableOrdered);
         let (ack, bits) = conn.ack_info();
-        assert_eq!(ack, 1, "the contiguous mark must wrap with the sequence space");
+        assert_eq!(
+            ack, 1,
+            "the contiguous mark must wrap with the sequence space"
+        );
         assert_eq!(bits, 0);
     }
 
@@ -1111,6 +1544,175 @@ mod sack_tests {
             b.bandwidth_limiter().admit(1_000, false),
             Admission::Send,
             "B must be unaffected by A's traffic"
+        );
+    }
+
+    // ---------- Bug №215: retransmit ledger ----------
+
+    #[test]
+    fn a_lost_command_retransmits_with_the_original_sequence() {
+        let conn = test_connection();
+        let sent = conn.send_command_ack(7, true, None);
+        assert_eq!(sent.len(), 1, "a CommandAck must be built");
+        let seq = sent[0].header.sequence;
+
+        let ledger = conn.get_channel(ChannelType::ReliableOrdered).unwrap();
+        assert!(ledger.contains(seq), "the send must reach the ledger");
+
+        // Zero timeout = "the timeout already elapsed". The retransmit keeps
+        // the ORIGINAL sequence (receiver SACK accounting is keyed on it) and
+        // re-wraps the SAME payload bytes.
+        let retransmits = conn.collect_retransmits_with(Duration::ZERO, 10, 16);
+        assert_eq!(retransmits.len(), 1);
+        assert_eq!(retransmits[0].header.sequence, seq);
+        assert_eq!(
+            retransmits[0].header.packet_type,
+            sent[0].header.packet_type
+        );
+        assert!(retransmits[0].header.ack <= seq, "fresh ack state");
+        assert_eq!(retransmits[0].payload, sent[0].payload);
+
+        // The ledger still holds it: the peer has not confirmed anything yet.
+        assert!(ledger.contains(seq));
+    }
+
+    #[test]
+    fn the_ledger_is_cleared_by_the_peers_ack_header() {
+        let conn = test_connection();
+        let sent = conn.send_command_ack(7, true, None);
+        let seq = sent[0].header.sequence;
+
+        // The peer's next datagram acknowledges our sequence. Its own channel
+        // is unreliable, so the arrival itself must not touch our mark.
+        let header = PacketHeader::new(
+            PacketType::Heartbeat,
+            ChannelType::UnreliableSequenced,
+            991,
+            seq,
+            0,
+            0,
+        );
+        conn.handle_packet(header, &[0u8; 4]).unwrap();
+
+        let ledger = conn.get_channel(ChannelType::ReliableOrdered).unwrap();
+        assert!(
+            !ledger.contains(seq),
+            "an ack header must retire the ledger entry"
+        );
+        assert!(conn
+            .collect_retransmits_with(Duration::ZERO, 10, 16)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_reliable_arrival_is_suppressed() {
+        let conn = test_connection();
+        let header = PacketHeader::new(
+            PacketType::Command,
+            ChannelType::ReliableOrdered,
+            5,
+            0,
+            0,
+            0,
+        );
+
+        let first = conn.handle_packet(header, &[0u8; 8]).unwrap();
+        assert_eq!(first.reliable_arrival, Some(ReliableArrival::New));
+
+        let again = conn.handle_packet(header, &[0u8; 8]).unwrap();
+        assert_eq!(
+            again.reliable_arrival,
+            Some(ReliableArrival::Duplicate),
+            "a retransmitted Command must not apply twice"
+        );
+
+        // The gap-filling neighbour is new; from now on 5 is behind the mark,
+        // so even a THIRD copy of it stays suppressed.
+        let mut filler = header;
+        filler.sequence = 6;
+        let third = conn.handle_packet(filler, &[0u8; 8]).unwrap();
+        assert_eq!(third.reliable_arrival, Some(ReliableArrival::New));
+        let old_again = conn.handle_packet(header, &[0u8; 8]).unwrap();
+        assert_eq!(old_again.reliable_arrival, Some(ReliableArrival::Duplicate));
+    }
+
+    #[test]
+    fn unreliable_channels_return_no_arrival_verdict() {
+        let conn = test_connection();
+        let header = PacketHeader::new(
+            PacketType::Input,
+            ChannelType::UnreliableSequenced,
+            3,
+            0,
+            0,
+            0,
+        );
+        let outcome = conn.handle_packet(header, &[0u8; 4]).unwrap();
+        assert_eq!(
+            outcome.reliable_arrival, None,
+            "unreliable traffic has no verdict — and duplicates by design"
+        );
+    }
+
+    #[test]
+    fn unreliable_sends_never_reach_the_ledger() {
+        let conn = test_connection();
+
+        // Events (small and fragmenting — lent to CompartmentSealed, the
+        // smallest packet variant) go out UNRELIABLE since №272; the retransmit
+        // ledger must never resurrect them.
+        //
+        // NLLINE-CHECK-TEMP: with the Event/InputAck exclusion removed from
+        // the fragment mapping this test goes red (fragments re-enter the
+        // ReliableUnordered ledger).
+        let small = conn.send_event(EventPacket {
+            events: vec![GameEvent::CompartmentSealed {
+                compartment: EntityId(1),
+            }],
+        });
+        assert!(!small.is_empty(), "a small event must serialize");
+        for packet in small {
+            assert_eq!(
+                channel_from_u8(packet.header.channel),
+                ChannelType::UnreliableSequenced,
+                "small events ride unreliable"
+            );
+        }
+        assert!(
+            conn.get_channel(ChannelType::ReliableUnordered)
+                .unwrap()
+                .pending_count()
+                == 0
+        );
+
+        let big = conn.send_event(EventPacket {
+            events: vec![
+                GameEvent::CompartmentSealed {
+                    compartment: EntityId(1),
+                };
+                8_000
+            ],
+        });
+        assert!(big.len() > 1, "an 8k-event payload must fragment");
+        for packet in big {
+            assert_eq!(
+                channel_from_u8(packet.header.channel),
+                ChannelType::UnreliableSequenced,
+                "fragmented events must not resurrect into the reliable bucket"
+            );
+        }
+
+        assert!(
+            conn.get_channel(ChannelType::ReliableUnordered)
+                .unwrap()
+                .pending_count()
+                == 0
+                && conn
+                    .get_channel(ChannelType::ReliableOrdered)
+                    .unwrap()
+                    .pending_count()
+                    == 0,
+            "events (small or fragmented) never enter the ledger"
         );
     }
 }

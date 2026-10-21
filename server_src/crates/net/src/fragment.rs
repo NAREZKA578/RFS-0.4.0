@@ -75,7 +75,8 @@ impl FragmentAssembler {
         let orig_type = payload[0];
         let total_chunks = u16::from_le_bytes([payload[1], payload[2]]);
         let index = u16::from_le_bytes([payload[3], payload[4]]) as usize;
-        let total_len = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
+        let total_len =
+            u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
         let msg_id = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
 
         if total_chunks == 0
@@ -219,13 +220,13 @@ impl FragmentAssembler {
     fn evict_stale(&mut self) {
         // Cap the number of in-flight groups: drop the oldest first.
         if self.groups.len() > MAX_FRAGMENT_GROUPS {
-            let mut keys: Vec<((u8, u32), Instant)> = self
-                .groups
-                .iter()
-                .map(|(k, g)| (*k, g.updated))
-                .collect();
+            let mut keys: Vec<((u8, u32), Instant)> =
+                self.groups.iter().map(|(k, g)| (*k, g.updated)).collect();
             keys.sort_by_key(|(_, t)| *t);
-            for (key, _) in keys.into_iter().take(self.groups.len() - MAX_FRAGMENT_GROUPS) {
+            for (key, _) in keys
+                .into_iter()
+                .take(self.groups.len() - MAX_FRAGMENT_GROUPS)
+            {
                 self.drop_group(key);
             }
         }
@@ -282,13 +283,19 @@ pub fn make_fragments(
         return Vec::new();
     }
     if data.len() > MAX_REASSEMBLED_SIZE {
-        warn!("make_fragments: message too large ({}), dropping", data.len());
+        warn!(
+            "make_fragments: message too large ({}), dropping",
+            data.len()
+        );
         return Vec::new();
     }
     let chunk_size = max_payload.saturating_sub(FRAGMENT_HEADER_SIZE).max(1);
     let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
     if chunks.len() > MAX_FRAGMENTS_PER_MESSAGE as usize {
-        warn!("make_fragments: too many chunks ({}), dropping", chunks.len());
+        warn!(
+            "make_fragments: too many chunks ({}), dropping",
+            chunks.len()
+        );
         return Vec::new();
     }
     let total_chunks = chunks.len() as u16;

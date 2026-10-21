@@ -1,6 +1,6 @@
-use rfs_core::entity::EntityId;
-use petgraph::graph::{Graph, NodeIndex, EdgeIndex};
+use petgraph::graph::{EdgeIndex, Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use rfs_core::entity::EntityId;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -242,7 +242,9 @@ impl DamageGraph {
     }
 
     pub fn get_compartment_mut(&mut self, entity_id: EntityId) -> Option<&mut CompartmentNode> {
-        self.node_map.get(&entity_id).map(|idx| &mut self.graph[*idx])
+        self.node_map
+            .get(&entity_id)
+            .map(|idx| &mut self.graph[*idx])
     }
 
     pub fn get_bulkhead(&self, entity_id: EntityId) -> Option<&BulkheadEdge> {
@@ -250,14 +252,20 @@ impl DamageGraph {
     }
 
     pub fn get_bulkhead_mut(&mut self, entity_id: EntityId) -> Option<&mut BulkheadEdge> {
-        self.edge_map.get(&entity_id).map(|idx| &mut self.graph[*idx])
+        self.edge_map
+            .get(&entity_id)
+            .map(|idx| &mut self.graph[*idx])
     }
 
     pub fn get_connected_compartments(&self, entity_id: EntityId) -> SmallVec<[EntityId; 4]> {
         let mut result = SmallVec::new();
         if let Some(idx) = self.node_map.get(&entity_id) {
             for edge in self.graph.edges(*idx) {
-                let other = if edge.source() == *idx { edge.target() } else { edge.source() };
+                let other = if edge.source() == *idx {
+                    edge.target()
+                } else {
+                    edge.source()
+                };
                 result.push(self.graph[other].entity_id);
             }
         }
@@ -453,11 +461,15 @@ impl DamageGraph {
     }
 
     pub fn iter_nodes(&self) -> impl Iterator<Item = (EntityId, &CompartmentNode)> {
-        self.graph.node_indices().map(|idx| (self.graph[idx].entity_id, &self.graph[idx]))
+        self.graph
+            .node_indices()
+            .map(|idx| (self.graph[idx].entity_id, &self.graph[idx]))
     }
 
     pub fn iter_edges(&self) -> impl Iterator<Item = (EntityId, &BulkheadEdge)> {
-        self.graph.edge_references().map(|edge| (edge.weight().entity_id, edge.weight()))
+        self.graph
+            .edge_references()
+            .map(|edge| (edge.weight().entity_id, edge.weight()))
     }
 }
 #[cfg(test)]
@@ -506,7 +518,10 @@ mod tests {
 
         let idx = *g.node_map.get(&EntityId::new(1)).unwrap();
         let n = &g.graph[idx];
-        assert!((n.current_level - 55.0).abs() < 1e-5, "water level was reset");
+        assert!(
+            (n.current_level - 55.0).abs() < 1e-5,
+            "water level was reset"
+        );
         assert!((n.fire_intensity - 0.75).abs() < 1e-5, "fire was reset");
         assert!(n.is_breached, "a breach was silently undone");
         assert!((n.damage - 42.0).abs() < 1e-5, "damage was reset");
@@ -524,7 +539,10 @@ mod tests {
         g.add_compartment(compartment(1));
         let n = &g.graph[*g.node_map.get(&EntityId::new(1)).unwrap()];
         assert!(n.is_breached);
-        assert!(!n.is_sealed, "a breached compartment must not report as sealed");
+        assert!(
+            !n.is_sealed,
+            "a breached compartment must not report as sealed"
+        );
     }
 
     /// Bug №241: a synthetic bulkhead built for the water path was sealed, and
@@ -561,7 +579,11 @@ mod tests {
         let added = g.add_water(EntityId::new(1), f32::NAN);
 
         assert_eq!(added, 0.0, "a NaN amount reported water entering");
-        assert_eq!(level(&g, EntityId::new(1)), 0.0, "a NaN amount filled the compartment");
+        assert_eq!(
+            level(&g, EntityId::new(1)),
+            0.0,
+            "a NaN amount filled the compartment"
+        );
     }
 
     /// Bug №197, the mirror image: `pump_water(NaN)` emptied the compartment,
@@ -577,7 +599,11 @@ mod tests {
         let pumped = g.pump_water(EntityId::new(1), f32::NAN);
 
         assert_eq!(pumped, 0.0, "a NaN amount reported water leaving");
-        assert_eq!(level(&g, EntityId::new(1)), before, "a NaN drained the compartment");
+        assert_eq!(
+            level(&g, EntityId::new(1)),
+            before,
+            "a NaN drained the compartment"
+        );
     }
 
     /// Both infinities must be refused too — `min` returns them as-is, which is
@@ -587,13 +613,25 @@ mod tests {
         for bad in [f32::INFINITY, f32::NEG_INFINITY] {
             let mut g = DamageGraph::new();
             g.add_compartment(compartment(1));
-            assert_eq!(g.add_water(EntityId::new(1), bad), 0.0, "{bad} flooded the compartment");
+            assert_eq!(
+                g.add_water(EntityId::new(1), bad),
+                0.0,
+                "{bad} flooded the compartment"
+            );
             assert_eq!(level(&g, EntityId::new(1)), 0.0, "{bad} changed the level");
 
             g.add_water(EntityId::new(1), 10.0);
             let before = level(&g, EntityId::new(1));
-            assert_eq!(g.pump_water(EntityId::new(1), bad), 0.0, "{bad} drained the compartment");
-            assert_eq!(level(&g, EntityId::new(1)), before, "{bad} changed the level");
+            assert_eq!(
+                g.pump_water(EntityId::new(1), bad),
+                0.0,
+                "{bad} drained the compartment"
+            );
+            assert_eq!(
+                level(&g, EntityId::new(1)),
+                before,
+                "{bad} changed the level"
+            );
         }
     }
 
@@ -657,7 +695,10 @@ mod tests {
         g.set_fire(EntityId::new(1), 0.6);
 
         assert!(g.extinguish_fire(EntityId::new(1)));
-        assert_eq!(g.get_compartment(EntityId::new(1)).unwrap().fire_intensity, 0.0);
+        assert_eq!(
+            g.get_compartment(EntityId::new(1)).unwrap().fire_intensity,
+            0.0
+        );
     }
 
     #[test]
@@ -665,8 +706,14 @@ mod tests {
         for bad in [f32::INFINITY, f32::NEG_INFINITY] {
             let mut g = DamageGraph::new();
             g.add_compartment(compartment(1));
-            assert!(!g.set_fire(EntityId::new(1), bad), "{bad} reported a successful ignite");
-            assert_eq!(g.get_compartment(EntityId::new(1)).unwrap().fire_intensity, 0.0);
+            assert!(
+                !g.set_fire(EntityId::new(1), bad),
+                "{bad} reported a successful ignite"
+            );
+            assert_eq!(
+                g.get_compartment(EntityId::new(1)).unwrap().fire_intensity,
+                0.0
+            );
         }
     }
 
@@ -678,10 +725,16 @@ mod tests {
         g.add_compartment(compartment(1));
 
         assert!(g.set_fire(EntityId::new(1), 5.0));
-        assert_eq!(g.get_compartment(EntityId::new(1)).unwrap().fire_intensity, 1.0);
+        assert_eq!(
+            g.get_compartment(EntityId::new(1)).unwrap().fire_intensity,
+            1.0
+        );
 
         assert!(g.set_fire(EntityId::new(1), -5.0));
-        assert_eq!(g.get_compartment(EntityId::new(1)).unwrap().fire_intensity, 0.0);
+        assert_eq!(
+            g.get_compartment(EntityId::new(1)).unwrap().fire_intensity,
+            0.0
+        );
     }
 
     /// Bug №197 again, on the damage path: `(damage + NaN).min(max_damage)`
@@ -691,7 +744,10 @@ mod tests {
         let mut g = DamageGraph::new();
         g.add_compartment(compartment(1));
 
-        assert!(!g.apply_damage(EntityId::new(1), f32::NAN), "a NaN reported a hit");
+        assert!(
+            !g.apply_damage(EntityId::new(1), f32::NAN),
+            "a NaN reported a hit"
+        );
 
         let node = g.get_compartment(EntityId::new(1)).unwrap();
         assert_eq!(node.damage, 0.0, "a NaN blast dealt damage");
@@ -703,7 +759,10 @@ mod tests {
         for bad in [f32::INFINITY, f32::NEG_INFINITY] {
             let mut g = DamageGraph::new();
             g.add_compartment(compartment(1));
-            assert!(!g.apply_damage(EntityId::new(1), bad), "{bad} reported a hit");
+            assert!(
+                !g.apply_damage(EntityId::new(1), bad),
+                "{bad} reported a hit"
+            );
             let node = g.get_compartment(EntityId::new(1)).unwrap();
             assert_eq!(node.damage, 0.0, "{bad} dealt damage");
             assert!(!node.is_breached, "{bad} breached the compartment");

@@ -40,6 +40,21 @@ struct BotReport {
     /// and only the second is healthy. `tick_advances == 0` is a stalled server.
     first_tick: Option<u64>,
     tick_advances: u64,
+    /// Bug №266 part (б): how many published ticks this bot never observed.
+    ///
+    /// A jump from tick N to N+k means k-1 published numbers arrived too late
+    /// for the receiver loop or never at all: counting the jump as one
+    /// advance hides them, and leaving them out of the report is exactly the
+    /// "silent mismatch" the record forbids. This is the client-side half of
+    /// the split; compare with the server's `rounds_per_tick`/`packets_per_round`.
+    missed_tick_publishes: u64,
+    /// Bug №267 (A): resync requests this bot put on the wire after a stall.
+    /// Non-zero next to `stalled_deltas` shows the healing ask is live.
+    resync_requests: u64,
+    /// Bug №699: the world the server told this bot about — the name and how
+    /// many structures it holds. Zero structures on a map that has them means
+    /// the description never arrived, and the bot's world is an empty sea.
+    map_obstacles: u64,
     /// Wall-clock seconds the bot was connected and sampling, so the observed
     /// tick rate can be compared against the nominal one.
     observed_secs: f64,
@@ -83,6 +98,28 @@ struct BotReport {
     /// Bug №274: the same, per layer, so a slow layer is distinguishable from a
     /// slow consumer.
     applied_deltas_by_layer: Vec<u64>,
+}
+
+impl BotReport {
+    /// Bug №72: a refused connection is a MEASURED outcome, not an error, and
+    /// it must be counted separately from the other refusals — a server that
+    /// answered `ServerFull` is behaving correctly, and a summary that mixes
+    /// the two hides the difference.
+    ///
+    /// Returns whether the refusal was `ServerFull` (the caller logs that one
+    /// as a result, the rest as a failure).
+    fn note_rejection(&mut self, reason: &rfs_core::packet::ConnectRejectReason) -> bool {
+        match reason {
+            rfs_core::packet::ConnectRejectReason::ServerFull => {
+                self.rejected_server_full += 1;
+                true
+            }
+            _ => {
+                self.rejected_other += 1;
+                false
+            }
+        }
+    }
 }
 
 /// Bug №274: what the bot learned about the world from one snapshot.
@@ -183,10 +220,8 @@ fn scan_world(snapshot: &Snapshot, connection_id: Option<u32>) -> WorldView {
         snapshot
             .entities
             .iter()
-            .filter(|e| {
-                e.ship_data.is_some() && e.entity_id != my_ship
-            })
-.map(|e| e.transform.position)
+            .filter(|e| e.ship_data.is_some() && e.entity_id != my_ship)
+            .map(|e| e.transform.position)
             .min_by(|a, b| {
                 let da = (*a - from).length_squared();
                 let db = (*b - from).length_squared();
@@ -194,7 +229,11 @@ fn scan_world(snapshot: &Snapshot, connection_id: Option<u32>) -> WorldView {
             })
     });
 
-    WorldView { gun, at_gun, target }
+    WorldView {
+        gun,
+        at_gun,
+        target,
+    }
 }
 
 async fn run_bot(
@@ -221,12 +260,15 @@ async fn run_bot(
         rtt_samples_ms: Vec::new(),
         first_tick: None,
         tick_advances: 0,
+        missed_tick_publishes: 0,
+        resync_requests: 0,
+        map_obstacles: 0,
         observed_secs: 0.0,
         rx_packets: 0,
         tx_packets: 0,
         stalled_deltas: 0,
         stale_deltas: 0,
-    stalls_by_layer: vec![0; LAYER_COUNT],
+        stalls_by_layer: vec![0; LAYER_COUNT],
         layers: [0; LAYER_COUNT],
         // Bug №274: read from the client at report time.
         applied_deltas: 0,
@@ -289,16 +331,15 @@ async fn run_bot(
                 }
                 ClientEvent::ConnectionFailed { reason } => {
                     // Bug №175: a full server is a result, not an error.
-                    match reason {
-                        rfs_core::packet::ConnectRejectReason::ServerFull => {
-                            report.rejected_server_full += 1;
-                            rejected_server_full.fetch_add(1, Ordering::Relaxed);
-                            info!("bot-{id} rejected: server full");
-                        }
-                        other => {
-                            warn!("bot-{id} connection failed: {other:?}");
-                            report.rejected_other += 1;
-                        }
+                    // Bug №72: the refusal is COUNTED, so the summary can say
+                    // how much of the requested fleet the server refused
+                    // instead of quietly dividing by the bots that made it
+                    // through.
+                    if report.note_rejection(&reason) {
+                        rejected_server_full.fetch_add(1, Ordering::Relaxed);
+                        info!("bot-{id} rejected: server full");
+                    } else {
+                        warn!("bot-{id} connection failed: {reason:?}");
                     }
                     return report;
                 }
@@ -446,22 +487,43 @@ async fn run_bot(
         // holding" or "is the server keeping up". Sampling is per harness
         // iteration and cheap, and the RTT list is bounded by the run length.
         if client.is_connected() {
-            let observed = client.server_tick().0;
-            if report.first_tick.is_none() {
-                report.first_tick = Some(observed);
-            }
-            if observed != report.server_tick {
-                report.server_tick = observed;
-                report.tick_advances += 1;
-            }
+            record_tick_observation(&mut report, client.server_tick().0);
             if rtt_measured {
-                report.rtt_samples_ms.push(client.rtt().as_secs_f64() * 1000.0);
+                report
+                    .rtt_samples_ms
+                    .push(client.rtt().as_secs_f64() * 1000.0);
             }
             report.observed_secs = start.elapsed().as_secs_f64();
         }
     }
 
     finish(client, report, live_entities.len())
+}
+
+/// Bug №266 part (б): the shared counting path for "what did this bot see".
+///
+/// The first observation only anchors the tick; every later one counts a
+/// single advance, and a jump of more than one counts the ticks the bot never
+/// observed into `missed_tick_publishes` — those numbers were published and
+/// lost or arrived too late for the receiver loop, and the jump-as-one-advance
+/// framing used to hide them.
+fn record_tick_observation(report: &mut BotReport, observed: u64) {
+    if report.first_tick.is_none() {
+        report.first_tick = Some(observed);
+        report.server_tick = observed;
+        return;
+    }
+    if observed == report.server_tick {
+        return;
+    }
+    report.tick_advances += 1;
+    if observed > report.server_tick {
+        let hop = observed - report.server_tick;
+        if hop > 1 {
+            report.missed_tick_publishes += hop - 1;
+        }
+    }
+    report.server_tick = observed;
 }
 
 fn finish(client: NetClient, mut report: BotReport, live: usize) -> BotReport {
@@ -473,6 +535,14 @@ fn finish(client: NetClient, mut report: BotReport, live: usize) -> BotReport {
     report.tx_packets = stats.sent_packets_total;
     report.stalled_deltas = client.base_mismatch_drops();
     report.stale_deltas = client.stale_delta_drops();
+    // Bug №267 (A): how many immediate-healing asks went out.
+    report.resync_requests = client.resync_requests_sent();
+    // Bug №699: the world the server told this bot about. A bot on a map
+    // with structures that reports zero was never told about the world.
+    report.map_obstacles = client
+        .map_description()
+        .map(|description| description.obstacles.len() as u64)
+        .unwrap_or(0);
     report.stalls_by_layer = client.base_mismatch_drops_by_layer();
     report.layers = client.applied_layer_ticks();
     // Bug №274: the honest delivery figure, read alongside `state_updates`.
@@ -510,10 +580,15 @@ async fn main() -> Result<()> {
         .unwrap_or(20)
         .clamp(1, 1000);
     let duration = Duration::from_secs(
-        args.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(20),
+        args.get(3)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(20),
     );
 
-    info!("stress: {bots} bots -> {server_addr} for {}s", duration.as_secs());
+    info!(
+        "stress: {bots} bots -> {server_addr} for {}s",
+        duration.as_secs()
+    );
 
     let connected_now = Arc::new(AtomicUsize::new(0));
     let updates_total = Arc::new(AtomicU64::new(0));
@@ -525,7 +600,9 @@ async fn main() -> Result<()> {
         let connected = connected_now.clone();
         let updates = updates_total.clone();
         let full = rejected_server_full.clone();
-        handles.push(tokio::spawn(run_bot(id, addr, duration, connected, updates, full)));
+        handles.push(tokio::spawn(run_bot(
+            id, addr, duration, connected, updates, full,
+        )));
         // Stagger connects so the accept path isn't hit by a SYN-like burst.
         tokio::time::sleep(Duration::from_millis(15)).await;
         if id % 20 == 0 {
@@ -559,14 +636,21 @@ async fn main() -> Result<()> {
     let entities: usize = reports.iter().map(|r| r.last_entities).sum();
     let bw_in: f64 = reports.iter().map(|r| r.bw_in_bps).sum();
     let bw_out: f64 = reports.iter().map(|r| r.bw_out_bps).sum();
-    let n = reports.len().max(1);
-
+    // Bug №72: the denominator is the number of bots that were ASKED for, not
+    // the number that happened to produce a report. A server that refuses
+    // connections (ServerFull) must not make the per-bot figures look better
+    // than they are — the refused bots are part of the requested fleet.
+    let n = bots.max(1);
+    let reports_collected = reports.len();
     // The two numbers the plan actually asks for.
     //
     // Latency: every bot's RTT samples pooled into one list, so a percentile is
     // over the whole run rather than over a per-bot average — an average of
     // averages hides exactly the tail the plan is looking for.
-    let mut all_rtt: Vec<f64> = reports.iter().flat_map(|r| r.rtt_samples_ms.clone()).collect();
+    let mut all_rtt: Vec<f64> = reports
+        .iter()
+        .flat_map(|r| r.rtt_samples_ms.clone())
+        .collect();
     all_rtt.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let percentile = |p: f64| -> f64 {
         if all_rtt.is_empty() {
@@ -585,7 +669,10 @@ async fn main() -> Result<()> {
     // moved during the run. `tick_advances == 0` means the server's tick never
     // changed for that client, whatever the final number happens to be.
     let live_bots = reports.iter().filter(|r| r.tick_advances > 0).count();
-    let stalled_bots = reports.iter().filter(|r| r.connected && r.tick_advances == 0).count();
+    let stalled_bots = reports
+        .iter()
+        .filter(|r| r.connected && r.tick_advances == 0)
+        .count();
     let ticks_advanced: u64 = reports.iter().map(|r| r.tick_advances).sum();
     let observed_secs: f64 = reports.iter().map(|r| r.observed_secs).sum();
     let observed_hz = if observed_secs > 0.0 {
@@ -605,10 +692,7 @@ async fn main() -> Result<()> {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         v
     };
-    let per_bot_p05 = per_bot_sorted
-        .first()
-        .copied()
-        .unwrap_or(0.0);
+    let per_bot_p05 = per_bot_sorted.first().copied().unwrap_or(0.0);
     let per_bot_p50 = if per_bot_sorted.is_empty() {
         0.0
     } else {
@@ -629,14 +713,14 @@ async fn main() -> Result<()> {
         warn!("stress: {dropped} client events were dropped (bounded queue full)");
     }
     info!(
-        "stress summary: bots={bots} connected_at_end={connected_peak} \
+        "stress summary: bots={bots} reports_collected={reports_collected} connected_at_end={connected_peak} \
          state_updates={updates} avg_entities_per_bot={:.1} sent={sent} acks={acks} errors={errors} \
          rejected_server_full={rejected_full} rejected_other={rejected_other} events_dropped={dropped} \
          bw_in_total={:.1}KB/s bw_out_total={:.1}KB/s bw_in_per_bot={:.1}KB/s",
-        entities as f64 / n as f64,
+        per_requested_bot(entities as f64, bots),
         bw_in / 1024.0,
         bw_out / 1024.0,
-        bw_in / 1024.0 / n as f64,
+        per_requested_bot(bw_in / 1024.0, bots),
     );
     info!(
         "stress network: rtt_mean={rtt_mean:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms samples={}",
@@ -650,7 +734,7 @@ async fn main() -> Result<()> {
         "stress convergence: live_bots={live_bots}/{bots} stalled_bots={stalled_bots} \
          ticks_advanced={ticks_advanced} observed_hz_aggregate={observed_hz:.2} \
          per_bot_hz_p05={per_bot_p05:.2} per_bot_hz_p50={per_bot_p50:.2} nominal_hz={}",
-rfs_core::time::TICK_RATE as f32,
+        rfs_core::time::TICK_RATE as f32,
     );
     // Bug #267: the client-apply rate, from events actually delivered to the
     // harness, not from the harness's own sampling loop (that loop is starved
@@ -679,7 +763,12 @@ rfs_core::time::TICK_RATE as f32,
         0.0
     };
     let applied_by_layer: Vec<u64> = (0..LAYER_COUNT)
-        .map(|l| reports.iter().map(|r| r.applied_deltas_by_layer.get(l).copied().unwrap_or(0)).sum())
+        .map(|l| {
+            reports
+                .iter()
+                .map(|r| r.applied_deltas_by_layer.get(l).copied().unwrap_or(0))
+                .sum()
+        })
         .collect();
     info!(
         "stress delivery: applied_deltas_total={applied_deltas} applied_deltas_hz={applied_deltas_hz:.2} \
@@ -743,7 +832,12 @@ rfs_core::time::TICK_RATE as f32,
     let stale: u64 = reports.iter().map(|r| r.stale_deltas).sum();
     let bots_with_stale = reports.iter().filter(|r| r.stale_deltas > 0).count();
     let by_layer: Vec<u64> = (0..LAYER_COUNT)
-        .map(|l| reports.iter().map(|r| r.stalls_by_layer.get(l).copied().unwrap_or(0)).sum())
+        .map(|l| {
+            reports
+                .iter()
+                .map(|r| r.stalls_by_layer.get(l).copied().unwrap_or(0))
+                .sum()
+        })
         .collect();
     info!(
         "stress packets: rx_total={rx_total} tx_total={tx_total} \
@@ -751,6 +845,31 @@ rfs_core::time::TICK_RATE as f32,
          stalled_deltas={stalled} bots_with_stalls={bots_with_stalls} \
          stalls_by_layer={by_layer:?} \
          stale_deltas={stale} bots_with_stale={bots_with_stale}",
+    );
+
+    // Bug №266 part (б): the ticks nobody saw. Advances minus covered span
+    // and missed counters are the client-side confluence; compare the totals
+    // with the server's own `rounds_per_tick`/`packets_per_round` from its
+    // perf line, following the record's (в) prescription.
+    let advances: u64 = reports.iter().map(|r| r.tick_advances).sum();
+    let missed: u64 = reports.iter().map(|r| r.missed_tick_publishes).sum();
+    let bots_with_missed = reports
+        .iter()
+        .filter(|r| r.missed_tick_publishes > 0)
+        .count();
+    // Bug №267 (A): the healing asks tied to the stalls that caused them.
+    let resync_requests: u64 = reports.iter().map(|r| r.resync_requests).sum();
+    let stalled_deltas_diag: u64 = reports.iter().map(|r| r.stalled_deltas).sum();
+    // Bug №699: how many structures the bots were told about. Zero on a map
+    // that has structures means the world never reached the clients.
+    let map_obstacles: u64 = reports.iter().map(|r| r.map_obstacles).sum();
+    let bots_with_map = reports.iter().filter(|r| r.map_obstacles > 0).count();
+    info!(
+        "stress ticks: advances={advances} missed_tick_publishes={missed} \
+         bots_with_missed={bots_with_missed}/{n} resync_requests={resync_requests} \
+         stalled_deltas={stalled_deltas_diag} map_obstacles_per_bot={map_obstacles} \
+         bots_with_map={bots_with_map}/{n} \
+         (compare with the server's rounds_per_tick and packets_per_round)"
     );
 
     // Bug #267: which layers actually advance, and how far behind the server
@@ -765,4 +884,200 @@ rfs_core::time::TICK_RATE as f32,
         "stress layers: server_tick_max={srv_tick} layer0_max={l0} layer1_max={l1} layer2_max={l2} layer3_max={l3}",
     );
     Ok(())
+}
+
+/// Bug №72: the per-bot figures divide by the fleet that was REQUESTED, not
+/// by the number of reports that came back.
+///
+/// A server that admits 30 of 300 requested bots has served a tenth of the
+/// load; dividing by the 30 makes every average look ten times better than
+/// the run deserved. The refused bots are part of the requested fleet.
+fn per_requested_bot(total: f64, requested_bots: usize) -> f64 {
+    if requested_bots == 0 {
+        return 0.0;
+    }
+    total / requested_bots as f64
+}
+
+#[cfg(test)]
+mod summary_accounting_tests {
+    //! Bug №72: the summary must not flatter a server that refuses
+    //! connections.
+    //!
+    //! `ServerFull` is a legitimate answer, not an error — but it is still a
+    //! refusal, and the per-bot figures have to be divided by the fleet that
+    //! was ASKED for. Otherwise a server that admitted 30 of 300 requested
+    //! bots looks like it served 300.
+
+    use super::*;
+    use rfs_core::packet::ConnectRejectReason;
+
+    fn blank_report() -> BotReport {
+        BotReport {
+            connected: false,
+            state_updates: 0,
+            last_entities: 0,
+            sent: 0,
+            acks: 0,
+            errors: 0,
+            rejected_server_full: 0,
+            rejected_other: 0,
+            events_dropped: 0,
+            bw_in_bps: 0.0,
+            bw_out_bps: 0.0,
+            server_tick: 0,
+            rtt_samples_ms: Vec::new(),
+            first_tick: None,
+            tick_advances: 0,
+            missed_tick_publishes: 0,
+            resync_requests: 0,
+            map_obstacles: 0,
+            observed_secs: 0.0,
+            rx_packets: 0,
+            tx_packets: 0,
+            stalled_deltas: 0,
+            stale_deltas: 0,
+            stalls_by_layer: vec![0; LAYER_COUNT],
+            layers: [0; LAYER_COUNT],
+            applied_deltas: 0,
+            applied_deltas_by_layer: vec![0; LAYER_COUNT],
+        }
+    }
+
+    #[test]
+    fn a_server_full_refusal_is_counted_as_a_refusal_and_not_as_an_error() {
+        let mut report = blank_report();
+        let server_full = report.note_rejection(&ConnectRejectReason::ServerFull);
+        assert!(server_full, "ServerFull is a measured outcome");
+        assert_eq!(report.rejected_server_full, 1);
+        assert_eq!(report.rejected_other, 0);
+        assert_eq!(
+            report.errors, 0,
+            "a full server is a result, not an error of the run"
+        );
+    }
+
+    #[test]
+    fn other_refusals_are_counted_apart() {
+        let mut report = blank_report();
+        let other = report.note_rejection(&ConnectRejectReason::VersionMismatch);
+        assert!(!other, "only ServerFull is a measured outcome");
+        assert_eq!(report.rejected_other, 1);
+        assert_eq!(report.rejected_server_full, 0);
+    }
+
+    #[test]
+    fn the_per_bot_average_divides_by_the_requested_fleet() {
+        // 300 bots requested, 30 admitted, 10 entities each: 300 entities
+        // over 300 requested bots is 1 entity per requested bot, not 10.
+        let entities = 300.0_f64;
+        let per_bot = per_requested_bot(entities, 300);
+        assert!(
+            (per_bot - 1.0).abs() < 1e-9,
+            "the average must be per REQUESTED bot, got {per_bot}"
+        );
+    }
+
+    #[test]
+    fn the_per_bot_average_of_an_empty_fleet_is_zero_not_a_division_by_zero() {
+        assert_eq!(per_requested_bot(10.0, 0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tick_observation_tests {
+    //! Bug №266 part (б): the counter must not stay silent on a tick jump. A
+    //! silent jump would once again present "one advance" where several
+    //! published ticks were never observed, which is exactly the framing the
+    //! record forbids.
+
+    use super::*;
+
+    fn blank_report() -> BotReport {
+        BotReport {
+            connected: false,
+            state_updates: 0,
+            last_entities: 0,
+            sent: 0,
+            acks: 0,
+            errors: 0,
+            rejected_server_full: 0,
+            rejected_other: 0,
+            events_dropped: 0,
+            bw_in_bps: 0.0,
+            bw_out_bps: 0.0,
+            server_tick: 0,
+            rtt_samples_ms: Vec::new(),
+            first_tick: None,
+            tick_advances: 0,
+            missed_tick_publishes: 0,
+            resync_requests: 0,
+            map_obstacles: 0,
+            observed_secs: 0.0,
+            rx_packets: 0,
+            tx_packets: 0,
+            stalled_deltas: 0,
+            stale_deltas: 0,
+            stalls_by_layer: vec![0; LAYER_COUNT],
+            layers: [0; LAYER_COUNT],
+            applied_deltas: 0,
+            applied_deltas_by_layer: vec![0; LAYER_COUNT],
+        }
+    }
+
+    #[test]
+    fn consecutive_ticks_are_advances_without_misses() {
+        let mut report = blank_report();
+        record_tick_observation(&mut report, 100);
+        record_tick_observation(&mut report, 101);
+        record_tick_observation(&mut report, 102);
+        assert_eq!(report.tick_advances, 2);
+        assert_eq!(report.missed_tick_publishes, 0);
+        assert_eq!(report.server_tick, 102);
+    }
+
+    #[test]
+    fn a_gapped_jump_counts_the_ticks_the_bot_never_saw() {
+        let mut report = blank_report();
+        record_tick_observation(&mut report, 100);
+        // 100 -> 103: ticks 101 and 102 were published, the bot saw neither.
+        record_tick_observation(&mut report, 103);
+        assert_eq!(report.tick_advances, 1);
+        assert_eq!(report.missed_tick_publishes, 2);
+        assert_eq!(report.server_tick, 103);
+    }
+
+    #[test]
+    fn a_bigger_gaps_count_is_the_sum_of_gaps() {
+        let mut report = blank_report();
+        record_tick_observation(&mut report, 100);
+        record_tick_observation(&mut report, 101);
+        record_tick_observation(&mut report, 104);
+        record_tick_observation(&mut report, 105);
+        record_tick_observation(&mut report, 110);
+        assert_eq!(report.tick_advances, 4);
+        // 101 -> 104 = 2 missed (102, 103); 105 -> 110 = 4 missed (106..109).
+        assert_eq!(report.missed_tick_publishes, 2 + 4);
+        assert_eq!(report.server_tick, 110);
+    }
+
+    #[test]
+    fn a_tick_rollback_is_an_advance_but_not_missed_publishes() {
+        let mut report = blank_report();
+        record_tick_observation(&mut report, 100);
+        record_tick_observation(&mut report, 99);
+        assert_eq!(report.tick_advances, 1);
+        assert_eq!(report.missed_tick_publishes, 0);
+        assert_eq!(report.server_tick, 99);
+    }
+
+    #[test]
+    fn the_first_observation_anchors_and_counts_nothing() {
+        let mut report = blank_report();
+        record_tick_observation(&mut report, 40);
+        assert_eq!(report.tick_advances, 0);
+        assert_eq!(report.missed_tick_publishes, 0);
+        assert_eq!(report.first_tick, Some(40));
+        assert_eq!(report.server_tick, 40);
+    }
 }

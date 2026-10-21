@@ -3,7 +3,7 @@
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
 use crate::render::core::RenderContext;
-use crate::render::graph::node::{PassDependency, RenderPass};
+use crate::render::graph::node::{PassDependency, PassOutcome, RenderPass};
 use crate::render::graph::resource::GraphResource;
 use crate::render::scene::Scene;
 use crate::rhi::CommandEncoder;
@@ -62,8 +62,14 @@ impl RenderPass for BaseRenderPass {
         _context: &mut RenderContext,
         _scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
-    ) {
-        // Base implementation does nothing
+    ) -> PassOutcome {
+        // Base implementation does nothing.
+        //
+        // Bug №653: it says so, rather than leaving the graph to guess. A pass
+        // that records nothing is not the same as a pass that was never called,
+        // and the instrument that answers "which subsystem did no work" can
+        // only answer it if the pass says which case it is.
+        PassOutcome::skipped("the base pass does nothing")
     }
 
     fn is_enabled(&self) -> bool {

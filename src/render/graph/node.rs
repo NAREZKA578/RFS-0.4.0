@@ -31,6 +31,56 @@ impl PassDependency {
     }
 }
 
+/// What a pass did when it ran.
+///
+/// Bug №653: the graph's counter was incremented *before* `execute` was
+/// called, so a pass that returned early — no framebuffer, no pipeline, no
+/// state — was counted as having run. The doc comment claimed the counts were
+/// "of real executions", and nothing in the code kept that claim true.
+///
+/// The difference is not academic. Five of the seven passes were in exactly
+/// that state: their pipelines were never created, so their `execute` returned
+/// before recording anything, and the counter said they ran every frame. An
+/// instrument that cannot tell "was called" from "did the work" is blind to
+/// the defect class it was built for.
+///
+/// So the pass says what it did. The reason matters as much as the fact: a
+/// pass that skipped because it has no pipeline says so, and the log says
+/// which.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PassOutcome {
+    /// Whether the pass recorded anything into the command stream.
+    pub recorded: bool,
+    /// Why the pass recorded nothing, when it did not.
+    pub reason: Option<String>,
+}
+
+impl PassOutcome {
+    /// The pass recorded work.
+    pub fn recorded() -> Self {
+        Self {
+            recorded: true,
+            reason: None,
+        }
+    }
+
+    /// The pass did nothing, for this reason.
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            recorded: false,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// A one-line description, for a log.
+    pub fn describe(&self) -> String {
+        match &self.reason {
+            Some(reason) => format!("skipped: {reason}"),
+            None => "recorded".to_string(),
+        }
+    }
+}
+
 /// Trait for render passes
 pub trait RenderPass {
     /// Get the name of the pass
@@ -42,19 +92,33 @@ pub trait RenderPass {
     /// Get outputs of this pass
     fn outputs(&self) -> &[String];
 
-    /// Initialize the pass
-    fn initialize(&mut self, _device: &crate::rhi::Device, _context: &RenderContext) {
+    /// Initialize the pass.
+    ///
+    /// The resource map is handed over so a pass can take the targets it was
+    /// promised and produce the ones it owns. It was not there before, and
+    /// that is why the graph's resources never fed a pass: the passes could
+    /// not reach them, so they made their own — and the graph's map stayed a
+    /// catalogue nobody read. Bug №652.
+    fn initialize(
+        &mut self,
+        _device: &crate::rhi::Device,
+        _context: &RenderContext,
+        _resources: &mut HashMap<String, GraphResource>,
+    ) {
         // Default: do nothing
     }
 
-    /// Execute the pass
+    /// Execute the pass.
+    ///
+    /// Returns what the pass did, so the graph can tell "was called" from
+    /// "contributed to the frame". See [`PassOutcome`].
     fn execute(
         &mut self,
         encoder: &mut CommandEncoder,
         context: &mut RenderContext,
         scene: &mut Scene,
         resources: &HashMap<String, GraphResource>,
-    );
+    ) -> PassOutcome;
 
     /// Resize the pass
     fn resize(&mut self, _width: u32, _height: u32) {
@@ -111,15 +175,25 @@ impl RenderPassNode {
         context: &mut RenderContext,
         scene: &mut Scene,
         resources: &HashMap<String, GraphResource>,
-    ) {
+    ) -> PassOutcome {
         if self.enabled {
-            self.pass.execute(encoder, context, scene, resources);
+            self.pass.execute(encoder, context, scene, resources)
+        } else {
+            // A disabled pass is not a pass that did nothing — it is a pass
+            // that was not asked to. Saying so keeps the two apart: the graph
+            // counts this separately from a pass that was called and skipped.
+            PassOutcome::skipped("disabled")
         }
     }
 
     /// Initialize the pass
-    pub fn initialize(&mut self, device: &crate::rhi::Device, context: &RenderContext) {
-        self.pass.initialize(device, context);
+    pub fn initialize(
+        &mut self,
+        device: &crate::rhi::Device,
+        context: &RenderContext,
+        resources: &mut HashMap<String, GraphResource>,
+    ) {
+        self.pass.initialize(device, context, resources);
     }
 
     /// Resize the pass

@@ -331,6 +331,41 @@ pub(crate) fn texture_layout(layout: crate::resource::TextureLayout) -> vk::Imag
     }
 }
 
+/// Convert a Vulkan image layout back to the RHI's own. Bug #644.
+///
+/// The other direction already existed; this one is needed because the layout
+/// tracker stores Vulkan's layouts, and the tracker has to be visible to
+/// anyone who wants to check it — a stale layout is exactly the kind of
+/// defect that stays invisible until something reads it back.
+///
+/// A layout the RHI has no name for is reported as `General`, which is the
+/// truthful answer: the RHI does not know what that layout is, and `General`
+/// is the one that means "no particular promise".
+pub(crate) fn rhi_texture_layout(layout: vk::ImageLayout) -> crate::resource::TextureLayout {
+    use crate::resource::TextureLayout;
+    match layout {
+        vk::ImageLayout::UNDEFINED => TextureLayout::Undefined,
+        vk::ImageLayout::GENERAL => TextureLayout::General,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => TextureLayout::ColorAttachmentOptimal,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => TextureLayout::TransferSrcOptimal,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL => TextureLayout::TransferDstOptimal,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => TextureLayout::ShaderReadOnlyOptimal,
+        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => {
+            TextureLayout::DepthStencilAttachmentOptimal
+        }
+        vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL => {
+            TextureLayout::DepthStencilReadOnlyOptimal
+        }
+        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL => TextureLayout::DepthAttachmentOptimal,
+        vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL => TextureLayout::DepthReadOnlyOptimal,
+        vk::ImageLayout::STENCIL_ATTACHMENT_OPTIMAL => TextureLayout::StencilAttachmentOptimal,
+        vk::ImageLayout::STENCIL_READ_ONLY_OPTIMAL => TextureLayout::StencilReadOnlyOptimal,
+        vk::ImageLayout::PREINITIALIZED => TextureLayout::Preinitialized,
+        vk::ImageLayout::PRESENT_SRC_KHR => TextureLayout::PresentSrc,
+        _ => TextureLayout::General,
+    }
+}
+
 /// Convert a render pass load operation to a Vulkan attachment load operation.
 pub(crate) fn attachment_load_op(op: crate::command::pass::render::LoadOp) -> vk::AttachmentLoadOp {
     use crate::command::pass::render::LoadOp;

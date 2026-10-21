@@ -176,6 +176,20 @@ impl Renderer {
         self.presentation = Some(Presentation { surface, swapchain });
         // `old` drops here. Its swapchain handle was consumed by Vulkan during
         // the handover, so `Drop` leaves it alone; its surface goes with it.
+        //
+        // Bug #645: the presentation state was not published here, and this is
+        // the only path that creates the first chain. `refresh_presentation_state`
+        // is the sole producer of `context.presentation_texture_views`, and it
+        // was called from `resize` and `rebuild_presentation` — so on a fresh
+        // window the vector was empty until the user dragged the window, and
+        // `UIPass::execute` returned before drawing anything:
+        //
+        //     let Some(view) = context.presentation_texture_views.get(..) else { return; };
+        //
+        // The example written to answer "does a UI pixel reach the screen" could
+        // not answer it, because the path it checked was cut short before it
+        // got there.
+        self.refresh_presentation_state();
         Ok(())
     }
 
@@ -270,6 +284,20 @@ impl Renderer {
         // transparent sorting and distance culling measure from the camera.
         self.context.set_camera_position(scene.camera_position());
 
+        // Initialize the graph if nobody has.
+        //
+        // A graph that was never initialized has no resources and no
+        // initialized passes, so every pass in it records nothing and the
+        // frame is submitted empty. That failure is invisible from outside:
+        // the instrument that knows is an info line, and the default threshold
+        // prints warnings and not info. So the first frame initializes the
+        // graph by itself, and a caller who added passes and rendered gets
+        // them on the screen without having to know about a separate step.
+        if !self.render_graph.is_initialized() {
+            self.render_graph
+                .initialize(&self.device, &self.context, scene);
+        }
+
         // Update scene
         scene.update(delta_time, &self.context);
 
@@ -345,6 +373,13 @@ impl Renderer {
         // swapchain render into the image about to be presented, instead of
         // always reaching for image 0.
         self.context.swapchain_image_index = acquired_index;
+        // The present waits on the semaphore of the *image* being presented, so
+        // the submit has to know which image it renders into. The frame slot and
+        // the image are unrelated — a slot comes round again after
+        // `FRAMES_IN_FLIGHT` frames, and the present of that image may still be
+        // pending — and sharing one semaphore between them is
+        // VUID-vkQueueSubmit-pSignalSemaphores-00067.
+        self.device.set_present_image(acquired_index);
 
         // Execute render graph
         //
@@ -391,14 +426,37 @@ impl Renderer {
         // A change in "which passes ran" is worth one line; the same summary every
         // frame is not. A pass that never runs is raised to a warning because the
         // default threshold prints warnings and not info — the finding must be
-        // visible without anyone remembering to raise it (§313).
+        // visible without anyone remembering to raise it (§313). The draw counts
+        // ride along on purpose: `RenderStats` used to be written and read by
+        // nothing, and a counter with no reader is not a diagnostic. One line per
+        // change keeps the log quiet.
+        //
+        // Bug №653: a pass that was *called* and did nothing is the finding
+        // this instrument was built for, and it is not the same as a pass that
+        // was never reached. Five of the seven passes were in exactly that
+        // state: dispatched every frame, contributing nothing, and the old
+        // counter called that "running". So the two lists are separated, and
+        // the reasons are printed — "no framebuffer" and "no pipeline" are two
+        // different bugs, and a list of names cannot tell them apart.
         let summary = self.render_graph.execution_summary();
         if summary != self.last_execution_summary {
             self.last_execution_summary = summary.clone();
-            if self.render_graph.never_executed().is_empty() {
-                crate::info!("renderer", "graph: {summary}");
+            let line = format!(
+                "graph: {summary}; frame: {} draw(s), {} triangle(s), {} vertex/indices",
+                draws.draws, draws.triangles, draws.vertices
+            );
+            let never = self.render_graph.never_executed();
+            let idle = self.render_graph.passes_without_work();
+            if never.is_empty() && idle.is_empty() {
+                crate::info!("renderer", "{line}");
             } else {
-                crate::warn!("renderer", "graph: {summary}");
+                crate::warn!("renderer", "{line}");
+                for name in &never {
+                    crate::warn!("renderer", "the pass {name:?} was never reached");
+                }
+                for (name, reason) in &idle {
+                    crate::warn!("renderer", "the pass {name:?} did no work: {reason}");
+                }
             }
         }
 
@@ -417,7 +475,19 @@ impl Renderer {
                 .map(|backend| backend.render_finished_semaphore())
                 .unwrap_or_else(crate::rhi::ash::vk::Semaphore::null);
             if let Err(e) = presentation.swapchain.present(acquired_index, render_finished) {
-                if !matches!(e, RhiError::SwapchainOutOfDate) {
+                // Bug #649: an out-of-date chain has to be rebuilt here too, not
+                // only on the acquire path. The present is where a suboptimal
+                // chain is first reported (Bug #640), and the acquire only
+                // reports it on the *next* frame — so a window that was resized
+                // or minimised kept presenting a stale image for one frame, and
+                // the error was swallowed here, so nothing rebuilt it.
+                //
+                // The acquire path rebuilds and returns; the present path cannot
+                // return, because the frame has already been recorded and
+                // submitted. It rebuilds and lets the frame go.
+                if matches!(e, RhiError::SwapchainOutOfDate) {
+                    self.rebuild_presentation();
+                } else {
                     crate::error!("renderer", "present failed: {e}");
                 }
             }

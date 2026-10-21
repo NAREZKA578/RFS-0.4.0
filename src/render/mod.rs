@@ -69,6 +69,7 @@ pub use postprocess::{
     BloomConfig, BloomEffect, DepthOfFieldEffect, DofConfig, FXAAEffect, HDREffect, HdrConfig,
     MotionBlurConfig, MotionBlurEffect, PostProcessConfig, PostProcessManager, ToneMapping,
 };
+pub use passes::{GBufferPass, GeometryPass, LightingPass, ResolvePass};
 pub use scene::{Entity, Renderable, Scene, Transform};
 pub use textures::{SamplerDesc, Texture, TextureLibrary};
 pub use ui::{HUDAlignment, Menu, MenuItem, MenuItemType, MenuType, Minimap, HUD};

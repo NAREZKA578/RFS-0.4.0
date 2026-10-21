@@ -334,4 +334,46 @@ impl RenderContext {
             _ => None,
         }
     }
+
+    /// The size of a screen-sized target, in physical pixels.
+    ///
+    /// Bug №651: this rule used to be written out again in every pass that
+    /// needed a size, and it was written out **wrongly** in most of them.
+    ///
+    /// `resolution` is the window's *logical* size, and it is not even that
+    /// until the first resize — it starts as a hard-coded 1920×1080, because
+    /// `Renderer::new` takes a window handle and does not use it. The physical
+    /// size is the swapchain's extent, and the two disagree at any scale factor
+    /// other than 100%: a 1280×720 window at 125% has a 1600×900 swapchain, so
+    /// a target sized from `resolution` covers 80% of the screen and the rest
+    /// is whatever was there before.
+    ///
+    /// The order is therefore: the presentation extent first (it is the size the
+    /// compositor will show), then the resolution as a fallback for a headless
+    /// context that has no surface. `None` means "there is no size to use", and
+    /// a caller that gets `None` must not invent one — a zero-sized viewport
+    /// records nothing, and a zero-sized attachment cannot be created at all.
+    ///
+    /// A pass that renders into a framebuffer it already holds has a better
+    /// source than this one: the framebuffer's own descriptor, which is by
+    /// construction the size of its attachments. See `passes/geometry.rs`.
+    pub fn drawable_extent(&self) -> Option<(u32, u32)> {
+        let extent = self.presentation_extent;
+        if extent.width != 0 && extent.height != 0 {
+            return Some((extent.width, extent.height));
+        }
+        if self.resolution.width != 0 && self.resolution.height != 0 {
+            return Some((self.resolution.width, self.resolution.height));
+        }
+        None
+    }
+
+    /// The size of a screen-sized target, or a zero extent when there is none.
+    ///
+    /// For the places that need a number rather than an option — an extent
+    /// field, a descriptor — and that treat zero as "nothing to draw into"
+    /// anyway.
+    pub fn drawable_size(&self) -> (u32, u32) {
+        self.drawable_extent().unwrap_or((0, 0))
+    }
 }

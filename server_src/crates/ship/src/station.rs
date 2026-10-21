@@ -1,4 +1,4 @@
-use rfs_core::entity::{StationTemplate, StationType, EntityId, Transform, Bounds};
+use rfs_core::entity::{Bounds, EntityId, StationTemplate, StationType, Transform};
 use rfs_core::math::Vec3f;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,12 @@ pub struct StationState {
     pub max_health: f32,
     pub cooldown: f32,
     pub last_fire_time: f32,
+    /// Bug №633: seconds until the next repair action is accepted. The 25 hp
+    /// ceiling was per *action*, and nothing throttled the actions — a client
+    /// spamming Repair packets restored 500 hp/s through one post and made a
+    /// damaged ship with a live damage-control seat tougher than any normal
+    /// damage intake. Decays in `update`, starts in `repair`.
+    pub repair_cooldown: f32,
 }
 
 impl Default for StationState {
@@ -72,6 +78,7 @@ impl Default for StationState {
             max_health: 500.0,
             cooldown: 0.0,
             last_fire_time: 0.0,
+            repair_cooldown: 0.0,
         }
     }
 }
@@ -134,7 +141,17 @@ impl Station {
         &self.config
     }
 
-    pub fn update(&self, dt: f32, state: &mut StationState, compartment_state: Option<&crate::compartment::CompartmentState>) {
+    pub fn update(
+        &self,
+        dt: f32,
+        state: &mut StationState,
+        compartment_state: Option<&crate::compartment::CompartmentState>,
+    ) {
+        // Bug №633: the repair cooldown decays even for a dead/offline station —
+        // if it decayed behind the early-returns below, a station destroyed
+        // mid-cooldown would freeze its clock and never be repairable again.
+        state.repair_cooldown = (state.repair_cooldown - dt).max(0.0);
+
         if state.health <= 0.0 {
             return;
         }
@@ -142,8 +159,8 @@ impl Station {
         // Bug №56: operational-ness is re-derived from the compartment every
         // tick — no latch. Pump the water out / quench the fire and the
         // station comes back by itself.
-        let compartment_dead = compartment_state
-            .is_some_and(|c| c.is_flooded() || c.fire_intensity > 0.5);
+        let compartment_dead =
+            compartment_state.is_some_and(|c| c.is_flooded() || c.fire_intensity > 0.5);
         state.is_operational = !compartment_dead;
         if !state.is_operational {
             return;
@@ -159,7 +176,7 @@ impl Station {
         let max_step = self.config.turn_speed * dt;
         state.yaw += yaw_diff.clamp(-max_step, max_step);
         state.pitch += pitch_diff.clamp(-max_step, max_step);
-        
+
         // Safe clamp: inverted (min>max) or non-finite ranges from JSON must
         // not panic (f32::clamp panics on min>max). Fall back to current value.
         fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
@@ -214,23 +231,34 @@ impl Station {
             v.clamp(lo, hi)
         }
         state.target_yaw = safe_clamp(yaw, self.config.yaw_range.0, self.config.yaw_range.1);
-        state.target_pitch = safe_clamp(
-            pitch,
-            self.config.pitch_range.0,
-            self.config.pitch_range.1,
-        );
+        state.target_pitch =
+            safe_clamp(pitch, self.config.pitch_range.0, self.config.pitch_range.1);
     }
 
     pub fn get_angles(&self, state: &StationState) -> (f32, f32) {
         (state.yaw, state.pitch)
     }
 
+    /// Bug №630: the resolution of "has the turret arrived at the angles it
+    /// was given". A deferred shot fires exactly when this turns true, so the
+    /// tolerance must be far below any real slew step (`turn_speed * dt` is
+    /// ≥ ~0.03 rad at the fixed sim rate) and far above f32 jitter from the
+    /// final sub-step of the capped slew.
+    pub const AIM_EPSILON_R: f32 = 1e-4;
+
+    /// True when the station's live angles sit within `AIM_EPSILON_R` of the
+    /// target angles `set_target_angles` last installed.
+    pub fn aim_reached(&self, state: &StationState) -> bool {
+        (state.target_yaw - state.yaw).abs() <= Self::AIM_EPSILON_R
+            && (state.target_pitch - state.pitch).abs() <= Self::AIM_EPSILON_R
+    }
+
     pub fn can_fire(&self, state: &StationState) -> bool {
-        state.is_operational &&
-        state.health > 0.0 &&
-        state.cooldown <= 0.0 &&
-        state.reload_progress >= 1.0 &&
-        state.ammo_count > 0
+        state.is_operational
+            && state.health > 0.0
+            && state.cooldown <= 0.0
+            && state.reload_progress >= 1.0
+            && state.ammo_count > 0
     }
 
     pub fn fire(&self, state: &mut StationState, ammo_type: Option<u8>) -> Option<FireResult> {
@@ -255,14 +283,14 @@ impl Station {
             }
             state.ammo_type = at;
         }
-        
+
         state.ammo_count = state.ammo_count.saturating_sub(1);
         state.reload_progress = 0.0;
         state.cooldown = 1.0 / self.config.fire_rate;
         state.last_fire_time = 0.0;
-        
+
         let direction = self.calculate_fire_direction(state.yaw, state.pitch);
-        
+
         Some(FireResult {
             station_id: self.entity_id,
             position: self.local_transform().position,
@@ -274,11 +302,7 @@ impl Station {
 
     fn calculate_fire_direction(&self, yaw: f32, pitch: f32) -> Vec3f {
         let cp = pitch.cos();
-        Vec3f::new(
-            cp * yaw.sin(),
-            pitch.sin(),
-            cp * yaw.cos(),
-        )
+        Vec3f::new(cp * yaw.sin(), pitch.sin(), cp * yaw.cos())
     }
 
     fn get_muzzle_velocity(&self) -> f32 {
@@ -305,6 +329,13 @@ impl Station {
     /// an out-of-range value from ever reaching it.
     pub const VALID_AMMO_TYPES: [u8; 7] = [0, 1, 2, 3, 4, 5, 6];
 
+    /// Bug №633: with this cooldown a post restores at most 25 hp per second
+    /// (`MAX_REPAIR_PER_ACTION` per action on the server side) instead of the
+    /// packet-rate 500 hp/s the spam pattern produced. One second per action
+    /// means full 500 hp repair in ~20 actions — deliberate, patient work,
+    /// not a spam gimmick.
+    pub const REPAIR_COOLDOWN: f32 = 1.0;
+
     /// Whether `ammo_type` names a real shell.
     pub fn is_valid_ammo_type(ammo_type: u8) -> bool {
         Self::VALID_AMMO_TYPES.contains(&ammo_type)
@@ -318,20 +349,26 @@ impl Station {
     /// The `_` arm stays for exhaustiveness, but it is no longer reachable
     /// through `reload`, which validates first.
     fn ammo_type_to_projectile(&self, ammo_type: u8) -> rfs_core::packet::ProjectileType {
+        Station::projectile_type_for(ammo_type)
+            .unwrap_or(rfs_core::packet::ProjectileType::Cannonball)
+    }
+
+    /// Bug №664 (remainder): the station→projectile-family mapping, without
+    /// needing a Station instance. The fire-control solution reads the loaded
+    /// round's type to price its arc for the right shell family (a contact-
+    /// exploding ballistic shell and a KP flat-nose slug land differently);
+    /// `station.rs` also uses it for the same mapping when it actually spawns.
+    pub fn projectile_type_for(ammo_type: u8) -> Option<rfs_core::packet::ProjectileType> {
+        use rfs_core::packet::ProjectileType;
         match ammo_type {
-            0 => rfs_core::packet::ProjectileType::Cannonball,
-            1 => rfs_core::packet::ProjectileType::ExplosiveShell,
-            2 => rfs_core::packet::ProjectileType::ArmorPiercing,
-            3 => rfs_core::packet::ProjectileType::ChainShot,
-            4 => rfs_core::packet::ProjectileType::GrapeShot,
-            5 => rfs_core::packet::ProjectileType::Torpedo,
-            6 => rfs_core::packet::ProjectileType::DepthCharge,
-            // Unreachable now, and genuinely so: `reload` validates before it
-            // writes (№192), and `fire` validates an explicit type before it
-            // raises the gun (№631). The arm stays only for exhaustiveness;
-            // Cannonball is the safe direction for a gun that must fire
-            // something.
-            _ => rfs_core::packet::ProjectileType::Cannonball,
+            0 => Some(ProjectileType::Cannonball),
+            1 => Some(ProjectileType::ExplosiveShell),
+            2 => Some(ProjectileType::ArmorPiercing),
+            3 => Some(ProjectileType::ChainShot),
+            4 => Some(ProjectileType::GrapeShot),
+            5 => Some(ProjectileType::Torpedo),
+            6 => Some(ProjectileType::DepthCharge),
+            _ => None,
         }
     }
 
@@ -361,19 +398,33 @@ impl Station {
         false
     }
 
-    pub fn repair(&self, state: &mut StationState, amount: f32) {
+    /// Apply a repair action with a per-post rate limit (Bug №633).
+    ///
+    /// Returns whether the action was applied. `false` means the request was
+    /// rejected and the station was left untouched: a non-finite amount
+    /// (Bug №604), or a repair still on cooldown (Bug №633). The cooldown
+    /// starts with the *action*, not with its usefulness — a repair on a
+    /// full-health or destroyed station also burns the window, so one owner
+    /// cannot pre-charge and another spend it.
+    pub fn repair(&self, state: &mut StationState, amount: f32) -> bool {
         // Bug №604: a non-finite amount (the input path used to pass
         // `f32::INFINITY` straight through) would poison `health`, and the
         // `.min(max_health)` below would then hand out a full repair from a
         // single packet. Same guard shape as `apply_damage` (№194).
         if !amount.is_finite() {
-            return;
+            return false;
         }
+        // Bug №633: the amount ceiling is per action; this is the action rate.
+        if state.repair_cooldown > 0.0 {
+            return false;
+        }
+        state.repair_cooldown = Self::REPAIR_COOLDOWN;
         // Negative repairs must not damage the station.
         state.health = (state.health + amount.max(0.0)).min(state.max_health);
         if state.health > 0.0 {
             state.is_operational = true;
         }
+        true
     }
 
     pub fn apply_damage(&self, state: &mut StationState, damage: f32) {
@@ -419,8 +470,30 @@ impl Station {
         self.config.station_type
     }
 
+    /// Sets the station's default behavior.
+    ///
+    /// The live semantics the state layer actually carries is a single
+    /// operational flag: `Active` puts the station up, `Passive` and
+    /// `Disabled` take it down (they are distinct only as wire codes, not
+    /// as behavior yet — the first consumer that needs a real passive
+    /// split gets the state field it asks for). The command rule is that
+    /// the occupant of the station decides; see `Ship::set_station_behavior`.
     pub fn set_default_behavior(&self, state: &mut StationState, behavior: DefaultBehavior) {
         state.is_operational = matches!(behavior, DefaultBehavior::Active);
+    }
+}
+
+impl DefaultBehavior {
+    /// The code a behavior travels as on the wire (bug №669): a small
+    /// integer, because `core` carries the command and must not depend on
+    /// the ship crate's types. Unknown codes are refused, never defaulted.
+    pub fn from_code(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Active),
+            1 => Some(Self::Passive),
+            2 => Some(Self::Disabled),
+            _ => None,
+        }
     }
 }
 
@@ -466,6 +539,51 @@ mod tests {
                 pitch_range: (-30.0, 30.0),
             },
         )
+    }
+
+    /// Bug №669: `from_code` is the whole wire contract for the behavior
+    /// codes. Refusal, not defaulting, is what keeps a typo from flipping
+    /// a gun unnoticed.
+    #[test]
+    fn the_behavior_codes_decode_their_own_level() {
+        assert_eq!(DefaultBehavior::from_code(0), Some(DefaultBehavior::Active));
+        assert_eq!(
+            DefaultBehavior::from_code(1),
+            Some(DefaultBehavior::Passive)
+        );
+        assert_eq!(
+            DefaultBehavior::from_code(2),
+            Some(DefaultBehavior::Disabled)
+        );
+        for unknown in [3u8, 77, 255] {
+            assert_eq!(
+                DefaultBehavior::from_code(unknown),
+                None,
+                "code {unknown} silently decoded instead of refusing"
+            );
+        }
+    }
+
+    /// The command layer believes `set_default_behavior` moves exactly one
+    /// flag: `Active` keeps the station runnable, `Passive` and `Disabled`
+    /// take it down (distinct only as wire codes for now). If that ever
+    /// stops being what the function does, this test stops running green
+    /// with it.
+    #[test]
+    fn a_default_behavior_moves_the_operational_flag() {
+        let mut state = StationState {
+            is_operational: true,
+            ..Default::default()
+        };
+        for keeping in [DefaultBehavior::Passive, DefaultBehavior::Disabled] {
+            station().set_default_behavior(&mut state, keeping);
+            assert!(
+                !state.is_operational,
+                "{keeping:?} must take the station down"
+            );
+        }
+        station().set_default_behavior(&mut state, DefaultBehavior::Active);
+        assert!(state.is_operational, "Active must put the station back up");
     }
 
     /// Bug №193: the old mapping had no arm for ammo 5 and 6, and its `_` arm
@@ -515,170 +633,251 @@ mod tests {
     fn an_explosive_shell_keeps_a_blast_radius() {
         // ExplosiveShell is 1; its config declares a 10.0 blast. If the type is
         // right, `for_type` will hand back a non-zero radius.
-            assert_eq!(station().ammo_type_to_projectile(1), ProjectileType::ExplosiveShell);
-        }
+        assert_eq!(
+            station().ammo_type_to_projectile(1),
+            ProjectileType::ExplosiveShell
+        );
+    }
 
-        /// Bug №192. The defect was not that a bad type fired the wrong shell — it
-        /// was that a bad type was *stored*, so the station reported one thing and
-        /// fired another, and nothing anywhere complained.
-        #[test]
-        fn an_unknown_ammo_type_is_never_written_to_the_station() {
-            for bad in [7u8, 8, 42, 200, 255] {
-                assert!(
-                    !Station::is_valid_ammo_type(bad),
-                    "{bad} must not count as a known shell"
-                );
+    /// Bug №192. The defect was not that a bad type fired the wrong shell — it
+    /// was that a bad type was *stored*, so the station reported one thing and
+    /// fired another, and nothing anywhere complained.
+    #[test]
+    fn an_unknown_ammo_type_is_never_written_to_the_station() {
+        for bad in [7u8, 8, 42, 200, 255] {
+            assert!(
+                !Station::is_valid_ammo_type(bad),
+                "{bad} must not count as a known shell"
+            );
 
-                let mut state = StationState {
-                    // A completed reload cycle, so the only thing that can stop
-                    // the shell from loading is the type check.
-                    reload_progress: 1.0,
-                    ammo_count: 0,
-                    ammo_type: 3,
-                    ..Default::default()
-                };
-                let loaded = station().reload(&mut state, bad);
-
-                assert!(!loaded, "ammo type {bad} was accepted");
-                assert_eq!(
-                    state.ammo_type, 3,
-                    "the rejected reload overwrote ammo_type with {bad}"
-                );
-                assert_eq!(state.ammo_count, 0, "the rejected reload added a round");
-            }
-        }
-
-        /// Bug №631. `fire` carried the promise, in a comment two functions
-        /// down, that it rejected an unknown type; it stored the byte and then
-        /// launched the `_` fallback, so the station reported one type and fired
-        /// another. The shot must not happen at all, and the station must be left
-        /// exactly as it was.
-        #[test]
-        fn an_unknown_ammo_type_fires_nothing_and_changes_nothing() {
-            for bad in [7u8, 8, 42, 200, 255] {
-                let mut state = StationState {
-                    // Ready to fire, with a known round already loaded, so the
-                    // only thing that can stop the shot is the type check.
-                    is_operational: true,
-                    health: 50.0,
-                    reload_progress: 1.0,
-                    cooldown: 0.0,
-                    ammo_count: 3,
-                    ammo_type: 2,
-                    ..Default::default()
-                };
-                let before = state.clone();
-
-                assert!(
-                    station().fire(&mut state, Some(bad)).is_none(),
-                    "a shot was fired with ammo type {bad}"
-                );
-                assert_eq!(
-                    state.ammo_type, before.ammo_type,
-                    "the refused shot overwrote ammo_type with {bad}"
-                );
-                assert_eq!(
-                    state.ammo_count, before.ammo_count,
-                    "the refused shot spent a round"
-                );
-                assert_eq!(
-                    state.cooldown, before.cooldown,
-                    "the refused shot set a cooldown"
-                );
-            }
-        }
-
-        /// Every type the mapping knows must survive the validator, or a real
-        /// shell would be rejected at the door. This is the check that keeps the
-        /// two lists from drifting apart.
-        #[test]
-        fn every_mapped_ammo_type_passes_validation() {
-            for mapped in 0u8..=6 {
-                assert!(
-                    Station::is_valid_ammo_type(mapped),
-                    "type {mapped} has a projectile mapping but is not accepted"
-                );
-            }
-            assert_eq!(Station::VALID_AMMO_TYPES.len(), 7);
-        }
-
-        /// The cast is the trap. `NaN as u8` and `-3.0 as u8` are both `0` in
-        /// Rust, and `0` is a *valid* cannonball — so validating after the cast
-        /// would have waved a malformed request straight through. This asserts
-        /// the fact the caller in `main.rs` relies on.
-        #[test]
-        // The casts are the subject of this test, not an oversight: the whole
-        // point is that `NaN as u8` is `0` and that `0` is a valid cannonball.
-        // Silencing the lint here is what keeps it firing everywhere else.
-        #[allow(clippy::cast_nan_to_int)]
-        fn a_float_ammo_type_would_survive_a_naive_cast_as_a_valid_shell() {
-            assert_eq!(f32::NAN as u8, 0);
-            assert_eq!(-3.0f32 as u8, 0);
-            assert_eq!(300.0f32 as u8, 255);
-            // Which is exactly why `main.rs` checks `is_finite`, `fract() == 0`
-            // and the range *before* casting. 255 does not pass the validator,
-            // but NaN and negatives do.
-            assert!(Station::is_valid_ammo_type(f32::NAN as u8));
-            assert!(!Station::is_valid_ammo_type(300.0f32 as u8));
-        }
-
-        /// A valid type still loads, and the validator did not break Bug №84
-        /// (finishing the cycle actually puts a round in the magazine).
-        #[test]
-        fn a_valid_ammo_type_still_loads() {
             let mut state = StationState {
+                // A completed reload cycle, so the only thing that can stop
+                // the shell from loading is the type check.
                 reload_progress: 1.0,
                 ammo_count: 0,
+                ammo_type: 3,
                 ..Default::default()
             };
-            assert!(station().reload(&mut state, 5));
-            assert_eq!(state.ammo_type, 5);
-            assert_eq!(state.ammo_count, 1);
-            assert_eq!(state.reload_progress, 0.0);
-        }
+            let loaded = station().reload(&mut state, bad);
 
-        /// Bug №604, negative control: `f32::INFINITY` used to reach
-        /// `.min(max_health)` and fill a half-damaged station in a single call,
-        /// which is exactly what the input path sent. Drop the guard above and
-        /// the first assertion goes red.
-        #[test]
-        fn a_non_finite_repair_amount_does_not_fill_the_station() {
-            let mut state = StationState {
-                health: 250.0,
-                max_health: 500.0,
-                ..Default::default()
-            };
-
-            station().repair(&mut state, f32::INFINITY);
+            assert!(!loaded, "ammo type {bad} was accepted");
             assert_eq!(
-                state.health, 250.0,
-                "an infinite repair amount filled the station"
+                state.ammo_type, 3,
+                "the rejected reload overwrote ammo_type with {bad}"
             );
-
-            station().repair(&mut state, f32::NAN);
-            assert_eq!(
-                state.health, 250.0,
-                "a NaN repair amount changed the station's health"
-            );
-        }
-
-        /// The guard must not break the honest case: a finite amount still
-        /// repairs, and negative amounts still cannot damage the station.
-        #[test]
-        fn a_finite_repair_amount_still_repairs() {
-            let mut state = StationState {
-                health: 250.0,
-                max_health: 500.0,
-                ..Default::default()
-            };
-
-            station().repair(&mut state, 100.0);
-            assert_eq!(state.health, 350.0, "a finite repair stopped working");
-
-            station().repair(&mut state, -10_000.0);
-            assert_eq!(state.health, 350.0, "a negative repair damaged the station");
-
-            station().repair(&mut state, 10_000.0);
-            assert_eq!(state.health, 500.0, "a repair overshoots max_health");
+            assert_eq!(state.ammo_count, 0, "the rejected reload added a round");
         }
     }
+
+    /// Bug №631. `fire` carried the promise, in a comment two functions
+    /// down, that it rejected an unknown type; it stored the byte and then
+    /// launched the `_` fallback, so the station reported one type and fired
+    /// another. The shot must not happen at all, and the station must be left
+    /// exactly as it was.
+    #[test]
+    fn an_unknown_ammo_type_fires_nothing_and_changes_nothing() {
+        for bad in [7u8, 8, 42, 200, 255] {
+            let mut state = StationState {
+                // Ready to fire, with a known round already loaded, so the
+                // only thing that can stop the shot is the type check.
+                is_operational: true,
+                health: 50.0,
+                reload_progress: 1.0,
+                cooldown: 0.0,
+                ammo_count: 3,
+                ammo_type: 2,
+                ..Default::default()
+            };
+            let before = state.clone();
+
+            assert!(
+                station().fire(&mut state, Some(bad)).is_none(),
+                "a shot was fired with ammo type {bad}"
+            );
+            assert_eq!(
+                state.ammo_type, before.ammo_type,
+                "the refused shot overwrote ammo_type with {bad}"
+            );
+            assert_eq!(
+                state.ammo_count, before.ammo_count,
+                "the refused shot spent a round"
+            );
+            assert_eq!(
+                state.cooldown, before.cooldown,
+                "the refused shot set a cooldown"
+            );
+        }
+    }
+
+    /// Every type the mapping knows must survive the validator, or a real
+    /// shell would be rejected at the door. This is the check that keeps the
+    /// two lists from drifting apart.
+    #[test]
+    fn every_mapped_ammo_type_passes_validation() {
+        for mapped in 0u8..=6 {
+            assert!(
+                Station::is_valid_ammo_type(mapped),
+                "type {mapped} has a projectile mapping but is not accepted"
+            );
+        }
+        assert_eq!(Station::VALID_AMMO_TYPES.len(), 7);
+    }
+
+    /// The cast is the trap. `NaN as u8` and `-3.0 as u8` are both `0` in
+    /// Rust, and `0` is a *valid* cannonball — so validating after the cast
+    /// would have waved a malformed request straight through. This asserts
+    /// the fact the caller in `main.rs` relies on.
+    #[test]
+    // The casts are the subject of this test, not an oversight: the whole
+    // point is that `NaN as u8` is `0` and that `0` is a valid cannonball.
+    // Silencing the lint here is what keeps it firing everywhere else.
+    #[allow(clippy::cast_nan_to_int)]
+    fn a_float_ammo_type_would_survive_a_naive_cast_as_a_valid_shell() {
+        assert_eq!(f32::NAN as u8, 0);
+        assert_eq!(-3.0f32 as u8, 0);
+        assert_eq!(300.0f32 as u8, 255);
+        // Which is exactly why `main.rs` checks `is_finite`, `fract() == 0`
+        // and the range *before* casting. 255 does not pass the validator,
+        // but NaN and negatives do.
+        assert!(Station::is_valid_ammo_type(f32::NAN as u8));
+        assert!(!Station::is_valid_ammo_type(300.0f32 as u8));
+    }
+
+    /// A valid type still loads, and the validator did not break Bug №84
+    /// (finishing the cycle actually puts a round in the magazine).
+    #[test]
+    fn a_valid_ammo_type_still_loads() {
+        let mut state = StationState {
+            reload_progress: 1.0,
+            ammo_count: 0,
+            ..Default::default()
+        };
+        assert!(station().reload(&mut state, 5));
+        assert_eq!(state.ammo_type, 5);
+        assert_eq!(state.ammo_count, 1);
+        assert_eq!(state.reload_progress, 0.0);
+    }
+
+    /// Bug №604, negative control: `f32::INFINITY` used to reach
+    /// `.min(max_health)` and fill a half-damaged station in a single call,
+    /// which is exactly what the input path sent. Drop the guard above and
+    /// the first assertion goes red.
+    #[test]
+    fn a_non_finite_repair_amount_does_not_fill_the_station() {
+        let mut state = StationState {
+            health: 250.0,
+            max_health: 500.0,
+            ..Default::default()
+        };
+
+        station().repair(&mut state, f32::INFINITY);
+        assert_eq!(
+            state.health, 250.0,
+            "an infinite repair amount filled the station"
+        );
+
+        station().repair(&mut state, f32::NAN);
+        assert_eq!(
+            state.health, 250.0,
+            "a NaN repair amount changed the station's health"
+        );
+    }
+
+    /// The guard must not break the honest case: a finite amount still
+    /// repairs, and negative amounts still cannot damage the station.
+    #[test]
+    fn a_finite_repair_amount_still_repairs() {
+        let mut state = StationState {
+            health: 250.0,
+            max_health: 500.0,
+            ..Default::default()
+        };
+
+        station().repair(&mut state, 100.0);
+        assert_eq!(state.health, 350.0, "a finite repair stopped working");
+
+        // Bug №633: the actions are rate-limited now, so the next two
+        // amounts step through real ticks — the same decay the ship tick
+        // runs — instead of hammering in one instant.
+        station().repair(&mut state, -10_000.0);
+        assert_eq!(state.health, 350.0, "a negative repair damaged the station");
+        station().update(1.0, &mut state, None);
+        station().repair(&mut state, 10_000.0);
+        assert_eq!(state.health, 500.0, "a repair overshoots max_health");
+    }
+
+    /// Bug №633: the repair loop used to accept every action, so a client
+    /// spamming Repair packets ran the 25 hp/action ceiling into 500 hp/s
+    /// of healing through one post. The window must refuse the immediate
+    /// repeat, and the refusal must leave the station untouched.
+    #[test]
+    fn a_repair_action_starts_a_cooldown_the_next_action_hits() {
+        let mut state = StationState {
+            health: 250.0,
+            max_health: 500.0,
+            ..Default::default()
+        };
+
+        assert!(
+            station().repair(&mut state, 25.0),
+            "the first action must apply"
+        );
+        assert_eq!(state.health, 275.0);
+        assert_eq!(
+            state.repair_cooldown, 1.0,
+            "a finished action must start the cooldown"
+        );
+
+        assert!(
+            !station().repair(&mut state, 25.0),
+            "the immediate second action must be refused"
+        );
+        assert_eq!(state.health, 275.0, "a refused action must not move health");
+
+        // Half a window in, still frozen.
+        station().update(0.5, &mut state, None);
+        assert!(
+            !station().repair(&mut state, 25.0),
+            "the cooldown is not finished yet"
+        );
+        assert_eq!(state.health, 275.0);
+
+        // A full window later the post works again.
+        station().update(0.5, &mut state, None);
+        assert!(
+            station().repair(&mut state, 25.0),
+            "a cooled-down post repairs again"
+        );
+        assert_eq!(state.health, 300.0);
+    }
+
+    /// Bug №633, the destroyed-station edge: if the decay lived behind the
+    /// `health <= 0` early-return in `update`, a station destroyed
+    /// mid-cooldown would freeze its clock forever and never become
+    /// repairable again.
+    #[test]
+    fn a_cooldown_decays_even_while_the_station_is_dead() {
+        let mut state = StationState {
+            health: 0.0,
+            max_health: 500.0,
+            is_operational: false,
+            repair_cooldown: 1.0,
+            ..Default::default()
+        };
+
+        assert!(
+            !station().repair(&mut state, 25.0),
+            "the frozen window must refuse"
+        );
+        station().update(1.0, &mut state, None);
+        assert_eq!(
+            state.repair_cooldown, 0.0,
+            "the cooldown must decay even behind the health early-return"
+        );
+        assert!(
+            station().repair(&mut state, 25.0),
+            "a destroyed station with a freed window must heal again"
+        );
+        assert_eq!(state.health, 25.0);
+    }
+}

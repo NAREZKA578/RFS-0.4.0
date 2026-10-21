@@ -1,4 +1,4 @@
-use rfs_core::entity::{CompartmentTemplate, EntityId, Bounds, Vec3f};
+use rfs_core::entity::{Bounds, CompartmentTemplate, EntityId, Vec3f};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -133,18 +133,6 @@ impl Compartment {
         &mut self.config
     }
 
-    pub fn set_connected_compartments(&mut self, compartments: Vec<EntityId>) {
-        self.config.connected_compartments = compartments;
-    }
-
-    pub fn set_bulkhead_connections(&mut self, connections: HashMap<EntityId, EntityId>) {
-        for bulkhead in self.config.bulkheads.iter_mut() {
-            if let Some(&target) = connections.get(&bulkhead.entity_id) {
-                bulkhead.connects_to = target;
-            }
-        }
-    }
-
     pub fn update(&self, dt: f32, state: &mut CompartmentState) {
         if state.is_breached && !state.is_sealed {
             let intake_rate = 10.0;
@@ -171,16 +159,18 @@ impl Compartment {
         dt: f32,
     ) -> Vec<WaterTransfer> {
         let mut transfers = Vec::new();
-        if state.water_level <= 0.0 {
+        if self.get_water_volume(state) <= 0.0 {
             return transfers;
         }
         for &connected_id in &state.connected_compartments {
             if let Some(other) = all_compartments.get(&connected_id) {
-                let bulkhead = state.bulkhead_states.iter()
+                let bulkhead = state
+                    .bulkhead_states
+                    .iter()
                     .find(|b| b.connects_to == connected_id);
                 if let Some(bh) = bulkhead {
                     if !bh.is_sealed || bh.is_destroyed {
-                        let diff = state.fill_ratio() - other.fill_ratio();
+                        let diff = self.get_fill_ratio(state) - other.fill_ratio();
                         if diff > 0.0 {
                             let flow = diff * 50.0 * dt;
                             // Cap by what the receiver has room for; the
@@ -220,7 +210,9 @@ impl Compartment {
         }
         for &connected_id in &state.connected_compartments {
             if let Some(_other) = all_compartments.get(&connected_id) {
-                let bulkhead = state.bulkhead_states.iter()
+                let bulkhead = state
+                    .bulkhead_states
+                    .iter()
                     .find(|b| b.connects_to == connected_id);
                 if let Some(bh) = bulkhead {
                     if !bh.is_sealed || bh.is_destroyed {
@@ -237,7 +229,10 @@ impl Compartment {
 
     pub fn breach(&self, state: &mut CompartmentState) {
         state.is_breached = true;
-        state.is_sealed = false;
+        // Bug №668: the seal/unseal pair is the single way a breached state's
+        // open flag is written, so the blast path drives the same helper as
+        // the seal command does — not a parallel raw write.
+        self.unseal(state);
     }
 
     pub fn seal(&self, state: &mut CompartmentState) {
@@ -246,11 +241,6 @@ impl Compartment {
 
     pub fn unseal(&self, state: &mut CompartmentState) {
         state.is_sealed = false;
-    }
-
-    pub fn toggle_seal(&self, state: &mut CompartmentState) -> bool {
-        state.is_sealed = !state.is_sealed;
-        state.is_sealed
     }
 
     pub fn activate_pump(&self, state: &mut CompartmentState) {
@@ -297,11 +287,15 @@ impl Compartment {
         }
     }
 
-    pub fn get_water_volume(&self, state: &CompartmentState) -> f32 {
+    /// Bug №668: these two were public getters no one called — the volume
+    /// answer belongs to the water-spread path, and the spread path now
+    /// reads it here, so the helpers stay off the public surface with one
+    /// internal consumer instead.
+    fn get_water_volume(&self, state: &CompartmentState) -> f32 {
         state.water_level
     }
 
-    pub fn get_fill_ratio(&self, state: &CompartmentState) -> f32 {
+    fn get_fill_ratio(&self, state: &CompartmentState) -> f32 {
         state.fill_ratio()
     }
 
@@ -319,5 +313,89 @@ impl Compartment {
 
     pub fn pump_capacity(&self) -> f32 {
         self.config.pump_capacity
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rfs_core::entity::CompartmentTemplate;
+
+    fn empty_state() -> (Compartment, CompartmentState) {
+        let template = CompartmentTemplate {
+            name: "test".to_string(),
+            local_bounds: Bounds::new(Vec3f::ZERO, Vec3f::new(1.0, 1.0, 1.0)),
+            max_water_level: 100.0,
+            pump_capacity: 10.0,
+            connected_compartments: Vec::new(),
+            bulkheads: Vec::new(),
+            stations: Vec::new(),
+        };
+        let comp = Compartment::new(
+            EntityId::new(1001),
+            EntityId::new(1),
+            template,
+            Vec::new(),
+            Vec::new(),
+        );
+        // A freshly built compartment is born sealed, as `Ship::new` leaves it.
+        let state = CompartmentState {
+            water_level: 0.0,
+            max_water_level: 100.0,
+            is_sealed: true,
+            is_breached: false,
+            fire_intensity: 0.0,
+            pump_active: false,
+            pump_capacity: 10.0,
+            bulkhead_states: Vec::new(),
+            connected_compartments: Vec::new(),
+        };
+        (comp, state)
+    }
+
+    /// Bug №668: the blast path must write the open flag through the same
+    /// helper the seal command does, not a parallel raw write — otherwise
+    /// the two paths can drift apart.
+    #[test]
+    fn a_breach_opens_the_seal_through_the_unseal_helper() {
+        let (comp, mut cs) = empty_state();
+        comp.breach(&mut cs);
+        assert!(cs.is_breached);
+        assert!(!cs.is_sealed, "a breach must stay open to take water");
+
+        comp.seal(&mut cs);
+        assert!(cs.is_sealed);
+    }
+
+    /// The whole point of the compartment seal: a breached compartment takes
+    /// water only while it is open; sealing stops the intake, unsealing lets
+    /// it back. This rides the live tick path (`update` is called by the
+    /// ship every frame).
+    #[test]
+    fn a_sealed_breach_stops_taking_water() {
+        let (comp, mut cs) = empty_state();
+        comp.breach(&mut cs);
+
+        comp.update(1.0, &mut cs);
+        assert_eq!(cs.water_level, 10.0);
+
+        comp.seal(&mut cs);
+        comp.update(1.0, &mut cs);
+        assert_eq!(cs.water_level, 10.0, "a sealed breach must not take water");
+
+        comp.unseal(&mut cs);
+        comp.update(1.0, &mut cs);
+        assert_eq!(cs.water_level, 20.0, "opening the seal lets water back in");
+    }
+
+    /// The pump helpers are the single way the flag is written, so the
+    /// direct and toggle paths in `Ship` share them.
+    #[test]
+    fn the_pump_helpers_move_one_flag() {
+        let (comp, mut cs) = empty_state();
+        comp.activate_pump(&mut cs);
+        assert!(cs.pump_active);
+        comp.deactivate_pump(&mut cs);
+        assert!(!cs.pump_active);
     }
 }

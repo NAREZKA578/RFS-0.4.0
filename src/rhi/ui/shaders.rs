@@ -28,6 +28,14 @@ pub enum UiShaderType {
     Geometry,
     /// Text glyph quads. Reserved; the font atlas is a separate task.
     Text,
+    /// Full-colour image quads: samples the texture's RGBA and multiplies it by
+    /// the vertex colour.
+    ///
+    /// Distinct from [`Self::Text`] on purpose: the glyph pipeline samples a
+    /// single-channel coverage atlas and uses only the red component as alpha,
+    /// so it cannot show an image's colour. Routing images through it made them
+    /// invisible whenever the red channel was zero, which is why this exists.
+    Image,
 }
 
 impl UiShaderType {
@@ -40,6 +48,7 @@ impl UiShaderType {
         match self {
             UiShaderType::Geometry => "ui_geom.wgsl",
             UiShaderType::Text => "ui_text.wgsl",
+            UiShaderType::Image => "ui.wgsl",
         }
     }
 }
@@ -131,6 +140,10 @@ impl UiShaderManager {
 
     pub fn load_text(&mut self, spirv: &[u8]) -> UiResult<()> {
         self.load(UiShaderType::Text, spirv)
+    }
+
+    pub fn load_image(&mut self, spirv: &[u8]) -> UiResult<()> {
+        self.load(UiShaderType::Image, spirv)
     }
 
     /// The module for `shader_type`, or an error naming what is missing.

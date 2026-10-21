@@ -1,0 +1,8 @@
+{
+  "vote_kick": {
+    "enabled": true,
+    "min_votes": 2,
+    "majority": 0.6,
+    "window_ticks": 600
+  }
+}

@@ -95,6 +95,22 @@ fn run() -> RhiResult<()> {
         size.height.max(1),
     )?;
 
+    // Bug #645: `attach_presentation` is the only path that creates the first
+    // swapchain, so it is where the typed presentation views have to be
+    // published. They used to be published only on a resize, so on a fresh
+    // window the vector was empty and every pass that needs a typed view — the
+    // UI pass — returned before drawing anything. The example written to
+    // answer "does a UI pixel reach the screen" could not answer it, because
+    // the path it checked was cut short before it got there.
+    let typed_views = renderer.context().presentation_texture_views.len();
+    assert!(
+        typed_views > 0,
+        "attach_presentation must publish the typed presentation views; it left \
+         {typed_views} of them, so every pass that needs a typed view will \
+         return before drawing"
+    );
+    println!("[cube] typed presentation views: {typed_views}");
+
     // The swapchain chose the format, so the pass has to be built for it.
     let Some(format) = renderer.presentation_format() else {
         return Err(rhi::RhiError::BackendError(
@@ -124,6 +140,9 @@ fn run() -> RhiResult<()> {
             index_type: mesh.index_type(),
             index_count: mesh.index_count(),
             model: glam::Mat4::IDENTITY,
+            // A hand-built item: it does not come from the scene, so nothing
+            // will refresh its model matrix.
+            entity_id: None,
         }],
         format,
         SHADER,

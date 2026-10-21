@@ -30,6 +30,19 @@ pub enum Command {
         sets: Vec<DescriptorSet>,
     },
 
+    /// Bind descriptor sets for a compute pipeline.
+    ///
+    /// A separate variant from [`Command::BindDescriptorSets`] because the
+    /// pipeline is a different type: a compute pipeline and a graphics
+    /// pipeline are not the same object, and the Vulkan call needs the compute
+    /// bind point. The layout comes from the pipeline in the same way as the
+    /// graphics one — from the field beside the handle.
+    BindComputeDescriptorSets {
+        pipeline: ComputePipeline,
+        first_set: u32,
+        sets: Vec<DescriptorSet>,
+    },
+
     // Vertex/Index Buffers
     BindVertexBuffers {
         first_binding: u32,

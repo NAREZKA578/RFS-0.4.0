@@ -682,6 +682,8 @@ dependencies = [
  "rfs_net",
  "rfs_ship",
  "rfs_sim",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -1,10 +1,12 @@
-use rfs_core::entity::{HitMark, ShipEntity, PlayerEntity, StationEntity, CompartmentEntity, ProjectileEntity};
+use parking_lot::RwLock;
+use rfs_core::entity::{
+    CompartmentEntity, HitMark, PlayerEntity, ProjectileEntity, ShipEntity, StationEntity,
+};
+use rfs_core::math::{Transform, Vec3f};
 use rfs_core::packet::*;
-use rfs_core::math::{Vec3f, Transform};
 use rfs_core::time::Tick;
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use parking_lot::RwLock;
 use tracing::warn;
 
 pub const MAX_SNAPSHOT_HISTORY: usize = 128;
@@ -392,10 +394,14 @@ impl DeltaCompressor {
             };
         }
 
-        let base_entities: HashMap<_, _> = base_snapshot.entities.iter()
+        let base_entities: HashMap<_, _> = base_snapshot
+            .entities
+            .iter()
             .map(|e| (e.entity_id, e))
             .collect();
-        let target_entities: HashMap<_, _> = target_snapshot.entities.iter()
+        let target_entities: HashMap<_, _> = target_snapshot
+            .entities
+            .iter()
             .map(|e| (e.entity_id, e))
             .collect();
 
@@ -420,10 +426,14 @@ impl DeltaCompressor {
             }
         }
 
-        let base_projectiles: HashMap<_, _> = base_snapshot.projectiles.iter()
+        let base_projectiles: HashMap<_, _> = base_snapshot
+            .projectiles
+            .iter()
             .map(|p| (p.entity_id, p))
             .collect();
-        let target_projectiles: HashMap<_, _> = target_snapshot.projectiles.iter()
+        let target_projectiles: HashMap<_, _> = target_snapshot
+            .projectiles
+            .iter()
             .map(|p| (p.entity_id, p))
             .collect();
 
@@ -461,11 +471,19 @@ impl DeltaCompressor {
         // next tick re-diffs from the same base and carries the full content.
         let mut truncated = false;
         if created.len() > MAX_DELTA_CREATED {
-            warn!("create_delta: {} created exceeds {}; withholding the delta for this tick", created.len(), MAX_DELTA_CREATED);
+            warn!(
+                "create_delta: {} created exceeds {}; withholding the delta for this tick",
+                created.len(),
+                MAX_DELTA_CREATED
+            );
             truncated = true;
         }
         if updated.len() > MAX_DELTA_UPDATED {
-            warn!("create_delta: {} updated exceeds {}; withholding the delta for this tick", updated.len(), MAX_DELTA_UPDATED);
+            warn!(
+                "create_delta: {} updated exceeds {}; withholding the delta for this tick",
+                updated.len(),
+                MAX_DELTA_UPDATED
+            );
             truncated = true;
         }
         if projectile_created.len() + projectile_updated.len() > MAX_DELTA_PROJECTILES {
@@ -562,7 +580,11 @@ impl DeltaCompressor {
             .insert((client_id, layer), Tick(target_tick));
     }
 
-    fn compute_entity_update(&self, base: &EntitySnapshot, target: &EntitySnapshot) -> EntityUpdate {
+    fn compute_entity_update(
+        &self,
+        base: &EntitySnapshot,
+        target: &EntitySnapshot,
+    ) -> EntityUpdate {
         let mut update = EntityUpdate {
             entity_id: base.entity_id,
             transform: None,
@@ -575,11 +597,12 @@ impl DeltaCompressor {
             player_data: None,
         };
 
-        if base.transform.position.distance(target.transform.position) > 0.01 ||
-           (base.transform.rotation.x - target.transform.rotation.x).abs() > 0.001 ||
-           (base.transform.rotation.y - target.transform.rotation.y).abs() > 0.001 ||
-           (base.transform.rotation.z - target.transform.rotation.z).abs() > 0.001 ||
-           (base.transform.rotation.w - target.transform.rotation.w).abs() > 0.001 {
+        if base.transform.position.distance(target.transform.position) > 0.01
+            || (base.transform.rotation.x - target.transform.rotation.x).abs() > 0.001
+            || (base.transform.rotation.y - target.transform.rotation.y).abs() > 0.001
+            || (base.transform.rotation.z - target.transform.rotation.z).abs() > 0.001
+            || (base.transform.rotation.w - target.transform.rotation.w).abs() > 0.001
+        {
             update.transform = Some(target.transform);
         }
 
@@ -614,7 +637,11 @@ impl DeltaCompressor {
         update
     }
 
-    fn compute_projectile_update(&self, base: &ProjectileSnapshot, target: &ProjectileSnapshot) -> ProjectileUpdate {
+    fn compute_projectile_update(
+        &self,
+        base: &ProjectileSnapshot,
+        target: &ProjectileSnapshot,
+    ) -> ProjectileUpdate {
         let mut update = ProjectileUpdate {
             entity_id: base.entity_id,
             position: None,
@@ -638,28 +665,28 @@ impl DeltaCompressor {
     }
 
     pub fn remove_client(&self, client_id: u32) {
-        self.last_snapshots.write().retain(|(id, _), _| *id != client_id);
+        self.last_snapshots
+            .write()
+            .retain(|(id, _), _| *id != client_id);
     }
 }
 
 impl EntityUpdate {
     pub fn has_changes(&self) -> bool {
-        self.transform.is_some() ||
-        self.velocity.is_some() ||
-        self.angular_velocity.is_some() ||
-        self.health.is_some() ||
-        self.flags.is_some() ||
-        self.ship_data.is_some() ||
-        self.station_data.is_some() ||
-        self.player_data.is_some()
+        self.transform.is_some()
+            || self.velocity.is_some()
+            || self.angular_velocity.is_some()
+            || self.health.is_some()
+            || self.flags.is_some()
+            || self.ship_data.is_some()
+            || self.station_data.is_some()
+            || self.player_data.is_some()
     }
 }
 
 impl ProjectileUpdate {
     pub fn has_changes(&self) -> bool {
-        self.position.is_some() ||
-        self.velocity.is_some() ||
-        self.lifetime.is_some()
+        self.position.is_some() || self.velocity.is_some() || self.lifetime.is_some()
     }
 }
 
@@ -746,37 +773,44 @@ impl SnapshotInterpolator {
         let mut result = before.clone();
         result.time = before.time + (after.time - before.time) * alpha as f64;
 
-        let before_entities: HashMap<_, _> = before.entities.iter().map(|e| (e.entity_id, e)).collect();
-        let after_entities: HashMap<_, _> = after.entities.iter().map(|e| (e.entity_id, e)).collect();
+        let before_entities: HashMap<_, _> =
+            before.entities.iter().map(|e| (e.entity_id, e)).collect();
+        let after_entities: HashMap<_, _> =
+            after.entities.iter().map(|e| (e.entity_id, e)).collect();
 
-        result.entities = before_entities.iter()
-            .map(|(id, b_entity)| {
-                match after_entities.get(id) {
-                    Some(a_entity) => self.interpolate_entity(b_entity, a_entity, alpha),
-                    None => (*b_entity).clone(),
-                }
+        result.entities = before_entities
+            .iter()
+            .map(|(id, b_entity)| match after_entities.get(id) {
+                Some(a_entity) => self.interpolate_entity(b_entity, a_entity, alpha),
+                None => (*b_entity).clone(),
             })
             .chain(
                 // Bug №22: entities created in `after` used to be invisible
                 // until the NEXT snapshot. Take them as-is.
-                after_entities.iter()
+                after_entities
+                    .iter()
                     .filter(|(id, _)| !before_entities.contains_key(id))
                     .map(|(_, a_entity)| (*a_entity).clone()),
             )
             .collect();
 
-        let before_projs: HashMap<_, _> = before.projectiles.iter().map(|p| (p.entity_id, p)).collect();
-        let after_projs: HashMap<_, _> = after.projectiles.iter().map(|p| (p.entity_id, p)).collect();
+        let before_projs: HashMap<_, _> = before
+            .projectiles
+            .iter()
+            .map(|p| (p.entity_id, p))
+            .collect();
+        let after_projs: HashMap<_, _> =
+            after.projectiles.iter().map(|p| (p.entity_id, p)).collect();
 
-        result.projectiles = before_projs.iter()
-            .map(|(id, b_proj)| {
-                match after_projs.get(id) {
-                    Some(a_proj) => self.interpolate_projectile(b_proj, a_proj, alpha),
-                    None => (*b_proj).clone(),
-                }
+        result.projectiles = before_projs
+            .iter()
+            .map(|(id, b_proj)| match after_projs.get(id) {
+                Some(a_proj) => self.interpolate_projectile(b_proj, a_proj, alpha),
+                None => (*b_proj).clone(),
             })
             .chain(
-                after_projs.iter()
+                after_projs
+                    .iter()
                     .filter(|(id, _)| !before_projs.contains_key(id))
                     .map(|(_, a_proj)| (*a_proj).clone()),
             )
@@ -789,12 +823,21 @@ impl SnapshotInterpolator {
         (q.x + q.y + q.z + q.w).is_finite()
     }
 
-    fn interpolate_entity(&self, before: &EntitySnapshot, after: &EntitySnapshot, alpha: f32) -> EntitySnapshot {
+    fn interpolate_entity(
+        &self,
+        before: &EntitySnapshot,
+        after: &EntitySnapshot,
+        alpha: f32,
+    ) -> EntitySnapshot {
         // Bug №22: slerp with a non-finite endpoint yields NaN rotations
         // that poison everything downstream. Fall back to the finite side.
         let rotation = if Self::finite_rotation(before.transform.rotation)
-            && Self::finite_rotation(after.transform.rotation) {
-            before.transform.rotation.slerp(after.transform.rotation, alpha)
+            && Self::finite_rotation(after.transform.rotation)
+        {
+            before
+                .transform
+                .rotation
+                .slerp(after.transform.rotation, alpha)
         } else if Self::finite_rotation(before.transform.rotation) {
             before.transform.rotation
         } else {
@@ -804,7 +847,10 @@ impl SnapshotInterpolator {
             entity_id: before.entity_id,
             entity_type: before.entity_type,
             transform: Transform {
-                position: before.transform.position.lerp(after.transform.position, alpha),
+                position: before
+                    .transform
+                    .position
+                    .lerp(after.transform.position, alpha),
                 rotation,
                 scale: before.transform.scale.lerp(after.transform.scale, alpha),
             },
@@ -819,7 +865,12 @@ impl SnapshotInterpolator {
         }
     }
 
-    fn interpolate_projectile(&self, before: &ProjectileSnapshot, after: &ProjectileSnapshot, alpha: f32) -> ProjectileSnapshot {
+    fn interpolate_projectile(
+        &self,
+        before: &ProjectileSnapshot,
+        after: &ProjectileSnapshot,
+        alpha: f32,
+    ) -> ProjectileSnapshot {
         ProjectileSnapshot {
             entity_id: before.entity_id,
             projectile_type: after.projectile_type,
@@ -847,16 +898,20 @@ impl From<&ShipEntity> for EntitySnapshot {
             flags: ship.flags,
             ship_data: Some(ShipSnapshotData {
                 ship_class_id: ship.ship_class_id,
-                compartments: ship.compartments.iter().map(|c| CompartmentSnapshot {
-                    compartment_id: c.entity_id,
-                    water_level: c.water_level,
-                    max_water_level: c.max_water_level,
-                    is_sealed: c.is_sealed,
-                    is_breached: c.is_breached,
-                    fire_intensity: c.fire_intensity,
-                    pump_active: c.pump_active,
-                    connected_compartments: c.connected_compartments.clone(),
-                }).collect(),
+                compartments: ship
+                    .compartments
+                    .iter()
+                    .map(|c| CompartmentSnapshot {
+                        compartment_id: c.entity_id,
+                        water_level: c.water_level,
+                        max_water_level: c.max_water_level,
+                        is_sealed: c.is_sealed,
+                        is_breached: c.is_breached,
+                        fire_intensity: c.fire_intensity,
+                        pump_active: c.pump_active,
+                        connected_compartments: c.connected_compartments.clone(),
+                    })
+                    .collect(),
                 stations: ship.stations.iter().map(|s| s.entity_id).collect(),
                 fuel: ship.fuel,
                 max_fuel: ship.max_fuel,
@@ -999,13 +1054,17 @@ impl From<&ShipStateData> for ShipSnapshotData {
     fn from(s: &ShipStateData) -> Self {
         ShipSnapshotData {
             ship_class_id: s.ship_class_id,
-            compartments: s.compartments.iter().map(CompartmentSnapshot::from).collect(),
+            compartments: s
+                .compartments
+                .iter()
+                .map(CompartmentSnapshot::from)
+                .collect(),
             stations: s.stations.clone(),
             fuel: s.fuel,
             max_fuel: s.max_fuel,
             speed: s.speed,
             max_speed: s.max_speed,
-heading: s.heading,
+            heading: s.heading,
             rudder_angle: s.rudder_angle,
             throttle: s.throttle,
             // Bug §272: the wire type carries the hit, so it MUST survive the
@@ -1015,7 +1074,7 @@ heading: s.heading,
             // erased before the client could see it — which is the exact loss
             // the field exists to prevent. The regression test that caught it
             // is `a_client_recovers_the_hit_from_the_layer_alone`.
-last_hit: s.last_hit,
+            last_hit: s.last_hit,
         }
     }
 }
@@ -1115,8 +1174,11 @@ impl Snapshot {
         // pass up front makes it O(entities + records); updated/created lookups
         // go through the index and pushes extend it, so the merge order of
         // records is preserved exactly as before.
-        let mut index: HashMap<EntityId, usize> =
-            entities.iter().enumerate().map(|(i, e)| (e.entity_id, i)).collect();
+        let mut index: HashMap<EntityId, usize> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.entity_id, i))
+            .collect();
         for created in &delta.created {
             let snapshot = EntitySnapshot::from(created);
             if let Some(slot) = index.get(&snapshot.entity_id).copied() {
@@ -1134,8 +1196,11 @@ impl Snapshot {
         entities.retain(|e| !delta.destroyed.contains(&e.entity_id));
 
         let mut projectiles = self.projectiles;
-        let mut pindex: HashMap<EntityId, usize> =
-            projectiles.iter().enumerate().map(|(i, p)| (p.entity_id, i)).collect();
+        let mut pindex: HashMap<EntityId, usize> = projectiles
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.entity_id, i))
+            .collect();
         for created in &delta.projectile_created {
             let snapshot = ProjectileSnapshot::from(created);
             if let Some(slot) = pindex.get(&snapshot.entity_id).copied() {
@@ -1168,7 +1233,11 @@ impl Snapshot {
             server_tick: self.tick.value() as u32,
             server_time: self.time,
             entities: self.entities.iter().map(EntitySnapshot::to_state).collect(),
-            projectiles: self.projectiles.iter().map(ProjectileSnapshot::to_state).collect(),
+            projectiles: self
+                .projectiles
+                .iter()
+                .map(ProjectileSnapshot::to_state)
+                .collect(),
         }
     }
 }
@@ -1177,7 +1246,11 @@ impl ShipSnapshotData {
     pub fn to_state(&self) -> ShipStateData {
         ShipStateData {
             ship_class_id: self.ship_class_id,
-            compartments: self.compartments.iter().map(CompartmentSnapshot::to_state).collect(),
+            compartments: self
+                .compartments
+                .iter()
+                .map(CompartmentSnapshot::to_state)
+                .collect(),
             stations: self.stations.clone(),
             fuel: self.fuel,
             max_fuel: self.max_fuel,
@@ -1285,7 +1358,10 @@ impl EntitySnapshot {
             max_health: self.max_health,
             flags: self.flags,
             ship_data: self.ship_data.as_ref().map(ShipSnapshotData::to_state),
-            station_data: self.station_data.as_ref().map(StationSnapshotData::to_state),
+            station_data: self
+                .station_data
+                .as_ref()
+                .map(StationSnapshotData::to_state),
             player_data: self.player_data.as_ref().map(PlayerSnapshotData::to_state),
         }
     }
@@ -1328,7 +1404,10 @@ impl EntityUpdate {
             health: self.health,
             flags: self.flags,
             ship_data: self.ship_data.as_ref().map(ShipSnapshotData::to_state),
-            station_data: self.station_data.as_ref().map(StationSnapshotData::to_state),
+            station_data: self
+                .station_data
+                .as_ref()
+                .map(StationSnapshotData::to_state),
             player_data: self.player_data.as_ref().map(PlayerSnapshotData::to_state),
         }
     }
@@ -1355,10 +1434,22 @@ impl DeltaSnapshot {
             server_time: self.target_time,
             is_resync: false,
             created: self.created.iter().map(EntitySnapshot::to_state).collect(),
-            updated: self.updated.iter().map(EntityUpdate::to_state_update).collect(),
+            updated: self
+                .updated
+                .iter()
+                .map(EntityUpdate::to_state_update)
+                .collect(),
             destroyed: self.destroyed.clone(),
-            projectile_created: self.projectile_created.iter().map(ProjectileSnapshot::to_state).collect(),
-            projectile_updated: self.projectile_updated.iter().map(ProjectileUpdate::to_state_update).collect(),
+            projectile_created: self
+                .projectile_created
+                .iter()
+                .map(ProjectileSnapshot::to_state)
+                .collect(),
+            projectile_updated: self
+                .projectile_updated
+                .iter()
+                .map(ProjectileUpdate::to_state_update)
+                .collect(),
             projectile_destroyed: self.projectile_destroyed.clone(),
         }
     }
@@ -1407,7 +1498,40 @@ mod compartment_entity_snapshot_tests {
             snapshot.health, 0.0,
             "layer 1 reports full health for a compartment layer 0 marks breached"
         );
-        assert_eq!(snapshot.max_health, 100.0, "the ceiling must stay for ratio math");
+        assert_eq!(
+            snapshot.max_health, 100.0,
+            "the ceiling must stay for ratio math"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resync_cadence_tests {
+    //! Bug №220: the record analysed a recovery ceiling of up to 5 s before
+    //! destroyed entities are pruned from a client's layer. The resync
+    //! cadence is the actual ceiling for how long a ghost can linger when a
+    //! layer delta was itself lost on the unreliable channel, so it must
+    //! never drift back to a seconds-scale value without an explicit
+    //! "layer empty" signal in the protocol.
+
+    use super::*;
+    use rfs_core::time::TICK_DURATION;
+    use std::time::Duration;
+
+    #[test]
+    fn the_resync_cadence_is_the_ghost_ceiling_and_stays_short() {
+        let ceiling_ticks = *LAYER_RESYNC_TICKS.iter().max().unwrap();
+        let ceiling = Duration::from_secs_f64(ceiling_ticks as f64 * TICK_DURATION.as_secs_f64());
+        assert!(
+            ceiling < Duration::from_millis(750),
+            "resync ceiling {} ticks = {:.2} s — ghost recovery must stay sub-second",
+            ceiling_ticks,
+            ceiling.as_secs_f64()
+        );
+        assert!(
+            LAYER_RESYNC_TICKS.iter().all(|&t| t > 0),
+            "a zero tick cadence would resync every tick and swallow the delta stream"
+        );
     }
 }
 
@@ -1536,8 +1660,15 @@ mod apply_delta_tests {
         let merged = base_snapshot().apply_delta(&d);
 
         let ids: Vec<u64> = merged.entities.iter().map(|e| e.entity_id.0).collect();
-        assert_eq!(ids, vec![2, 3], "existing id replaced in place, new id appended, destroyed dropped");
-        assert_eq!(merged.entities[0].health, 80.0, "the upsert replaces the stored record");
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "existing id replaced in place, new id appended, destroyed dropped"
+        );
+        assert_eq!(
+            merged.entities[0].health, 80.0,
+            "the upsert replaces the stored record"
+        );
         let created = merged
             .entities
             .iter()
@@ -1547,7 +1678,11 @@ mod apply_delta_tests {
             created.health, 42.0,
             "an update for an entity created by the same delta must reach it, not fall through the index"
         );
-        assert_eq!(merged.tick, Tick(12), "the merged snapshot carries the delta's tick");
+        assert_eq!(
+            merged.tick,
+            Tick(12),
+            "the merged snapshot carries the delta's tick"
+        );
     }
 
     /// A partial update name-touches only its fields: everything left None
@@ -1577,7 +1712,10 @@ mod apply_delta_tests {
             Vec3f::new(1.0, 2.0, 3.0),
             "fields the delta left None keep the stored value"
         );
-        assert_eq!(merged.entities[1].health, 90.0, "records outside the delta stay untouched");
+        assert_eq!(
+            merged.entities[1].health, 90.0,
+            "records outside the delta stay untouched"
+        );
     }
 
     /// Projectile side has its own three branches (upsert, partial update,
@@ -1596,11 +1734,19 @@ mod apply_delta_tests {
 
         let merged = base_snapshot().apply_delta(&d);
 
-        assert_eq!(merged.projectiles.len(), 2, "created arrives alongside the base shell");
+        assert_eq!(
+            merged.projectiles.len(),
+            2,
+            "created arrives alongside the base shell"
+        );
         let updated = &merged.projectiles[0];
         assert_eq!(updated.entity_id, EntityId::new(500));
         // Bug №24 semantics: None keeps the stored value in place.
-        assert_eq!(updated.position, Vec3f::new(1.0, 1.0, 1.0), "position the delta left None keeps the stored value");
+        assert_eq!(
+            updated.position,
+            Vec3f::new(1.0, 1.0, 1.0),
+            "position the delta left None keeps the stored value"
+        );
         assert_eq!(updated.velocity, Vec3f::new(1.0, 1.0, 1.0));
         assert_eq!(updated.lifetime, 2.0);
         assert_eq!(merged.projectiles[1].entity_id, EntityId::new(600));
@@ -1618,5 +1764,191 @@ mod apply_delta_tests {
 
         let ids: Vec<u64> = merged.projectiles.iter().map(|p| p.entity_id.0).collect();
         assert_eq!(ids, vec![600], "the named shell is gone, the rest stays");
+    }
+
+    /// Bug №672: the full-state branch — `Snapshot::to_state_packet`, fed by
+    /// `EntitySnapshot::to_state` and the whole `to_state` family for
+    /// ship/station/player/compartment/projectile — must carry every snapshot
+    /// field through the wire round-trip. The recipient rebuilds its view with
+    /// the symmetric `From<&EntityState>`s, so a field dropped on the way out
+    /// shows up here as a changed snapshot, not as a silent gap.
+    #[test]
+    fn a_full_state_packet_carries_every_field_back() {
+        let source = EntitySnapshot {
+            entity_id: EntityId::new(2),
+            entity_type: EntityType::Ship,
+            transform: Transform::new(
+                Vec3f::new(4.0, 5.0, 6.0),
+                Quatf::from_euler(0.1, 0.2, 0.0),
+                Vec3f::ONE,
+            ),
+            velocity: Vec3f::new(3.0, 0.0, 0.0),
+            angular_velocity: Vec3f::new(0.0, 0.1, 0.0),
+            health: 70.0,
+            max_health: 100.0,
+            // Anything but the NONE constant: a dropped field must change the
+            // round-trip, so neither side may match a default here.
+            flags: EntityFlags::ON_FIRE | EntityFlags::FLOODING,
+            ship_data: Some(ShipSnapshotData {
+                ship_class_id: 7,
+                compartments: vec![CompartmentSnapshot {
+                    compartment_id: EntityId::new(1001),
+                    water_level: 30.0,
+                    max_water_level: 100.0,
+                    is_sealed: false,
+                    is_breached: true,
+                    fire_intensity: 0.0,
+                    pump_active: true,
+                    connected_compartments: SmallVec::from_slice(&[EntityId::new(1002)]),
+                }],
+                stations: vec![EntityId::new(2001)],
+                fuel: 400.0,
+                max_fuel: 500.0,
+                speed: 12.0,
+                max_speed: 30.0,
+                heading: 1.5,
+                rudder_angle: -0.2,
+                throttle: 0.8,
+                last_hit: Some(HitMark {
+                    hit_tick: 55,
+                    position: Vec3f::new(9.0, 0.0, 0.0),
+                    normal: Vec3f::new(-1.0, 0.0, 0.0),
+                    compartment: Some(EntityId::new(1001)),
+                    damage: 42.0,
+                }),
+            }),
+            station_data: Some(StationSnapshotData {
+                station_type: StationType::Gun,
+                occupant: Some(EntityId::new(42)),
+                yaw: 0.5,
+                pitch: -0.1,
+                reload_progress: 0.25,
+                ammo_type: 3,
+                ammo_count: 20,
+                max_ammo: 50,
+                health: 400.0,
+                max_health: 500.0,
+                cooldown: 2.0,
+                max_cooldown: 10.0,
+                is_operational: true,
+            }),
+            player_data: Some(PlayerSnapshotData {
+                player_id: 42,
+                name: "fixture".into(),
+                team: 1,
+                current_station: Some(EntityId::new(2001)),
+                current_ship: Some(EntityId::new(2)),
+                posture: PlayerPosture::Seated,
+                health: 90.0,
+                stamina: 80.0,
+            }),
+        };
+
+        let packet = Snapshot {
+            tick: Tick(12),
+            time: 0.4,
+            entities: vec![source.clone()],
+            projectiles: vec![],
+            events: Vec::new(),
+        }
+        .to_state_packet();
+
+        let restored = EntitySnapshot::from(&packet.entities[0]);
+        assert_eq!(restored, source, "a wire field got dropped on the way out");
+    }
+
+    /// Bug №672 (delta branch): `DeltaSnapshot::to_state_delta` feeds both
+    /// `to_state_update` converters. The packet must apply onto a base
+    /// snapshot exactly like the records say — created upserts, the partial
+    /// update names its fields, and a None stays None through the converter.
+    #[test]
+    fn a_state_delta_packet_applies_like_the_records_say() {
+        let source = entity(4, 60.0);
+        let update = EntityUpdate {
+            entity_id: EntityId::new(1),
+            transform: None,
+            velocity: Some(Vec3f::new(6.0, 0.0, 0.0)),
+            angular_velocity: None,
+            health: Some(50.0),
+            flags: None,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        };
+        let proj_update = ProjectileUpdate {
+            entity_id: EntityId::new(500),
+            position: Some(Vec3f::new(5.0, 5.0, 5.0)),
+            velocity: None,
+            lifetime: Some(9.0),
+        };
+
+        let packet = DeltaSnapshot {
+            layer: LAYER_SHIP,
+            base_tick: Tick(10),
+            target_tick: Tick(12),
+            target_time: 12.0 / 30.0,
+            created: vec![source.clone()],
+            updated: vec![update],
+            destroyed: vec![EntityId::new(2)],
+            projectile_created: vec![],
+            projectile_updated: vec![proj_update],
+            projectile_destroyed: vec![],
+        }
+        .to_state_delta();
+
+        // The created record survived the converter: the recipient can
+        // rebuild the source snapshot from exactly what arrived.
+        assert_eq!(
+            EntitySnapshot::from(&packet.created[0]),
+            source,
+            "the created record changed shape through to_state"
+        );
+        assert_eq!(
+            packet.updated[0].entity_id,
+            EntityId::new(1),
+            "the update record keeps its subject"
+        );
+        assert_eq!(packet.updated[0].health, Some(50.0));
+        assert_eq!(packet.updated[0].velocity, Some(Vec3f::new(6.0, 0.0, 0.0)));
+        assert_eq!(
+            packet.updated[0].angular_velocity, None,
+            "None must stay None through the update converter (bug №24 semantics)"
+        );
+        assert_eq!(packet.destroyed, vec![EntityId::new(2)]);
+        assert_eq!(
+            packet.projectile_updated[0].position,
+            Some(Vec3f::new(5.0, 5.0, 5.0))
+        );
+        assert_eq!(packet.projectile_updated[0].lifetime, Some(9.0));
+        assert_eq!(
+            packet.projectile_updated[0].velocity, None,
+            "None must stay None through the update converter (bug №24 semantics)"
+        );
+
+        // And it applies: the merge is the consumer the packet is built for.
+        let merged = base_snapshot().apply_delta(&packet);
+        assert_eq!(
+            merged
+                .entities
+                .iter()
+                .map(|e| e.entity_id.0)
+                .collect::<Vec<_>>(),
+            vec![1, 4],
+            "created became an entity, destroyed is gone"
+        );
+        assert_eq!(merged.entities[0].health, 50.0);
+        assert_eq!(merged.entities[0].velocity, Vec3f::new(6.0, 0.0, 0.0));
+        let restored = &merged.entities[1];
+        assert_eq!(
+            restored.health, 60.0,
+            "the created record carries its own health through the full path"
+        );
+        assert_eq!(merged.projectiles[0].position, Vec3f::new(5.0, 5.0, 5.0));
+        assert_eq!(merged.projectiles[0].lifetime, 9.0);
+        assert_eq!(
+            merged.projectiles[0].velocity,
+            Vec3f::new(10.0, 0.0, 0.0),
+            "fields the update left None keep the stored value"
+        );
     }
 }

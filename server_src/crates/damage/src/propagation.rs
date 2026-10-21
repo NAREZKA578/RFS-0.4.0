@@ -1,4 +1,4 @@
-use crate::graph::{DamageGraph, CompartmentNode};
+use crate::graph::{CompartmentNode, DamageGraph};
 use rfs_core::entity::EntityId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -82,7 +82,7 @@ impl PropagationSystem {
 
     pub fn update(&mut self, graph: &mut DamageGraph, dt: f32) -> Vec<PropagationEvent> {
         let mut events = Vec::new();
-        
+
         self.propagate_water(graph, dt, &mut events);
         self.propagate_fire(graph, dt, &mut events);
         self.process_pumps(graph, dt, &mut events);
@@ -92,7 +92,7 @@ impl PropagationSystem {
         // entries in the edge-trigger maps — a re-add then suppressed the
         // first Flooded/Critical event forever.
         self.prune_known_states(graph);
-        
+
         events.append(&mut self.event_queue.drain(..).collect());
         events
     }
@@ -103,7 +103,12 @@ impl PropagationSystem {
         self.critical_known.retain(|id, _| alive.contains(id));
     }
 
-    fn propagate_water(&self, graph: &mut DamageGraph, dt: f32, events: &mut Vec<PropagationEvent>) {
+    fn propagate_water(
+        &self,
+        graph: &mut DamageGraph,
+        dt: f32,
+        events: &mut Vec<PropagationEvent>,
+    ) {
         // Bug №63: intake used to run inside the up-to-10 iteration loop
         // against flags captured ONCE into a stale snapshot — every breached
         // compartment flooded up to x10 per tick. It runs exactly once now.
@@ -181,10 +186,7 @@ impl PropagationSystem {
                     // bulkhead resistance was never consulted. Now the
                     // resistance slows the flow towards the sink.
                     let resistance = bulkhead.effective_resistance().max(0.05);
-                    let flow = pressure_diff
-                        * self.config.water_equalization_rate
-                        * dt
-                        * 100.0
+                    let flow = pressure_diff * self.config.water_equalization_rate * dt * 100.0
                         / resistance;
                     let actual_flow = flow.min(source.current_level).min(room);
 
@@ -225,7 +227,7 @@ impl PropagationSystem {
             .iter_nodes()
             .map(|(id, node)| (id, node.clone()))
             .collect();
-        
+
         for (comp_id, comp) in &compartments {
             // Bug №198: this guard is `fire_intensity <= 0.0`, which is false
             // for NaN, so a NaN intensity read as "burning". Read it through
@@ -235,7 +237,7 @@ impl PropagationSystem {
             if intensity <= 0.0 {
                 continue;
             }
-            
+
             if comp.is_flooded() {
                 let reduction = intensity * 0.5 * dt;
                 if let Some(node) = graph.get_compartment_mut(*comp_id) {
@@ -253,9 +255,9 @@ impl PropagationSystem {
                 }
                 continue;
             }
-            
+
             let connected = graph.get_connected_compartments(*comp_id);
-            
+
             for target_id in connected {
                 if let Some(bulkhead_id) = graph.get_bulkhead_between(*comp_id, target_id) {
                     let bulkhead_passable = graph
@@ -309,7 +311,7 @@ impl PropagationSystem {
             if can_pump {
                 let pump_amount = pump_capacity * dt;
                 let pumped = graph.pump_water(comp_id, pump_amount);
-                
+
                 if pumped > 0.0 {
                     events.push(PropagationEvent {
                         event_type: PropagationEventType::WaterPumped,
@@ -355,7 +357,12 @@ impl PropagationSystem {
         }
     }
 
-    pub fn ignite_fire(&mut self, graph: &mut DamageGraph, compartment_id: EntityId, intensity: f32) -> bool {
+    pub fn ignite_fire(
+        &mut self,
+        graph: &mut DamageGraph,
+        compartment_id: EntityId,
+        intensity: f32,
+    ) -> bool {
         // Bug №198: `f32::clamp` returns NaN unchanged, so an unusable
         // intensity became a NaN `fire_intensity` that then spread at full
         // strength. Refused outright instead of written as zero, so garbage
@@ -394,7 +401,11 @@ impl PropagationSystem {
         }
     }
 
-    pub fn breach_compartment(&mut self, graph: &mut DamageGraph, compartment_id: EntityId) -> bool {
+    pub fn breach_compartment(
+        &mut self,
+        graph: &mut DamageGraph,
+        compartment_id: EntityId,
+    ) -> bool {
         if graph.breach_compartment(compartment_id) {
             // Do NOT emit CompartmentFlooded here: breach starts at water 0,
             // the edge detector below emits Flooded when fill_ratio actually
@@ -435,7 +446,12 @@ impl PropagationSystem {
         }
     }
 
-    pub fn damage_bulkhead(&mut self, graph: &mut DamageGraph, bulkhead_id: EntityId, damage: f32) -> bool {
+    pub fn damage_bulkhead(
+        &mut self,
+        graph: &mut DamageGraph,
+        bulkhead_id: EntityId,
+        damage: f32,
+    ) -> bool {
         if graph.damage_bulkhead(bulkhead_id, damage) {
             if let Some(bulkhead) = graph.get_bulkhead(bulkhead_id) {
                 if bulkhead.is_destroyed {
@@ -501,16 +517,18 @@ impl FloodingSimulator {
     }
 
     pub fn remove_water_source(&mut self, compartment_id: EntityId) {
-        self.water_sources.retain(|s| s.compartment_id != compartment_id);
+        self.water_sources
+            .retain(|s| s.compartment_id != compartment_id);
     }
 
     pub fn step(&mut self, dt: f32) -> Vec<PropagationEvent> {
         for source in &self.water_sources {
             if source.is_active {
-                self.graph.add_water(source.compartment_id, source.flow_rate * dt);
+                self.graph
+                    .add_water(source.compartment_id, source.flow_rate * dt);
             }
         }
-        
+
         self.propagation.update(&mut self.graph, dt)
     }
 
@@ -523,35 +541,59 @@ impl FloodingSimulator {
     }
 
     pub fn get_compartment_state(&self, compartment_id: EntityId) -> Option<CompartmentState> {
-        self.graph.get_compartment(compartment_id).map(|c| CompartmentState {
-            entity_id: c.entity_id,
-            name: c.name.clone(),
-            water_level: c.current_level,
-            max_water_level: c.max_capacity,
-            fill_ratio: c.fill_ratio(),
-            is_sealed: c.is_sealed,
-            is_breached: c.is_breached,
-            fire_intensity: c.fire_intensity,
-            pump_active: c.pump_active,
-            pump_capacity: c.pump_capacity,
-        })
+        self.graph
+            .get_compartment(compartment_id)
+            .map(|c| CompartmentState {
+                entity_id: c.entity_id,
+                name: c.name.clone(),
+                water_level: c.current_level,
+                max_water_level: c.max_capacity,
+                fill_ratio: c.fill_ratio(),
+                is_sealed: c.is_sealed,
+                is_breached: c.is_breached,
+                fire_intensity: c.fire_intensity,
+                pump_active: c.pump_active,
+                pump_capacity: c.pump_capacity,
+            })
     }
 
     pub fn total_water_volume(&self) -> f32 {
-        self.graph.all_compartments().iter().map(|c| c.current_level).sum()
+        self.graph
+            .all_compartments()
+            .iter()
+            .map(|c| c.current_level)
+            .sum()
     }
 
     pub fn flooded_compartment_count(&self) -> usize {
-        self.graph.all_compartments().iter().filter(|c| c.is_flooded()).count()
+        self.graph
+            .all_compartments()
+            .iter()
+            .filter(|c| c.is_flooded())
+            .count()
     }
 
     pub fn critical_compartment_count(&self) -> usize {
-        self.graph.all_compartments().iter().filter(|c| c.is_critical()).count()
+        self.graph
+            .all_compartments()
+            .iter()
+            .filter(|c| c.is_critical())
+            .count()
     }
 
     pub fn is_ship_lost(&self) -> bool {
-        let total_capacity: f32 = self.graph.all_compartments().iter().map(|c| c.max_capacity).sum();
-        let total_water: f32 = self.graph.all_compartments().iter().map(|c| c.current_level).sum();
+        let total_capacity: f32 = self
+            .graph
+            .all_compartments()
+            .iter()
+            .map(|c| c.max_capacity)
+            .sum();
+        let total_water: f32 = self
+            .graph
+            .all_compartments()
+            .iter()
+            .map(|c| c.current_level)
+            .sum();
 
         // Bug №83: 0/0 = NaN never compares > 0.7 — an empty graph meant the
         // ship could never be counted as lost.

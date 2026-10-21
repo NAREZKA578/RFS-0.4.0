@@ -1,5 +1,5 @@
-use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 pub const TICK_RATE: u32 = 30;
 pub const TICK_DURATION_MS: u64 = 1000 / TICK_RATE as u64;
@@ -43,9 +43,7 @@ impl Tick {
     }
 
     pub fn duration_since(&self, other: Tick) -> Duration {
-        Duration::from_millis(
-            (self.0.saturating_sub(other.0)).saturating_mul(TICK_DURATION_MS),
-        )
+        Duration::from_millis((self.0.saturating_sub(other.0)).saturating_mul(TICK_DURATION_MS))
     }
 }
 
@@ -145,7 +143,11 @@ pub struct GameTime {
 
 impl GameTime {
     pub fn new(tick: Tick, time: f64, delta_time: f32) -> Self {
-        Self { tick, time, delta_time }
+        Self {
+            tick,
+            time,
+            delta_time,
+        }
     }
 
     pub fn from_tick(tick: Tick) -> Self {
@@ -224,11 +226,7 @@ mod tests {
     #[test]
     fn advancing_past_the_last_tick_wraps_instead_of_panicking() {
         let last = Tick(u64::MAX);
-        assert_eq!(
-            last.next(),
-            Tick(0),
-            "next must wrap rather than overflow"
-        );
+        assert_eq!(last.next(), Tick(0), "next must wrap rather than overflow");
         assert_eq!(last + 1, Tick(0), "Add must wrap rather than overflow");
         assert_eq!(last + 10, Tick(9));
         // u64::MAX + u64::MAX wraps to u64::MAX - 1.
@@ -250,6 +248,9 @@ mod tests {
         assert_eq!(Tick(41).next(), Tick(42));
         assert_eq!(Tick(41) + 2, Tick(43));
         assert_eq!(Tick(41).prev(), Tick(40));
-        assert_eq!(Tick(41).duration_since(Tick(1)), std::time::Duration::from_millis(40 * TICK_DURATION_MS));
+        assert_eq!(
+            Tick(41).duration_since(Tick(1)),
+            std::time::Duration::from_millis(40 * TICK_DURATION_MS)
+        );
     }
 }

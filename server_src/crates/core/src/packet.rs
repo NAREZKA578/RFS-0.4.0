@@ -1,11 +1,17 @@
-pub use crate::spatial::EntityId;
 use crate::entity::HitMark;
-use crate::math::{Vec3f, Transform};
+use crate::math::{Transform, Vec3f};
+pub use crate::spatial::EntityId;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Bug №239: the single statement of the per-datagram wire budget. It does
+/// not deliberately enforce itself inside core — core only serializes — but
+/// the net crate re-exports exactly this value as `connection::MAX_PACKET_SIZE`
+/// and takes its default config MTU from it, so a change made here is the
+/// change the wire really enforces. Restating the number anywhere else is a
+/// defect, not a convenience.
 pub const MAX_PACKET_SIZE: usize = 1400;
 pub const HEADER_SIZE: usize = 24;
 
@@ -33,6 +39,24 @@ pub enum PacketType {
     CommandAck = 0x41,
     Rpc = 0x50,
     RpcResponse = 0x51,
+    /// Bug №267 (A): the client asks the server to resync one replication
+    /// layer immediately. Appended after RpcResponse so the positional
+    /// coding of every earlier variant stays exactly where it was (bug №60)
+    /// — no PROTOCOL_VERSION bump is needed for an append.
+    ResyncRequest = 0x52,
+    /// Bug №699: the world's static description, sent once when a client
+    /// connects. The world is not a layer and does not change, so there is
+    /// nothing to stream — a client that never hears of the structures cannot
+    /// draw them, and a shell that vanishes at an invisible rock looks like a
+    /// bug in the shooter.
+    MapDescription = 0x53,
+    /// Bug №216: the client's proof that it may connect — the secret the
+    /// match was configured with.
+    ///
+    /// A SEPARATE packet, not a field of `Connect`: the connect handshake
+    /// keeps its shape, and a server that wants no secret simply ignores
+    /// this one.
+    Auth = 0x54,
 }
 
 impl PacketType {
@@ -56,6 +80,9 @@ impl PacketType {
             0x41 => Self::CommandAck,
             0x50 => Self::Rpc,
             0x51 => Self::RpcResponse,
+            0x52 => Self::ResyncRequest,
+            0x53 => Self::MapDescription,
+            0x54 => Self::Auth,
             _ => return None,
         })
     }
@@ -93,7 +120,14 @@ pub struct PacketHeader {
 impl PacketHeader {
     pub const MAGIC: u32 = 0x52465300;
 
-    pub fn new(packet_type: PacketType, channel: ChannelType, sequence: u32, ack: u32, ack_bitfield: u32, payload_size: u16) -> Self {
+    pub fn new(
+        packet_type: PacketType,
+        channel: ChannelType,
+        sequence: u32,
+        ack: u32,
+        ack_bitfield: u32,
+        payload_size: u16,
+    ) -> Self {
         Self {
             magic: Self::MAGIC,
             version: PROTOCOL_VERSION,
@@ -172,6 +206,9 @@ pub enum DisconnectReason {
     Timeout = 2,
     ServerShutdown = 3,
     Error = 4,
+    /// Bug №216: the client did not prove it may connect — wrong secret, or
+    /// none where one is required.
+    Unauthorized = 5,
 }
 
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
@@ -526,6 +563,33 @@ pub enum GameEvent {
     MatchStateChanged {
         state: MatchState,
     },
+    /// Bug №634: a chat message accepted from an authenticated player. The
+    /// command carries a spoofable `player` field; by the time this event is
+    /// broadcast, the server has already replaced it with the connection's
+    /// authenticated player. Interest filtering applies at the server:
+    /// `All` reaches everyone (no subject), every narrower channel is about
+    /// the sender.
+    ChatReceived {
+        player: EntityId,
+        message: String,
+        channel: ChatChannel,
+    },
+    /// A ramming hit: two hulls met and the contact did damage.
+    ///
+    /// Appended last so the positional coding of every earlier variant (bug
+    /// №60) stays where it was. The design note asks for the ram to be a
+    /// DIFFERENT source of damage, not a new damage system — the same
+    /// compartment graph does the work, but the client has to be able to tell
+    /// a ram from a shell, so this is its own event.
+    ShipRam {
+        /// The ship that hit.
+        rammer: EntityId,
+        /// The ship that was hit.
+        target: EntityId,
+        position: Vec3f,
+        normal: Vec3f,
+        damage: f32,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -550,21 +614,74 @@ pub struct CommandPacket {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerCommand {
-    SetShipThrottle { ship: EntityId, throttle: f32 },
-    SetShipRudder { ship: EntityId, rudder: f32 },
-    FireWeapon { station: EntityId, target_pos: Option<Vec3f> },
-    ReloadWeapon { station: EntityId, ammo_type: u8 },
-    SealBulkhead { bulkhead: EntityId },
-    OpenBulkhead { bulkhead: EntityId },
-    ActivatePump { pump: EntityId },
-    DeactivatePump { pump: EntityId },
-    RepairStation { station: EntityId },
-    ExtinguishFire { compartment: EntityId },
-    EnterStation { player: EntityId, station: EntityId },
-    ExitStation { player: EntityId },
-    Respawn { player: EntityId },
-    ChatMessage { player: EntityId, message: String, channel: ChatChannel },
-    VoteKick { initiator: EntityId, target: EntityId },
+    SetShipThrottle {
+        ship: EntityId,
+        throttle: f32,
+    },
+    SetShipRudder {
+        ship: EntityId,
+        rudder: f32,
+    },
+    FireWeapon {
+        station: EntityId,
+        target_pos: Option<Vec3f>,
+    },
+    ReloadWeapon {
+        station: EntityId,
+        ammo_type: u8,
+    },
+    SealBulkhead {
+        bulkhead: EntityId,
+    },
+    OpenBulkhead {
+        bulkhead: EntityId,
+    },
+    /// Seals or opens a whole compartment's hull-side seal (bug №668): the
+    /// flag a breached compartment checks before taking water at all. The
+    /// seat rule mirrors the bulkhead commands: damage control only.
+    SetCompartmentSeal {
+        compartment: EntityId,
+        sealed: bool,
+    },
+    ActivatePump {
+        pump: EntityId,
+    },
+    DeactivatePump {
+        pump: EntityId,
+    },
+    RepairStation {
+        station: EntityId,
+    },
+    ExtinguishFire {
+        compartment: EntityId,
+    },
+    /// Turns a station's default behavior on and off (bug №669). The code is
+    /// a small integer: 0 = Active, 1 = Passive, 2 = Disabled (the mapping
+    /// lives on the ship side, `DefaultBehavior::from_code`). An unknown code
+    /// is refused by the server, never defaulted.
+    SetStationBehavior {
+        station: EntityId,
+        behavior: u8,
+    },
+    EnterStation {
+        player: EntityId,
+        station: EntityId,
+    },
+    ExitStation {
+        player: EntityId,
+    },
+    Respawn {
+        player: EntityId,
+    },
+    ChatMessage {
+        player: EntityId,
+        message: String,
+        channel: ChatChannel,
+    },
+    VoteKick {
+        initiator: EntityId,
+        target: EntityId,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -597,7 +714,41 @@ pub struct RpcResponsePacket {
     pub error: Option<String>,
 }
 
-pub fn serialize_packet<T: Serializable>(packet: &T, header: PacketHeader) -> Result<Vec<u8>, bincode::Error> {
+/// Bug №267 (A): the layer this client wants resynced now. Deliberately tiny
+/// — it must never fragment, and 24 bytes of payload leaves room for it under
+/// any MTU.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResyncRequestPacket {
+    pub layer: u8,
+}
+
+/// Bug №699: the world's static description, sent once per client.
+///
+/// The payload is a volume plus a list of solid volumes. It can be larger
+/// than a datagram (a map with thousands of structures), so it goes through
+/// the same fragmentation path as a full state.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapDescriptionPacket {
+    pub name: String,
+    pub bounds_min: Vec3f,
+    pub bounds_max: Vec3f,
+    pub obstacles: Vec<crate::world::MapObstacleDescription>,
+}
+
+/// Bug №216: the client's proof that it may connect.
+///
+/// The secret comes from the match configuration on the server side and from
+/// the client's own settings on this side; an empty secret means "this server
+/// asks for none", and a server that asks for none ignores the packet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPacket {
+    pub token: String,
+}
+
+pub fn serialize_packet<T: Serializable>(
+    packet: &T,
+    header: PacketHeader,
+) -> Result<Vec<u8>, bincode::Error> {
     let payload = bincode::serialize(packet)?;
     let mut header = header;
     // Bug №9: `as u16` truncation used to let a lying header reach the wire.
@@ -611,18 +762,24 @@ pub fn serialize_packet<T: Serializable>(packet: &T, header: PacketHeader) -> Re
 
 pub fn deserialize_packet(data: &[u8]) -> Result<(PacketHeader, &[u8]), bincode::Error> {
     if data.len() < HEADER_SIZE {
-        return Err(bincode::Error::new(bincode::ErrorKind::Custom("Packet too small".into())));
+        return Err(bincode::Error::new(bincode::ErrorKind::Custom(
+            "Packet too small".into(),
+        )));
     }
 
     let header: PacketHeader = bincode::deserialize(&data[..HEADER_SIZE])?;
 
     if !header.is_valid() {
-        return Err(bincode::Error::new(bincode::ErrorKind::Custom("Invalid packet header".into())));
+        return Err(bincode::Error::new(bincode::ErrorKind::Custom(
+            "Invalid packet header".into(),
+        )));
     }
 
     let payload = &data[HEADER_SIZE..];
     if payload.len() != header.payload_size as usize {
-        return Err(bincode::Error::new(bincode::ErrorKind::Custom("Payload size mismatch".into())));
+        return Err(bincode::Error::new(bincode::ErrorKind::Custom(
+            "Payload size mismatch".into(),
+        )));
     }
 
     Ok((header, payload))

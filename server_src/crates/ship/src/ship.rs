@@ -1,9 +1,9 @@
-use rfs_core::entity::{ShipClass, CompartmentTemplate, StationTemplate, StationType, EntityId};
-use rfs_core::math::{Vec3f, Transform, Quatf, Bounds as CoreBounds};
-use crate::station::{FireResult, Station, StationState};
 use crate::compartment::{Compartment, CompartmentState, WaterTransfer};
-use rfs_damage::damage::{CompartmentHit, DamageSystem, DamageTarget, StationHit};
+use crate::station::{DefaultBehavior, FireResult, Station, StationState};
 use parking_lot::RwLock;
+use rfs_core::entity::{CompartmentTemplate, EntityId, ShipClass, StationTemplate, StationType};
+use rfs_core::math::{Bounds as CoreBounds, Quatf, Transform, Vec3f};
+use rfs_damage::damage::{CompartmentHit, DamageSystem, DamageTarget, StationHit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -147,7 +147,7 @@ impl Ship {
             damage_system,
             entity_id,
         };
-        
+
         ship.initialize_compartments();
         ship.initialize_stations();
 
@@ -160,7 +160,12 @@ impl Ship {
                 .iter()
                 .map(|(id, comp)| {
                     let cfg = comp.config();
-                    (*id, cfg.name.clone(), cfg.max_water_level, cfg.pump_capacity)
+                    (
+                        *id,
+                        cfg.name.clone(),
+                        cfg.max_water_level,
+                        cfg.pump_capacity,
+                    )
                 })
                 .collect();
             let edges: Vec<(EntityId, EntityId, EntityId, f32)> = ship
@@ -202,11 +207,22 @@ impl Ship {
             .iter()
             .enumerate()
             .take(MAX_COMPARTMENTS)
-            .map(|(i, t)| (t.name.clone(), EntityId::new(self.entity_id.0 + 1000 + i as u64)))
+            .map(|(i, t)| {
+                (
+                    t.name.clone(),
+                    EntityId::new(self.entity_id.0 + 1000 + i as u64),
+                )
+            })
             .collect();
 
         let mut states = self.state.write();
-        for (i, template) in self.config.compartments.iter().enumerate().take(MAX_COMPARTMENTS) {
+        for (i, template) in self
+            .config
+            .compartments
+            .iter()
+            .enumerate()
+            .take(MAX_COMPARTMENTS)
+        {
             let comp_id = EntityId::new(self.entity_id.0 + 1000 + i as u64);
 
             let connected: Vec<EntityId> = template
@@ -273,21 +289,26 @@ impl Ship {
             .compartments
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.name.clone(), EntityId::new(self.entity_id.0 + 1000 + i as u64)))
+            .map(|(i, t)| {
+                (
+                    t.name.clone(),
+                    EntityId::new(self.entity_id.0 + 1000 + i as u64),
+                )
+            })
             .collect();
 
         // Guard station region spill: compartments use +1000+i, stations
         // +2000+i — cap stations so they never reach bulkhead region (+3000).
         const MAX_STATIONS: usize = 900;
-        for (i, template) in self.config.stations.iter().enumerate().take(MAX_STATIONS) {
+        let templates = self.config.stations.clone();
+        for (i, template) in templates.iter().enumerate().take(MAX_STATIONS) {
             let station_id = EntityId::new(self.entity_id.0 + 2000 + i as u64);
             let compartment_id = name_to_comp
                 .get(&template.compartment_name)
                 .copied()
                 .unwrap_or_else(EntityId::nil);
 
-            let mut station = Station::new(station_id, self.entity_id, template.clone());
-            station.set_compartment_id(compartment_id);
+            let station = Station::new(station_id, self.entity_id, template.clone());
 
             self.state.write().station_states.insert(
                 station_id,
@@ -303,6 +324,12 @@ impl Ship {
                 },
             );
             self.stations.insert(station_id, station);
+            // Bug №670: the accessor is the single mutable door for an
+            // inserted station; the template binding is applied after the
+            // insert, not on a local before it.
+            if let Some(station) = self.get_station_mut(station_id) {
+                station.set_compartment_id(compartment_id);
+            }
         }
 
         // Backfill compartment.config.stations: Compartment::new only knew
@@ -401,29 +428,29 @@ impl Ship {
         // turn the clamp into a panic (min > max).
         let turn_limit = self.config.turn_rate.abs();
         let rudder = state.rudder_angle.clamp(-turn_limit, turn_limit);
-        
+
         let forward = state.transform.rotation.mul_vec3(Vec3f::FORWARD);
 
         // Bug №57: unvalidated JSON mass (0 / negative / NaN) used to divide
         // into inf/NaN. Clamp to a floor so dynamics always stay finite.
         let mass = self.config.mass.max(0.0001);
-        
+
         let thrust_force = throttle * self.config.acceleration * mass;
         let drag_force = -state.velocity.length() * state.velocity * 0.1;
-        
+
         let acceleration = (forward * thrust_force + drag_force) / mass;
         state.velocity += acceleration * dt;
         state.transform.position += state.velocity * dt;
-        
+
         state.speed = state.velocity.length();
-        
+
         // turn_rate sign must not invert steering; damping must be
         // dt-dependent (pow), not per-tick constant.
         let turn_torque = rudder * turn_limit * state.speed;
         state.angular_velocity.y += turn_torque * dt;
         let damping = 0.98f32.powf(dt * 60.0);
         state.angular_velocity *= damping;
-        
+
         let yaw_change = state.angular_velocity.y * dt;
         state.heading += yaw_change;
         // from_euler(yaw, pitch, roll): heading spins around Y, so it goes first.
@@ -448,7 +475,11 @@ impl Ship {
         for comp in self.compartments.values() {
             let comp_id = comp.entity_id();
             if let Some(cs) = state.compartment_states.get(&comp_id) {
-                water_transfers.extend(comp.compute_water_spread(cs, &state.compartment_states, dt));
+                water_transfers.extend(comp.compute_water_spread(
+                    cs,
+                    &state.compartment_states,
+                    dt,
+                ));
                 fire_spreads.extend(comp.fire_spread(cs, &state.compartment_states, dt));
             }
         }
@@ -510,13 +541,13 @@ impl Ship {
             state.is_sinking = true;
             state.sink_timer = 30.0;
         }
-        
+
         if state.is_sinking {
             // Bug №57: use the real dt — the old FIXED_DT timer lied the
             // moment the tick rate changed.
             state.sink_timer -= dt;
             state.transform.position.y -= 0.1 * dt;
-            
+
             // Bug №57: the old body was an empty `if` — the sink never
             // finished and the ship was never removed. Flag it for the sim
             // to despawn.
@@ -562,7 +593,9 @@ impl Ship {
         // made a ship flood. The graph now returns every compartment that just
         // breached; mirror it into the real state so Compartment::update starts
         // the water intake.
-        let report = self.damage_system.apply_damage_to_ship(self, local_pos, damage);
+        let report = self
+            .damage_system
+            .apply_damage_to_ship(self, local_pos, damage);
         if !report.breached.is_empty() {
             let mut state = self.state.write();
             for comp_id in &report.breached {
@@ -641,7 +674,26 @@ impl Ship {
         }
     }
 
-    pub fn try_fire_station(&self, station_id: EntityId, ammo_type: Option<u8>) -> Option<FireResult> {
+    /// Bug №630: whether the station has finished slewing to the angles
+    /// `set_station_target_angles` last requested. An unknown station is
+    /// "never aimed" — a deferred shot on it can only end in a deadline, not
+    /// in a shot.
+    pub fn station_aim_reached(&self, station_id: EntityId) -> bool {
+        let Some(station) = self.stations.get(&station_id) else {
+            return false;
+        };
+        let state = self.state.read();
+        state
+            .station_states
+            .get(&station_id)
+            .is_some_and(|s| station.aim_reached(s))
+    }
+
+    pub fn try_fire_station(
+        &self,
+        station_id: EntityId,
+        ammo_type: Option<u8>,
+    ) -> Option<FireResult> {
         let station = self.stations.get(&station_id)?;
         let mut state = self.state.write();
         let station_state = state.station_states.get_mut(&station_id)?;
@@ -664,6 +716,29 @@ impl Ship {
         }
     }
 
+    /// Sets a station's default behavior — `Active` puts the station up,
+    /// `Passive` and `Disabled` take it down (distinct only as wire codes
+    /// for now; bug №669). The command rule is that the occupant of the
+    /// station decides.
+    ///
+    /// Returns whether anything was set. `false` covers both an unknown
+    /// station and a station whose state is missing — a pairing the server
+    /// is not supposed to break. Setting an already-set behavior succeeds:
+    /// repeat requests are idempotent, not errors.
+    pub fn set_station_behavior(&self, station_id: EntityId, behavior: DefaultBehavior) -> bool {
+        let Some(station) = self.stations.get(&station_id) else {
+            return false;
+        };
+        let mut state = self.state.write();
+        match state.station_states.get_mut(&station_id) {
+            Some(station_state) => {
+                station.set_default_behavior(station_state, behavior);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn vacate_station(&self, station_id: EntityId) -> Option<EntityId> {
         let mut state = self.state.write();
         if let Some(station_state) = state.station_states.get_mut(&station_id) {
@@ -680,20 +755,39 @@ impl Ship {
     // Pump/Repair/Extinguish/Open/Seal commands and station interactions fell
     // into `_ => {}` and did nothing. These are the real implementations.
 
+    /// Bug №668: the pump is written through the Compartment API, not by
+    /// reaching into the state map from the side. Both direct and toggle
+    /// paths share the same helpers.
     pub fn set_compartment_pump(&self, compartment_id: EntityId, active: bool) {
+        let Some(comp) = self.compartments.get(&compartment_id) else {
+            return;
+        };
         let mut state = self.state.write();
         if let Some(cs) = state.compartment_states.get_mut(&compartment_id) {
-            cs.pump_active = active;
+            if active {
+                comp.activate_pump(cs);
+            } else {
+                comp.deactivate_pump(cs);
+            }
         }
     }
 
     pub fn toggle_compartment_pump(&self, compartment_id: EntityId) -> bool {
+        let Some(comp) = self.compartments.get(&compartment_id) else {
+            return false;
+        };
         let mut state = self.state.write();
-        if let Some(cs) = state.compartment_states.get_mut(&compartment_id) {
-            cs.pump_active = !cs.pump_active;
-            true
-        } else {
-            false
+        match state.compartment_states.get_mut(&compartment_id) {
+            Some(cs) => {
+                let was_active = cs.pump_active;
+                if was_active {
+                    comp.deactivate_pump(cs);
+                } else {
+                    comp.activate_pump(cs);
+                }
+                !was_active
+            }
+            None => false,
         }
     }
 
@@ -728,17 +822,57 @@ impl Ship {
         false
     }
 
+    /// Bug №668: the compartment-level seal existed as methods with no
+    /// caller; the bulkhead seal was live but a breached compartment's own
+    /// `is_sealed` flag (which decides whether it keeps taking water at all)
+    /// was unreachable from the command path. The new command drives the
+    /// same helpers: `Compartment::seal` / `unseal`.
+    ///
+    /// Returns whether anything was set: an unknown compartment is the only
+    /// refusal.
+    pub fn set_compartment_seal(&self, compartment_id: EntityId, sealed: bool) -> bool {
+        let Some(comp) = self.compartments.get(&compartment_id) else {
+            return false;
+        };
+        let mut state = self.state.write();
+        match state.compartment_states.get_mut(&compartment_id) {
+            Some(cs) => {
+                if sealed {
+                    comp.seal(cs);
+                } else {
+                    comp.unseal(cs);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Apply a repair action to a station. Returns whether anything was
+    /// applied: `false` is either an unknown station/state or a station still
+    /// on its repair cooldown (Bug №633) — callers that need the difference
+    /// read `station_repair_cooldown`.
     pub fn repair_station(&self, station_id: EntityId, amount: f32) -> bool {
         let Some(station) = self.stations.get(&station_id) else {
             return false;
         };
         let mut state = self.state.write();
         if let Some(s) = state.station_states.get_mut(&station_id) {
-            station.repair(s, amount);
-            true
+            station.repair(s, amount)
         } else {
             false
         }
+    }
+
+    /// Remaining repair cooldown on a post, `None` when the station or its
+    /// state does not exist (Bug №633: lets the command path tell "not found"
+    /// apart from "on cooldown" honestly).
+    pub fn station_repair_cooldown(&self, station_id: EntityId) -> Option<f32> {
+        self.state
+            .read()
+            .station_states
+            .get(&station_id)
+            .map(|s| s.repair_cooldown)
     }
 
     pub fn extinguish_compartment(&self, compartment_id: EntityId) -> bool {
@@ -813,9 +947,9 @@ impl Ship {
     /// `EntityId` derives no `Ord`, so the sort is on its public `u64` rather
     /// than on the wrapper.
     pub fn get_compartment_at(&self, local_pos: Vec3f) -> Option<EntityId> {
-            let mut ids: Vec<EntityId> = self.compartments.keys().copied().collect();
-            ids.sort_unstable_by_key(|id| id.0);
-            ids.into_iter().find(|id| {
+        let mut ids: Vec<EntityId> = self.compartments.keys().copied().collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.into_iter().find(|id| {
             self.compartments
                 .get(id)
                 .is_some_and(|comp| comp.bounds().contains(local_pos))
@@ -834,7 +968,14 @@ impl Ship {
     /// by diffing two snapshots, so a per-tick list would need to accumulate
     /// history to stay correct, and the client only needs the latest to draw
     /// the effect.
-    pub fn note_hit(&self, tick: u64, position: Vec3f, normal: Vec3f, compartment: Option<EntityId>, damage: f32) {
+    pub fn note_hit(
+        &self,
+        tick: u64,
+        position: Vec3f,
+        normal: Vec3f,
+        compartment: Option<EntityId>,
+        damage: f32,
+    ) {
         self.state.write().last_hit = Some(HitMark {
             tick,
             position,
@@ -873,7 +1014,11 @@ impl Ship {
 
     pub fn total_water_volume(&self) -> f32 {
         let state = self.state.read();
-        state.compartment_states.values().map(|c| c.water_level).sum()
+        state
+            .compartment_states
+            .values()
+            .map(|c| c.water_level)
+            .sum()
     }
 
     pub fn is_operational(&self) -> bool {
@@ -1039,7 +1184,9 @@ impl From<&Ship> for ShipSnapshot {
             heading: state.heading,
             rudder_angle: state.rudder_angle,
             throttle: state.throttle,
-            compartments: state.compartment_states.iter()
+            compartments: state
+                .compartment_states
+                .iter()
                 .map(|(id, s)| ShipCompartmentSnapshot {
                     entity_id: *id,
                     water_level: s.water_level,
@@ -1048,7 +1195,9 @@ impl From<&Ship> for ShipSnapshot {
                     fire_intensity: s.fire_intensity,
                 })
                 .collect(),
-            stations: state.station_states.iter()
+            stations: state
+                .station_states
+                .iter()
                 .map(|(id, s)| ShipStationSnapshot {
                     entity_id: *id,
                     station_type: s.station_type,
@@ -1113,6 +1262,78 @@ mod tests {
         (ship, EntityId::new(2001))
     }
 
+    /// The pump and bulkhead commands all reach their compartment *through*
+    /// the station, so a station built with an unset template link would
+    /// strand them. The binding is decided once, when the station list is
+    /// built, and this pins it (bug №670).
+    #[test]
+    fn a_station_starts_bound_to_its_compartment() {
+        let (s, station_id) = ship_with_station();
+        let station = s.get_station(station_id).expect("fixture station exists");
+        assert_eq!(
+            station.compartment_id(),
+            EntityId::new(1001),
+            "the station must be bound to the first compartment (+1000+0)"
+        );
+    }
+
+    /// A station's behavior is the mutable connection between a command and
+    /// the operational flag: `Disabled` turns the station off, `Active`
+    /// turns it back on, and repeating a set is a success, not an error
+    /// (bug №669).
+    #[test]
+    fn a_station_behavior_can_be_set_and_repeated() {
+        let (s, station_id) = ship_with_station();
+        let operational = |s: &Ship| {
+            s.get_state()
+                .station_states
+                .get(&station_id)
+                .expect("fixture station exists")
+                .is_operational
+        };
+        assert!(
+            operational(&s),
+            "the fixture station starts active (bug №58 pins this)"
+        );
+        assert!(
+            s.set_station_behavior(station_id, DefaultBehavior::Disabled),
+            "an existing station renders its behavior unreachable"
+        );
+        assert!(
+            !operational(&s),
+            "Disabled must de-operationalize the station"
+        );
+        // Idempotency: the same request again is a success, not a refusal.
+        assert!(s.set_station_behavior(station_id, DefaultBehavior::Disabled));
+        assert!(!operational(&s));
+        assert!(s.set_station_behavior(station_id, DefaultBehavior::Active));
+        assert!(operational(&s), "Active must put the station back");
+    }
+
+    /// `Disabled` de-operationalizes the station without evicting the seated
+    /// player: seats belong to the player, damage is what clears them, and
+    /// the fire refusal carries the same way it does for a broken station.
+    #[test]
+    fn a_disabled_station_keeps_its_seat() {
+        let (s, station_id) = ship_with_station();
+        let player = EntityId::new(4242);
+        assert!(
+            s.occupy_station(station_id, player),
+            "fixture could not sit"
+        );
+        assert!(
+            s.set_station_behavior(station_id, DefaultBehavior::Disabled),
+            "an existing station renders its behavior unreachable"
+        );
+        let remained = s
+            .get_state()
+            .station_states
+            .get(&station_id)
+            .expect("fixture station exists")
+            .occupant;
+        assert_eq!(remained, Some(player), "Disabled evicted the seated player");
+    }
+
     /// Bug №194: `Station::apply_damage` had no caller, so a station could
     /// never be destroyed — `is_operational` and `occupant` never cleared and
     /// the gun fired forever.
@@ -1121,19 +1342,31 @@ mod tests {
         let (s, station_id) = ship_with_station();
         let before = s.get_state();
         let station = before.station_states.get(&station_id).expect("no station");
-        assert!(station.is_operational, "the fixture station is not operational");
+        assert!(
+            station.is_operational,
+            "the fixture station is not operational"
+        );
         assert!(station.health > 0.0);
 
         s.apply_damage(10_000.0, Vec3f::new(1.0, 0.0, 0.0));
 
         let after = s.get_state();
-        let station = after.station_states.get(&station_id).expect("station vanished");
+        let station = after
+            .station_states
+            .get(&station_id)
+            .expect("station vanished");
         assert!(
             !station.is_operational,
             "a direct hit left the station operational"
         );
-        assert!(station.health <= 0.0, "the station kept health after a huge hit");
-        assert!(station.occupant.is_none(), "a destroyed station kept its crew");
+        assert!(
+            station.health <= 0.0,
+            "the station kept health after a huge hit"
+        );
+        assert!(
+            station.occupant.is_none(),
+            "a destroyed station kept its crew"
+        );
     }
 
     /// The falloff has to apply to stations too: a blast far away must not
@@ -1198,7 +1431,9 @@ mod tests {
         );
         // It must be reachable as a station, though.
         assert!(
-            DamageTarget::station_hits(&s).iter().any(|h| h.entity_id == station_id),
+            DamageTarget::station_hits(&s)
+                .iter()
+                .any(|h| h.entity_id == station_id),
             "the station is not in the blast path either, so it is now invulnerable"
         );
     }
@@ -1302,7 +1537,10 @@ mod tests {
             max_health: 1000.0,
             compartments: vec![CompartmentTemplate {
                 name: "bridge".into(),
-                local_bounds: CoreBounds::new(Vec3f::new(-5.0, -5.0, -5.0), Vec3f::new(5.0, 5.0, 5.0)),
+                local_bounds: CoreBounds::new(
+                    Vec3f::new(-5.0, -5.0, -5.0),
+                    Vec3f::new(5.0, 5.0, 5.0),
+                ),
                 max_water_level: 100.0,
                 pump_capacity: 5.0,
                 connected_compartments: Vec::new(),
@@ -1326,7 +1564,11 @@ mod tests {
 
         let started = s.get_state();
         assert!(started.is_sinking, "the ship did not start sinking");
-        assert!((started.sink_timer - 30.0).abs() < 1e-4, "timer {}", started.sink_timer);
+        assert!(
+            (started.sink_timer - 30.0).abs() < 1e-4,
+            "timer {}",
+            started.sink_timer
+        );
 
         // Ten seconds of sinking: ten seconds should be gone from the timer.
         let mid = tick(&s, 10);
@@ -1374,7 +1616,10 @@ mod tests {
             }
         }
 
-        assert!(sunk, "the wreck never finished sinking under continuous fire");
+        assert!(
+            sunk,
+            "the wreck never finished sinking under continuous fire"
+        );
     }
 
     /// A ship that is not sinking must be unaffected by the new guard, and a
@@ -1384,7 +1629,10 @@ mod tests {
         let s = ship(100.0);
         hurt(&s, 40.0);
         let alive = s.get_state();
-        assert!(!alive.is_sinking, "a damaged but living ship started sinking");
+        assert!(
+            !alive.is_sinking,
+            "a damaged but living ship started sinking"
+        );
         assert_eq!(alive.sink_timer, 0.0);
 
         hurt(&s, 80.0);
@@ -1489,5 +1737,31 @@ mod tests {
         let missing = EntityId::new(9999);
         assert!(!s.ignite_compartment(missing, 0.5));
         assert!(!s.extinguish_compartment(missing));
+    }
+
+    /// Bug №668: the compartment's hull-side seal — the flag a breached
+    /// compartment checks before taking water at all — was unreachable from
+    /// the command path, because the pump/bulkhead paths wrote the state map
+    /// from the side. The command now drives `Compartment::seal`/`unseal`,
+    /// an unknown compartment is the only refusal, and repeating a set is
+    /// a success, not an error.
+    #[test]
+    fn a_compartment_seal_can_be_set_and_repeated() {
+        let (s, _) = ship_with_station();
+        let compartment = EntityId::new(1001);
+
+        assert!(s.set_compartment_seal(compartment, true));
+        assert!(s.get_state().compartment_states[&compartment].is_sealed);
+
+        assert!(s.set_compartment_seal(compartment, true));
+        assert!(s.get_state().compartment_states[&compartment].is_sealed);
+
+        assert!(s.set_compartment_seal(compartment, false));
+        assert!(!s.get_state().compartment_states[&compartment].is_sealed);
+
+        assert!(
+            !s.set_compartment_seal(EntityId::new(9999), true),
+            "an unknown compartment was acked"
+        );
     }
 }

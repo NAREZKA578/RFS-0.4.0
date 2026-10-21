@@ -16,6 +16,39 @@ use crate::resource::{
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 
+/// Report a backend refusal that this convenience API cannot pass on. Bug #642.
+///
+/// The five "legacy" creators here — a sampler, a texture, a buffer, a shader
+/// module, a descriptor set layout — return their argument, not a result, so
+/// a refusal by the backend has nowhere to go. It used to go nowhere at all:
+/// the caller received a handle-less stand-in, `is_ok()` was true, and the
+/// object looked created. A texture that cannot be bound draws nothing, and a
+/// layout that cannot be allocated holds no descriptors, so the failure
+/// surfaced much later and as something else entirely.
+///
+/// The stand-in is still returned — the signature cannot change without
+/// breaking every caller, and nine of them are in `src/rhi/ui/`, which is
+/// another agent's zone. But the refusal is no longer silent, and the message
+/// says what the backend said instead of inventing a reason.
+fn report_backend_refusal(what: &str, error: &crate::error::RhiError) -> ! {
+    panic!(
+        "the backend refused to create {what}: {error}. The CPU-side stand-in \
+         this would have returned has no native handle, so anything bound to it \
+         draws nothing - and the failure would surface later, and as something \
+         else entirely."
+    );
+}
+
+/// Report that there is no backend at all to create something with. Bug #642.
+///
+/// The same silence as [`report_backend_refusal`], and the same reason for
+/// keeping the stand-in: a headless or null-backend caller has nothing better
+/// to receive. The difference is that this one is a configuration fact and not
+/// a failure, and the message says so.
+fn report_no_backend(what: &str) {
+    eprintln!("[rhi] no active backend to create {what} with; a CPU-side stand-in is returned");
+}
+
 /// Physical device type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PhysicalDeviceType {
@@ -204,13 +237,29 @@ impl Device {
     }
 
     /// Create a framebuffer from the given render pass and texture views.
+    ///
+    /// Bug #646: this used to build a `Framebuffer` object and never call the
+    /// backend. The result had no native handle, and the two passes that used
+    /// it — `transparent` and `water` — bound it and then recorded a
+    /// `BeginRenderPass` against it, which the translator refuses:
+    /// "framebuffer has no GPU backing". So those two passes could not record
+    /// a frame at all, and the error pointed at the pass rather than at the
+    /// method that produced an object with nothing in it.
+    ///
+    /// The name did the damage: it reads as "create a framebuffer", next to
+    /// `create_gpu_framebuffer`, which is the one that reaches the backend. The
+    /// two differ only by a prefix, and the shorter one was the one that looked
+    /// like the ordinary way to do it.
+    ///
+    /// The error is now the error, rather than a framebuffer that cannot be
+    /// bound to anything.
     pub fn create_framebuffer(
         &self,
         render_pass: &RenderPass,
         attachments: Vec<TextureView>,
         width: u32,
         height: u32,
-    ) -> Framebuffer {
+    ) -> RhiResult<Framebuffer> {
         let attachments = attachments
             .into_iter()
             .map(|texture_view| FramebufferAttachment {
@@ -219,7 +268,7 @@ impl Device {
                 mip_level: 0,
             })
             .collect();
-        Framebuffer::new(FramebufferDesc {
+        self.create_gpu_framebuffer(&FramebufferDesc {
             render_pass: render_pass.clone(),
             attachments,
             width,
@@ -229,6 +278,17 @@ impl Device {
     }
 
     /// Create a sampler with uniform wrap/filter modes.
+    ///
+    /// Bug #642: a refusal by the backend used to disappear. The caller got a
+    /// sampler with no native handle, `is_ok()` was true, and the object looked
+    /// created — and a sampler that cannot be bound to anything is a defect
+    /// that shows up much later, as a texture that samples black.
+    ///
+    /// The refusal is now reported. The stand-in is still returned, because
+    /// this method's signature cannot change without breaking every caller,
+    /// and nine of them are in `src/rhi/ui/`, which is another agent's zone.
+    /// The honest half of the fix is the report: an error that vanishes is
+    /// indistinguishable from an error that never happened.
     pub fn create_sampler(&self, wrap_mode: AddressMode, filter_mode: FilterMode, anisotropy: f32) -> Sampler {
         let desc = SamplerDesc {
             mag_filter: filter_mode,
@@ -240,15 +300,42 @@ impl Device {
             max_anisotropy: anisotropy,
             ..Default::default()
         };
-        if let Some(backend) = &self.backend_resource {
-            if let Ok(sampler) = backend.create_sampler(&desc) {
-                return sampler;
-            }
+        match &self.backend_resource {
+            Some(backend) => match backend.create_sampler(&desc) {
+                Ok(sampler) => return sampler,
+                Err(e) => report_backend_refusal("a sampler", &e),
+            },
+            None => report_no_backend("a sampler"),
         }
         Sampler::from_desc(desc)
     }
 
+    /// Create a sampler from a full description.
+    ///
+    /// The convenience [`Self::create_sampler`] takes the wrap and filter
+    /// modes and nothing else, and that is not enough for a comparison
+    /// sampler: `compare_enable` and `compare_op` live in the description, and
+    /// a comparison sampler is the only sampler that may filter a depth
+    /// image. So a shadow map had no sampler it could legally use.
+    ///
+    /// The fallible shape on purpose, like [`Self::create_texture_from_desc`]:
+    /// a sampler without a native handle cannot be bound to anything, and a
+    /// caller that believes it has one draws with a broken descriptor.
+    pub fn create_sampler_from_desc(&self, desc: &SamplerDesc) -> crate::error::RhiResult<Sampler> {
+        let Some(backend) = &self.backend_resource else {
+            return Err(crate::error::RhiError::BackendError(
+                "active backend cannot create samplers".into(),
+            ));
+        };
+        backend.create_sampler(desc)
+    }
+
     /// Create a 2D/3D texture (convenience used by the legacy client render code).
+    ///
+    /// Bug #642: same shape as [`Self::create_sampler`] — a refused texture
+    /// came back as a handle-less stand-in reported as a success, and a
+    /// framebuffer built on it drew nothing. The refusal is reported now; the
+    /// stand-in stays because the signature cannot change here.
     pub fn create_texture(
         &self,
         width: u32,
@@ -271,35 +358,53 @@ impl Device {
             sharing_mode: SharingMode::Exclusive,
             queue_family_indices: Vec::new(),
         };
-        if let Some(backend) = &self.backend_resource {
-            if let Ok(texture) = backend.create_texture(&desc) {
-                return texture;
-            }
+        match &self.backend_resource {
+            Some(backend) => match backend.create_texture(&desc) {
+                Ok(texture) => return texture,
+                Err(e) => report_backend_refusal("a texture", &e),
+            },
+            None => report_no_backend("a texture"),
         }
         Texture::from_desc(desc)
     }
 
     /// Create a texture from a full description.
+    ///
+    /// Bug #642: this returned `Ok(Texture::from_desc(desc.clone()))` when the
+    /// backend refused — a texture with no native handle, reported as a success.
+    /// The caller would go on to bind it and draw nothing, with no error
+    /// anywhere. There is no fallback here on purpose, the same reason
+    /// [`Self::create_graphics_pipeline`] has none: a descriptor-only texture
+    /// is exactly the defect, so returning one again would reintroduce it with
+    /// the signature as cover.
     pub fn create_texture_from_desc(&self, desc: &TextureDesc) -> RhiResult<Texture> {
-        if let Some(backend) = &self.backend_resource {
-            if let Ok(texture) = backend.create_texture(desc) {
-                return Ok(texture);
-            }
-        }
-        Ok(Texture::from_desc(desc.clone()))
+        let Some(backend) = &self.backend_resource else {
+            return Err(crate::error::RhiError::BackendError(
+                "active backend cannot create textures".into(),
+            ));
+        };
+        backend.create_texture(desc)
     }
 
     /// Create a texture view on the active backend.
+    ///
+    /// Bug #642: same shape as [`Self::create_texture_from_desc`] — a refused
+    /// view used to come back as a handle-less stand-in reported as a success.
+    /// A view without a native handle cannot be bound to anything, so the
+    /// caller only found out when the draw produced nothing.
     pub fn create_texture_view(&self, texture: &Texture, desc: &TextureViewDesc) -> RhiResult<TextureView> {
-        if let Some(backend) = &self.backend_resource {
-            if let Ok(view) = backend.create_texture_view(texture, desc) {
-                return Ok(view);
-            }
-        }
-        Ok(TextureView::from_parts(texture.clone(), desc.clone()))
+        let Some(backend) = &self.backend_resource else {
+            return Err(crate::error::RhiError::BackendError(
+                "active backend cannot create texture views".into(),
+            ));
+        };
+        backend.create_texture_view(texture, desc)
     }
 
     /// Create a buffer (convenience used by the legacy client render code).
+    ///
+    /// Bug #642: same shape as [`Self::create_sampler`]. A refused buffer came
+    /// back as a handle-less stand-in, and an upload into it wrote nowhere.
     pub fn create_buffer(&self, size: u64, usage: BufferUsage, cpu_visible: bool) -> Buffer {
         let memory_flags = if cpu_visible {
             MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT
@@ -313,22 +418,28 @@ impl Device {
             sharing_mode: SharingMode::Exclusive,
             queue_family_indices: Vec::new(),
         };
-        if let Some(backend) = &self.backend_resource {
-            if let Ok(buffer) = backend.create_buffer(&desc) {
-                return buffer;
-            }
+        match &self.backend_resource {
+            Some(backend) => match backend.create_buffer(&desc) {
+                Ok(buffer) => return buffer,
+                Err(e) => report_backend_refusal("a buffer", &e),
+            },
+            None => report_no_backend("a buffer"),
         }
         Buffer::from_desc(desc)
     }
 
     /// Create a buffer from a full description.
+    ///
+    /// Bug #642: same shape as [`Self::create_texture_from_desc`] — a refused
+    /// buffer used to come back as a handle-less stand-in reported as a
+    /// success, and an upload into it then wrote nowhere.
     pub fn create_buffer_from_desc(&self, desc: &BufferDesc) -> RhiResult<Buffer> {
-        if let Some(backend) = &self.backend_resource {
-            if let Ok(buffer) = backend.create_buffer(desc) {
-                return Ok(buffer);
-            }
-        }
-        Ok(Buffer::from_desc(desc.clone()))
+        let Some(backend) = &self.backend_resource else {
+            return Err(crate::error::RhiError::BackendError(
+                "active backend cannot create buffers".into(),
+            ));
+        };
+        backend.create_buffer(desc)
     }
 
     /// Upload data to a buffer. Delegates to the active backend when the
@@ -340,7 +451,13 @@ impl Device {
     /// no error anywhere.
     pub fn upload_buffer<T>(&self, buffer: &Buffer, data: &[T]) -> RhiResult<()> {
         let Some(backend) = &self.backend_resource else {
-            return Ok(());
+            // There is no device to upload to, so nothing was written. That is
+            // not the same statement as "the upload happened", and reporting
+            // success would let the caller go on to bind a buffer that holds
+            // nothing.
+            return Err(crate::error::RhiError::BackendError(
+                "no active backend to upload to".into(),
+            ));
         };
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -357,13 +474,22 @@ impl Device {
     /// The backend is asked to make pending device writes visible first: for
     /// non-coherent host memory the slice would otherwise show the previous
     /// contents of the range.
+    ///
+    /// A failed invalidate means the range cannot be trusted — the device may
+    /// have written to it since the last invalidate, and those writes are not
+    /// visible. The answer is then `None` rather than the stale bytes: "I
+    /// cannot give you a current view" and "here is what was there before" are
+    /// different statements, and only one of them is true. The error used to be
+    /// discarded, so a stale read looked exactly like a current one.
     pub fn buffer_data(&self, buffer: &Buffer) -> Option<&[u8]> {
         let gpu = buffer.backend()?;
         if gpu.mapped == 0 {
             return None;
         }
         if let Some(backend) = &self.backend_resource {
-            backend.invalidate_mapped_buffer(buffer).ok();
+            if backend.invalidate_mapped_buffer(buffer).is_err() {
+                return None;
+            }
         }
         Some(unsafe { std::slice::from_raw_parts(gpu.mapped as *const u8, buffer.size() as usize) })
     }
@@ -374,30 +500,42 @@ impl Device {
     /// reason as [`Self::upload_buffer`].
     pub fn upload_texture(&self, texture: &Texture, data: &[u8]) -> RhiResult<()> {
         let Some(backend) = &self.backend_resource else {
-            return Ok(());
+            // Nothing was written; see `upload_buffer` for why this is an error
+            // rather than a success.
+            return Err(crate::error::RhiError::BackendError(
+                "no active backend to upload to".into(),
+            ));
         };
         backend.upload_texture(texture, data)
     }
 
     /// Compile a shader module on the active backend.
     pub fn create_shader_module(&self, desc: &crate::shader::module::ShaderModuleDesc) -> crate::shader::module::ShaderModule {
-        if let Some(backend) = &self.backend_resource {
-            if let Ok(module) = backend.create_shader_module(desc) {
-                return module;
-            }
+        match &self.backend_resource {
+            Some(backend) => match backend.create_shader_module(desc) {
+                Ok(module) => return module,
+                Err(e) => report_backend_refusal("a shader module", &e),
+            },
+            None => report_no_backend("a shader module"),
         }
         crate::shader::module::ShaderModule::new(desc.clone())
     }
 
     /// Create a descriptor set layout on the active backend.
+    ///
+    /// Bug #642: same shape as [`Self::create_sampler`]. A refused layout came
+    /// back as a stand-in, and a descriptor set allocated from it holds
+    /// nothing — so the draw that used it produced nothing, with no error.
     pub fn create_descriptor_set_layout(
         &self,
         desc: &crate::descriptor::DescriptorSetLayoutDesc,
     ) -> crate::descriptor::DescriptorSetLayout {
-        if let Some(backend) = &self.backend_resource {
-            if let Ok(layout) = backend.create_descriptor_set_layout(desc) {
-                return layout;
-            }
+        match &self.backend_resource {
+            Some(backend) => match backend.create_descriptor_set_layout(desc) {
+                Ok(layout) => return layout,
+                Err(e) => report_backend_refusal("a descriptor set layout", &e),
+            },
+            None => report_no_backend("a descriptor set layout"),
         }
         crate::descriptor::DescriptorSetLayout::new(desc.clone())
     }
@@ -423,10 +561,15 @@ impl Device {
         set: &crate::descriptor::DescriptorSet,
         writes: &[crate::descriptor::DescriptorWrite],
     ) -> RhiResult<()> {
-        if let Some(backend) = &self.backend_resource {
-            return backend.write_descriptors(set, writes);
-        }
-        Ok(())
+        let Some(backend) = &self.backend_resource else {
+            // Nothing was written; see `upload_buffer` for why this is an error
+            // rather than a success. A descriptor set that was never written
+            // reads as uninitialised memory in the shader.
+            return Err(crate::error::RhiError::BackendError(
+                "no active backend to write descriptors on".into(),
+            ));
+        };
+        backend.write_descriptors(set, writes)
     }
 
     /// Create a compute pipeline on the active backend.
@@ -444,6 +587,17 @@ impl Device {
     }
 
     /// Dispatch a compute pipeline on the active backend.
+    ///
+    /// Bug #641: this used to return `()` and throw the backend's result away
+    /// with `let _ = backend.dispatch_compute(...)`. It was the only method on
+    /// `Device` with no error channel at all, and the only one where a failed
+    /// dispatch — a pipeline layout the backend rejects, a descriptor set that
+    /// was never written — was invisible to the caller. A dispatch that did not
+    /// happen looked exactly like a dispatch that did.
+    ///
+    /// The no-backend arm is an error rather than a silent success, for the
+    /// same reason: "there was no device to dispatch on" is not the same
+    /// statement as "the dispatch happened".
     pub fn dispatch_compute(
         &self,
         pipeline: &crate::pipeline::compute::ComputePipeline,
@@ -451,10 +605,13 @@ impl Device {
         group_count_x: u32,
         group_count_y: u32,
         group_count_z: u32,
-    ) {
-        if let Some(backend) = &self.backend_resource {
-            let _ = backend.dispatch_compute(pipeline, sets, group_count_x, group_count_y, group_count_z);
-        }
+    ) -> RhiResult<()> {
+        let Some(backend) = &self.backend_resource else {
+            return Err(crate::error::RhiError::BackendError(
+                "no active backend to dispatch a compute pipeline on".into(),
+            ));
+        };
+        backend.dispatch_compute(pipeline, sets, group_count_x, group_count_y, group_count_z)
     }
 
     /// Read a range of a buffer back to the host on the active backend.
@@ -689,7 +846,24 @@ pub fn release_framebuffer(&self, framebuffer: &crate::command::pass::render::Fr
                 "no active backend for swapchain creation".into(),
             ));
         };
-        backend.create_swapchain(surface, request, old)
+        let swapchain = backend.create_swapchain(surface, request, old)?;
+        // The present waits on one semaphore per swapchain *image*, and the
+        // number of images is known only now. A backend that keeps a semaphore
+        // per image is told how many it needs; a chain that is rebuilt with a
+        // different count only ever grows the pool.
+        backend.ensure_presentation_images(swapchain.images.len());
+        Ok(swapchain)
+    }
+
+    /// The swapchain image the frame being recorded will be presented into.
+    ///
+    /// The present waits on the semaphore of that image, so the submit has to
+    /// know which one it is rendering into. Only the renderer knows: the
+    /// acquire is what assigns the image.
+    pub fn set_present_image(&self, image_index: u32) {
+        if let Some(backend) = &self.backend_resource {
+            backend.set_present_image(image_index);
+        }
     }
 
     /// A render pass matching a presentation surface's negotiated format.
@@ -858,5 +1032,23 @@ pub fn release_framebuffer(&self, framebuffer: &crate::command::pass::render::Fr
         Err(crate::error::RhiError::BackendError(
             "active backend cannot download textures".into(),
         ))
+    }
+
+    /// The layout the backend believes the image behind `texture` is in. Bug #644.
+    ///
+    /// `None` means the backend does not track that image — a swapchain image,
+    /// whose layout belongs to whoever owns it. That is different from
+    /// `Some(Undefined)`, which means the backend tracks it and believes its
+    /// contents are gone.
+    ///
+    /// This exists because a stale layout is invisible by construction. The one
+    /// thing that reads it is the readback, and a readback that names the
+    /// wrong old layout produces bytes that look right on a driver that kept
+    /// them — so nothing fails and nothing is wrong, until a driver that
+    /// honours the contract zeroes the contents.
+    pub fn texture_layout(&self, texture: &Texture) -> Option<crate::resource::TextureLayout> {
+        let gpu = texture.backend()?;
+        let backend = self.backend_resource.as_ref()?;
+        backend.image_layout(gpu.handle)
     }
 }

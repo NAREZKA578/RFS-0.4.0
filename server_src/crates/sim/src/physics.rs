@@ -1,4 +1,4 @@
-use rfs_core::math::{Vec3f, Transform, Quatf, Bounds};
+use rfs_core::math::{Bounds, Quatf, Transform, Vec3f};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,8 +68,6 @@ impl ShipPhysics {
         }
     }
 
-    
-
     pub fn set_state(&mut self, state: ShipPhysicsState) {
         self.state = state;
     }
@@ -81,19 +79,17 @@ impl ShipPhysics {
     pub fn update(&mut self, dt: f32, throttle: f32, rudder_input: f32) {
         self.forces = Vec3f::ZERO;
         self.torques = Vec3f::ZERO;
-        
+
         self.state.thrust = throttle.clamp(-1.0, 1.0);
-        self.state.rudder_angle = (rudder_input * self.config.max_rudder_angle).clamp(
-            -self.config.max_rudder_angle,
-            self.config.max_rudder_angle,
-        );
-        
+        self.state.rudder_angle = (rudder_input * self.config.max_rudder_angle)
+            .clamp(-self.config.max_rudder_angle, self.config.max_rudder_angle);
+
         self.calculate_hydrostatics();
         self.calculate_propulsion(dt);
         self.calculate_rudder_forces(dt);
         self.calculate_drag(dt);
         self.calculate_wave_forces(dt);
-        
+
         self.integrate(dt);
     }
 
@@ -101,14 +97,16 @@ impl ShipPhysics {
         let submerged_depth = (self.config.waterline_height - self.state.position.y).max(0.0);
         let hull_area = 1000.0;
         self.state.submerged_volume = submerged_depth * hull_area;
-        
+
         let buoyancy_force = self.state.submerged_volume * 1025.0 * 9.81;
         self.forces.y += buoyancy_force;
-        
-        let com_world = self.state.rotation.mul_vec3(self.config.center_of_mass) + self.state.position;
-        let cob_world = self.state.rotation.mul_vec3(self.config.center_of_buoyancy) + self.state.position;
+
+        let com_world =
+            self.state.rotation.mul_vec3(self.config.center_of_mass) + self.state.position;
+        let cob_world =
+            self.state.rotation.mul_vec3(self.config.center_of_buoyancy) + self.state.position;
         let righting_arm = cob_world - com_world;
-        
+
         let righting_torque = righting_arm.cross(Vec3f::new(0.0, buoyancy_force, 0.0));
         self.torques += righting_torque;
     }
@@ -117,7 +115,7 @@ impl ShipPhysics {
         let target_rpm = self.state.thrust * self.config.max_propeller_rpm;
         let rpm_diff = target_rpm - self.state.propeller_rpm;
         self.state.propeller_rpm += rpm_diff * dt * 2.0;
-        
+
         let propeller_force = self.state.propeller_rpm * self.config.propeller_force_coefficient;
         let forward = self.state.rotation.mul_vec3(Vec3f::FORWARD);
         self.forces += forward * propeller_force;
@@ -135,7 +133,8 @@ impl ShipPhysics {
         const RUDDER_LEVER_ARM: f32 = -150.0;
 
         let speed = self.state.velocity.length();
-        let rudder_force = self.state.rudder_angle * speed * speed * self.config.rudder_force_coefficient;
+        let rudder_force =
+            self.state.rudder_angle * speed * speed * self.config.rudder_force_coefficient;
         let right = self.state.rotation.mul_vec3(Vec3f::RIGHT);
 
         self.forces += right * rudder_force;
@@ -147,16 +146,16 @@ impl ShipPhysics {
     fn calculate_drag(&mut self, _dt: f32) {
         let local_vel = self.state.rotation.inverse().mul_vec3(self.state.velocity);
         let speed = local_vel.length();
-        
+
         if speed < 0.1 {
             return;
         }
-        
+
         let drag_force = speed * speed * self.config.drag_coefficient;
         let drag_dir = -local_vel.normalize();
         let world_drag = self.state.rotation.mul_vec3(drag_dir * drag_force);
         self.forces += world_drag;
-        
+
         let angular_speed = self.state.angular_velocity.length();
         if angular_speed > 0.01 {
             let angular_drag = angular_speed * angular_speed * self.config.angular_drag_coefficient;
@@ -167,15 +166,21 @@ impl ShipPhysics {
 
     fn calculate_wave_forces(&mut self, _dt: f32) {
         let time = self.state.position.x * 0.01;
-        let wave_height = (time * self.config.wave_response_frequency).sin() * self.config.wave_response_amplitude;
-        
-        let heave_force = (wave_height - self.state.position.y) * 10000.0 - self.state.velocity.y * 5000.0;
+        let wave_height = (time * self.config.wave_response_frequency).sin()
+            * self.config.wave_response_amplitude;
+
+        let heave_force =
+            (wave_height - self.state.position.y) * 10000.0 - self.state.velocity.y * 5000.0;
         self.forces.y += heave_force;
-        
+
         // Bug №195: see `roll_and_pitch` and `restoring_torque`. Angular
         // damping stays on its own axes — `angular_velocity` components are real.
-        let restoring =
-            restoring_torque(self.state.rotation, self.state.angular_velocity, 50000.0, 10000.0);
+        let restoring = restoring_torque(
+            self.state.rotation,
+            self.state.angular_velocity,
+            50000.0,
+            10000.0,
+        );
         self.torques.x += restoring.x;
         self.torques.y += restoring.y;
         self.torques.z += restoring.z;
@@ -216,14 +221,14 @@ impl ShipPhysics {
             self.torques.z / inertia[2],
         );
         self.state.angular_velocity += angular_acceleration * dt;
-        
+
         let half_omega = Quatf::new(
             self.state.angular_velocity.x * 0.5,
             self.state.angular_velocity.y * 0.5,
             self.state.angular_velocity.z * 0.5,
             0.0,
         );
-        
+
         let q = self.state.rotation;
         let dq = Quatf::new(
             half_omega.x * q.w + half_omega.y * q.z - half_omega.z * q.y,
@@ -231,13 +236,14 @@ impl ShipPhysics {
             half_omega.z * q.w + half_omega.x * q.y - half_omega.y * q.x,
             -half_omega.x * q.x - half_omega.y * q.y - half_omega.z * q.z,
         );
-        
+
         self.state.rotation = Quatf::new(
             q.x + dq.x * dt,
             q.y + dq.y * dt,
             q.z + dq.z * dt,
             q.w + dq.w * dt,
-        ).normalize();
+        )
+        .normalize();
     }
 
     pub fn apply_impulse(&mut self, impulse: Vec3f, point: Vec3f) {
@@ -270,7 +276,8 @@ impl ShipPhysics {
             },
         ];
         self.state.velocity += impulse / mass;
-        let r = point - (self.state.rotation.mul_vec3(self.config.center_of_mass) + self.state.position);
+        let r = point
+            - (self.state.rotation.mul_vec3(self.config.center_of_mass) + self.state.position);
         let torque = r.cross(impulse);
         self.state.angular_velocity += Vec3f::new(
             torque.x / inertia[0],
@@ -312,8 +319,7 @@ impl ShipPhysics {
     // quaternion formulas instead.
     pub fn get_heel_angle(&self) -> f32 {
         let q = self.state.rotation;
-        (2.0 * (q.w * q.x + q.y * q.z))
-            .atan2(1.0 - 2.0 * (q.x * q.x + q.y * q.y))
+        (2.0 * (q.w * q.x + q.y * q.z)).atan2(1.0 - 2.0 * (q.x * q.x + q.y * q.y))
     }
 
     pub fn get_trim_angle(&self) -> f32 {
@@ -353,8 +359,10 @@ impl WaveSystem {
     pub fn add_wave(&mut self, wave: Wave) {
         // Bug №161: wavelength=0 made k = inf and poisoned every height with
         // NaN. Reject degenerate waves at the door.
-        if wave.wavelength.is_finite() && wave.wavelength > 0.0
-            && wave.amplitude.is_finite() && wave.direction.is_finite()
+        if wave.wavelength.is_finite()
+            && wave.wavelength > 0.0
+            && wave.amplitude.is_finite()
+            && wave.direction.is_finite()
         {
             self.waves.push(wave);
         }
@@ -382,7 +390,7 @@ impl WaveSystem {
         let h = self.get_height(position);
         let hx = self.get_height(position + Vec3f::new(epsilon, 0.0, 0.0));
         let hz = self.get_height(position + Vec3f::new(0.0, 0.0, epsilon));
-        
+
         Vec3f::new(h - hx, epsilon, h - hz).normalize()
     }
 
@@ -414,7 +422,9 @@ impl WaveSystem {
 fn roll_and_pitch(rotation: Quatf) -> (f32, f32) {
     let roll = (2.0 * (rotation.w * rotation.x + rotation.y * rotation.z))
         .atan2(1.0 - 2.0 * (rotation.x * rotation.x + rotation.y * rotation.y));
-    let pitch = (2.0 * (rotation.w * rotation.y - rotation.z * rotation.x)).clamp(-1.0, 1.0).asin();
+    let pitch = (2.0 * (rotation.w * rotation.y - rotation.z * rotation.x))
+        .clamp(-1.0, 1.0)
+        .asin();
     (roll, pitch)
 }
 
@@ -537,7 +547,11 @@ mod tests {
     #[test]
     fn a_capsized_hull_is_still_restored() {
         let t = restoring_for(rolled(2.0));
-        assert!(t.x < 0.0, "a capsized hull got no restoring torque: {:?}", t);
+        assert!(
+            t.x < 0.0,
+            "a capsized hull got no restoring torque: {:?}",
+            t
+        );
     }
 
     /// The old code also put a restoring term on z, where a quaternion component
@@ -558,7 +572,12 @@ mod tests {
     /// appear with a zero restoring angle.
     #[test]
     fn damping_opposes_angular_velocity() {
-        let t = restoring_torque(Quatf::IDENTITY, Vec3f::new(2.0, -3.0, 4.0), STIFFNESS, DAMPING);
+        let t = restoring_torque(
+            Quatf::IDENTITY,
+            Vec3f::new(2.0, -3.0, 4.0),
+            STIFFNESS,
+            DAMPING,
+        );
         assert!(t.x < 0.0, "damping did not oppose +x spin");
         assert!(t.y > 0.0, "damping did not oppose -y spin");
         assert!(t.z < 0.0, "damping did not oppose +z spin");

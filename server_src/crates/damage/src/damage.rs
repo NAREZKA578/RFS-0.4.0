@@ -1,7 +1,7 @@
 use crate::graph::{BulkheadEdge, CompartmentNode, DamageGraph};
+use parking_lot::Mutex;
 use rfs_core::entity::EntityId;
 use rfs_core::math::{Bounds, Vec3f};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,7 +132,12 @@ impl DamageSystem {
     /// battle damage actually floods it) and every compartment that took a
     /// share of the blast (Bug №607: an explosive hit lights the compartment it
     /// reached).
-    pub fn apply_damage_to_ship(&self, target: &impl DamageTarget, position: Vec3f, damage: f32) -> DamageReport {
+    pub fn apply_damage_to_ship(
+        &self,
+        target: &impl DamageTarget,
+        position: Vec3f,
+        damage: f32,
+    ) -> DamageReport {
         // Bug №65: NaN/negative "damage" must never reach the hull or the
         // compartments — a negative blast used to heal the ship.
         // Spelled out rather than `!(damage > 0.0)`: the NaN case has to stay
@@ -244,7 +249,8 @@ impl DamageSystem {
         // a station could never be destroyed and its gun fired forever.
         for station in target.station_hits() {
             let distance = distance_to_bounds(position, &station.bounds);
-            let damage_dealt = damage * self.falloff(distance) * self.config.direct_damage_multiplier;
+            let damage_dealt =
+                damage * self.falloff(distance) * self.config.direct_damage_multiplier;
             if damage_dealt <= 0.0 {
                 continue;
             }
@@ -297,12 +303,15 @@ impl DamageSystem {
         if !distance.is_finite() || distance < 0.0 {
             return 1.0;
         }
-        let falloff = if self.config.falloff_distance.is_finite() && self.config.falloff_distance >= 0.0 {
-            self.config.falloff_distance
-        } else {
-            0.0
-        };
-        let max_r = if self.config.max_damage_radius.is_finite() && self.config.max_damage_radius > falloff {
+        let falloff =
+            if self.config.falloff_distance.is_finite() && self.config.falloff_distance >= 0.0 {
+                self.config.falloff_distance
+            } else {
+                0.0
+            };
+        let max_r = if self.config.max_damage_radius.is_finite()
+            && self.config.max_damage_radius > falloff
+        {
             self.config.max_damage_radius
         } else {
             falloff + 1.0
@@ -314,7 +323,8 @@ impl DamageSystem {
         } else {
             let range = (max_r - falloff).max(0.01);
             let t = (1.0 - (distance - falloff) / range).clamp(0.0, 1.0);
-            let power = if self.config.falloff_power.is_finite() && self.config.falloff_power >= 0.0 {
+            let power = if self.config.falloff_power.is_finite() && self.config.falloff_power >= 0.0
+            {
                 self.config.falloff_power
             } else {
                 1.0
@@ -380,7 +390,11 @@ mod tests {
         }
 
         fn compartment_total(&self) -> f32 {
-            self.compartment_damage.borrow().iter().map(|(_, d)| *d).sum()
+            self.compartment_damage
+                .borrow()
+                .iter()
+                .map(|(_, d)| *d)
+                .sum()
         }
     }
 
@@ -452,7 +466,10 @@ mod tests {
         let good = RecordingShip::new(compartment_bounds());
         sys.apply_damage_to_ship(&good, blast_along_the_inverted_axis(), 100.0);
         let good_hull = good.hull();
-        assert_eq!(good_hull, 0.0, "a far blast reached a sound compartment box");
+        assert_eq!(
+            good_hull, 0.0,
+            "a far blast reached a sound compartment box"
+        );
 
         // The malformed box must behave identically.
         let bad = RecordingShip::new(inverted_bounds());
