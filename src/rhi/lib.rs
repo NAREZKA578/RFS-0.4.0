@@ -38,6 +38,7 @@ pub use ash;
 pub mod error;
 pub mod memory;
 pub mod pipeline;
+pub mod present;
 pub mod query;
 pub mod resource;
 pub mod shader;

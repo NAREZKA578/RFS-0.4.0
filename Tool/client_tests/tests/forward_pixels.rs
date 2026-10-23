@@ -10,25 +10,33 @@
 //! from the light each time, so the two renders differ in exactly one thing —
 //! where the light is — and the difference in the picture can only come from
 //! the map.
+//!
+//! The light itself comes from the **clustering pass's buffer**: the forward
+//! pass reads the light by the index the clustering wrote, so the test runs
+//! the whole chain. The test `forward_clusters.rs` covers that junction in
+//! detail; this one is about the shadow.
 
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
 use rfs_client::render::graph::node::RenderPassNode;
 use rfs_client::render::graph::RenderGraph;
+use rfs_client::render::lighting::light_buffer::{pack_light, LIGHT_STRIDE_FLOATS};
 use rfs_client::render::meshes::Mesh;
-use rfs_client::render::passes::forward::{ForwardLight, ForwardPass};
+use rfs_client::render::passes::cluster::{ClusterConfig, ClusterPass};
+use rfs_client::render::passes::forward::ForwardPass;
 use rfs_client::render::passes::geometry::GeometryItem;
 use rfs_client::render::passes::shadow::{light_view_projection, ShadowConfig, ShadowPass};
 use rfs_client::render::scene::Scene;
 use rfs_client::render::RenderContext;
 use rhi::core::device::DeviceDesc;
 use rhi::types::{Extent2D, Features};
-use rhi::{Format, RhiConfig};
+use rhi::RhiConfig;
 
 const EXTENT: u32 = 128;
 const FORWARD_SHADER: &[u8] = include_bytes!("../assets/shaders/forward.spv");
 const SHADOW_SHADER: &[u8] = include_bytes!("../assets/shaders/shadow.spv");
+const CLUSTER_SHADER: &[u8] = include_bytes!("../assets/shaders/cluster.spv");
 
 fn open_device() -> Arc<rhi::Device> {
     let backend = rhi::backend::create_backend(&RhiConfig {
@@ -65,11 +73,32 @@ fn scene_items(device: &rhi::Device) -> Vec<GeometryItem> {
 
 /// Render the scene with the light at `light_position` and read the centre
 /// pixel's brightness.
-fn render_with_light(
-    device: &Arc<rhi::Device>,
-    light_position: Vec3,
-) -> f32 {
+fn render_with_light(device: &Arc<rhi::Device>, light_position: Vec3) -> f32 {
     let items = scene_items(device);
+
+    // The clustering pass, and the light in its buffer.
+    let config = ClusterConfig {
+        tiles_x: 4,
+        tiles_y: 4,
+        depth_slices: 8,
+    };
+    let (cluster, cluster_state) =
+        ClusterPass::create(device, config, CLUSTER_SHADER).expect("cluster pass");
+    {
+        let state = cluster_state.lock().expect("state");
+        let mut data = vec![0.0f32; LIGHT_STRIDE_FLOATS];
+        pack_light(
+            &mut data,
+            0,
+            light_position,
+            Vec3::ONE,
+            4.0,
+            50.0,
+        );
+        device
+            .upload_buffer(&state.lights_buffer, &data)
+            .expect("the light's upload must succeed");
+    }
 
     let (shadow, shadow_state) = ShadowPass::create(
         device,
@@ -89,7 +118,8 @@ fn render_with_light(
     );
 
     let (forward, forward_state) =
-        ForwardPass::create(device, items, Format::RGBA8_UNORM, FORWARD_SHADER).expect("forward pass");
+        ForwardPass::create(device, items, rhi::Format::RGBA8_UNORM, FORWARD_SHADER)
+            .expect("forward pass");
 
     // The shadow map is the forward pass's input.
     let shadow_map = ShadowPass::shadow_map(&shadow_state).expect("the shadow map");
@@ -108,14 +138,25 @@ fn render_with_light(
             },
         )
         .expect("shadow view");
-    ForwardPass::set_shadow_map(&forward_state, Some(shadow_view));
+    ForwardPass::set_shadow_maps(&forward_state, vec![shadow_view]);
+
+    // The clustering pass's buffers: the lights and the cluster indices.
+    {
+        let state = cluster_state.lock().expect("state");
+        ForwardPass::set_cluster_buffers(
+            &forward_state,
+            state.lights_buffer.clone(),
+            state.cluster_indices_buffer.clone(),
+            config,
+        );
+    }
 
     // The target the scene is drawn into.
     let colour = device.create_texture(
         EXTENT,
         EXTENT,
         1,
-        Format::RGBA8_UNORM,
+        rhi::Format::RGBA8_UNORM,
         rhi::TextureUsage::COLOR_ATTACHMENT | rhi::TextureUsage::TRANSFER_SRC,
         1,
     );
@@ -138,7 +179,7 @@ fn render_with_light(
         EXTENT,
         EXTENT,
         1,
-        Format::D32_SFLOAT,
+        rhi::Format::D32_SFLOAT,
         rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
         1,
     );
@@ -171,31 +212,46 @@ fn render_with_light(
         .expect("framebuffer");
     ForwardPass::set_framebuffer(&forward_state, Some(framebuffer));
 
+    let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 3.0), Vec3::ZERO, Vec3::Y);
+    let projection = Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0);
+    assert!(
+        ForwardPass::update_uniforms(
+            &forward_state,
+            device,
+            view,
+            projection,
+            &[light_space],
+            &[100.0],
+            1,
+            0,
+            0.1,
+            100.0,
+            Vec3::new(0.02, 0.02, 0.02),
+        ),
+        "the uniform upload must succeed"
+    );
+    assert!(
+        ClusterPass::update_uniforms(
+            &cluster_state,
+            device,
+            view,
+            projection,
+            1,
+            0.1,
+            100.0,
+            EXTENT,
+            EXTENT,
+        ),
+        "the cluster uniform upload must succeed"
+    );
+
     let mut graph = RenderGraph::new();
+    graph.add_pass(RenderPassNode::new("cluster", Box::new(cluster)));
     graph.add_pass(RenderPassNode::new("shadow", Box::new(shadow)));
     graph.add_pass(RenderPassNode::new("forward", Box::new(forward)));
     let mut context = RenderContext::headless(device.clone());
     context.resolution = Extent2D::new(EXTENT, EXTENT);
     let mut scene = Scene::new("forward");
-
-    let light = ForwardLight {
-        position: light_position,
-        color: Vec3::ONE,
-        intensity: 4.0,
-        radius: 50.0,
-    };
-    assert!(
-        ForwardPass::update_uniforms(
-            &forward_state,
-            device,
-            Mat4::look_at_rh(Vec3::new(0.0, 0.0, 3.0), Vec3::ZERO, Vec3::Y),
-            Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0),
-            light,
-            light_space,
-            Vec3::new(0.02, 0.02, 0.02),
-        ),
-        "the uniform upload must succeed"
-    );
 
     graph.execute(device, &mut context, &mut scene);
     device.wait_idle().expect("wait for the frame");

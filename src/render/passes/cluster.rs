@@ -46,9 +46,17 @@ pub const MAX_LIGHTS_PER_CLUSTER: u32 = 32;
 
 /// The light, in the layout the scene's light buffer uses.
 ///
-/// `vec3` is 16-aligned inside a struct, so the stride is 48: the same buffer is
-/// read by the lighting shader, and the two have to agree exactly.
-pub const LIGHT_STRIDE: u64 = 48;
+/// `vec3` is 16-aligned inside a struct, so the stride is 48: the same buffer
+/// is read by the lighting shader, and the two have to agree exactly.
+///
+/// The layout itself is written down once, in
+/// [`crate::render::lighting::light_buffer`], and every writer and every
+/// reader uses it. It used to be written down in three places, and two of
+/// them disagreed with the third by four bytes — which is enough for the
+/// shader to read a light's intensity out of the padding and find a zero
+/// there. A light with an intensity of zero is a light that is present in the
+/// file and contributes nothing to the picture.
+pub use crate::render::lighting::light_buffer::LIGHT_STRIDE_BYTES as LIGHT_STRIDE;
 
 /// How the screen is divided.
 #[derive(Debug, Clone, Copy)]
@@ -86,8 +94,6 @@ impl ClusterConfig {
 /// Everything the pass needs to record, shared with the caller.
 pub struct ClusterPassState {
     pub pipeline: crate::rhi::pipeline::compute::ComputePipeline,
-    /// The pipeline that zeroes the counts.
-    pub clear_pipeline: crate::rhi::pipeline::compute::ComputePipeline,
     pub descriptor_layout: DescriptorSetLayout,
     pub descriptor_set: Option<DescriptorSet>,
     /// The uniforms: the two matrices and the two vectors.
@@ -151,18 +157,28 @@ impl ClusterPass {
         let indices_size = u64::from(clusters) * u64::from(MAX_LIGHTS_PER_CLUSTER) * 4;
         let counts_size = u64::from(clusters) * 4;
 
-        let uniform_buffer =
-            device.create_buffer(UNIFORM_SIZE, BufferUsage::UNIFORM, true);
+        let uniform_buffer = device
+            .create_buffer(UNIFORM_SIZE, BufferUsage::UNIFORM, true)
+            .map_err(|e| RhiError::BackendError(format!("the cluster uniform buffer: {e}")))?;
         // The lights' buffer is host visible, because the scene's lights are
         // written into it every frame.
-        let lights_buffer = device.create_buffer(1024 * LIGHT_STRIDE, BufferUsage::STORAGE, true);
-        let cluster_indices_buffer = device.create_buffer(
-            indices_size,
-            BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
-            false,
-        );
-        let cluster_counts_buffer =
-            device.create_buffer(counts_size, BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC, false);
+        let lights_buffer = device
+            .create_buffer(1024 * LIGHT_STRIDE, BufferUsage::STORAGE, true)
+            .map_err(|e| RhiError::BackendError(format!("the cluster lights buffer: {e}")))?;
+        let cluster_indices_buffer = device
+            .create_buffer(
+                indices_size,
+                BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
+                false,
+            )
+            .map_err(|e| {
+                RhiError::BackendError(format!("the cluster indices buffer: {e}"))
+            })?;
+        let cluster_counts_buffer = device
+            .create_buffer(counts_size, BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC, false)
+            .map_err(|e| {
+                RhiError::BackendError(format!("the cluster counts buffer: {e}"))
+            })?;
 
         let descriptor_layout = device.create_descriptor_set_layout(
             &crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
@@ -197,7 +213,8 @@ impl ClusterPass {
                     },
                 ],
             },
-        );
+        )
+        .map_err(|e| RhiError::BackendError(format!("the cluster descriptor layout: {e}")))?;
         let descriptor_set = device.create_descriptor_set(&descriptor_layout)?;
         device.write_descriptors(
             &descriptor_set,
@@ -245,32 +262,30 @@ impl ClusterPass {
             ],
         )?;
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("cs_main".into()),
-            name: Some("cluster".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the cluster shader module was not created on the device".into(),
-            ));
-        }
-        // Two pipelines: one zeroes the counts, the other bins the lights.
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("cs_main".into()),
+                name: Some("cluster".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the cluster shader module: {e}")))?;
+        // One pipeline: the shader does the clearing and the binning in a
+        // single dispatch.
         //
-        // The zeroing is on the GPU on purpose. The host cannot do it: the
-        // host's write would race with the previous frame's binning, which may
-        // still be running, and the counts would be a mixture of two frames.
-        let clear_pipeline = device.create_compute_pipeline(
-            &ComputePipelineDesc {
-                shader: crate::rhi::pipeline::graphics::PipelineShaderStage {
-                    stage: crate::rhi::ShaderStage::COMPUTE,
-                    module: module.clone(),
-                    entry_point: "cs_clear".into(),
-                },
-            },
-            &descriptor_layout,
-        )?;
+        // It used to be two — one to zero the counters and mark the slots
+        // empty, and one to bin the lights — with a barrier between them. The
+        // split was there because the binning pass worked per *light* and every
+        // light had to claim a slot in every cluster it reached, which needs a
+        // counter that several lights write at once, and a counter that several
+        // invocations write at once has to be atomic.
+        //
+        // The shader now works per *cluster*: one invocation owns one cluster
+        // and writes that cluster's list, so nothing can collide and there is
+        // no counter to protect. The barrier between the two dispatches is
+        // gone with it, and so is the atomics — which the SPIR-V validator
+        // rejected, because the compiler emitted them with a memory order
+        // that does not exist.
         let pipeline = device.create_compute_pipeline(
             &ComputePipelineDesc {
                 shader: crate::rhi::pipeline::graphics::PipelineShaderStage {
@@ -289,7 +304,6 @@ impl ClusterPass {
 
         Ok(Self::with_state(ClusterPassState {
             pipeline,
-            clear_pipeline,
             descriptor_layout,
             descriptor_set: Some(descriptor_set),
             uniform_buffer,
@@ -396,37 +410,9 @@ impl RenderPass for ClusterPass {
             return PassOutcome::skipped("no descriptor set");
         };
         let pipeline = state.pipeline.clone();
-        let clear_pipeline = state.clear_pipeline.clone();
-        let groups = state.light_count.div_ceil(64);
-        let clear_groups = state.config.cluster_count().div_ceil(64);
-        let descriptor_set = descriptor_set.clone();
+        let groups = state.config.cluster_count().div_ceil(64);
 
         let mut commands: Vec<Command> = Vec::with_capacity(6);
-        // Zero the counts, then bin. The barrier between them is what makes
-        // the zeroing visible to the binning: two dispatches in a row are
-        // ordered in *execution*, not in memory.
-        commands.push(Command::BindComputePipeline(clear_pipeline.clone()));
-        commands.push(Command::BindComputeDescriptorSets {
-            pipeline: clear_pipeline,
-            first_set: 0,
-            sets: vec![descriptor_set.clone()],
-        });
-        commands.push(Command::Dispatch {
-            x: clear_groups,
-            y: 1,
-            z: 1,
-        });
-        commands.push(Command::PipelineBarrier {
-            src_stage: crate::rhi::PipelineStage::COMPUTE_SHADER,
-            dst_stage: crate::rhi::PipelineStage::COMPUTE_SHADER,
-            memory_barriers: vec![crate::rhi::sync::barrier::MemoryBarrier {
-                src_access: crate::rhi::AccessFlags::SHADER_WRITE,
-                dst_access: crate::rhi::AccessFlags::SHADER_READ
-                    | crate::rhi::AccessFlags::SHADER_WRITE,
-            }],
-            buffer_barriers: vec![],
-            texture_barriers: vec![],
-        });
         commands.push(Command::BindComputePipeline(pipeline.clone()));
         commands.push(Command::BindComputeDescriptorSets {
             pipeline,

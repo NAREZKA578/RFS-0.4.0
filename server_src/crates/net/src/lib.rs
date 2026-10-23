@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod bandwidth;
 pub mod channel;
 pub mod client;
@@ -7,6 +8,7 @@ pub mod interest;
 pub mod server;
 pub mod snapshot;
 
+pub use auth::*;
 pub use bandwidth::*;
 pub use channel::*;
 pub use client::*;

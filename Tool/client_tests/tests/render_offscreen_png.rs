@@ -216,6 +216,17 @@ fn renders_a_frame_and_writes_a_png() {
         .join("target")
         .join("render_offscreen.png");
     let png = encode_rgba8(EXTENT, EXTENT, &bytes);
+    // The directory is created if it is not there.
+    //
+    // The path is `Tool/target`, which is where cargo puts the build's
+    // artefacts — but only when the build's target directory *is* that one.
+    // With `CARGO_TARGET_DIR` pointing elsewhere the directory never comes
+    // into existence, and the test fails on the write with "path not found",
+    // which says nothing about the renderer and looks like the renderer's
+    // fault.
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).expect("create the directory for the PNG");
+    }
     std::fs::write(&out, &png).expect("write PNG");
     println!("wrote {} ({} bytes)", out.display(), png.len());
     assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A], "PNG signature");

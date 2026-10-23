@@ -826,27 +826,21 @@ impl UiRenderer {
     fn build_uniforms(&self) -> UiResult<(Buffer, DescriptorSetLayout, DescriptorSet)> {
         let uniform = self
             .device
-            .create_buffer(UI_UNIFORM_SIZE, BufferUsage::UNIFORM, true);
-        if !uniform.has_gpu_backing() {
-            // Reported as an allocation failure, not `RendererNotInitialized`.
-            // That variant is what `record` returns when the renderer was never
-            // built, so using it here pointed the reader at the wrong thing
-            // entirely: the message said "not initialized" while the actual
-            // cause was a buffer that got no GPU memory.
-            return Err(UiError::BackendError(format!(
-                "UI uniform buffer ({UI_UNIFORM_SIZE} bytes) got no GPU backing"
-            )));
-        }
+            .create_buffer(UI_UNIFORM_SIZE, BufferUsage::UNIFORM, true)
+            .map_err(|e| UiError::BackendError(format!("UI uniform buffer: {e}")))?;
 
-        let layout = self.device.create_descriptor_set_layout(&DescriptorSetLayoutDesc {
-            bindings: vec![DescriptorBinding {
-                binding: 0,
-                ty: DescriptorType::UniformBuffer,
-                count: 1,
-                stages: ShaderStage::VERTEX,
-                immutable_samplers: None,
-            }],
-        });
+        let layout = self
+            .device
+            .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+                bindings: vec![DescriptorBinding {
+                    binding: 0,
+                    ty: DescriptorType::UniformBuffer,
+                    count: 1,
+                    stages: ShaderStage::VERTEX,
+                    immutable_samplers: None,
+                }],
+            })
+            .map_err(|e| UiError::BackendError(format!("UI uniform descriptor set layout: {e}")))?;
 
         let set = self
             .device
@@ -967,31 +961,33 @@ impl UiRenderer {
 
     /// Descriptor layout for the textured pipeline: uniform, atlas, sampler.
     fn build_text_layout(&self) -> UiResult<DescriptorSetLayout> {
-        Ok(self.device.create_descriptor_set_layout(&DescriptorSetLayoutDesc {
-            bindings: vec![
-                DescriptorBinding {
-                    binding: 0,
-                    ty: DescriptorType::UniformBuffer,
-                    count: 1,
-                    stages: ShaderStage::VERTEX,
-                    immutable_samplers: None,
-                },
-                DescriptorBinding {
-                    binding: 1,
-                    ty: DescriptorType::SampledTexture,
-                    count: 1,
-                    stages: ShaderStage::FRAGMENT,
-                    immutable_samplers: None,
-                },
-                DescriptorBinding {
-                    binding: 2,
-                    ty: DescriptorType::Sampler,
-                    count: 1,
-                    stages: ShaderStage::FRAGMENT,
-                    immutable_samplers: None,
-                },
-            ],
-        }))
+        self.device
+            .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+                bindings: vec![
+                    DescriptorBinding {
+                        binding: 0,
+                        ty: DescriptorType::UniformBuffer,
+                        count: 1,
+                        stages: ShaderStage::VERTEX,
+                        immutable_samplers: None,
+                    },
+                    DescriptorBinding {
+                        binding: 1,
+                        ty: DescriptorType::SampledTexture,
+                        count: 1,
+                        stages: ShaderStage::FRAGMENT,
+                        immutable_samplers: None,
+                    },
+                    DescriptorBinding {
+                        binding: 2,
+                        ty: DescriptorType::Sampler,
+                        count: 1,
+                        stages: ShaderStage::FRAGMENT,
+                        immutable_samplers: None,
+                    },
+                ],
+            })
+            .map_err(|e| UiError::BackendError(format!("UI text descriptor set layout: {e}")))
     }
 
     /// Build a pipeline that samples binding 1 with binding 2's sampler.
@@ -1067,21 +1063,22 @@ impl UiRenderer {
         vertex_capacity: usize,
         index_capacity: usize,
     ) -> UiResult<(Buffer, Buffer)> {
-        let vertex = self.device.create_buffer(
-            (vertex_capacity * std::mem::size_of::<UiVertex>()) as u64,
-            BufferUsage::VERTEX,
-            true,
-        );
-        let index = self.device.create_buffer(
-            (index_capacity * std::mem::size_of::<u32>()) as u64,
-            BufferUsage::INDEX,
-            true,
-        );
-        if !vertex.has_gpu_backing() || !index.has_gpu_backing() {
-            return Err(UiError::BackendError(
-                "UI vertex/index buffers were not created on the device".into(),
-            ));
-        }
+        let vertex = self
+            .device
+            .create_buffer(
+                (vertex_capacity * std::mem::size_of::<UiVertex>()) as u64,
+                BufferUsage::VERTEX,
+                true,
+            )
+            .map_err(|e| UiError::BackendError(format!("UI vertex buffer: {e}")))?;
+        let index = self
+            .device
+            .create_buffer(
+                (index_capacity * std::mem::size_of::<u32>()) as u64,
+                BufferUsage::INDEX,
+                true,
+            )
+            .map_err(|e| UiError::BackendError(format!("UI index buffer: {e}")))?;
         Ok((vertex, index))
     }
 
@@ -1203,14 +1200,17 @@ impl UiRenderer {
         let font = super::bitmap_font::UiBitmapFont::new();
         let (w, h) = (font.atlas_width(), font.atlas_height());
 
-        let texture = self.device.create_texture(
-            w,
-            h,
-            1,
-            crate::types::Format::R8_UNORM,
-            crate::types::TextureUsage::SAMPLED | crate::types::TextureUsage::TRANSFER_DST,
-            1,
-        );
+        let texture = self
+            .device
+            .create_texture(
+                w,
+                h,
+                1,
+                crate::types::Format::R8_UNORM,
+                crate::types::TextureUsage::SAMPLED | crate::types::TextureUsage::TRANSFER_DST,
+                1,
+            )
+            .map_err(|e| UiError::BackendError(format!("UI atlas texture: {e}")))?;
         self.device
             .upload_texture(&texture, font.atlas_pixels())
             .map_err(|e| UiError::BackendError(format!("UI atlas upload: {e}")))?;
@@ -2614,7 +2614,8 @@ impl UiRenderer {
         // `src/rhi/backend/vulkan/device.rs`; it should be `> 1.0`.
         let sampler = self
             .device
-            .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 0.0);
+            .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 0.0)
+            .map_err(|e| UiError::BackendError(format!("UI text sampler: {e}")))?;
         let view = self.gpu_texture_view(atlas)?;
 
         self.device
@@ -2707,7 +2708,8 @@ fn gpu_texture_view(
         // See `write_text_descriptors` for why the anisotropy argument is 0.
         let sampler = self
             .device
-            .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 0.0);
+            .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 0.0)
+            .map_err(|e| UiError::BackendError(format!("UI image sampler: {e}")))?;
         let view = self.gpu_texture_view(texture)?;
         let uniform = self
             .gpu

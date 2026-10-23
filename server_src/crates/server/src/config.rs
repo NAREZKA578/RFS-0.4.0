@@ -25,12 +25,9 @@ pub const DEFAULT_CONFIG_PATH: &str = "server_config.json";
 pub struct MatchConfig {
     #[serde(default)]
     pub vote_kick: VoteKickConfig,
-    /// Bug №216: the secret a client has to present to join the match.
-    ///
-    /// `None` (or an empty string) means the match asks for none — every
-    /// client is admitted. That is the default, and the server says so in its
-    /// log: a server that looks protected and is not is worse than one that
-    /// says it is open.
+    /// Bug №700: the shared secret HMAC-SHA256 keys every datagram with.
+    /// A blank value or a missing field runs the server in the unsigned
+    /// dialect — accepted framing, no key — and `main` says so in the log.
     #[serde(default)]
     pub auth_token: Option<String>,
 }

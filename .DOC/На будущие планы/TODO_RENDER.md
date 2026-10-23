@@ -11,7 +11,7 @@
 > `.DOC/На будущие планы/TODO.md`, section "Render: the Forward+ plan, agreed
 > 2026-10-20" — the shadow pass, forward lighting, clustering, transparency,
 > water, and the removal of the deferred chain. The state of every defect is
-> in `.DOC/BUGS.md` (379 entries), and the warnings in `.DOC/WARN.md`.
+> in `.DOC/BUGS.md` (379 entries).
 >
 > What is below is kept for the structure it gives, not for its content.
 

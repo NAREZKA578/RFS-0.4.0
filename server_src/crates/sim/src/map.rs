@@ -67,7 +67,7 @@ pub const MAX_OBSTACLES: usize = 65_536;
 /// радиолокационную тень", and it is the only kind an open-sea map is ever
 /// expected to contain.
 ///
-/// Bug №699: the kind lives in `rfs_core` now, because it travels on the
+/// Bug №698: the kind lives in `rfs_core` now, because it travels on the
 /// wire — the client is told about the structures, and it has to know what
 /// kind each one is. One definition, two users.
 pub use rfs_core::world::ObstacleKind;
@@ -303,7 +303,7 @@ impl WorldMap {
 
     /// The wire description of this world.
     ///
-    /// Bug №699: the client has to be told what the world holds. The world is
+    /// Bug №698: the client has to be told what the world holds. The world is
     /// static, so this is a one-off description rather than a layer — and this
     /// is the one place where the simulation's boxes become the plain data the
     /// client stores.
@@ -494,31 +494,6 @@ impl SmallRng {
 mod tests {
     use super::*;
 
-    /// Bug №699: the description the client is told about must carry the
-    /// whole world — the volume and every structure in it, with its identity
-    /// and its kind. A description that lost the obstacles would leave the
-    /// client with an empty sea and a shell that vanishes for no reason.
-    #[test]
-    fn a_world_describes_itself_for_the_client() {
-        let world = WorldMap::from_json("test-water", AUTHORED).expect("the authored map is valid");
-        let description = world.to_description();
-
-        assert_eq!(description.name, "test-water");
-        assert_eq!(description.bounds_min, world.bounds.min);
-        assert_eq!(description.bounds_max, world.bounds.max);
-        assert_eq!(
-            description.obstacles.len(),
-            world.obstacles.len(),
-            "every structure must reach the client"
-        );
-        for (described, obstacle) in description.obstacles.iter().zip(world.obstacles.iter()) {
-            assert_eq!(described.id, obstacle.id);
-            assert_eq!(described.kind, obstacle.kind);
-            assert_eq!(described.min, obstacle.bounds.min);
-            assert_eq!(described.max, obstacle.bounds.max);
-        }
-    }
-
     /// A hand-written map, so the tests exercise the parse path and not the
     /// generator. Numbers are chosen so that every rock is inside the volume —
     /// a map that fails its own validation is a different test.
@@ -588,6 +563,29 @@ mod tests {
         match WorldMap::from_json("test-water", &json) {
             Err(MapError::ObstacleOutsideMap { id, .. }) => assert_eq!(id, 100_001),
             other => panic!("an outside rock was accepted or misreported: {other:?}"),
+        }
+    }
+
+    /// Bug №699: the description is the only thing the client ever sees of the
+    /// world, so it has to be THE world. The name and bounds are compared for
+    /// equality, and every structure is matched pair by pair — id and kind are
+    /// what the client uses to tell a rock from a berth, and only identical
+    /// boxes make the two views agree on what exists.
+    #[test]
+    fn a_world_describes_itself_for_the_client() {
+        let world = authored();
+        let description = world.to_description();
+
+        assert_eq!(description.name, "test-water");
+        assert_eq!(description.bounds_min, world.bounds.min);
+        assert_eq!(description.bounds_max, world.bounds.max);
+        assert_eq!(description.obstacles.len(), world.obstacles.len());
+
+        for (original, described) in world.obstacles.iter().zip(&description.obstacles) {
+            assert_eq!(described.id, original.id, "structure id diverged");
+            assert_eq!(described.kind, original.kind, "structure kind diverged");
+            assert_eq!(described.min, original.bounds.min, "box min diverged");
+            assert_eq!(described.max, original.bounds.max, "box max diverged");
         }
     }
 

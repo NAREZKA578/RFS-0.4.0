@@ -207,7 +207,7 @@ pub trait BackendResource: Send + Sync {
         &self,
         _hinstance: u64,
         _hwnd: u64,
-    ) -> RhiResult<super::vulkan::WindowSurface> {
+    ) -> RhiResult<crate::present::WindowSurface> {
         Err(crate::error::RhiError::NotSupported(
             "this backend cannot present to a window".into(),
         ))
@@ -215,15 +215,15 @@ pub trait BackendResource: Send + Sync {
 
     /// Create a swapchain on an already-created surface.
     ///
-    /// `old` is the chain being replaced, if any. It must be handed to Vulkan
-    /// rather than dropped first, or creating the replacement fails with
-    /// `ERROR_NATIVE_WINDOW_IN_USE_KHR`.
+    /// `old` is the chain being replaced, if any. It must be handed to the
+    /// backend rather than dropped first, or creating the replacement fails
+    /// (on Vulkan, with `ERROR_NATIVE_WINDOW_IN_USE_KHR`).
     fn create_swapchain(
         &self,
-        _surface: &super::vulkan::WindowSurface,
-        _request: super::vulkan::SwapchainRequest,
-        _old: Option<&mut super::vulkan::Swapchain>,
-    ) -> RhiResult<super::vulkan::Swapchain> {
+        _surface: &crate::present::WindowSurface,
+        _request: crate::present::SwapchainRequest,
+        _old: Option<&mut crate::present::Swapchain>,
+    ) -> RhiResult<crate::present::Swapchain> {
         Err(crate::error::RhiError::NotSupported(
             "this backend cannot create a swapchain".into(),
         ))

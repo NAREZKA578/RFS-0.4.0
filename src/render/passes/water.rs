@@ -28,6 +28,7 @@ use crate::render::core::RenderContext;
 use crate::render::graph::node::{PassDependency, PassOutcome, RenderPass};
 use crate::render::graph::resource::GraphResource;
 use crate::render::passes::base::BaseRenderPass;
+use crate::render::passes::depth_target::DepthTarget;
 use crate::render::passes::geometry::GeometryItem;
 use crate::render::scene::Scene;
 use crate::rhi::{
@@ -131,19 +132,33 @@ impl ReflectionQuality {
 /// Everything the pass needs to record, shared with the caller.
 pub struct WaterPassState {
     pub pipeline: GraphicsPipeline,
+    /// The pipeline for the shared-depth mode.
+    ///
+    /// A second one, because a pipeline belongs to a render pass and the two
+    /// modes are two render passes: the standalone one clears the colour and
+    /// the depth and writes the depth, and the shared one loads both and
+    /// writes neither.
+    pub shared_pipeline: Option<GraphicsPipeline>,
     pub descriptor_layout: DescriptorSetLayout,
-    /// One descriptor set per item: the uniform is per item, and the set holds
-    /// the uniform and the textures together.
+    /// One descriptor set per item.
     pub descriptor_sets: Vec<DescriptorSet>,
     /// One uniform buffer per item.
     pub uniform_buffers: Vec<crate::rhi::Buffer>,
     pub items: Vec<GeometryItem>,
     pub render_pass: crate::rhi::RenderPass,
+    /// The render pass for the shared-depth mode.
+    pub shared_render_pass: Option<crate::rhi::RenderPass>,
     /// Where the water is drawn: the pass's own image.
     pub output_texture: Option<crate::rhi::Texture>,
     pub output_view: Option<crate::rhi::TextureView>,
     pub depth_texture: Option<crate::rhi::Texture>,
     pub depth_view: Option<crate::rhi::TextureView>,
+    /// The frame's shared depth, when the caller gave one.
+    ///
+    /// The water is then tested against the **opaque** geometry's depth,
+    /// which is the whole point: a water surface behind a wall must not be
+    /// drawn over the wall.
+    pub depth_target: Option<DepthTarget>,
     /// The wave normals, generated once.
     pub normal_map: Option<crate::rhi::Texture>,
     pub normal_map_view: Option<crate::rhi::TextureView>,
@@ -152,8 +167,20 @@ pub struct WaterPassState {
     /// The scene seen through the water.
     pub refraction_view: Option<crate::rhi::TextureView>,
     pub config: WaterConfig,
+    /// The framebuffer the water is drawn into, in the standalone mode.
     pub framebuffer: Option<Framebuffer>,
     pub framebuffer_pinned: bool,
+    /// The framebuffer the water is drawn into, in the shared-depth mode.
+    ///
+    /// A separate one: the standalone framebuffer holds the water's own
+    /// image and the water's own depth, and the shared one holds the image
+    /// the renderer acquired and the frame's shared depth. They are different
+    /// pictures, and a framebuffer's attachments must all be the size of the
+    /// render area — so they cannot be the same framebuffer.
+    pub shared_framebuffer: Option<Framebuffer>,
+    /// The generation of the shared depth the shared framebuffer was built
+    /// with.
+    pub shared_framebuffer_depth_generation: Option<u64>,
 }
 
 /// Shared handle to the pass state.
@@ -170,6 +197,18 @@ impl WaterPass {
     /// Build a pass with no GPU objects yet.
     pub fn new(config: WaterConfig) -> Self {
         let mut base = BaseRenderPass::new("water");
+        // The water is drawn over the picture the opaque pass produced, so the
+        // pass comes after it, and the depth it is tested against is the
+        // opaque pass's depth.
+        //
+        // The dependency names the pass that writes the depth, because the
+        // graph orders by that name. The resource name is not in the graph's
+        // catalogue, so nothing is created for it — the ordering is the point.
+        base.add_dependency(
+            "forward",
+            "shared_depth",
+            crate::render::graph::types::ResourceUsage::Sampled,
+        );
         base.add_output("water");
         Self {
             base,
@@ -181,6 +220,11 @@ impl WaterPass {
     /// Build a pass around a new shared state and return both.
     pub fn with_state(state: WaterPassState) -> (Self, SharedState) {
         let mut base = BaseRenderPass::new("water");
+        base.add_dependency(
+            "forward",
+            "shared_depth",
+            crate::render::graph::types::ResourceUsage::Sampled,
+        );
         base.add_output("water");
         let config = state.config.clone();
         let shared: SharedState = Arc::new(Mutex::new(state));
@@ -222,21 +266,18 @@ impl WaterPass {
 
         // The image the water is drawn into, and the depth it is tested
         // against.
-        let output_texture = device.create_texture(
-            resolution,
-            resolution,
-            1,
-            color_format,
-            crate::rhi::TextureUsage::COLOR_ATTACHMENT
-                | crate::rhi::TextureUsage::SAMPLED
-                | crate::rhi::TextureUsage::TRANSFER_SRC,
-            1,
-        );
-        if !output_texture.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the water's output texture was not created on the device".into(),
-            ));
-        }
+        let output_texture = device
+            .create_texture(
+                resolution,
+                resolution,
+                1,
+                color_format,
+                crate::rhi::TextureUsage::COLOR_ATTACHMENT
+                    | crate::rhi::TextureUsage::SAMPLED
+                    | crate::rhi::TextureUsage::TRANSFER_SRC,
+                1,
+            )
+            .map_err(|e| RhiError::BackendError(format!("the water's output texture: {e}")))?;
         let output_view = device
             .create_texture_view(
                 &output_texture,
@@ -253,14 +294,16 @@ impl WaterPass {
             )
             .map_err(|e| RhiError::BackendError(format!("the water's output view: {e}")))?;
 
-        let depth_texture = device.create_texture(
-            resolution,
-            resolution,
-            1,
-            crate::rhi::Format::D32_SFLOAT,
-            crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-            1,
-        );
+        let depth_texture = device
+            .create_texture(
+                resolution,
+                resolution,
+                1,
+                crate::rhi::Format::D32_SFLOAT,
+                crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                1,
+            )
+            .map_err(|e| RhiError::BackendError(format!("the water's depth texture: {e}")))?;
         let depth_view = device
             .create_texture_view(
                 &depth_texture,
@@ -321,6 +364,63 @@ impl WaterPass {
             })
             .map_err(|e| RhiError::BackendError(format!("the water render pass: {e}")))?;
 
+        // The shared-depth render pass.
+        //
+        // - the colour is **loaded**, not cleared: the opaque picture is
+        //   already in it, and clearing it would throw the picture away and
+        //   draw the water over black;
+        // - the depth is **loaded** too, and the water does not write it: the
+        //   water is tested against the opaque geometry's depth, and a water
+        //   surface that wrote depth would hide the transparent objects
+        //   behind it, and the depth would no longer be the opaque
+        //   geometry's.
+        let shared_render_pass = device
+            .create_gpu_render_pass(&crate::rhi::RenderPassDesc {
+                attachments: vec![
+                    crate::rhi::AttachmentDescription {
+                        format: color_format,
+                        samples: crate::rhi::SampleCount::X1,
+                        load_op: crate::rhi::LoadOp::Load,
+                        store_op: crate::rhi::StoreOp::Store,
+                        stencil_load_op: crate::rhi::LoadOp::DontCare,
+                        stencil_store_op: crate::rhi::StoreOp::DontCare,
+                        initial_layout: crate::rhi::TextureLayout::ColorAttachmentOptimal,
+                        final_layout: crate::rhi::TextureLayout::ColorAttachmentOptimal,
+                    },
+                    crate::rhi::AttachmentDescription {
+                        format: crate::rhi::Format::D32_SFLOAT,
+                        samples: crate::rhi::SampleCount::X1,
+                        load_op: crate::rhi::LoadOp::Load,
+                        store_op: crate::rhi::StoreOp::Store,
+                        stencil_load_op: crate::rhi::LoadOp::DontCare,
+                        stencil_store_op: crate::rhi::StoreOp::DontCare,
+                        initial_layout: crate::rhi::TextureLayout::DepthStencilAttachmentOptimal,
+                        // The attachment stays writable, and the *pipeline* is
+                        // the one that does not write: the RHI's attachment
+                        // reference has no "read only" flag, and a subpass that
+                        // names a read-only layout without the flag is a
+                        // validation error.
+                        final_layout: crate::rhi::TextureLayout::DepthStencilAttachmentOptimal,
+                    },
+                ],
+                subpasses: vec![crate::rhi::SubpassDescription {
+                    pipeline_bind_point: crate::rhi::PipelineBindPoint::Graphics,
+                    color_attachments: vec![crate::rhi::AttachmentReference {
+                        attachment: 0,
+                        layout: crate::rhi::TextureLayout::ColorAttachmentOptimal,
+                    }],
+                    depth_stencil_attachment: Some(crate::rhi::AttachmentReference {
+                        attachment: 1,
+                        layout: crate::rhi::TextureLayout::DepthStencilAttachmentOptimal,
+                    }),
+                    ..Default::default()
+                }],
+                dependencies: vec![],
+            })
+            .map_err(|e| {
+                RhiError::BackendError(format!("the water shared-depth render pass: {e}"))
+            })?;
+
         let framebuffer = device
             .create_gpu_framebuffer(&FramebufferDesc {
                 render_pass: render_pass.clone(),
@@ -376,12 +476,15 @@ impl WaterPass {
                     },
                 ],
             },
-        );
+        )
+        .map_err(|e| RhiError::BackendError(format!("the water descriptor layout: {e}")))?;
 
         let mut uniform_buffers = Vec::with_capacity(items.len());
         let mut descriptor_sets = Vec::with_capacity(items.len());
         for _ in 0..items.len() {
-            let uniform = device.create_buffer(UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true);
+            let uniform = device
+                .create_buffer(UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true)
+                .map_err(|e| RhiError::BackendError(format!("the water uniform buffer: {e}")))?;
             let set = device.create_descriptor_set(&descriptor_layout)?;
             device.write_descriptors(
                 &set,
@@ -396,17 +499,14 @@ impl WaterPass {
             descriptor_sets.push(set);
         }
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("water".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the water shader module was not created on the device".into(),
-            ));
-        }
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("water".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the water shader module: {e}")))?;
 
         let mut desc = GraphicsPipelineDesc {
             shader_stages: vec![
@@ -459,17 +559,34 @@ impl WaterPass {
             ));
         }
 
+        // The shared-depth pipeline: the depth is tested against the opaque
+        // geometry's and not written. A second one, because a pipeline belongs
+        // to a render pass, and the shared-depth mode is a different render
+        // pass with a different depth state.
+        desc.depth_stencil_state = Some(DepthStencilState::read_only());
+        let shared_pipeline = device
+            .create_gpu_graphics_pipeline(&desc, &shared_render_pass, &[&descriptor_layout])
+            .map_err(|e| RhiError::BackendError(format!("the water shared-depth pipeline: {e}")))?;
+        if !shared_pipeline.has_gpu_backing() {
+            return Err(RhiError::BackendError(
+                "the water shared-depth graphics pipeline was not created on the device".into(),
+            ));
+        }
+
         Ok(Self::with_state(WaterPassState {
             pipeline,
+            shared_pipeline: Some(shared_pipeline),
             descriptor_layout,
             descriptor_sets,
             uniform_buffers,
             items,
             render_pass,
+            shared_render_pass: Some(shared_render_pass),
             output_texture: Some(output_texture),
             output_view: Some(output_view),
             depth_texture: Some(depth_texture),
             depth_view: Some(depth_view),
+            depth_target: None,
             normal_map: Some(normal_map),
             normal_map_view: Some(normal_map_view),
             reflection_view: None,
@@ -477,7 +594,22 @@ impl WaterPass {
             config,
             framebuffer: Some(framebuffer),
             framebuffer_pinned: false,
+            shared_framebuffer: None,
+            shared_framebuffer_depth_generation: None,
         }))
+    }
+
+    /// The frame's shared depth.
+    ///
+    /// The water is then tested against the **opaque** geometry's depth, which
+    /// is the whole point: a water surface behind a wall must not be drawn
+    /// over the wall. A depth of its own is a depth of nothing — the pass
+    /// would clear it to the far plane, and the water would be in front of
+    /// everything.
+    pub fn set_depth_target(state: &SharedState, depth: DepthTarget) {
+        if let Ok(mut state) = state.lock() {
+            state.depth_target = Some(depth);
+        }
     }
 
     /// The scene seen from the mirrored camera, and the scene under the water.
@@ -589,14 +721,16 @@ fn create_normal_map(
             pixels[offset + 3] = 255;
         }
     }
-    let texture = device.create_texture(
-        NORMAL_MAP_SIZE,
-        NORMAL_MAP_SIZE,
-        1,
-        crate::rhi::Format::RGBA8_UNORM,
-        crate::rhi::TextureUsage::SAMPLED | crate::rhi::TextureUsage::TRANSFER_DST,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            NORMAL_MAP_SIZE,
+            NORMAL_MAP_SIZE,
+            1,
+            crate::rhi::Format::RGBA8_UNORM,
+            crate::rhi::TextureUsage::SAMPLED | crate::rhi::TextureUsage::TRANSFER_DST,
+            1,
+        )
+        .map_err(|e| crate::rhi::error::RhiError::BackendError(format!("the water's normal map texture: {e}")))?;
     device.upload_texture(&texture, &pixels).map_err(|e| {
         crate::rhi::error::RhiError::BackendError(format!("the water's normal map: {e}"))
     })?;
@@ -618,6 +752,81 @@ fn create_normal_map(
             crate::rhi::error::RhiError::BackendError(format!("the water's normal map view: {e}"))
         })?;
     Ok((texture, view))
+}
+
+/// The framebuffer the water is drawn into in the shared-depth mode.
+///
+/// The water is drawn into the image the renderer acquired — the same image
+/// the opaque pass drew into — and against the frame's shared depth. The
+/// water's own image is a different size (it is the reflection's size), and a
+/// framebuffer's attachments must all be the size of the render area, so the
+/// two cannot be one framebuffer.
+///
+/// A pinned framebuffer wins, as it does everywhere else: the caller said
+/// exactly where to draw, and the framebuffer it pinned was built for the
+/// shared-depth render pass.
+///
+/// The framebuffer is cached and rebuilt when the shared depth is: a
+/// framebuffer holds the depth's *view*, and a view of a destroyed image is
+/// not a view of anything.
+fn resolve_shared_target(
+    state: &mut WaterPassState,
+    context: &RenderContext,
+    device: &crate::rhi::Device,
+) -> Option<Framebuffer> {
+    if state.framebuffer_pinned {
+        return state.framebuffer.clone();
+    }
+    let target = state.depth_target.clone()?;
+    let index = context.swapchain_image_index;
+    let view = context
+        .presentation_texture_views
+        .get(index as usize)?
+        .clone();
+    let (width, height) = context.drawable_size();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let Some(depth_view) = target.view(device, width, height) else {
+        return None;
+    };
+    // The framebuffer is rebuilt when the depth was: the old one holds the
+    // old depth's view.
+    let depth_generation = target.generation();
+    if state.shared_framebuffer_depth_generation != Some(depth_generation) {
+        state.shared_framebuffer = None;
+        state.shared_framebuffer_depth_generation = Some(depth_generation);
+    }
+    if let Some(framebuffer) = state.shared_framebuffer.clone() {
+        return Some(framebuffer);
+    }
+    let render_pass = state.shared_render_pass.clone()?;
+    let framebuffer = match device.create_gpu_framebuffer(&FramebufferDesc {
+        render_pass,
+        attachments: vec![
+            FramebufferAttachment {
+                texture_view: view,
+                layer: 0,
+                mip_level: 0,
+            },
+            FramebufferAttachment {
+                texture_view: depth_view,
+                layer: 0,
+                mip_level: 0,
+            },
+        ],
+        width,
+        height,
+        layers: 1,
+    }) {
+        Ok(framebuffer) => framebuffer,
+        Err(e) => {
+            crate::error!("water", "the framebuffer could not be created: {e}");
+            return None;
+        }
+    };
+    state.shared_framebuffer = Some(framebuffer.clone());
+    Some(framebuffer)
 }
 
 impl RenderPass for WaterPass {
@@ -647,7 +856,7 @@ impl RenderPass for WaterPass {
     fn execute(
         &mut self,
         encoder: &mut CommandEncoder,
-        _context: &mut RenderContext,
+        context: &mut RenderContext,
         _scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
     ) -> PassOutcome {
@@ -657,12 +866,13 @@ impl RenderPass for WaterPass {
         let Some(state) = self.state.as_ref() else {
             return PassOutcome::skipped("the pass has no state");
         };
-        let Ok(state) = state.lock() else {
+        let Ok(mut state) = state.lock() else {
             return PassOutcome::skipped("the state lock is poisoned");
         };
         if state.items.is_empty() {
             return PassOutcome::skipped("no water surface to draw");
         }
+        let device = context.device().clone();
         // Without a reflection the shader has nothing to mix, and a surface
         // that samples an unbound texture shows whatever the driver left there.
         if state.reflection_view.is_none() {
@@ -670,33 +880,108 @@ impl RenderPass for WaterPass {
                 "no reflection: the scene has to be rendered from the mirrored camera first",
             );
         }
-        let Some(framebuffer) = state.framebuffer.clone() else {
-            return PassOutcome::skipped("no framebuffer");
-        };
+        // The shared-depth mode: the water is drawn over the picture the
+        // opaque pass produced, and tested against the opaque geometry's depth.
+        //
+        // The water's **own** depth would be a depth of nothing: the pass
+        // would clear it to the far plane, and the water would be in front of
+        // every wall in the scene.
+        let shared = state.depth_target.is_some();
 
-        let resolution = state
-            .output_texture
-            .as_ref()
-            .map(|texture| (texture.width(), texture.height()))
-            .unwrap_or((0, 0));
-        let (width, height) = resolution;
+        // The target.
+        //
+        // In the shared mode the water is drawn into the image the renderer
+        // acquired — the same image the opaque pass drew into, and the same
+        // depth. The water's own image is a different size (it is the
+        // reflection's size), and a framebuffer's attachments must all be the
+        // size of the render area, so the two cannot share one framebuffer.
+        let (framebuffer, render_pass, pipeline, width, height) = if shared {
+            let Some(framebuffer) = resolve_shared_target(&mut state, context, device.as_ref())
+            else {
+                return PassOutcome::skipped("no target for the acquired image");
+            };
+            let Some(render_pass) = state.shared_render_pass.clone() else {
+                return PassOutcome::skipped("the shared-depth render pass is missing");
+            };
+            let Some(pipeline) = state.shared_pipeline.clone() else {
+                return PassOutcome::skipped("the shared-depth pipeline is missing");
+            };
+            let (width, height) = {
+                let desc = framebuffer.desc();
+                (desc.width, desc.height)
+            };
+            (framebuffer, render_pass, pipeline, width, height)
+        } else {
+            let Some(framebuffer) = state.framebuffer.clone() else {
+                return PassOutcome::skipped("no framebuffer");
+            };
+            let resolution = state
+                .output_texture
+                .as_ref()
+                .map(|texture| (texture.width(), texture.height()))
+                .unwrap_or((0, 0));
+            let (width, height) = resolution;
+            (
+                framebuffer,
+                state.render_pass.clone(),
+                state.pipeline.clone(),
+                width,
+                height,
+            )
+        };
         if width == 0 || height == 0 {
             return PassOutcome::skipped("the target has no size");
         }
 
         let mut commands: Vec<Command> = Vec::with_capacity(8 + state.items.len() * 4);
+        if shared {
+            // The barrier between the opaque pass and this one.
+            //
+            // The order of the passes is not a memory dependency: the forward
+            // pass wrote the depth and the colour, and without this the water
+            // pass would read them without being guaranteed to see them. A
+            // render pass's own dependencies do not cover the gap between two
+            // render passes — the second pass's "external" subpass
+            // dependencies would, and this render pass declares none.
+            //
+            // So the barrier is **before** the render pass starts: inside a
+            // render pass instance a barrier needs a self-dependency, and the
+            // render pass has none.
+            commands.push(Command::PipelineBarrier {
+                src_stage: crate::rhi::PipelineStage::COLOR_ATTACHMENT_OUTPUT
+                    | crate::rhi::PipelineStage::LATE_FRAGMENT_TESTS,
+                dst_stage: crate::rhi::PipelineStage::COLOR_ATTACHMENT_OUTPUT
+                    | crate::rhi::PipelineStage::FRAGMENT_SHADER
+                    | crate::rhi::PipelineStage::EARLY_FRAGMENT_TESTS,
+                memory_barriers: vec![crate::rhi::sync::barrier::MemoryBarrier {
+                    src_access: crate::rhi::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | crate::rhi::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    dst_access: crate::rhi::AccessFlags::COLOR_ATTACHMENT_READ
+                        | crate::rhi::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+                }],
+                buffer_barriers: vec![],
+                texture_barriers: vec![],
+            });
+        }
+        let clear_values = if shared {
+            // The load operations ignore the clear values, and a render pass
+            // with a load operation has nothing to clear.
+            Vec::new()
+        } else {
+            vec![
+                crate::rhi::ClearValue::color(0.0, 0.0, 0.0, 0.0),
+                crate::rhi::ClearValue::depth_stencil(1.0, 0),
+            ]
+        };
         commands.push(Command::BeginRenderPass(
             crate::rhi::command::pass::render::RenderPassBeginInfo {
-                render_pass: state.render_pass.clone(),
+                render_pass,
                 framebuffer,
                 render_area: Rect2D {
                     offset: Offset2D { x: 0, y: 0 },
                     extent: crate::rhi::Extent2D { width, height },
                 },
-                clear_values: vec![
-                    crate::rhi::ClearValue::color(0.0, 0.0, 0.0, 0.0),
-                    crate::rhi::ClearValue::depth_stencil(1.0, 0),
-                ],
+                clear_values,
             },
         ));
         commands.push(Command::SetViewport(crate::rhi::Viewport {
@@ -711,14 +996,14 @@ impl RenderPass for WaterPass {
             offset: Offset2D { x: 0, y: 0 },
             extent: crate::rhi::Extent2D { width, height },
         }));
-        commands.push(Command::BindGraphicsPipeline(state.pipeline.clone()));
+        commands.push(Command::BindGraphicsPipeline(pipeline.clone()));
 
         for (index, item) in state.items.iter().enumerate() {
             let Some(descriptor_set) = state.descriptor_sets.get(index) else {
                 continue;
             };
             commands.push(Command::BindDescriptorSets {
-                pipeline: state.pipeline.clone(),
+                pipeline: pipeline.clone(),
                 first_set: 0,
                 sets: vec![descriptor_set.clone()],
             });

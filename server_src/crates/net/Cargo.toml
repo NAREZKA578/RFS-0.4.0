@@ -17,6 +17,12 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rayon = "1"
+# Bug №700: per-datagram authenticity. HMAC-SHA256 (truncated to 16 bytes)
+# over each datagram with a shared secret from the match config, plus a
+# per-source sequence for replay refusal. Integrity only — payload secrecy
+# remains an open plan item, not silently implied by these crates.
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 # The crate itself only needs net/sync/time; the end-to-end tests need a

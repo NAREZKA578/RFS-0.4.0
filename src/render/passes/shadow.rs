@@ -312,21 +312,20 @@ impl ShadowPass {
         let mut shadow_maps = Vec::with_capacity(cascade_count);
         let mut shadow_views = Vec::with_capacity(cascade_count);
         for _ in 0..cascade_count {
-            let shadow_map = device.create_texture(
-                resolution,
-                resolution,
-                1,
-                SHADOW_FORMAT,
-                crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT
-                    | crate::rhi::TextureUsage::SAMPLED
-                    | crate::rhi::TextureUsage::TRANSFER_SRC,
-                1,
-            );
-            if !shadow_map.has_gpu_backing() {
-                return Err(RhiError::BackendError(
-                    "the shadow map texture was not created on the device".into(),
-                ));
-            }
+            let shadow_map = device
+                .create_texture(
+                    resolution,
+                    resolution,
+                    1,
+                    SHADOW_FORMAT,
+                    crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT
+                        | crate::rhi::TextureUsage::SAMPLED
+                        | crate::rhi::TextureUsage::TRANSFER_SRC,
+                    1,
+                )
+                .map_err(|e| {
+                    RhiError::BackendError(format!("the shadow map texture: {e}"))
+                })?;
             let shadow_view = device
                 .create_texture_view(
                     &shadow_map,
@@ -400,21 +399,25 @@ impl ShadowPass {
         // One uniform buffer and one descriptor set per item: the uniform
         // holds the item's model matrix, and one buffer for the whole pass
         // would make every item use the last one's matrix (§654).
-        let descriptor_layout = device.create_descriptor_set_layout(
-            &crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
-                bindings: vec![crate::rhi::descriptor::layout::DescriptorBinding {
-                    binding: 0,
-                    ty: crate::rhi::DescriptorType::UniformBuffer,
-                    count: 1,
-                    stages: crate::rhi::ShaderStage::VERTEX | crate::rhi::ShaderStage::FRAGMENT,
-                    immutable_samplers: None,
-                }],
-            },
-        );
+        let descriptor_layout = device
+            .create_descriptor_set_layout(
+                &crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
+                    bindings: vec![crate::rhi::descriptor::layout::DescriptorBinding {
+                        binding: 0,
+                        ty: crate::rhi::DescriptorType::UniformBuffer,
+                        count: 1,
+                        stages: crate::rhi::ShaderStage::VERTEX | crate::rhi::ShaderStage::FRAGMENT,
+                        immutable_samplers: None,
+                    }],
+                },
+            )
+            .map_err(|e| RhiError::BackendError(format!("the shadow descriptor layout: {e}")))?;
         let mut uniform_buffers = Vec::with_capacity(items.len());
         let mut descriptor_sets = Vec::with_capacity(items.len());
         for _ in 0..items.len() {
-            let uniform = device.create_buffer(UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true);
+            let uniform = device
+                .create_buffer(UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true)
+                .map_err(|e| RhiError::BackendError(format!("the shadow uniform buffer: {e}")))?;
             let set = device.create_descriptor_set(&descriptor_layout)?;
             device.write_descriptors(
                 &set,
@@ -429,17 +432,14 @@ impl ShadowPass {
             descriptor_sets.push(set);
         }
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("shadow".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the shadow shader module was not created on the device".into(),
-            ));
-        }
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("shadow".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the shadow shader module: {e}")))?;
 
         let mut desc = GraphicsPipelineDesc {
             shader_stages: vec![

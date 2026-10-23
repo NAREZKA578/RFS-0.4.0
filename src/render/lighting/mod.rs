@@ -3,10 +3,12 @@
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
 pub mod light;
+pub mod light_buffer;
 pub mod probe;
 pub mod shadows;
 
 pub use light::{DirectionalLight, Light, LightConfig, LightType, PointLight, SpotLight};
+pub use light_buffer::{pack_light, LIGHT_STRIDE_BYTES, LIGHT_STRIDE_FLOATS, LIGHT_STRUCT_WGSL};
 pub use probe::{LightProbe, LightProbeConfig, LightProbeType};
 pub use shadows::{CascadedShadowConfig, ShadowConfig};
 

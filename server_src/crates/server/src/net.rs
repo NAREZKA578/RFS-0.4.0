@@ -548,20 +548,17 @@ pub fn translate_command(
             }
         }
         ServerCommand::Respawn { .. } => {
-            // Bug №634: this command is declared in the wire protocol and
-            // nothing implements it. The catch-all used to answer it, which
-            // made a declared-but-absent feature look like a forgotten match
-            // arm rather than a decision.
-            //
-            // The decision here is that respawn CANNOT be implemented yet:
-            // nothing in the simulation marks a player dead (the `PlayerDied`
-            // event is declared in the protocol and sent by nobody), so the
-            // server cannot tell a dead player asking to come back from a live
-            // one, and "respawn" would mean recreating a player who is
-            // playing. The honest answer is a refusal that says so; the
-            // question of what respawn means — where the player returns, after
-            // how long, what it costs — is in the bug record for the owner.
-            (false, Some("respawn is not supported yet".into()))
+            // Bug №634 → №701: this command is declared in the wire protocol,
+            // and since №701 it is implemented — ABOVE this per-ship path, in
+            // `handle_respawn`: a respawned player's ship is by definition
+            // gone or going under, so the per-ship translator never sees a
+            // live hull to route commands through. If a Respawn reaches this
+            // arm anyway (a direct caller, a path added later), the honest
+            // answer stays a refusal that says where respawn does NOT live.
+            (
+                false,
+                Some("respawn is not handled by the per-ship path".into()),
+            )
         }
         _ => (false, Some("command not implemented".into())),
     }
@@ -570,9 +567,10 @@ pub fn translate_command(
 #[cfg(test)]
 mod respawn_command_tests {
     //! Bug №634: `Respawn` is declared in the wire protocol and implemented
-    //! nowhere. The catch-all answered it with "command not implemented",
-    //! which reads as a forgotten match arm rather than a decision. It now has
-    //! its own arm with an honest reason.
+    //! nowhere (now stale — №701 implemented it server-wide). The catch-all
+    //! answered it with "command not implemented", which reads as a forgotten
+    //! match arm rather than a decision. The per-ship arm keeps its own
+    //! refusal: respawn does not belong to this path.
 
     use super::*;
     use crate::match_::SHIP_ID;

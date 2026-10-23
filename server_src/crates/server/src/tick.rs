@@ -382,6 +382,14 @@ pub fn core_game_event(event: &SimGameEvent) -> CoreGameEvent {
             position: *position,
             normal: *normal,
         },
+        // Bug №701: the crossing of the point of no return is world-visible —
+        // every viewer of the hull learns it is going down. The crew's own
+        // deaths do NOT ride this arm: they are fanned out per player in
+        // `main.rs`, which reads the players map that the pure translator
+        // never sees.
+        SimGameEvent::ShipSinkingStarted { ship } => {
+            CoreGameEvent::ShipSinkingStarted { ship: *ship }
+        }
     }
 }
 

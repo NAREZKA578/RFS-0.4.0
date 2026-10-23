@@ -8,7 +8,6 @@ use crate::snapshot::{
     entity_layer, DeltaCompressor, EntitySnapshot, LayerBase, ProjectileSnapshot, Snapshot,
     SnapshotBuffer, LAYER_COUNT, LAYER_INTERVAL_TICKS, LAYER_RESYNC_TICKS,
 };
-use bytes::BytesMut;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use rfs_core::entity::{PlayerEntity, ShipEntity};
@@ -16,7 +15,7 @@ use rfs_core::packet::*;
 use rfs_core::spatial::InterestConfig;
 use rfs_core::time::{Tick, TICK_DURATION, TICK_RATE};
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Wire cap for a single bincode message (DoS: Vec len prefix could OOM).
@@ -59,6 +58,16 @@ pub struct NetServer {
     /// simply not sent on this tick.
     snapshot_rounds: Arc<AtomicU64>,
     snapshot_packets: Arc<AtomicU64>,
+    /// Bug №710: first-full builds admitted out of the join queue so far. The
+    /// storm-side counterpart of the client's resync counter: ~4 per round
+    /// during a flood draining to ~0 is the queue working; a value stuck at
+    /// zero while clients sit Connected and unregistered is the queue
+    /// starving (or the discovery path broken) — either way it is loud.
+    first_fulls_built: Arc<AtomicU64>,
+    /// Bug №710: the join admission queue itself, so disconnects between
+    /// rounds are pruned by the admission stage instead of being admitted
+    /// into a dead base.
+    first_full_queue: Arc<Mutex<FirstFullQueue>>,
     /// Bug №274: deltas actually sent, per layer. The send-side half of the
     /// delivery measurement — the client's `applied_delta_count_by_layer` is
     /// the receive half, and a per-layer shortfall means different things on
@@ -104,17 +113,94 @@ pub struct NetServer {
     dropped_events: Arc<AtomicU64>,
     /// Outbox entries dropped for the same reason (Bug №613).
     dropped_outbox: Arc<AtomicU64>,
-    /// Bug №699: the world's static description, sent to every client when it
+    /// Bug №698: the world's static description, sent to every client when it
     /// connects. The layers carry ships, players, stations, compartments and
     /// projectiles — and no structure, so a client that never heard of the
     /// world could not draw it and could not explain a shell vanishing at an
     /// invisible rock.
     world_description: Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
-    /// Bug №216: the secret a client has to prove it with.
-    ///
-    /// `None` means the server asks for no secret — every client is
-    /// authenticated by default, and the server says so in its log.
-    auth_token: Arc<RwLock<Option<String>>>,
+    /// Bug №700: the shared auth key plus the per-peer outbound sequence
+    /// table, carried together so every send path needs one handle instead
+    /// of two.
+    wire_auth: Arc<WireAuth>,
+    /// Bug №216: un-confirmed connect challenges, by (claimed) address.
+    /// The gate between "this datagram says Connect" and "this address owns
+    /// a connection": without it the address registration trusts the sender
+    /// field of a UDP datagram, which anyone with a raw socket can write.
+    pending_challenges: Arc<RwLock<HashMap<SocketAddr, PendingChallenge>>>,
+    /// Bug №216: inbound packets of the gated types with a session echo that
+    /// does not match the connection the address is bound to — the spoof
+    /// signature. Dropped before any state is touched.
+    session_rejects: Arc<AtomicU64>,
+}
+
+/// Bug №700: the shared key and its outbound sequence table live in ONE
+/// struct, so no send path re-implements "empty means unsigned" on its own.
+struct WireAuth {
+    key: Arc<RwLock<Option<Vec<u8>>>>,
+    out_seq: Arc<Mutex<HashMap<SocketAddr, (Instant, u64)>>>,
+}
+
+impl WireAuth {
+    fn new() -> Self {
+        Self {
+            key: Arc::new(RwLock::new(None)),
+            out_seq: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Bug №700: the secret every datagram is keyed with. `None` or a
+    /// blank token means the unsigned dialect — the caller says so in the
+    /// log; here only the wire is concerned.
+    fn set_token(&self, token: Option<String>) {
+        *self.key.write() = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .map(String::into_bytes);
+    }
+
+    fn key(&self) -> Option<Vec<u8>> {
+        self.key.read().clone()
+    }
+}
+
+/// Bug №700: the outbound sequence an unsigned peer's next datagram gets.
+/// Wrap skips 0 — a zero sequence means "this server is unkeyed", and a
+/// keyed server must never emit it.
+fn next_out_seq(table: &Mutex<HashMap<SocketAddr, (Instant, u64)>>, addr: SocketAddr) -> u64 {
+    let mut table = table.lock();
+    let entry = table.entry(addr).or_insert((Instant::now(), 0));
+    entry.0 = Instant::now();
+    entry.1 = entry.1.wrapping_add(1);
+    if entry.1 == 0 {
+        entry.1 = 1;
+    }
+    entry.1
+}
+
+/// Bug №700: a rejection datagram carries the same auth block as everything
+/// else — a forgeable rejection would be its own attack (spoofed ServerFull
+/// rate-limits nobody but lies to the victim with no receipt left behind).
+async fn send_reject(
+    socket: &Arc<UdpSocket>,
+    addr: SocketAddr,
+    packet_data: &[u8],
+    auth: &Arc<WireAuth>,
+    bandwidth: &BandwidthTracker,
+) -> anyhow::Result<()> {
+    let seq = next_out_seq(&auth.out_seq, addr);
+    let key = auth.key();
+    let mut wire = Vec::with_capacity(crate::auth::AUTH_WIRE_LEN + packet_data.len());
+    crate::auth::seal(
+        key.as_deref(),
+        crate::auth::Direction::ServerToClient,
+        seq,
+        packet_data,
+        &mut wire,
+    );
+    socket.send_to(&wire, addr).await?;
+    bandwidth.record_sent(wire.len());
+    Ok(())
 }
 
 /// One queued datagram awaiting the writer task.
@@ -188,12 +274,186 @@ const CONNECT_BURST: f64 = 4.0;
 const CONNECT_REFILL_PER_SEC: f64 = 4.0;
 /// Upper bound for the limiter table itself; oldest entries are evicted past it.
 const CONNECT_TABLE_CAP: usize = 4096;
+/// Bug №700: the same shape for the per-peer auth tables — a window entry
+/// or a sequence counter nobody spoke to for a minute is dead and may go.
+const PEER_TABLE_TTL: Duration = Duration::from_secs(60);
 
 /// Bug №171: how long a reliable packet may wait for bandwidth tokens before
 /// the send path gives up and returns an error instead of silently discarding
 /// a message that has no retransmit behind it. Bounded so one slow client
 /// cannot stall the whole send loop.
 const RELIABLE_ADMIT_BUDGET: Duration = Duration::from_millis(250);
+
+/// Bug №710: how many clients get their FIRST full state built per publish
+/// round. The first full is per client expensive work — `compute_interest`,
+/// a filtered world pass, a full `to_state_packet` serialization and the
+/// layer split — and the old hot path did all of it inside ONE tick round
+/// for every join that had just become ready: a connect storm of 200 bots
+/// turned a single publish round into 200 first-full builds (measured during
+/// the №697 flood: sim+sync 126-144 ms with only 13-73 players registered).
+///
+/// A budget of 4 drains a 200-join storm in ~1.7 s at 30 rounds/s while a
+/// LONE late join is admitted one round later than before — the cost of the
+/// guarantee is one publish round for the single client, and the benefit is
+/// that the round itself stays inside the tick budget.
+const FIRST_FULL_BUDGET_PER_ROUND: usize = 4;
+
+/// Bug №216: how many un-confirmed connect challenges may be pending at once.
+/// A challenge is per (claimed) address and lives until the nonce comes back
+/// or the TTL expires, so the table is the one state an address sprayer can
+/// grow — it must be finite.
+const PENDING_CHALLENGE_CAP: usize = 1024;
+/// Bug №216: how long a pending challenge is honored. An honest handshake
+/// completes in three datagrams (Challenge, Confirm, Accept) — well under a
+/// second on anything the game targets.
+const CHALLENGE_TTL: Duration = Duration::from_secs(8);
+/// Bug №216: a Connect signed with a session it does not know — the spoof
+/// shape. Counted, not chatty: one line per 1024 rejections keeps the flood
+/// visible without turning the log into the attack's amplifier.
+const SESSION_REJECT_LOG_EVERY: u64 = 1024;
+
+/// Bug №216: a Connect whose source address has not answered a challenge
+/// yet. The recorded ConnectPacket is the one that carries the claimed
+/// identity — when the nonce comes back, the admission proceeds with THESE
+/// packets, not with the confirm's (a Confirm carries no identity at all).
+struct PendingChallenge {
+    nonce: u128,
+    connect: ConnectPacket,
+    since: Instant,
+}
+
+/// Bug №710: the join admission queue. Discovery ("this client is ready for
+/// its first full") and admission ("build that first full now") are split:
+/// the per-client pass in `send_snapshots` only DISCOVERS, and the admission
+/// stage pops at most `FIRST_FULL_BUDGET_PER_ROUND` ready clients per round.
+///
+/// The queue is bounded twice over: by the dedupe set (a client discovered
+/// in round N-1 and still not admitted is NOT re-added in round N+1, so the
+/// storm cannot grow the queue with copies of itself) and by `CAP` (a queue
+/// longer than this is a queue nobody can drain in any sane number of
+/// rounds; exceptions are refused and re-discovered the next round).
+#[derive(Default)]
+struct FirstFullQueue {
+    queue: VecDeque<u32>,
+    waiting: HashSet<u32>,
+}
+
+impl FirstFullQueue {
+    /// Bound on clients waiting for admission at once. 256 is far above any
+    /// legitimate simultaneous join (the storm measured at 200) yet keeps the
+    /// queue and its drain time finite even under a sprayer that never stops.
+    const CAP: usize = 256;
+
+    /// Discovery. Returns `false` when the client was already queued or the
+    /// queue is full — both are non-events: the client either waits for a
+    /// later round or is re-discovered next round.
+    fn push(&mut self, id: u32) -> bool {
+        if self.waiting.contains(&id) {
+            return false;
+        }
+        if self.waiting.len() >= Self::CAP {
+            return false;
+        }
+        self.waiting.insert(id);
+        self.queue.push_back(id);
+        true
+    }
+
+    /// Admission. Pops up to `budget` clients who are `ready`; clients that
+    /// are not ready are dropped WITHOUT consuming budget slots — a queued
+    /// client that disconnected (or whose player was despawned) while
+    /// waiting must not stall the line's head, and a stale id must not be
+    /// admitted at all (that would rebuild the №164 empty-base trap against
+    /// a viewer that no longer exists). FIFO order is preserved.
+    fn admit(&mut self, budget: usize, ready: impl Fn(u32) -> bool) -> Vec<u32> {
+        let mut out = Vec::new();
+        while out.len() < budget && !self.queue.is_empty() {
+            let id = self.queue.pop_front().expect("queue checked non-empty");
+            self.waiting.remove(&id);
+            if ready(id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// How many clients are currently waiting for admission.
+    /// Test-visible only: production reads the queue's drain state through
+    /// the gateway counters, not by peeking at the line.
+    #[cfg(test)]
+    fn waiting_len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+/// Bug №710: the admission stage of a publish round.
+///
+/// Pops at most `FIRST_FULL_BUDGET_PER_ROUND` ids the queue marks ready —
+/// Connected connection AND a registered player. Both conditions were
+/// already enforced at discovery, but both can change between rounds, so
+/// they are re-checked HERE: a client that disconnected while queued, or
+/// lost its player, is dropped rather than admitted into an empty base
+/// (the №164 shape, recreated through the queue if omitted).
+///
+/// For every admitted client the first full is built exactly as the hot
+/// path used to do it in-line: refresh the interest sets, filter the world,
+/// serialize the full state packet and split it into per-layer bases
+/// registered in `client_layers`. Returns the packets to flush; called from
+/// `send_snapshots` before the per-client pass, and directly from tests.
+fn admit_first_fulls(
+    connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
+    client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+    interest_manager: &Arc<InterestManager>,
+    snapshot: &Snapshot,
+    first_full: &Arc<Mutex<FirstFullQueue>>,
+    first_fulls_built: &AtomicU64,
+) -> Vec<(Arc<Connection>, OutgoingPacket)> {
+    // The ready-check holds a short connection-map read only; the expensive
+    // per-client work never runs under any lock (bug №79 lock discipline).
+    let ready = |id: u32| -> bool {
+        let connected = {
+            let conns = connections.read();
+            conns
+                .get(&id)
+                .map(|c| c.state() == ConnectionState::Connected)
+                .unwrap_or(false)
+        };
+        connected && interest_manager.has_player(id)
+    };
+    let admitted = first_full.lock().admit(FIRST_FULL_BUDGET_PER_ROUND, ready);
+
+    let mut out: Vec<(Arc<Connection>, OutgoingPacket)> = Vec::new();
+    for id in admitted {
+        // Released before the work below; a connection that vanished between
+        // the ready-check and here is skipped and will be re-discovered next
+        // round by the ordinary discovery path.
+        let conn = {
+            let conns = connections.read();
+            conns.get(&id).cloned()
+        };
+        let Some(conn) = conn else {
+            continue;
+        };
+
+        // Exactly the work the old in-line first-full path performed.
+        interest_manager.compute_interest(id);
+        let filtered = NetServer::filter_snapshot(snapshot, interest_manager, id);
+        let tick = filtered.tick.value();
+        let already = client_layers.read().contains_key(&id);
+        let mut layers = client_layers.write();
+        layers.entry(id).or_insert_with(|| {
+            // First contact: full state now, layer bases start from it.
+            for packet in conn.send_state(filtered.to_state_packet()) {
+                out.push((conn.clone(), packet));
+            }
+            NetServer::split_layers(&filtered, tick)
+        });
+        if !already {
+            first_fulls_built.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    out
+}
 
 /// Bug №219: how long a Connected connection may go without its game-layer
 /// player being registered. The snapshot gate (send_snapshots, №164) holds
@@ -306,6 +566,8 @@ impl NetServer {
             snapshot_buffer: Arc::new(SnapshotBuffer::new(config.snapshot_history)),
             snapshot_rounds: Arc::new(AtomicU64::new(0)),
             snapshot_packets: Arc::new(AtomicU64::new(0)),
+            first_fulls_built: Arc::new(AtomicU64::new(0)),
+            first_full_queue: Arc::new(Mutex::new(FirstFullQueue::default())),
             // Bug №274: per-layer send counter, see the field.
             sent_deltas_by_layer: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             delta_compressor: Arc::new(DeltaCompressor::new()),
@@ -330,7 +592,9 @@ impl NetServer {
             dropped_events: Arc::new(AtomicU64::new(0)),
             dropped_outbox: Arc::new(AtomicU64::new(0)),
             world_description: Arc::new(RwLock::new(None)),
-            auth_token: Arc::new(RwLock::new(None)),
+            wire_auth: Arc::new(WireAuth::new()),
+            pending_challenges: Arc::new(RwLock::new(HashMap::new())),
+            session_rejects: Arc::new(AtomicU64::new(0)),
         };
 
         Ok(server)
@@ -340,7 +604,7 @@ impl NetServer {
         self.match_id
     }
 
-    /// Bug №699: the world this server runs, as the client is told about it.
+    /// Bug №698: the world this server runs, as the client is told about it.
     ///
     /// The server loads the map in the match binary; the network layer keeps
     /// the DESCRIPTION of it so it can hand it to every client that connects.
@@ -353,14 +617,11 @@ impl NetServer {
         self.world_description.read().clone()
     }
 
-    /// Bug №216: the secret a client has to present.
-    ///
-    /// `None` (or an empty secret) means the server asks for none: every
-    /// client is authenticated by default, and the caller is expected to say
-    /// so out loud — a server that looks protected and is not is worse than
-    /// one that says it is open.
+    /// Bug №700: the shared secret the server's datagrams are keyed with.
+    /// `None` or a blank string is the unsigned dialect — the caller warns
+    /// the human about it; here only the wire is concerned.
     pub fn set_auth_token(&self, token: Option<String>) {
-        *self.auth_token.write() = token.filter(|t| !t.is_empty());
+        self.wire_auth.set_token(token);
     }
 
     pub fn current_tick(&self) -> Tick {
@@ -390,6 +651,25 @@ impl NetServer {
 
     pub fn connection_count(&self) -> usize {
         self.connections.read().len()
+    }
+
+    /// Bug №710: first-full builds admitted out of the join queue so far.
+    pub fn first_fulls_built(&self) -> u64 {
+        self.first_fulls_built.load(Ordering::Relaxed)
+    }
+
+    /// Bug №216: inbound packets carrying a session echo that did not match
+    /// the connection their source address is bound to. In signed mode the
+    /// HMAC already proves the datagram's origin; the session gate catches
+    /// the spoof shape in the unsigned dialect where the datagram itself
+    /// proves nothing.
+    pub fn session_rejects(&self) -> u64 {
+        self.session_rejects.load(Ordering::Relaxed)
+    }
+
+    /// Bug №216: how many connects are awaiting their challenge confirmation.
+    pub fn pending_challenges(&self) -> usize {
+        self.pending_challenges.read().len()
     }
 
     pub fn get_connection(&self, connection_id: u32) -> Option<Arc<Connection>> {
@@ -466,12 +746,14 @@ impl NetServer {
         let socket = self.socket.clone();
         let bandwidth = self.bandwidth_tracker.clone();
         let limit_enabled = self.config.enable_bandwidth_limit;
+        let auth = self.wire_auth.clone();
 
         let handle = tokio::spawn(async move {
             while let Some(item) = rx.recv().await {
                 let OutboxItem { conn, packet } = item;
                 if let Err(e) =
-                    Self::send_packet(&socket, &conn, &packet, &bandwidth, limit_enabled).await
+                    Self::send_packet(&socket, &conn, &packet, &bandwidth, limit_enabled, &auth)
+                        .await
                 {
                     // An oversize or unadmittable packet is a per-packet
                     // problem; the connection keeps running.
@@ -527,11 +809,20 @@ impl NetServer {
         let match_id = self.match_id;
         let delta_compressor = self.delta_compressor.clone();
         let client_layers = self.client_layers.clone();
-        // Bug №699: the world description travels into the task by value —
-        // the task outlives this borrow.
+        // Bug №700: the auth key goes with the loop, and every datagram
+        // opens its block before any packet parsing. A datagram that does
+        // not open is indistinguishable from network noise: dropped with a
+        // count, no state touched.
+        let auth = self.wire_auth.clone();
+        // Per-peer replay windows, keyed the same way the handshake rate
+        // table is, bounded with the same TTL sweep shape.
+        let peer_replay: Arc<Mutex<HashMap<SocketAddr, (Instant, crate::auth::ReplayWindow)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let world_description = self.world_description.clone();
-        // Bug №216: the secret, the same way.
-        let auth_token = self.auth_token.clone();
+        // Bug №216: the challenge table and the spoof counter travel with the
+        // loop — the handshake happens inside the receive path itself.
+        let pending_challenges = self.pending_challenges.clone();
+        let session_rejects = self.session_rejects.clone();
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -539,8 +830,47 @@ impl NetServer {
             while *running.lock() {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, addr)) => {
-                        let data = &buf[..len];
+                        let datagram = &buf[..len];
                         bandwidth_tracker.record_received(len);
+
+                        // Bug №700: the block is stripped and verified before
+                        // anything else. WITHOUT a key the datagram must still
+                        // carry the 24-byte block — the framing of the wire
+                        // has one shape now, instead of "raw when unsigned".
+                        let key = auth.key();
+                        let (seq, data) = match crate::auth::unseal(
+                            key.as_deref(),
+                            crate::auth::Direction::ClientToServer,
+                            datagram,
+                        ) {
+                            Some((seq, packet)) => (seq, packet),
+                            None => {
+                                debug!(
+                                    "unauthenticated datagram ({} bytes) from {addr}",
+                                    datagram.len()
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Replay freshness only means anything when a key is
+                        // in play: an unsigned peer emits no sequence.
+                        if key.is_some() {
+                            let mut windows = peer_replay.lock();
+                            let entry = windows.entry(addr).or_insert_with(|| {
+                                (Instant::now(), crate::auth::ReplayWindow::default())
+                            });
+                            if !entry.1.accept(seq) {
+                                warn!(
+                                    "replayed datagram from {addr}: sequence {seq} is stale for its peer window"
+                                );
+                                continue;
+                            }
+                            entry.0 = Instant::now();
+                            if windows.len() > CONNECT_TABLE_CAP {
+                                windows.retain(|_, (last, _)| last.elapsed() < PEER_TABLE_TTL);
+                            }
+                        }
 
                         if let Err(e) = Self::handle_received_packet(
                             &socket,
@@ -558,10 +888,10 @@ impl NetServer {
                             match_id,
                             &delta_compressor,
                             &client_layers,
-                            // Bug №699: the world description.
+                            &auth,
                             &world_description,
-                            // Bug №216: the secret.
-                            &auth_token,
+                            &pending_challenges,
+                            &session_rejects,
                             addr,
                             data,
                         )
@@ -640,10 +970,15 @@ impl NetServer {
         match_id: Uuid,
         delta_compressor: &Arc<DeltaCompressor>,
         client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
-        // Bug №699: the world description, handed to every client on connect.
+        // Bug №700: unsealing happens in the receive loop; what reaches here
+        // is an already-verified payload. The auth handle serves the OUTGOING
+        // side (rejects) and the world reference serves the №698 connect path.
+        auth: &Arc<WireAuth>,
         world_description: &Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
-        // Bug №216: the secret a client has to present.
-        auth_token: &Arc<RwLock<Option<String>>>,
+        // Bug №216: the challenge table and the gate's counter, both part of
+        // the handshake the receive path now owns.
+        pending_challenges: &Arc<RwLock<HashMap<SocketAddr, PendingChallenge>>>,
+        session_rejects: &Arc<AtomicU64>,
         addr: SocketAddr,
         data: &[u8],
     ) -> anyhow::Result<()> {
@@ -678,19 +1013,77 @@ impl NetServer {
                 // Bug №27: only a Connect opens a connection. Any other packet
                 // from an unknown address is stray traffic (late duplicate,
                 // scanner, spoof) — it must not allocate state or spawn a player.
-                if PacketType::from_u8(header.packet_type) != Some(PacketType::Connect) {
+                // Bug №216: except the handshake's own proof-of-life — the
+                // Confirm answers a challenge we sent, and is the ONLY packet
+                // that may complete the registration of an unknown address.
+                if !matches!(
+                    PacketType::from_u8(header.packet_type),
+                    Some(PacketType::Connect) | Some(PacketType::ConnectConfirm)
+                ) {
                     return Ok(());
                 }
                 // ...and Connects themselves are rate-limited per address, so
                 // one sender cannot spray registrations at full line rate.
+                // The Confirm shares the bucket: its cost is comparable, and
+                // the honest path (Connect + Confirm + retries) stays far
+                // below the burst.
                 if !Self::check_connect_rate(connect_limits, addr) {
                     return Ok(());
+                }
+
+                // Bug №216: a Confirm without a pending challenge, with the
+                // wrong nonce, or long after the challenge left, is refused —
+                // the address proves nothing on its own.
+                if PacketType::from_u8(header.packet_type) == Some(PacketType::ConnectConfirm) {
+                    match deserialize_limited::<ConnectConfirmPacket>(payload) {
+                        Ok(confirm) => {
+                            let pending = pending_challenges.write().remove(&addr);
+                            match pending {
+                                Some(pending)
+                                    if pending.nonce == confirm.nonce
+                                        && pending.since.elapsed() <= CHALLENGE_TTL =>
+                                {
+                                    Self::admit_connection(
+                                        socket,
+                                        connections,
+                                        connection_by_addr,
+                                        next_id,
+                                        config,
+                                        bandwidth,
+                                        limit_enabled,
+                                        auth,
+                                        event_sender,
+                                        dropped_events,
+                                        current_tick,
+                                        server_time,
+                                        match_id,
+                                        world_description,
+                                        pending.connect,
+                                        addr,
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                                _ => {
+                                    // The confirm is forged, stale or ours got
+                                    // replaced by a newer claim. Nothing was
+                                    // ever registered, so leak nothing: drop
+                                    // without a reply.
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("malformed ConnectConfirm from {addr}: {e}");
+                            return Ok(());
+                        }
+                    }
                 }
 
                 // Bug №176: check the build before allocating a slot. A
                 // mismatched client must not consume a connection id, and must
                 // not get as far as ClientConnected.
-                match deserialize_limited::<ConnectPacket>(payload) {
+                let connect = match deserialize_limited::<ConnectPacket>(payload) {
                     Ok(connect) if connect.protocol_version != PROTOCOL_VERSION => {
                         warn!(
                             "rejecting Connect from {addr}: protocol {} != {PROTOCOL_VERSION}",
@@ -708,105 +1101,92 @@ impl NetServer {
                             0,
                         );
                         let packet_data = serialize_packet(&reject, header)?;
-                        socket.send_to(&packet_data, addr).await?;
-                        bandwidth.record_sent(packet_data.len());
+                        send_reject(socket, addr, &packet_data, auth, bandwidth).await?;
                         return Ok(());
                     }
-                    Ok(_) => {}
+                    Ok(connect) => connect,
                     Err(e) => {
                         // An undecodable Connect is malformed, not a version
                         // problem — drop it silently rather than allocating.
                         warn!("rejecting malformed Connect from {addr}: {e}");
                         return Ok(());
                     }
-                }
-
-                // Bug №27: the cap check and the registration run under one
-                // write lock, so a concurrent Connect cannot slip between the
-                // len check and the insert (TOCTOU in the old read-then-write).
-                let admitted: Option<(u32, Arc<Connection>)> = {
-                    let mut conns = connections.write();
-                    if conns.len() >= config.max_connections {
-                        None
-                    } else {
-                        let id = {
-                            let mut id_gen = next_id.lock();
-                            let id = *id_gen;
-                            *id_gen = id_gen.wrapping_add(1);
-                            if *id_gen == 0 {
-                                *id_gen = 1;
-                            }
-                            id
-                        };
-
-                        // Bug №176: hand each connection its own send budget
-                        // instead of sharing one server-wide bucket.
-                        let conn_config = ConnectionConfig {
-                            max_bandwidth_bps: config.max_bandwidth_bps,
-                            bandwidth_window: config.bandwidth_window,
-                            ..config.connection_config.clone()
-                        };
-                        let conn = Connection::new(id, addr, conn_config);
-                        conn.set_state(ConnectionState::Connected);
-                        let conn_arc = Arc::new(conn);
-                        conns.insert(id, conn_arc.clone());
-                        connection_by_addr.write().insert(addr, id);
-                        Some((id, conn_arc))
-                    }
                 };
 
-                let Some((id, conn_arc)) = admitted else {
-                    let reject = ConnectRejectPacket {
-                        reason: ConnectRejectReason::ServerFull,
+                // Bug №216: the address claim is NOT trusted yet. Registration
+                // does not happen here — the source field of a UDP datagram is
+                // raw and can be written by anyone, and a bare Connect would
+                // bind the victim's address to the attacker. Instead: mint a
+                // nonce, remember this Connect, and challenge the claimed
+                // socket. Only the real listener of that address ever sees the
+                // challenge, and only its Confirm carries the nonce.
+                // Bug №216: ...challenge... (the serialized challenge leaves
+                // the lock scope BEFORE the socket write: a parking_lot guard
+                // is not Send, and this whole arm must stay a Send future.)
+                let packet_data = {
+                    let mut pending = pending_challenges.write();
+                    if pending.len() >= PENDING_CHALLENGE_CAP {
+                        warn!(
+                            "challenge table full ({}), dropping Connect from {addr}",
+                            pending.len()
+                        );
+                        return Ok(());
+                    }
+                    let nonce = Uuid::new_v4().as_u128();
+                    let entry = PendingChallenge {
+                        nonce,
+                        connect: connect.clone(),
+                        since: Instant::now(),
                     };
+                    // A second Connect from the same address replaces the
+                    // pending claim: the latest Connect speaks for whoever now
+                    // claims it (the honest case is a client whose challenge
+                    // reply was lost and who retries).
+                    pending.insert(addr, entry);
+
+                    let challenge = ConnectChallengePacket { nonce };
                     let header = PacketHeader::new(
-                        PacketType::ConnectReject,
+                        PacketType::ConnectChallenge,
                         ChannelType::ReliableOrdered,
                         0,
                         0,
                         0,
                         0,
                     );
-                    let packet_data = serialize_packet(&reject, header)?;
-                    socket.send_to(&packet_data, addr).await?;
-                    bandwidth.record_sent(packet_data.len());
-                    return Ok(());
+                    serialize_packet(&challenge, header)?
                 };
-
-                let accept = {
-                    let tick = current_tick.lock().value();
-                    let time = *server_time.lock();
-                    conn_arc.send_connect_accept(tick, time, match_id)
-                };
-
-                emit_event(
-                    event_sender,
-                    dropped_events,
-                    ServerEvent::ClientConnected {
-                        connection_id: id,
-                        addr,
-                    },
-                );
-
-                if let Some(accept) = accept {
-                    Self::send_packet(socket, &conn_arc, &accept, bandwidth, limit_enabled)
-                        .await
-                        .map(|_| ())?;
-                }
-
-                id
+                send_reject(socket, addr, &packet_data, auth, bandwidth).await?;
+                return Ok(());
             }
         };
 
         let conn = connections.read().get(&connection_id).cloned();
 
         if let Some(conn) = conn {
+            // Bug №216: the session gate. Heartbeat, Input and Command ARE the
+            // packets a spoofed source would ride — they act as someone. The
+            // session echo was carried over the accept, which only the real
+            // listener of the claimed address ever received, so a mismatch
+            // proves the datagram did not come from that listener. Refused
+            // before any state (ack bookkeeping, liveness, ledgers) is touched.
+            if !Self::session_gate(&conn, header.packet_type, payload) {
+                let rejects = session_rejects.fetch_add(1, Ordering::Relaxed);
+                if rejects % SESSION_REJECT_LOG_EVERY == 0 {
+                    warn!(
+                        "session echo rejected for connection {connection_id} from {addr} \
+                         (rejection no. {})",
+                        rejects + 1
+                    );
+                }
+                return Ok(());
+            }
+
             // Bug №215: the outcome carries both the reply packets and the
             // reliable-arrival verdict the dispatch below needs.
             let outcome = conn.handle_packet(header, payload)?;
 
             for packet in outcome.outgoing {
-                Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled)
+                Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled, auth)
                     .await
                     .map(|_| ())?;
             }
@@ -864,8 +1244,7 @@ impl NetServer {
                                 0,
                             );
                             let packet_data = serialize_packet(&reject, header)?;
-                            socket.send_to(&packet_data, addr).await?;
-                            bandwidth.record_sent(packet_data.len());
+                            send_reject(socket, addr, &packet_data, auth, bandwidth).await?;
                             return Ok(());
                         }
                         _ => {}
@@ -876,88 +1255,44 @@ impl NetServer {
                         conn.send_connect_accept(tick, time, match_id)
                     };
                     if let Some(accept) = accept {
-                        Self::send_packet(socket, &conn, &accept, bandwidth, limit_enabled)
+                        Self::send_packet(socket, &conn, &accept, bandwidth, limit_enabled, auth)
                             .await
                             .map(|_| ())?;
                     }
-                    // Bug №216: when the match asks for a secret, the world is
-                    // held back until the client proves itself. The accept
-                    // still goes out — the client has to know the server is
-                    // there before it can answer.
-                    let secret = auth_token.read().clone();
-                    if secret.is_some() {
-                        conn.set_authenticated(false);
-                    } else {
-                        // Bug №699: the world, right after the accept and before
-                        // any snapshot. The client cannot draw a world it was
-                        // never told about, and a snapshot that arrives first
-                        // would put entities in a void the client has no
-                        // description of.
-                        let description = world_description.read().clone();
-                        if let Some(description) = description {
-                            let packets = conn.send_map_description(&description);
-                            for packet in packets {
-                                Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled)
-                                    .await
-                                    .map(|_| ())?;
-                            }
+                    // Bug №698: the world, right after the accept and before
+                    // any snapshot. The client cannot draw a world it was
+                    // never told about, and a snapshot that arrives first
+                    // would put entities in a void the client has no
+                    // description of.
+                    let description = world_description.read().clone();
+                    if let Some(description) = description {
+                        let packets = conn.send_map_description(&description);
+                        for packet in packets {
+                            Self::send_packet(
+                                socket,
+                                &conn,
+                                &packet,
+                                bandwidth,
+                                limit_enabled,
+                                auth,
+                            )
+                            .await
+                            .map(|_| ())?;
                         }
-                    }
-                }
-                Some(PacketType::Auth) => {
-                    // Bug №216: the client's proof. A wrong secret ends the
-                    // session by name; a right one opens the world.
-                    let secret = auth_token.read().clone();
-                    let Some(expected) = secret else {
-                        // The server asks for no secret: nothing to prove.
-                        return Ok(());
-                    };
-                    let offered = deserialize_limited::<AuthPacket>(payload)
-                        .map(|auth| auth.token)
-                        .unwrap_or_default();
-                    if offered == expected {
-                        conn.set_authenticated(true);
-                        // Bug №699: the world, now that the client may have it.
-                        let description = world_description.read().clone();
-                        if let Some(description) = description {
-                            let packets = conn.send_map_description(&description);
-                            for packet in packets {
-                                Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled)
-                                    .await
-                                    .map(|_| ())?;
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "rejecting {addr}: wrong secret ({} bytes offered)",
-                            offered.len()
-                        );
-                        let reason = DisconnectReason::Unauthorized;
-                        let header = PacketHeader::new(
-                            PacketType::Disconnect,
-                            ChannelType::ReliableOrdered,
-                            0,
-                            0,
-                            0,
-                            0,
-                        );
-                        let packet = DisconnectPacket { reason };
-                        if let Ok(bytes) = serialize_packet(&packet, header) {
-                            let _ = socket.send_to(&bytes, addr).await;
-                            bandwidth.record_sent(bytes.len());
-                        }
-                        Self::remove_connection(
-                            connection_by_addr,
-                            connections,
-                            delta_compressor,
-                            client_layers,
-                            connection_id,
-                            addr,
-                        );
                     }
                 }
                 Some(PacketType::Fragment) => {
                     if let Some((orig_type, bytes)) = conn.reassemble_fragment(payload) {
+                        // Bug №216: the top-level gate validated the FRAGMENT
+                        // datagram itself; identity packets come back here in
+                        // reassembled form, with the session echo inside the
+                        // reassembled bytes. Same gate, actual payload.
+                        if matches!(orig_type, PacketType::Input | PacketType::Command)
+                            && !Self::session_gate(&conn, orig_type as u8, &bytes)
+                        {
+                            session_rejects.fetch_add(1, Ordering::Relaxed);
+                            return Ok(());
+                        }
                         match orig_type {
                             PacketType::Input => {
                                 if let Ok(input) = deserialize_limited::<InputPacket>(&bytes) {
@@ -1026,14 +1361,158 @@ impl NetServer {
         Ok(())
     }
 
+    /// Bug №216: whether an inbound packet's session echo matches the
+    /// connection its source address is bound to. Types a spoofed source
+    /// could act through (Heartbeat, HeartbeatAck, Input, Command) must echo
+    /// the session the server minted and delivered over the accept; every
+    /// other type is ungated. A payload of a gated type that fails to
+    /// deserialize is refused too — an unverifiable claim of identity is not
+    /// an identity.
+    fn session_gate(conn: &Connection, packet_type: u8, payload: &[u8]) -> bool {
+        let expected = conn.session();
+        match PacketType::from_u8(packet_type) {
+            Some(PacketType::Heartbeat | PacketType::HeartbeatAck) => {
+                deserialize_limited::<HeartbeatPacket>(payload)
+                    .map_or(false, |p| p.session == expected)
+            }
+            Some(PacketType::Input) => deserialize_limited::<InputPacket>(payload)
+                .map_or(false, |p| p.session == expected),
+            Some(PacketType::Command) => deserialize_limited::<CommandPacket>(payload)
+                .map_or(false, |p| p.session == expected),
+            _ => true,
+        }
+    }
+
+    /// Bug №216: the admission proper, run only after ConnectConfirm proved
+    /// the claimed address actually listens. Extracted from the old
+    /// unknown-addr Connect path so the challenge handshake can call it; the
+    /// body is the registration, the ClientConnected event, the accept
+    /// (which carries the session the client will echo from now on) and the
+    /// static world description.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_connection(
+        socket: &Arc<UdpSocket>,
+        connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
+        connection_by_addr: &Arc<RwLock<HashMap<SocketAddr, u32>>>,
+        next_id: &Arc<Mutex<u32>>,
+        config: &ServerConfig,
+        bandwidth: &BandwidthTracker,
+        limit_enabled: bool,
+        auth: &Arc<WireAuth>,
+        event_sender: &mpsc::Sender<ServerEvent>,
+        dropped_events: &AtomicU64,
+        current_tick: &Arc<Mutex<Tick>>,
+        server_time: &Arc<Mutex<f64>>,
+        match_id: Uuid,
+        world_description: &Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
+        // The claimed identity, already version-checked at the challenge
+        // stage. Kept on the signature so the admit path stays reviewable
+        // as "this connect packet became this connection" — the fields the
+        // game layer consumes (player name) reach it through ClientConnected
+        // handlers, not through here.
+        _connect: ConnectPacket,
+        addr: SocketAddr,
+    ) -> anyhow::Result<()> {
+        // Bug №27: the cap check and the registration run under one
+        // write lock, so a concurrent Connect cannot slip between the
+        // len check and the insert (TOCTOU in the old read-then-write).
+        let admitted: Option<(u32, Arc<Connection>)> = {
+            let mut conns = connections.write();
+            if conns.len() >= config.max_connections {
+                None
+            } else {
+                let id = {
+                    let mut id_gen = next_id.lock();
+                    let id = *id_gen;
+                    *id_gen = id_gen.wrapping_add(1);
+                    if *id_gen == 0 {
+                        *id_gen = 1;
+                    }
+                    id
+                };
+
+                // Bug №176: hand each connection its own send budget
+                // instead of sharing one server-wide bucket.
+                let conn_config = ConnectionConfig {
+                    max_bandwidth_bps: config.max_bandwidth_bps,
+                    bandwidth_window: config.bandwidth_window,
+                    ..config.connection_config.clone()
+                };
+                let conn = Connection::new(id, addr, conn_config);
+                conn.set_state(ConnectionState::Connected);
+                let conn_arc = Arc::new(conn);
+                conns.insert(id, conn_arc.clone());
+                connection_by_addr.write().insert(addr, id);
+                Some((id, conn_arc))
+            }
+        };
+
+        let Some((id, conn_arc)) = admitted else {
+            let reject = ConnectRejectPacket {
+                reason: ConnectRejectReason::ServerFull,
+            };
+            let header = PacketHeader::new(
+                PacketType::ConnectReject,
+                ChannelType::ReliableOrdered,
+                0,
+                0,
+                0,
+                0,
+            );
+            let packet_data = serialize_packet(&reject, header)?;
+            send_reject(socket, addr, &packet_data, auth, bandwidth).await?;
+            return Ok(());
+        };
+
+        let accept = {
+            let tick = current_tick.lock().value();
+            let time = *server_time.lock();
+            conn_arc.send_connect_accept(tick, time, match_id)
+        };
+
+        emit_event(
+            event_sender,
+            dropped_events,
+            ServerEvent::ClientConnected {
+                connection_id: id,
+                addr,
+            },
+        );
+
+        if let Some(accept) = accept {
+            Self::send_packet(socket, &conn_arc, &accept, bandwidth, limit_enabled, auth)
+                .await
+                .map(|_| ())?;
+        }
+
+        // Bug №698: the world, right after the accept and before any
+        // snapshot — the №698 order, moved here from the packet-type arm,
+        // because a confirmed connect no longer travels as a Connect packet
+        // and would never pass that arm again.
+        let description = world_description.read().clone();
+        if let Some(description) = description {
+            let packets = conn_arc.send_map_description(&description);
+            for packet in packets {
+                Self::send_packet(socket, &conn_arc, &packet, bandwidth, limit_enabled, auth)
+                    .await
+                    .map(|_| ())?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn send_packet(
         socket: &Arc<UdpSocket>,
         conn: &Connection,
         packet: &OutgoingPacket,
         bandwidth: &BandwidthTracker,
         limit_enabled: bool,
+        auth: &Arc<WireAuth>,
     ) -> anyhow::Result<bool> {
-        let total_size = HEADER_SIZE + packet.payload.len();
+        // Bug №700: the wire now also carries the auth block on EVERY
+        // datagram, so the MTU guard and the limiter both count it.
+        let total_size = crate::auth::AUTH_WIRE_LEN + HEADER_SIZE + packet.payload.len();
         // Bug №30: the MTU comes from the connection's own config — the same
         // value the packet builders fragment against — not a stray constant.
         let max = conn.config.max_packet_size;
@@ -1072,9 +1551,30 @@ impl NetServer {
             }
         }
 
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.extend_from_slice(&bincode::serialize(&packet.header)?);
-        buffer.extend_from_slice(&packet.payload);
+        let mut buffer = Vec::with_capacity(total_size);
+        // Bug №700: the packet bytes are built first, then the auth block
+        // rides in front — this is the one production seal for connected
+        // sends. A reconnect makes a fresh connection with a fresh counter,
+        // and the CLIENT's window remembers the old numbers, so a stale
+        // datagram cannot pass for new at the far end.
+        let mut packet_bytes = bincode::serialize(&packet.header)?;
+        packet_bytes.extend_from_slice(&packet.payload);
+        let seq = {
+            let mut seq = conn.wire_seq.lock();
+            *seq = seq.wrapping_add(1);
+            if *seq == 0 {
+                *seq = 1;
+            }
+            *seq
+        };
+        let key = auth.key();
+        crate::auth::seal(
+            key.as_deref(),
+            crate::auth::Direction::ServerToClient,
+            seq,
+            &packet_bytes,
+            &mut buffer,
+        );
 
         socket.send_to(&buffer, conn.addr).await?;
         bandwidth.record_sent(total_size);
@@ -1096,8 +1596,17 @@ impl NetServer {
         let interest_manager = self.interest_manager.clone();
         let bandwidth_tracker = self.bandwidth_tracker.clone();
         let limit_enabled = self.config.enable_bandwidth_limit;
+        let auth = self.wire_auth.clone();
         let event_sender = self.event_sender.clone();
         let running = self.running.clone();
+        // Bug №710: the join admission queue travels with the send loop; the
+        // queue is shared with nothing else, so round N+1 continues round N's
+        // line instead of restarting it.
+        let first_full_queue = self.first_full_queue.clone();
+        let first_fulls_built = self.first_fulls_built.clone();
+        // Bug №216: challenge cells expire through the same sweep pass the
+        // timeouts run.
+        let pending_challenges = self.pending_challenges.clone();
         // Bug №613: as in the receive loop, the drop counter goes with the
         // sender into the task.
         let dropped_events = self.dropped_events.clone();
@@ -1167,6 +1676,7 @@ impl NetServer {
                         &client_layers,
                         &event_sender,
                         &dropped_events,
+                        &pending_challenges,
                     );
                 }
 
@@ -1191,6 +1701,9 @@ impl NetServer {
                         tick,
                         &snapshot_packets,
                         &sent_deltas_by_layer,
+                        &auth,
+                        &first_full_queue,
+                        &first_fulls_built,
                     )
                     .await;
                 }
@@ -1202,14 +1715,26 @@ impl NetServer {
                 // connected client look dead and reaped it. The two must be
                 // independent: the world can stand still while the server
                 // still has to prove it is there.
-                Self::send_heartbeats(&socket, &connections, &bandwidth_tracker, limit_enabled)
-                    .await;
+                Self::send_heartbeats(
+                    &socket,
+                    &connections,
+                    &bandwidth_tracker,
+                    limit_enabled,
+                    &auth,
+                )
+                .await;
 
                 // Bug №215: retransmit pass immediately after the heartbeat
                 // pass. Wall-clock work next to wall-clock work; neither is
                 // part of the unchanged-tick skip above.
-                Self::send_retransmits(&socket, &connections, &bandwidth_tracker, limit_enabled)
-                    .await;
+                Self::send_retransmits(
+                    &socket,
+                    &connections,
+                    &bandwidth_tracker,
+                    limit_enabled,
+                    &auth,
+                )
+                .await;
             }
         });
 
@@ -1228,7 +1753,20 @@ impl NetServer {
         // Bug №613: the bounded event queue drops what it cannot hold, and
         // this is where that drop is counted.
         dropped_events: &AtomicU64,
+        // Bug №216: the challenge pass rides the same once-a-second sweep.
+        pending_challenges: &Arc<RwLock<HashMap<SocketAddr, PendingChallenge>>>,
     ) {
+        // Bug №216: challenges whose address never came back — expired, or
+        // never honest — go with the once-a-second pass. The table only
+        // grows through Connect-spam otherwise, so the sweep is what makes
+        // the challenge memory bounded in reality, not just by its CAP.
+        pending_challenges.write().retain(|addr, pending| {
+            let keep = pending.since.elapsed() <= CHALLENGE_TTL;
+            if !keep {
+                debug!("challenge for {addr} expired unanswered");
+            }
+            keep
+        });
         let timed_out: Vec<(u32, SocketAddr)> = {
             let conns = connections.read();
             conns
@@ -1412,6 +1950,14 @@ impl NetServer {
         // Bug №274: passed so the send path can record what it actually put on
         // the wire, per layer.
         sent_deltas_by_layer: &Arc<[AtomicU64; LAYER_COUNT]>,
+        // Bug №700: the last hop of the seal, from the send loop.
+        auth: &Arc<WireAuth>,
+        // Bug №710: the join admission queue and its counter. Discovery and
+        // first-full building are split; the queue is the contract between
+        // the per-client pass (discovery only) and `admit_first_fulls`
+        // (at most `FIRST_FULL_BUDGET_PER_ROUND` builds per round).
+        first_full_queue: &Arc<Mutex<FirstFullQueue>>,
+        first_fulls_built: &Arc<AtomicU64>,
     ) {
         let snapshot = snapshot_buffer.get_latest().unwrap_or_else(|| Snapshot {
             tick: current_tick,
@@ -1455,7 +2001,20 @@ impl NetServer {
             conns.iter().map(|(id, conn)| (*id, conn.clone())).collect()
         };
 
-        let pending_batches: Vec<Vec<(Arc<Connection>, OutgoingPacket)>> = clients
+        // Bug №710: admission BEFORE the per-client pass. Every client the
+        // queue pop marks ready gets its first full now; the storms' rest
+        // stay queued for later rounds. The packets ride in the same flush
+        // as everything else the round produced.
+        let admitted_batch = admit_first_fulls(
+            connections,
+            client_layers,
+            interest_manager,
+            &snapshot,
+            first_full_queue,
+            first_fulls_built,
+        );
+
+        let parallel_batches: Vec<Vec<(Arc<Connection>, OutgoingPacket)>> = clients
             .par_iter()
             .map(|(client_id, conn)| {
                 let mut out: Vec<(Arc<Connection>, OutgoingPacket)> = Vec::new();
@@ -1468,31 +2027,25 @@ impl NetServer {
                 // registered the new player. `should_replicate_entity` answers
                 // `false` for an unknown viewer, so the client was locked into an
                 // empty base and saw nothing until the first resync (up to 5 s).
-                // Hold the first full back until the player is tracked, and
-                // refresh the interest sets so the very first full is complete.
+                // Hold the first full back until the player is tracked. Since
+                // №710 the ready client is not BUILT here either: the expensive
+                // first full (compute_interest + filtered world pass + full
+                // serialize + layer split) is the admission stage's job, at most
+                // FIRST_FULL_BUDGET_PER_ROUND builds per round — a storm of 200
+                // joins cannot turn one publish round into 200 of those. This
+                // path DISCOVERS only: queue the ready client and send it
+                // nothing this round; the next rounds find it in `client_layers`
+                // once the admission stage has run.
                 let initialized = client_layers.read().contains_key(client_id);
                 if !initialized {
-                    if !interest_manager.has_player(*client_id) {
-                        return out;
+                    if interest_manager.has_player(*client_id) {
+                        first_full_queue.lock().push(*client_id);
                     }
-                    // This is a one-shot per client (the next round finds it in
-                    // `client_layers`). Keep the cloning wrapper: one client, once.
-                    interest_manager.compute_interest(*client_id);
+                    return out;
                 }
 
                 let filtered = Self::filter_snapshot(&snapshot, interest_manager, *client_id);
                 let tick = filtered.tick.value();
-
-                if !initialized {
-                    let mut layers = client_layers.write();
-                    layers.entry(*client_id).or_insert_with(|| {
-                        // First contact: full state now, layer bases start from it.
-                        for packet in conn.send_state(filtered.to_state_packet()) {
-                            out.push((conn.clone(), packet));
-                        }
-                        Self::split_layers(&filtered, tick)
-                    });
-                }
 
                 for layer in 0..LAYER_COUNT {
                     let layer_u8 = layer as u8;
@@ -1682,6 +2235,8 @@ impl NetServer {
                 out
             })
             .collect();
+        let mut pending_batches = vec![admitted_batch];
+        pending_batches.extend(parallel_batches);
 
         // Bug №266: packets actually put on the wire for this round. Counted
         // before the sends so a round that emits nothing is still visible — an
@@ -1693,7 +2248,8 @@ impl NetServer {
         );
         for batch in pending_batches {
             for (conn, packet) in batch {
-                let _ = Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled).await;
+                let _ =
+                    Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled, auth).await;
             }
         }
     }
@@ -1743,6 +2299,7 @@ impl NetServer {
         connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
         bandwidth: &BandwidthTracker,
         limit_enabled: bool,
+        auth: &Arc<WireAuth>,
     ) {
         let mut pending_heartbeats: Vec<(Arc<Connection>, OutgoingPacket)> = Vec::new();
 
@@ -1763,7 +2320,7 @@ impl NetServer {
         }
 
         for (conn, packet) in pending_heartbeats {
-            let _ = Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled).await;
+            let _ = Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled, auth).await;
         }
     }
 
@@ -1778,6 +2335,7 @@ impl NetServer {
         connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
         bandwidth: &BandwidthTracker,
         limit_enabled: bool,
+        auth: &Arc<WireAuth>,
     ) {
         let mut pending: Vec<(Arc<Connection>, Vec<OutgoingPacket>)> = Vec::new();
 
@@ -1797,7 +2355,8 @@ impl NetServer {
 
         for (conn, packets) in pending {
             for packet in &packets {
-                let _ = Self::send_packet(socket, &conn, packet, bandwidth, limit_enabled).await;
+                let _ =
+                    Self::send_packet(socket, &conn, packet, bandwidth, limit_enabled, auth).await;
             }
         }
     }
@@ -1860,6 +2419,10 @@ impl NetServer {
                 }
             }
             GameEvent::ShipSunk { ship, .. } => subjects.push(*ship),
+            // Bug №701: the hull's loss is world-visible to exactly the same
+            // viewers as the eventual removal is; the crew's own deaths ride
+            // `PlayerDied` and need no ship subject of their own.
+            GameEvent::ShipSinkingStarted { ship } => subjects.push(*ship),
             GameEvent::ShipRam { rammer, target, .. } => {
                 subjects.push(*rammer);
                 subjects.push(*target);
@@ -2393,6 +2956,256 @@ mod bounded_queue_tests {
 /// and is deliberately callable without a socket; the loop that applies it is
 /// three lines of plumbing around it.
 #[cfg(test)]
+mod first_full_queue_tests {
+    use super::*;
+
+    // Bug №710: the queue's own contract — dedupe, cap, FIFO admission with
+    // a budget, and the pruning of dead ids — tested on the bare type. The
+    // admission stage that consumes it is tested in
+    // `first_full_admission_tests`.
+
+    #[test]
+    fn discovery_of_one_client_queues_it_exactly_once() {
+        let mut q = FirstFullQueue::default();
+        assert!(q.push(7));
+        // The same client is discovered again next round while still waiting:
+        // a second copy would double its place in the line.
+        assert!(!q.push(7));
+        assert_eq!(q.waiting_len(), 1);
+        assert_eq!(q.admit(1, |_| true), vec![7]);
+        assert_eq!(q.waiting_len(), 0);
+    }
+
+    #[test]
+    fn the_queue_is_finite_even_under_a_never_ending_storm() {
+        let mut q = FirstFullQueue::default();
+        for id in 0..FirstFullQueue::CAP as u32 {
+            assert!(q.push(id));
+        }
+        // The 257th simultaneously waiting client is refused instead of
+        // growing the line: it will be re-discovered the next round, when
+        // earlier clients have been admitted and the queue has room again.
+        assert!(!q.push(FirstFullQueue::CAP as u32));
+        assert_eq!(q.waiting_len(), FirstFullQueue::CAP);
+    }
+
+    #[test]
+    fn admission_respects_the_budget_and_keeps_the_line() {
+        let mut q = FirstFullQueue::default();
+        for id in 1..=6u32 {
+            q.push(id);
+        }
+        assert_eq!(q.admit(4, |_| true), vec![1, 2, 3, 4]);
+        assert_eq!(q.waiting_len(), 2);
+        // FIFO order is preserved for the rest of the line.
+        assert_eq!(q.admit(4, |_| true), vec![5, 6]);
+        assert_eq!(q.waiting_len(), 0);
+    }
+
+    #[test]
+    fn a_dead_queued_client_is_pruned_without_costing_a_slot() {
+        let mut q = FirstFullQueue::default();
+        for id in 1..=4u32 {
+            q.push(id);
+        }
+        // Client 1 disconnected while queued. It must neither be admitted
+        // (an unready base is the №164 shape) nor consume a budget slot —
+        // the budget belongs to the clients who can actually start.
+        let alive = |id: u32| id != 1;
+        assert_eq!(q.admit(2, alive), vec![2, 3]);
+        assert_eq!(q.waiting_len(), 1);
+        assert_eq!(q.admit(2, alive), vec![4]);
+        assert_eq!(q.waiting_len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod first_full_admission_tests {
+    use super::*;
+    use rfs_core::entity::PlayerPosture;
+    use rfs_core::math::{Transform, Vec3f};
+
+    fn storm_ship(id: u64) -> ShipEntity {
+        ShipEntity {
+            entity_id: EntityId::new(id),
+            ship_class_id: 0,
+            transform: Transform::from_position(Vec3f::new(0.0, 0.0, 0.0)),
+            velocity: Vec3f::ZERO,
+            angular_velocity: Vec3f::ZERO,
+            health: 100.0,
+            max_health: 100.0,
+            flags: EntityFlags::empty(),
+            fuel: 50.0,
+            max_fuel: 50.0,
+            speed: 0.0,
+            max_speed: 10.0,
+            heading: 0.0,
+            rudder_angle: 0.0,
+            throttle: 0.0,
+            last_hit: None,
+            compartments: Vec::new(),
+            stations: Vec::new(),
+            team: 0,
+        }
+    }
+
+    fn storm_player(entity_id: u64, player_id: u32, ship_id: u64) -> PlayerEntity {
+        PlayerEntity {
+            entity_id: EntityId::new(entity_id),
+            player_id,
+            name: format!("storm-{player_id}"),
+            team: 0,
+            transform: Transform::from_position(Vec3f::new(0.0, 0.0, 0.0)),
+            velocity: Vec3f::ZERO,
+            posture: PlayerPosture::Standing,
+            health: 100.0,
+            max_health: 100.0,
+            stamina: 100.0,
+            max_stamina: 100.0,
+            current_station: None,
+            current_ship: Some(EntityId::new(ship_id)),
+            input_sequence: 0,
+            last_acknowledged_tick: 0,
+        }
+    }
+
+    /// An empty world: nothing is in it, yet the first full still has to be
+    /// BUILT for the client to start receiving deltas against a real base.
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            tick: Tick(1),
+            time: 0.0,
+            entities: Vec::new(),
+            projectiles: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn connect(id: u32) -> Connection {
+        let addr: SocketAddr = format!("127.0.0.1:{}", 41000 + id)
+            .parse()
+            .expect("test port");
+        let conn = Connection::new(id, addr, ConnectionConfig::default());
+        conn.set_state(ConnectionState::Connected);
+        conn
+    }
+
+    struct StormFixture {
+        connections: Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
+        interest_manager: Arc<InterestManager>,
+        client_layers: Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+        first_full_queue: Arc<Mutex<FirstFullQueue>>,
+        first_fulls_built: Arc<AtomicU64>,
+    }
+
+    fn storm_fixture(storm: usize) -> StormFixture {
+        let interest_manager = Arc::new(InterestManager::new(InterestConfig::default()));
+        let connections: Arc<RwLock<HashMap<u32, Arc<Connection>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let client_layers: Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let first_full_queue = Arc::new(Mutex::new(FirstFullQueue::default()));
+        let first_fulls_built = Arc::new(AtomicU64::new(0));
+
+        for i in 1..=storm as u32 {
+            let ship_id = 1_000u64 + i as u64;
+            interest_manager.add_ship(storm_ship(ship_id));
+            interest_manager.add_player(storm_player(ship_id, i, ship_id), EntityId::new(ship_id));
+            connections.write().insert(i, Arc::new(connect(i)));
+            // The per-client pass's discovery step, verbatim: a client
+            // becomes ready when its player is registered.
+            first_full_queue.lock().push(i);
+        }
+
+        StormFixture {
+            connections,
+            interest_manager,
+            client_layers,
+            first_full_queue,
+            first_fulls_built,
+        }
+    }
+
+    /// Bug №710: the admission stage under a join storm. Six clients became
+    /// ready in the same round; the stage admits the first
+    /// `FIRST_FULL_BUDGET_PER_ROUND`, the rest keep their place, and a second
+    /// pass drains the line — the burst is absorbed by the queue, not by the
+    /// publishing round.
+    #[test]
+    fn a_storm_of_joins_admits_only_the_budget_per_round() {
+        const STORM: usize = 6;
+        let fx = storm_fixture(STORM);
+        let snapshot = snapshot();
+
+        let first_batch = admit_first_fulls(
+            &fx.connections,
+            &fx.client_layers,
+            &fx.interest_manager,
+            &snapshot,
+            &fx.first_full_queue,
+            &fx.first_fulls_built,
+        );
+        // Budget: exactly the budget built this round, layers registered for
+        // exactly those clients, the rest still queued — and the packets are
+        // not empty, the first full is real content for the client to
+        // receive.
+        assert_eq!(fx.client_layers.read().len(), FIRST_FULL_BUDGET_PER_ROUND);
+        assert_eq!(
+            fx.first_fulls_built.load(Ordering::Relaxed),
+            FIRST_FULL_BUDGET_PER_ROUND as u64
+        );
+        assert_eq!(
+            fx.first_full_queue.lock().waiting_len(),
+            STORM - FIRST_FULL_BUDGET_PER_ROUND
+        );
+        assert!(!first_batch.is_empty(), "an admitted first full is packets");
+
+        // A later round admits the rest of the line in order.
+        admit_first_fulls(
+            &fx.connections,
+            &fx.client_layers,
+            &fx.interest_manager,
+            &snapshot,
+            &fx.first_full_queue,
+            &fx.first_fulls_built,
+        );
+        assert_eq!(fx.client_layers.read().len(), STORM);
+        assert_eq!(fx.first_fulls_built.load(Ordering::Relaxed), STORM as u64);
+        assert_eq!(fx.first_full_queue.lock().waiting_len(), 0);
+    }
+
+    /// A client that lost its player between discovery and admission (quit,
+    /// despawn, rejoin) is dropped from the line instead of being admitted —
+    /// the same shape bug №164 locked out of the hot path, recreated here
+    /// faithfully if the ready re-check is dropped.
+    #[test]
+    fn a_client_who_lost_its_player_is_dropped_not_admitted() {
+        const STORM: usize = 1;
+        let fx = storm_fixture(STORM);
+        let snapshot = snapshot();
+
+        // The game layer despawns the player while their connection still
+        // sits in the queue.
+        fx.interest_manager.remove_player(1, EntityId::new(1_001));
+
+        let batch = admit_first_fulls(
+            &fx.connections,
+            &fx.client_layers,
+            &fx.interest_manager,
+            &snapshot,
+            &fx.first_full_queue,
+            &fx.first_fulls_built,
+        );
+        // Nothing admitted, nothing built, no layer base behind an empty
+        // replica — and the line is empty again instead of holding a ghost.
+        assert!(batch.is_empty());
+        assert!(fx.client_layers.read().get(&1).is_none());
+        assert_eq!(fx.first_fulls_built.load(Ordering::Relaxed), 0);
+        assert_eq!(fx.first_full_queue.lock().waiting_len(), 0);
+    }
+}
+
+#[cfg(test)]
 mod event_interest_tests {
     use super::*;
     use rfs_core::entity::PlayerPosture;
@@ -2500,6 +3313,10 @@ mod event_interest_tests {
                 hit_compartment: None,
             },
             ship_sunk(1),
+            // Bug №701: the manifest pin must not rot when a variant smells
+            // future — a subjectless variant would mirror the no-leak test
+            // here.
+            GameEvent::ShipSinkingStarted { ship: id },
             GameEvent::CompartmentFlooded {
                 compartment: id,
                 water_level: 1.0,

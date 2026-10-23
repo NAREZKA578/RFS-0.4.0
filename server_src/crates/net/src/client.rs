@@ -1,14 +1,13 @@
 use crate::bandwidth::{Admission, BandwidthLimiter, BandwidthStats, BandwidthTracker};
 use crate::connection::{
     channel_from_u8, is_reliable_channel, smooth_rtt, Connection, ConnectionConfig,
-    ConnectionError, ConnectionState, OutgoingPacket, ReliableArrival,
+    ConnectionError, ConnectionState, OutgoingPacket, ReliableArrival, SESSION_UNSET,
 };
 use crate::snapshot::{
     entity_layer, EntitySnapshot, ProjectileSnapshot, Snapshot, SnapshotBuffer,
     SnapshotInterpolator, LAYER_COUNT, LAYER_PROJECTILE, MAX_ENTITIES_PER_SNAPSHOT,
     MAX_PROJECTILES_PER_SNAPSHOT,
 };
-use bytes::BytesMut;
 use parking_lot::{Mutex, RwLock};
 use rfs_core::packet::*;
 use rfs_core::time::{Tick, TICK_DURATION, TICK_RATE};
@@ -343,16 +342,25 @@ pub struct NetClient {
     stale_full_state_drops: Arc<AtomicU64>,
     /// Bug №267 (A): armed resync requests waiting for the receive loop.
     resync_requests: ResyncRequestChannel,
-    /// Bug №267 (A): requests actually sent, so the harness can compare the
+    /// Bug №698: requests actually sent, so the harness can compare the
     /// asks with the server's resync behaviour.
     resync_requests_sent: Arc<AtomicU64>,
-    /// Bug №699: the world's static description, as the server told it.
+    /// Bug №698: the world's static description, as the server told it.
     ///
     /// The layers carry ships, players, stations, compartments and
     /// projectiles — and no structure, so without this the client could not
     /// draw the world and could not explain a shell vanishing at a rock it
     /// had never heard of.
     map_description: Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
+    /// Bug №700: the shared secret with the server; `None` is the unsigned
+    /// dialect. Taken from `ClientConfig::auth_token` once, at construction.
+    auth_key: Option<Vec<u8>>,
+    /// Bug №700: outbound auth sequence for C2S datagrams. Starts at 1 — a
+    /// zero sequence is the unsigned dialect — and skips 0 on wrap.
+    wire_seq: Arc<Mutex<u64>>,
+    /// Bug №700: replay window against the server, checked before any packet
+    /// parsing. A datagram with a sequence this window already saw is dropped.
+    server_replay: Arc<Mutex<crate::auth::ReplayWindow>>,
 }
 
 /// One queued client datagram awaiting the writer task.
@@ -432,8 +440,9 @@ pub struct ClientConfig {
     pub enable_bandwidth_limit: bool,
     pub player_name: String,
     pub build_version: String,
-    /// Bug №216: the secret this client proves with. `None` means "this client
-    /// has no secret" — a server that asks for one will refuse the connection.
+    /// Bug №700: the shared secret with the server. `None` or blank is the
+    /// unsigned dialect — the server answers in kind, so a client with a
+    /// token must not talk to a server without one and vice versa.
     pub auth_token: Option<String>,
 }
 
@@ -449,8 +458,6 @@ impl Default for ClientConfig {
             enable_bandwidth_limit: false,
             player_name: "Player".to_string(),
             build_version: "0.1.0".to_string(),
-            // Bug №216: no secret by default — a server without one accepts
-            // everyone, and a server WITH one refuses a client that has none.
             auth_token: None,
         }
     }
@@ -578,6 +585,16 @@ impl NetClient {
             resync_requests: ResyncRequestChannel::new(),
             resync_requests_sent: Arc::new(AtomicU64::new(0)),
             map_description: Arc::new(RwLock::new(None)),
+            // Bug №700: one key for the client's whole life; blank means the
+            // unsigned dialect, same rule the server applies to its token.
+            auth_key: config
+                .auth_token
+                .as_ref()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .map(String::into_bytes),
+            wire_seq: Arc::new(Mutex::new(0)),
+            server_replay: Arc::new(Mutex::new(crate::auth::ReplayWindow::default())),
         };
 
         Ok(client)
@@ -631,13 +648,31 @@ impl NetClient {
                     header.payload_size = len;
                     match bincode::serialize(&header) {
                         Ok(head) => {
-                            let total = HEADER_SIZE + payload.len();
+                            // Bug №700: the farewell carries the same auth
+                            // block as every datagram, so the server unwraps
+                            // it the same way it unwraps the rest.
+                            let total = crate::auth::AUTH_WIRE_LEN + HEADER_SIZE + payload.len();
                             if total > MAX_PACKET_SIZE {
                                 warn!("disconnect: {total} exceeds the MTU, not sending");
                             } else {
-                                let mut buffer = BytesMut::with_capacity(total);
-                                buffer.extend_from_slice(&head);
-                                buffer.extend_from_slice(&payload);
+                                let mut packet_bytes = head.to_vec();
+                                packet_bytes.extend_from_slice(&payload);
+                                let seq = {
+                                    let mut seq = self.wire_seq.lock();
+                                    *seq = seq.wrapping_add(1);
+                                    if *seq == 0 {
+                                        *seq = 1;
+                                    }
+                                    *seq
+                                };
+                                let mut buffer = Vec::with_capacity(total);
+                                crate::auth::seal(
+                                    self.auth_key.as_deref(),
+                                    crate::auth::Direction::ClientToServer,
+                                    seq,
+                                    &packet_bytes,
+                                    &mut buffer,
+                                );
                                 match self.socket.try_send(&buffer) {
                                     Ok(n) => {
                                         self.bandwidth_tracker.record_sent(n);
@@ -684,12 +719,24 @@ impl NetClient {
         let bandwidth = self.bandwidth_tracker.clone();
         let limiter = self.bandwidth_limiter.clone();
         let limit_enabled = self.config.enable_bandwidth_limit;
+        // Bug №700: the seal travels with the writer, together with the
+        // sequence counter it drives.
+        let auth_key = self.auth_key.clone();
+        let wire_seq = self.wire_seq.clone();
 
         let handle = tokio::spawn(async move {
             while let Some(OutboxItem { header, payload }) = rx.recv().await {
                 let out = OutgoingPacket { header, payload };
-                if let Err(e) =
-                    Self::send_raw(&socket, &bandwidth, &limiter, limit_enabled, &out).await
+                if let Err(e) = Self::send_raw(
+                    &socket,
+                    &bandwidth,
+                    &limiter,
+                    limit_enabled,
+                    &out,
+                    &auth_key,
+                    &wire_seq,
+                )
+                .await
                 {
                     warn!("client outbox send failed: {e}");
                 }
@@ -755,6 +802,9 @@ impl NetClient {
         let attempt = self.connect_attempt.clone();
         let running = self.running.clone();
         let event_sender = self.event_sender.clone();
+        // Bug №700: the Connect itself travels signed.
+        let auth_key = self.auth_key.clone();
+        let wire_seq = self.wire_seq.clone();
         tokio::spawn(async move {
             let mut first = true;
             loop {
@@ -784,6 +834,8 @@ impl NetClient {
                     limit_enabled,
                     &header,
                     &packet,
+                    &auth_key,
+                    &wire_seq,
                 )
                 .await;
             }
@@ -805,6 +857,10 @@ impl NetClient {
         limit_enabled: bool,
         header: &PacketHeader,
         packet: &impl Serializable,
+        // Bug №700: the key this datagram is keyed with (None = unsigned
+        // dialect) and the counter whose next number this send consumes.
+        auth_key: &Option<Vec<u8>>,
+        wire_seq: &Arc<Mutex<u64>>,
     ) -> anyhow::Result<()> {
         // Bug №81: a serialization failure must surface — not silently turn
         // into an empty payload the peer drops as invalid.
@@ -813,7 +869,9 @@ impl NetClient {
         // lying about the size on the wire.
         let payload_len = u16::try_from(payload.len())
             .map_err(|_| anyhow::anyhow!("payload {} bytes exceeds u16 header", payload.len()))?;
-        let total_size = HEADER_SIZE + payload.len();
+        // Bug №700: the auth block rides on every datagram, so the MTU guard
+        // and the limiter both count it.
+        let total_size = crate::auth::AUTH_WIRE_LEN + HEADER_SIZE + payload.len();
         // Bug №30/#81: the peer deserializes strictly and discards oversized
         // datagrams — honour the MTU here so nothing bogus goes out.
         if total_size > MAX_PACKET_SIZE {
@@ -849,9 +907,24 @@ impl NetClient {
             }
         }
 
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.extend_from_slice(&bincode::serialize(&header)?);
-        buffer.extend_from_slice(&payload);
+        let mut packet_bytes = bincode::serialize(&header)?;
+        packet_bytes.extend_from_slice(&payload);
+        let seq = {
+            let mut seq = wire_seq.lock();
+            *seq = seq.wrapping_add(1);
+            if *seq == 0 {
+                *seq = 1;
+            }
+            *seq
+        };
+        let mut buffer = Vec::with_capacity(total_size);
+        crate::auth::seal(
+            auth_key.as_deref(),
+            crate::auth::Direction::ClientToServer,
+            seq,
+            &packet_bytes,
+            &mut buffer,
+        );
 
         socket.send(&buffer).await?;
         bandwidth.record_sent(total_size);
@@ -866,8 +939,13 @@ impl NetClient {
         limiter: &BandwidthLimiter,
         limit_enabled: bool,
         out: &OutgoingPacket,
+        // Bug №700: the seal key and the sequence counter, same as
+        // `send_packet_static`.
+        auth_key: &Option<Vec<u8>>,
+        wire_seq: &Arc<Mutex<u64>>,
     ) -> anyhow::Result<()> {
-        let total_size = out.total_size();
+        // Bug №700: the block rides on every datagram and both guards count it.
+        let total_size = crate::auth::AUTH_WIRE_LEN + out.total_size();
         if total_size > MAX_PACKET_SIZE {
             return Err(anyhow::anyhow!(
                 "packet too large: {total_size} > {MAX_PACKET_SIZE}"
@@ -900,9 +978,24 @@ impl NetClient {
             }
         }
 
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.extend_from_slice(&bincode::serialize(&out.header)?);
-        buffer.extend_from_slice(&out.payload);
+        let mut packet_bytes = bincode::serialize(&out.header)?;
+        packet_bytes.extend_from_slice(&out.payload);
+        let seq = {
+            let mut seq = wire_seq.lock();
+            *seq = seq.wrapping_add(1);
+            if *seq == 0 {
+                *seq = 1;
+            }
+            *seq
+        };
+        let mut buffer = Vec::with_capacity(total_size);
+        crate::auth::seal(
+            auth_key.as_deref(),
+            crate::auth::Direction::ClientToServer,
+            seq,
+            &packet_bytes,
+            &mut buffer,
+        );
 
         socket.send(&buffer).await?;
         bandwidth.record_sent(total_size);
@@ -952,9 +1045,16 @@ impl NetClient {
         // loop takes them out to the wire.
         let resync_requests = self.resync_requests.clone();
         let resync_requests_sent = self.resync_requests_sent.clone();
-        // Bug №699: the world description, stored as it arrives.
+        // Bug №698: the world description, stored as it arrives.
         let map_description = self.map_description.clone();
         let connect_attempt = self.connect_attempt.clone();
+        // Bug №700: the key and the replay window go with the loop; every
+        // datagram opens its block before any packet parsing.
+        let auth_key = self.auth_key.clone();
+        let server_replay = self.server_replay.clone();
+        // The HeartbeatAck answer and the resync request go back out through
+        // the same helpers, so the counter travels here too.
+        let wire_seq = self.wire_seq.clone();
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -962,8 +1062,34 @@ impl NetClient {
             while *running.lock() {
                 match socket.recv(&mut buf).await {
                     Ok(len) => {
-                        let data = &buf[..len];
+                        let datagram = &buf[..len];
                         bandwidth_tracker.record_received(len);
+
+                        // Bug №700: the framing of the wire is one block in
+                        // front of the packet, in every dialect. The server's
+                        // sequence freshness is refused here, the same way
+                        // the server refuses ours.
+                        let (seq, data) = match crate::auth::unseal(
+                            auth_key.as_deref(),
+                            crate::auth::Direction::ServerToClient,
+                            datagram,
+                        ) {
+                            Some((seq, packet)) => (seq, packet),
+                            None => {
+                                debug!(
+                                    "unauthenticated server datagram ({} bytes)",
+                                    datagram.len()
+                                );
+                                continue;
+                            }
+                        };
+                        if auth_key.is_some() {
+                            let mut window = server_replay.lock();
+                            if !window.accept(seq) {
+                                debug!("stale server datagram (sequence {seq} already seen)");
+                                continue;
+                            }
+                        }
 
                         if let Err(e) = Self::handle_received_packet(
                             &socket,
@@ -998,13 +1124,16 @@ impl NetClient {
                             // Bug №267 (A): the arm/drain funnel.
                             &resync_requests,
                             &resync_requests_sent,
-                            // Bug №699: the world description lands here.
+                            // Bug №698: the world description lands here.
                             &map_description,
                             &running,
                             &bandwidth_tracker,
                             &limiter,
                             limit_enabled,
                             &connect_attempt,
+                            // Bug №700: the auth state for the answers.
+                            &auth_key,
+                            &wire_seq,
                             data,
                         )
                         .await
@@ -1080,7 +1209,7 @@ impl NetClient {
         // receive loop drains and wires it out.
         resync_requests: &ResyncRequestChannel,
         resync_requests_sent: &Arc<AtomicU64>,
-        // Bug №699: where the world's static description is stored.
+        // Bug №698: where the world's static description is stored.
         map_description: &Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
         running: &Arc<Mutex<bool>>,
         bandwidth: &BandwidthTracker,
@@ -1088,6 +1217,10 @@ impl NetClient {
         limiter: &BandwidthLimiter,
         limit_enabled: bool,
         connect_attempt: &Arc<Mutex<Option<Instant>>>,
+        // Bug №700: the seal on the answers (HeartbeatAck, resync request)
+        // and the counter it consumes.
+        auth_key: &Option<Vec<u8>>,
+        wire_seq: &Arc<Mutex<u64>>,
         data: &[u8],
     ) -> Result<(), ConnectionError> {
         if data.len() < HEADER_SIZE {
@@ -1122,6 +1255,36 @@ impl NetClient {
         };
 
         match packet_type {
+            PacketType::ConnectChallenge => {
+                // Bug №216: the handshake the server expects before any
+                // registration. The answer must not wait for the connect
+                // loop's next retry — the loop only ever re-sends Connect,
+                // and the server would keep re-challenging; send Confirm
+                // straight from here through the same signed send path.
+                let challenge: ConnectChallengePacket = deserialize_limited(payload)?;
+                let confirm = ConnectConfirmPacket {
+                    nonce: challenge.nonce,
+                };
+                let confirm_header = PacketHeader::new(
+                    PacketType::ConnectConfirm,
+                    ChannelType::ReliableOrdered,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                let _ = Self::send_packet_static(
+                    socket,
+                    bandwidth,
+                    limiter,
+                    limit_enabled,
+                    &confirm_header,
+                    &confirm,
+                    auth_key,
+                    wire_seq,
+                )
+                .await;
+            }
             PacketType::ConnectAccept => {
                 let accept: ConnectAcceptPacket = deserialize_limited(payload)?;
                 // Duplicate Accept (we retried, both got answered): refresh
@@ -1142,6 +1305,11 @@ impl NetClient {
                     });
                     conn.set_state(ConnectionState::Connected);
                     conn.set_client_id(Some(accept.assigned_client_id));
+                    // Bug №216: the accept is the ONLY courier of the session
+                    // number. From here on, every Heartbeat/Input/Command we
+                    // send carries it, and the server refuses those that do
+                    // not echo what it minted for this connection.
+                    conn.set_session(accept.session);
                     *conn_guard = Some(conn);
                 }
 
@@ -1210,42 +1378,6 @@ impl NetClient {
                         })
                         .await;
                 }
-
-                // Bug №216: the secret, right after the accept. A server that
-                // requires one holds the world back until it arrives; a server
-                // that does not ignores the packet.
-                if let Some(token) = config.auth_token.as_ref() {
-                    if !token.is_empty() {
-                        let auth = AuthPacket { token: token.clone() };
-                        let (seq, ack, ack_bitfield) = {
-                            let conn_guard = connection.lock();
-                            match conn_guard.as_ref() {
-                                Some(conn) => {
-                                    let (ack, ack_bitfield) = conn.ack_info();
-                                    (conn.next_sequence(), ack, ack_bitfield)
-                                }
-                                None => (0, 0, 0),
-                            }
-                        };
-                        let auth_header = PacketHeader::new(
-                            PacketType::Auth,
-                            ChannelType::ReliableOrdered,
-                            seq,
-                            ack,
-                            ack_bitfield,
-                            0,
-                        );
-                        let _ = Self::send_packet_static(
-                            socket,
-                            bandwidth,
-                            limiter,
-                            limit_enabled,
-                            &auth_header,
-                            &auth,
-                        )
-                        .await;
-                    }
-                }
             }
             PacketType::ConnectReject => {
                 let reject: ConnectRejectPacket = deserialize_limited(payload)?;
@@ -1266,21 +1398,29 @@ impl NetClient {
                     .await;
             }
             PacketType::Heartbeat => {
-                let _hb: HeartbeatPacket = deserialize_limited(payload)?;
+                let hb: HeartbeatPacket = deserialize_limited(payload)?;
+                // Bug №216: only the accept carries the session, and the
+                // accept went to the claimed socket's listener alone — a
+                // beat that echoes a stranger's session is part of a spoof,
+                // not of the game; answering it would confirm liveness.
+                let known = connection.lock().as_ref().map(|conn| conn.session());
+                if !known.is_some_and(|known| known == hb.session) {
+                    return Ok(());
+                }
                 // The server pings us to measure ITS RTT on our ack — no send
                 // stamp exists here, so we measure nothing and just answer.
                 // Bug №176: this used to go out with sequence 0 and an empty
                 // bitfield, so the server's own ack bookkeeping learned
                 // nothing from our answers. Bug №167: carry the real SACK
                 // state, and a real sequence, like every other send site.
-                let (ack, ack_bitfield, ack_seq) = {
+                let (ack, ack_bitfield, ack_seq, session) = {
                     let guard = connection.lock();
                     match guard.as_ref() {
                         Some(conn) => {
                             let (a, b) = conn.ack_info();
-                            (a, b, conn.next_sequence())
+                            (a, b, conn.next_sequence(), conn.session())
                         }
-                        None => (0, 0, 0),
+                        None => (0, 0, 0, SESSION_UNSET),
                     }
                 };
                 let ack_header = PacketHeader::new(
@@ -1294,6 +1434,9 @@ impl NetClient {
                 let ack_packet = HeartbeatPacket {
                     client_time: 0.0,
                     server_time: 0.0,
+                    // Bug №216: echo the session so the server can tell a
+                    // real answer from a spoofed one.
+                    session,
                 };
                 let _ = Self::send_packet_static(
                     socket,
@@ -1302,10 +1445,21 @@ impl NetClient {
                     limit_enabled,
                     &ack_header,
                     &ack_packet,
+                    // Bug №700: the answer is sealed like everything else.
+                    auth_key,
+                    wire_seq,
                 )
                 .await;
             }
             PacketType::HeartbeatAck => {
+                // Bug №216: the ack carries the session the beat asked for; an
+                // ack from a stranger's session would only drag RTT toward
+                // wrong numbers, so it is refused before it moves anything.
+                let ack: HeartbeatPacket = deserialize_limited(payload)?;
+                let known = connection.lock().as_ref().map(|conn| conn.session());
+                if !known.is_some_and(|known| known == ack.session) {
+                    return Ok(());
+                }
                 // Bug №12: measure RTT against the last heartbeat WE sent
                 // (stamped in start_send_loop), never Instant::now().elapsed()
                 // which is always ~0. No nested lock: conn and rtt are distinct.
@@ -1399,20 +1553,6 @@ impl NetClient {
                                 Self::dispatch_events(&packet, event_sender);
                             }
                         }
-                        // Bug №699: a map with many structures does not fit a
-                        // datagram, so the description can arrive fragmented —
-                        // exactly like a full state.
-                        PacketType::MapDescription => {
-                            if let Ok(packet) = deserialize_limited::<MapDescriptionPacket>(&bytes)
-                            {
-                                *map_description.write() = Some(rfs_core::world::MapDescription {
-                                    name: packet.name,
-                                    bounds_min: packet.bounds_min,
-                                    bounds_max: packet.bounds_max,
-                                    obstacles: packet.obstacles,
-                                });
-                            }
-                        }
                         PacketType::CommandAck => {
                             if let Ok(ack) = deserialize_limited::<CommandAckPacket>(&bytes) {
                                 event_sender
@@ -1445,7 +1585,7 @@ impl NetClient {
                 Self::dispatch_events(&event_packet, event_sender);
             }
             PacketType::MapDescription => {
-                // Bug №699: the world's static description. It is stored, not
+                // Bug №698: the world's static description. It is stored, not
                 // interpreted: what to do with it is the client's business
                 // (draw it, collide against it), and the network layer's job
                 // is to make sure the client HAS it.
@@ -1515,6 +1655,9 @@ impl NetClient {
                 limit_enabled,
                 &header,
                 &request,
+                // Bug №700: the request is sealed like everything else.
+                auth_key,
+                wire_seq,
             )
             .await
             {
@@ -1976,6 +2119,9 @@ impl NetClient {
         // outbound rate stays uncapped.
         let limiter = self.bandwidth_limiter.clone();
         let limit_enabled = self.config.enable_bandwidth_limit;
+        // Bug №700: the seal and its counter are the send loop's, too.
+        let auth_key = self.auth_key.clone();
+        let wire_seq = self.wire_seq.clone();
         // Bug №31: a degenerate tick_rate would panic on 1000/0 or busy-loop the
         // send task (interval 0 ms). Clamp to the sane 1..=1000 ticks/sec.
         let tick_rate = self.config.tick_rate.clamp(1, 1000);
@@ -2008,7 +2154,7 @@ impl NetClient {
                             // sequence we happened to see.
                             let (ack, ack_bitfield) = conn.ack_info();
 
-                            let input = Self::build_input_packet(tick);
+                            let input = Self::build_input_packet(tick, conn.session());
                             let seq = {
                                 let mut iseq = input_sequence.lock();
                                 *iseq = iseq.wrapping_add(1);
@@ -2048,6 +2194,10 @@ impl NetClient {
                                     HeartbeatPacket {
                                         client_time: 0.0,
                                         server_time: 0.0,
+                                        // Bug №216: the beat proves the session;
+                                        // a beat without the session the accept
+                                        // carried keeps no connection alive.
+                                        session: conn.session(),
                                     },
                                 )
                             } else {
@@ -2079,13 +2229,22 @@ impl NetClient {
                         limit_enabled,
                         &header,
                         &input,
+                        &auth_key,
+                        &wire_seq,
                     )
                     .await;
                 }
                 if let Some(hb) = heartbeat {
-                    let _ =
-                        Self::send_raw(&socket, &bandwidth_tracker, &limiter, limit_enabled, &hb)
-                            .await;
+                    let _ = Self::send_raw(
+                        &socket,
+                        &bandwidth_tracker,
+                        &limiter,
+                        limit_enabled,
+                        &hb,
+                        &auth_key,
+                        &wire_seq,
+                    )
+                    .await;
                 }
                 // Bug №215: retransmits go through the plain raw path — the
                 // ledger entry already exists, so no registration on this
@@ -2097,6 +2256,8 @@ impl NetClient {
                         &limiter,
                         limit_enabled,
                         packet,
+                        &auth_key,
+                        &wire_seq,
                     )
                     .await;
                 }
@@ -2106,7 +2267,7 @@ impl NetClient {
         *self.send_handle.lock() = Some(handle);
     }
 
-    fn build_input_packet(tick: Tick) -> InputPacket {
+    fn build_input_packet(tick: Tick, session: u128) -> InputPacket {
         InputPacket {
             tick: tick.value() as u32,
             delta_time: TICK_DURATION.as_secs_f32(),
@@ -2118,10 +2279,22 @@ impl NetClient {
             roll: 0.0,
             actions: InputActions::NONE,
             station_interaction: None,
+            // Bug №216: the session echo rides every input.
+            session,
         }
     }
 
-    pub fn send_input(&self, input: InputPacket) {
+    pub fn send_input(&self, mut input: InputPacket) {
+        // Bug №216: the session echo overwrites whatever the caller
+        // filled — the session belongs to the connection, not to callers,
+        // so a caller that never negotiated cannot poison the field.
+        input.session = self
+            .connection
+            .lock()
+            .as_ref()
+            .map(|conn| conn.session())
+            .unwrap_or(SESSION_UNSET);
+
         let seq = {
             let mut iseq = self.input_sequence.lock();
             *iseq = iseq.wrapping_add(1);
@@ -2167,6 +2340,8 @@ impl NetClient {
             let packet = CommandPacket {
                 command_id,
                 command,
+                // Bug №216: the session echo rides every command.
+                session: conn.session(),
             };
             // Bug №77: ack the server's sequence high-water mark too.
             // Bug №167: real SACK state.
@@ -2227,7 +2402,7 @@ impl NetClient {
         self.resync_requests_sent.load(Ordering::Relaxed)
     }
 
-    /// Bug №699: the world's static description, as the server told it.
+    /// Bug №698: the world's static description, as the server told it.
     ///
     /// `None` until the server's description arrives — which it does right
     /// after the accept, before the first snapshot.
@@ -2434,6 +2609,9 @@ mod input_ack_tests {
             roll: 0.0,
             actions: InputActions::NONE,
             station_interaction: None,
+            // The session attach happens at the send sites; the field itself
+            // is the session the server minted (bug №216).
+            session: SESSION_UNSET,
         }
     }
 
@@ -2574,105 +2752,6 @@ mod disconnect_tests {
             server.connection_count(),
             0,
             "a disconnected client must not hold a slot"
-        );
-    }
-}
-
-#[cfg(test)]
-mod map_description_tests {
-    //! Bug №699: the server loads a map, but the client never heard of it —
-    //! the layers carry ships, players, stations, compartments and projectiles,
-    //! and no structure. A client that does not know the world cannot draw it
-    //! and cannot explain a shell vanishing at an invisible rock.
-
-    use super::*;
-    use crate::{NetServer, ServerConfig};
-    use rfs_core::math::Vec3f;
-
-    fn world_with_one_structure() -> rfs_core::world::MapDescription {
-        rfs_core::world::MapDescription {
-            name: "test-world".into(),
-            bounds_min: Vec3f::new(-1000.0, -1000.0, -1000.0),
-            bounds_max: Vec3f::new(1000.0, 1000.0, 1000.0),
-            obstacles: vec![rfs_core::world::MapObstacleDescription {
-                id: 7,
-                kind: rfs_core::world::ObstacleKind::Structure,
-                min: Vec3f::new(10.0, -10.0, -10.0),
-                max: Vec3f::new(30.0, 10.0, 10.0),
-            }],
-        }
-    }
-
-    #[tokio::test]
-    async fn a_client_is_told_about_the_world_when_it_connects() {
-        let server = NetServer::new(ServerConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            ..ServerConfig::default()
-        })
-        .await
-        .expect("server bind");
-        let addr = server.local_addr().expect("server local_addr");
-        server.set_world_description(world_with_one_structure());
-        server.start();
-
-        let client = NetClient::new(ClientConfig {
-            server_addr: addr,
-            player_name: "map-test".to_string(),
-            ..ClientConfig::default()
-        })
-        .await
-        .expect("client create");
-        client.connect();
-        let _rx = client.get_event_receiver().expect("event receiver");
-
-        // The description arrives right after the accept, so it is there as
-        // soon as the client is connected — no polling loop, just a moment
-        // for the datagram to land.
-        let mut description = None;
-        for _ in 0..200 {
-            if let Some(found) = client.map_description() {
-                description = Some(found);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let description = description.expect("the client was never told about the world");
-        assert_eq!(description.name, "test-world");
-        assert_eq!(description.obstacles.len(), 1);
-        assert_eq!(description.obstacles[0].id, 7);
-        assert_eq!(
-            description.bounds_min,
-            Vec3f::new(-1000.0, -1000.0, -1000.0),
-            "the playable volume must come with the description"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_client_without_a_world_just_has_none() {
-        let server = NetServer::new(ServerConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            ..ServerConfig::default()
-        })
-        .await
-        .expect("server bind");
-        let addr = server.local_addr().expect("server local_addr");
-        server.start();
-
-        let client = NetClient::new(ClientConfig {
-            server_addr: addr,
-            player_name: "no-map-test".to_string(),
-            ..ClientConfig::default()
-        })
-        .await
-        .expect("client create");
-        client.connect();
-        let _rx = client.get_event_receiver().expect("event receiver");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            client.map_description().is_none(),
-            "a server with no world must not invent one"
         );
     }
 }
@@ -2989,8 +3068,13 @@ mod event_delivery_tests {
     }
 
     async fn send_to(server: &UdpSocket, client_addr: SocketAddr, bytes: &[u8]) {
+        // Bug №700: the wire frames EVERY datagram with the 24-byte auth
+        // block in front, and the tests run the unsigned dialect: a zero
+        // block with no MAC, exactly what `unseal(None, ...)` strips.
+        let mut framed = vec![0u8; crate::auth::AUTH_WIRE_LEN];
+        framed.extend_from_slice(bytes);
         server
-            .send_to(bytes, client_addr)
+            .send_to(&framed, client_addr)
             .await
             .expect("send crafted packet");
     }
@@ -3017,6 +3101,8 @@ mod event_delivery_tests {
             assigned_client_id: 7,
             match_id: m1,
             tick_rate: 30,
+            // Bug №216: the session was not the test subject here.
+            session: 1,
         };
         send_to(
             &server,
@@ -3092,6 +3178,8 @@ mod event_delivery_tests {
             assigned_client_id: 7,
             match_id: m2,
             tick_rate: 30,
+            // Bug №216: the session was not the test subject here.
+            session: 2,
         };
         send_to(
             &server,
@@ -3157,6 +3245,8 @@ mod event_delivery_tests {
             assigned_client_id: 9,
             match_id: Uuid::new_v4(),
             tick_rate: 30,
+            // Bug №216: the session was not the test subject here.
+            session: 3,
         };
         send_to(
             &server,
@@ -3240,5 +3330,236 @@ mod event_delivery_tests {
         assert!(advance_world_clock(&mut tick, &mut time, 12, 41.0));
         assert_eq!(tick, Tick(12));
         assert_eq!(time, 41.0);
+    }
+}
+
+#[cfg(test)]
+mod auth_pair_tests {
+    //! Bug №700: the whole datagram path, keyed. The unit tests of `auth.rs`
+    //! prove the block arithmetic; these prove the loop — a signed client
+    //! reaches a signed server, and nobody else does.
+
+    use super::*;
+    use crate::{NetServer, ServerConfig};
+    use std::time::Duration;
+
+    async fn signed_pair(
+        server_token: Option<String>,
+        client_token: Option<String>,
+    ) -> (NetServer, NetClient, mpsc::Receiver<ClientEvent>) {
+        let server = NetServer::new(ServerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("server bind");
+        server.set_auth_token(server_token.clone());
+        let addr = server.local_addr().expect("server local_addr");
+        server.start();
+
+        let client = NetClient::new(ClientConfig {
+            server_addr: addr,
+            player_name: "auth-test".to_string(),
+            auth_token: client_token,
+            ..ClientConfig::default()
+        })
+        .await
+        .expect("client create");
+        client.connect();
+        let rx = client.get_event_receiver().expect("event receiver");
+        (server, client, rx)
+    }
+
+    #[tokio::test]
+    async fn a_client_with_the_configured_secret_connects() {
+        let (server, client, mut rx) = signed_pair(
+            Some("the shared secret".into()),
+            Some("the shared secret".into()),
+        )
+        .await;
+
+        // A signed handshake means every datagram grew by 24 bytes and now
+        // travels through seal/unseal on both sides; if any of that framing
+        // is off, no Connected ever arrives and the pull below says so.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "Connected: timed out — the signed handshake broke the wire, dropped={}",
+                client.events_dropped()
+            );
+            match tokio::time::timeout(left, rx.recv()).await {
+                Ok(Some(ClientEvent::Connected { .. })) => break,
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("Connected: event channel closed"),
+                Err(_) => panic!("Connected: timed out, dropped={}", client.events_dropped()),
+            }
+        }
+        assert_eq!(
+            server.connection_count(),
+            1,
+            "a signed client reaches a signed server"
+        );
+        client.disconnect(DisconnectReason::ClientQuit);
+    }
+
+    #[tokio::test]
+    async fn a_client_with_a_foreign_secret_never_connects() {
+        let (server, client, mut rx) =
+            signed_pair(Some("secret-a".into()), Some("secret-b".into())).await;
+
+        // No reject is sent for an unverifiable datagram: that would turn the
+        // authentication itself into a tool for flooding honest peers. The
+        // client keeps retransmitting; the server keeps dropping. Before the
+        // 5 s connect timeout fires, nothing about this should look like a
+        // connection.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            server.connection_count(),
+            0,
+            "a datagram signed with a different secret must not open a connection"
+        );
+        match rx.try_recv() {
+            Ok(ClientEvent::Connected { .. }) | Ok(ClientEvent::ConnectionFailed { .. }) => {
+                panic!("a foreign secretary must neither connect nor close the handshake")
+            }
+            _ => {}
+        }
+        client.disconnect(DisconnectReason::ClientQuit);
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_client_connects_to_an_unsigned_server() {
+        let (server, client, mut rx) = signed_pair(None, None).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "Connected: timed out — the framing change broke the unsigned dialect, dropped={}",
+                client.events_dropped()
+            );
+            match tokio::time::timeout(left, rx.recv()).await {
+                Ok(Some(ClientEvent::Connected { .. })) => break,
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("Connected: event channel closed"),
+                Err(_) => panic!("Connected: timed out, dropped={}", client.events_dropped()),
+            }
+        }
+        assert_eq!(
+            server.connection_count(),
+            1,
+            "an unsigned client and server must still talk: the block is framing now, not a switch"
+        );
+        client.disconnect(DisconnectReason::ClientQuit);
+    }
+}
+
+#[cfg(test)]
+mod map_description_tests {
+    //! Bug №699, recovered by SBF3 from the chat record after the worktree
+    //! restore burned the originals: the connected client must hear about the
+    //! world the server loaded, and a server that has no world must not invent
+    //! one.
+
+    use super::*;
+    use crate::{NetServer, ServerConfig};
+    use rfs_core::math::Vec3f;
+    use rfs_core::world::{MapDescription, MapObstacleDescription, ObstacleKind};
+    use std::time::Duration;
+
+    /// One-structure world: enough to compare name, bounds and the structure
+    /// itself, and small enough that no fragmentation is involved.
+    fn one_structure() -> MapDescription {
+        MapDescription {
+            name: "smoke-world".to_string(),
+            bounds_min: Vec3f::new(-1000.0, -1000.0, -1000.0),
+            bounds_max: Vec3f::new(1000.0, 1000.0, 1000.0),
+            obstacles: vec![MapObstacleDescription {
+                id: 100_001,
+                kind: ObstacleKind::Structure,
+                min: Vec3f::new(300.0, -20.0, -20.0),
+                max: Vec3f::new(340.0, 20.0, 20.0),
+            }],
+        }
+    }
+
+    /// The map-description send sits directly behind the ConnectAccept, so the
+    /// same connection path as the auth pair tests is what carries it.
+    async fn pair(world: Option<MapDescription>) -> (NetServer, NetClient) {
+        let server = NetServer::new(ServerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("server bind");
+        if let Some(world) = world {
+            server.set_world_description(world);
+        }
+        let addr = server.local_addr().expect("server local_addr");
+        server.start();
+
+        let client = NetClient::new(ClientConfig {
+            server_addr: addr,
+            player_name: "map-test".to_string(),
+            ..ClientConfig::default()
+        })
+        .await
+        .expect("client create");
+        client.connect();
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn a_connected_client_receives_the_world_description() {
+        // Held for the whole test: the server owns its sockets, so binding
+        // with `_` would drop it mid-handshake.
+        let (_server, client) = pair(Some(one_structure())).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let received = loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "map description: timed out, the description never arrived"
+            );
+            if let Some(description) = client.map_description() {
+                break description;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(received.name, "smoke-world");
+        assert_eq!(received.bounds_min, Vec3f::new(-1000.0, -1000.0, -1000.0));
+        assert_eq!(received.bounds_max, Vec3f::new(1000.0, 1000.0, 1000.0));
+        assert_eq!(received.obstacles.len(), 1, "exactly the loaded structure");
+        let structure = &received.obstacles[0];
+        assert_eq!(structure.id, 100_001);
+        assert_eq!(structure.kind, ObstacleKind::Structure);
+        assert_eq!(structure.min, Vec3f::new(300.0, -20.0, -20.0));
+        assert_eq!(structure.max, Vec3f::new(340.0, 20.0, 20.0));
+
+        client.disconnect(DisconnectReason::ClientQuit);
+    }
+
+    #[tokio::test]
+    async fn a_server_without_a_world_does_not_invent_one() {
+        let (server, client) = pair(None).await;
+
+        // The description rides behind ConnectAccept, so give the wire ample
+        // time to run the whole handshake and its retries before trusting the
+        // absence: a None at 100 ms would prove nothing.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            client.map_description().is_none(),
+            "a server with no world must not describe one"
+        );
+        // No world does not mean no clients: connecting worked before №699 and
+        // keeps working — the absence is only about the description.
+        assert_eq!(server.connection_count(), 1);
+        assert!(server.world_description().is_none());
+        client.disconnect(DisconnectReason::ClientQuit);
     }
 }

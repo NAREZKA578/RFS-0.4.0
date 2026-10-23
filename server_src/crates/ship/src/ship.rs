@@ -1024,6 +1024,15 @@ impl Ship {
     pub fn is_operational(&self) -> bool {
         self.state.read().health > 0.0 && !self.state.read().is_sinking
     }
+
+    /// Bug №701: the raw sinking flag, without the "operational" reading on
+    /// top. The sim takes the crossing edge across a whole tick — the flag
+    /// can flip during `apply_pending_damage` (`apply_health_damage`, №191's
+    /// guard), before `update_ships_parallel` captures its pre-tick state —
+    /// so the sim needs this before the tick's fallout lands.
+    pub fn is_sinking(&self) -> bool {
+        self.state.read().is_sinking
+    }
 }
 
 impl DamageTarget for Ship {

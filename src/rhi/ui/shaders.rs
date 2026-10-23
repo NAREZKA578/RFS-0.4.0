@@ -104,19 +104,20 @@ impl UiShaderManager {
             )));
         }
 
-        let module = self.device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some(UiShaderType::VERTEX_ENTRY.to_string()),
-            name: Some(shader_type.source_filename().to_string()),
-        });
-
-        if !module.has_gpu_backing() {
-            return Err(UiError::ShaderCompilationFailed(format!(
-                "{}: the shader module was not created on the device",
-                shader_type.source_filename()
-            )));
-        }
+        let module = self
+            .device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some(UiShaderType::VERTEX_ENTRY.to_string()),
+                name: Some(shader_type.source_filename().to_string()),
+            })
+            .map_err(|e| {
+                UiError::ShaderCompilationFailed(format!(
+                    "{}: the backend refused the shader module: {e}",
+                    shader_type.source_filename()
+                ))
+            })?;
 
         self.sources.insert(
             shader_type,

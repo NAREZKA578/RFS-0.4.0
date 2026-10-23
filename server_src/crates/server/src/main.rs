@@ -13,14 +13,14 @@ use rfs_net::*;
 use rfs_server::config::MatchConfig;
 use rfs_server::control::TickCadence;
 use rfs_server::match_::{
-    arg_value, despawn_player, load_ship_classes, load_world, resolve_input_target,
-    resolve_ship_count, spawn_is_blocked, spawn_player, PlayerMeta, TrackedShip,
-    DEFAULT_SHIP_CLASS_ID, SHIP_ID, SHIP_ID_STRIDE, SHIP_SPACING,
+    arg_value, broadcast_player_deaths, despawn_player, handle_respawn, load_ship_classes,
+    load_world, resolve_input_target, resolve_ship_count, spawn_is_blocked, spawn_player,
+    PlayerMeta, TrackedShip, DEFAULT_SHIP_CLASS_ID, SHIP_ID, SHIP_ID_STRIDE, SHIP_SPACING,
 };
 use rfs_server::net::handle_command;
 use rfs_server::tick::{apply_input, core_game_event, resolve_deferred_shots, DeferredShot};
 use rfs_server::votes::{handle_vote_kick, VoteKickState};
-use rfs_sim::tick::TickSystem;
+use rfs_sim::tick::{GameEvent as SimGameEvent, TickSystem};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,11 +50,6 @@ async fn main() -> Result<()> {
     // can be checked against it and nothing runs in an empty universe by
     // accident.
     let world = load_world(&args, ship_count)?;
-    // Bug №699: the network layer needs the world's DESCRIPTION, so it can
-    // hand it to every client that connects — the layers carry ships, players
-    // and shots, but not the structures, and a client cannot draw a world it
-    // was never told about.
-    net.set_world_description(world.to_description());
 
     // Owner decision (2026-10-19): the config file is created with defaults
     // on the first run and read on every start; `--config` moves it off the
@@ -73,18 +68,22 @@ async fn main() -> Result<()> {
         (match_config.vote_kick.majority * 100.0) as u32,
         match_config.vote_kick.window_ticks
     );
-    // Bug №216: the secret a client has to present. A match without one is
-    // open, and the log says so out loud — a server that looks protected and
-    // is not is worse than one that says it is open.
-    match match_config.auth_token.as_deref() {
+    // Bug №700: the token lands in the network layer before anyone connects.
+    // A blank config is legal — the unsigned dialect — but the operator must
+    // SEE that it is legal, not discover it during an attack.
+    match match_config.auth_token.as_deref().map(str::trim) {
         Some(token) if !token.is_empty() => {
-            info!("match requires a secret ({} bytes)", token.len());
+            net.set_auth_token(Some(token.to_string()));
+            info!("auth: every datagram is now keyed with the configured secret");
         }
         _ => {
-            warn!("match has NO secret: every client that reaches this port is admitted");
+            warn!(
+                "auth: the server runs WITHOUT a shared secret — datagrams are \
+                 accepted on framing alone. Set `auth_token` in the config file \
+                 to require the HMAC key."
+            );
         }
     }
-    net.set_auth_token(match_config.auth_token.clone());
 
     struct ShipEntry {
         id: EntityId,
@@ -94,6 +93,12 @@ async fn main() -> Result<()> {
     let mut sim = TickSystem::new();
     sim.set_world(world.clone())
         .context("map validation failed")?;
+    // Bug №698: the network layer holds the world's description and hands it
+    // to every client that connects. The description is the wire form of the
+    // loaded map — obstacles, bounds, name — and it goes out the moment a
+    // client is accepted, before any snapshot.
+    let description = world.to_description();
+    net.set_world_description(description);
     // Bug №667: ships are built from the class registry (disk-first, built-in
     // frigate fallback), not by calling `create_default_frigate()` per ship —
     // one door from a class to a ship, with the JSON path live.
@@ -210,6 +215,12 @@ async fn main() -> Result<()> {
     // two can be compared instead of assumed equal.
     let mut last_rounds = 0u64;
     let mut last_packets = 0u64;
+    // Bug №710: first-full builds admitted out of the join queue per report
+    // window, the same monoton-then-difference shape as the rounds above.
+    // During a connect storm this shows the queue draining at the budget
+    // rate (~4 per 33 ms-report); after the storm it flatlines, and a value
+    // STUCK at zero while clients connected is the discovery path starving.
+    let mut last_first_fulls = 0u64;
     // Bug №614: the skipped total is monotonic, so the per-report figure is the
     // difference against the last one. Same shape as the round/packet counters
     // above, which is why it reads the same way in the log.
@@ -293,48 +304,59 @@ async fn main() -> Result<()> {
                     connection_id,
                     command,
                 } => {
-                    let actor = players
-                        .get(&connection_id)
-                        .map(|m| (m.ship_id, m.player_entity_id));
-                    match actor.and_then(|(ship_id, _)| sim.get_ship(ship_id)) {
-                        Some(ship) => {
-                            let player_id = players
-                                .get(&connection_id)
-                                .map(|m| m.player_entity_id)
-                                .unwrap_or(EntityId::nil());
-                            // VoteKick reads server-wide state (net, the players
-                            // map) the per-ship command translator does not see,
-                            // so it is routed here directly; everything else
-                            // keeps the per-ship path.
-                            if let ServerCommand::VoteKick { .. } = &command.command {
-                                handle_vote_kick(
-                                    &net,
-                                    &sim,
+                    // Bug №701: a player asking to respawn is by definition
+                    // standing on nothing (№57 took the wreck out) or on a
+                    // hull that is no longer operational. Both the per-ship
+                    // answers below are wrong for that request — "ship not
+                    // ready" refuses a legal command outright, and steering a
+                    // listing wreck is a nonsense target — so the command
+                    // routes to its glue first, exactly like VoteKick does.
+                    if let ServerCommand::Respawn { .. } = &command.command {
+                        handle_respawn(&net, &sim, connection_id, &command, &mut players);
+                    } else {
+                        let actor = players
+                            .get(&connection_id)
+                            .map(|m| (m.ship_id, m.player_entity_id));
+                        match actor.and_then(|(ship_id, _)| sim.get_ship(ship_id)) {
+                            Some(ship) => {
+                                let player_id = players
+                                    .get(&connection_id)
+                                    .map(|m| m.player_entity_id)
+                                    .unwrap_or(EntityId::nil());
+                                // VoteKick reads server-wide state (net, the players
+                                // map) the per-ship command translator does not see,
+                                // so it is routed here directly; everything else
+                                // keeps the per-ship path.
+                                if let ServerCommand::VoteKick { .. } = &command.command {
+                                    handle_vote_kick(
+                                        &net,
+                                        &sim,
+                                        connection_id,
+                                        player_id,
+                                        &command,
+                                        &mut vote_kick,
+                                        &mut players,
+                                    );
+                                } else {
+                                    handle_command(
+                                        &net,
+                                        &sim,
+                                        &ship,
+                                        connection_id,
+                                        player_id,
+                                        &mut deferred_shots,
+                                        &command,
+                                    );
+                                }
+                            }
+                            None => {
+                                net.send_command_ack(
                                     connection_id,
-                                    player_id,
-                                    &command,
-                                    &mut vote_kick,
-                                    &mut players,
-                                );
-                            } else {
-                                handle_command(
-                                    &net,
-                                    &sim,
-                                    &ship,
-                                    connection_id,
-                                    player_id,
-                                    &mut deferred_shots,
-                                    &command,
+                                    command.command_id,
+                                    false,
+                                    Some("ship not ready".into()),
                                 );
                             }
-                        }
-                        None => {
-                            net.send_command_ack(
-                                connection_id,
-                                command.command_id,
-                                false,
-                                Some("ship not ready".into()),
-                            );
                         }
                     }
                 }
@@ -491,6 +513,14 @@ async fn main() -> Result<()> {
         let interest_done = std::time::Instant::now();
 
         for event in &result.events {
+            if let SimGameEvent::ShipSinkingStarted { ship } = event {
+                // Bug №701: one `PlayerDied` per crew member, right beside the
+                // world-visible sinking event. The deaths are a fact of this
+                // tick; any later `Respawn` command rebinds AFTER they were
+                // broadcast, so ordering here is what a respawned player's
+                // client can rely on.
+                broadcast_player_deaths(&net, &players, *ship);
+            }
             net.broadcast_event(core_game_event(event));
         }
         let broadcast_done = std::time::Instant::now();
@@ -549,6 +579,9 @@ async fn main() -> Result<()> {
             // server diffed an unchanged layer to nothing, or the client dropped
             // something that was sent.
             let sent_by_layer = net.sent_deltas_by_layer();
+            let first_fulls = net.first_fulls_built();
+            let first_fulls_delta =
+                first_fulls.saturating_sub(std::mem::replace(&mut last_first_fulls, first_fulls));
             let rounds_delta = rounds.saturating_sub(std::mem::replace(&mut last_rounds, rounds));
             let packets_delta =
                 packets.saturating_sub(std::mem::replace(&mut last_packets, packets));
@@ -560,7 +593,7 @@ async fn main() -> Result<()> {
             let skipped_this_report = cadence.skipped().saturating_sub(last_skipped);
             last_skipped = cadence.skipped();
             info!(
-                "perf: tick={} sim+sync avg={:.2}ms max={:.2}ms | phases events={event_drain_ms:.2}ms sim={sim_ms:.2}ms entity_sync={entity_sync_ms:.2}ms interest={interest_ms:.2}ms broadcast={broadcast_ms:.2}ms | loop avg={loop_avg_ms:.2}ms max={:.2}ms budget={:.2}ms | ticks ran={ran_this_report} skipped={skipped_this_report} | publish rounds={rounds_delta} packets={packets_delta} rounds_per_tick={:.2} packets_per_round={:.2} sent_deltas_by_layer={sent_by_layer:?} ships={} players={} entities={{ships:{},players:{},stations:{},compartments:{},projectiles:{}}}",
+                "perf: tick={} sim+sync avg={:.2}ms max={:.2}ms | phases events={event_drain_ms:.2}ms sim={sim_ms:.2}ms entity_sync={entity_sync_ms:.2}ms interest={interest_ms:.2}ms broadcast={broadcast_ms:.2}ms | loop avg={loop_avg_ms:.2}ms max={:.2}ms budget={:.2}ms | ticks ran={ran_this_report} skipped={skipped_this_report} | publish rounds={rounds_delta} packets={packets_delta} rounds_per_tick={:.2} packets_per_round={:.2} sent_deltas_by_layer={sent_by_layer:?} first_fulls={first_fulls_delta} ships={} players={} entities={{ships:{},players:{},stations:{},compartments:{},projectiles:{}}}",
                 result.tick.0,
                 avg_ms,
                 tick_time_max.as_secs_f64() * 1000.0,

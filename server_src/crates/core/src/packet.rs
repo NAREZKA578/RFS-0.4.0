@@ -5,7 +5,16 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+// Bug №700: the authentication block (bug №700, owner plan point 1) changes
+// the framing of every datagram — an HMAC block now precedes the header — so
+// the version moves and an old client is refused at the version door it
+// already reaches (bug №176) instead of being misparsed as datagrams.
+// Bug №216: the version moves again — the session fields (`session` on
+// Accept/Heartbeat/Input/Command) and the Challenge/Confirm variants change
+// the meaning of every replicated packet, so a cross-version pair must not
+// try to talk: the old client would send session-less packets that the new
+// server honestly drops, and the game would look like random lag.
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Bug №239: the single statement of the per-datagram wire budget. It does
 /// not deliberately enforce itself inside core — core only serializes — but
 /// the net crate re-exports exactly this value as `connection::MAX_PACKET_SIZE`
@@ -14,6 +23,11 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// defect, not a convenience.
 pub const MAX_PACKET_SIZE: usize = 1400;
 pub const HEADER_SIZE: usize = 24;
+/// Bug №700: what every datagram grows by before the header — a 16-byte
+/// truncated HMAC plus an 8-byte replay sequence. Both sides pay it in both
+/// modes (the unsigned dialect writes a zero block) so the framing itself
+/// has exactly one statement, here, next to the budget it eats into.
+pub const AUTH_WIRE_LEN: usize = 24;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 // Bug №60: bincode 1.3 codes this enum POSITIONALLY on the wire — the
@@ -44,19 +58,23 @@ pub enum PacketType {
     /// coding of every earlier variant stays exactly where it was (bug №60)
     /// — no PROTOCOL_VERSION bump is needed for an append.
     ResyncRequest = 0x52,
-    /// Bug №699: the world's static description, sent once when a client
+    /// Bug №698: the world's static description, sent once when a client
     /// connects. The world is not a layer and does not change, so there is
     /// nothing to stream — a client that never hears of the structures cannot
     /// draw them, and a shell that vanishes at an invisible rock looks like a
     /// bug in the shooter.
     MapDescription = 0x53,
-    /// Bug №216: the client's proof that it may connect — the secret the
-    /// match was configured with.
-    ///
-    /// A SEPARATE packet, not a field of `Connect`: the connect handshake
-    /// keeps its shape, and a server that wants no secret simply ignores
-    /// this one.
-    Auth = 0x54,
+    /// Bug №216: the server-to-client challenge of the connect handshake.
+    /// An address claim proves nothing over UDP; the challenge proves the
+    /// sender actually listens on the socket it wrote, because the nonce —
+    /// an off-path attacker cannot guess — travels back in Confirm. Appended
+    /// after MapDescription so the positional coding of every earlier
+    /// variant stays exactly where it was (bug №60) — no enum reorder.
+    ConnectChallenge = 0x54,
+    /// Bug №216: the client's answer. Carries back the nonce from the
+    /// challenge; only a matching nonce promotes Connect to a real
+    /// connection.
+    ConnectConfirm = 0x55,
 }
 
 impl PacketType {
@@ -82,7 +100,8 @@ impl PacketType {
             0x51 => Self::RpcResponse,
             0x52 => Self::ResyncRequest,
             0x53 => Self::MapDescription,
-            0x54 => Self::Auth,
+            0x54 => Self::ConnectChallenge,
+            0x55 => Self::ConnectConfirm,
             _ => return None,
         })
     }
@@ -176,6 +195,28 @@ pub struct ConnectAcceptPacket {
     pub assigned_client_id: u32,
     pub match_id: Uuid,
     pub tick_rate: u32,
+    /// Bug №216: the per-connection session number the server minted for
+    /// this connection. The client echoes it in every inbound packet
+    /// (Heartbeat, Input, Command); the server drops packets whose echo does
+    /// not match the session it issued over the accept — which only the real
+    /// listener of the claimed address ever saw.
+    pub session: u128,
+}
+
+/// Bug №216: the server-to-client challenge. `nonce` is unpredictable and
+/// single-use; the client proves it lives on the claimed socket by echoing
+/// it back in ConnectConfirm. An off-path forger that claimed a victim's
+/// source address never receives this packet and never answers it.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct ConnectChallengePacket {
+    pub nonce: u128,
+}
+
+/// Bug №216: the client's answer to ConnectChallenge, the proof of life on
+/// the claimed socket.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct ConnectConfirmPacket {
+    pub nonce: u128,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -206,15 +247,16 @@ pub enum DisconnectReason {
     Timeout = 2,
     ServerShutdown = 3,
     Error = 4,
-    /// Bug №216: the client did not prove it may connect — wrong secret, or
-    /// none where one is required.
-    Unauthorized = 5,
 }
 
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HeartbeatPacket {
     pub client_time: f64,
     pub server_time: f64,
+    /// Bug №216: the session echo. A heartbeat without the session the
+    /// accept carried cannot refresh a connection's liveness — a spoofed
+    /// beat would otherwise keep any registered address alive forever.
+    pub session: u128,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
@@ -229,6 +271,10 @@ pub struct InputPacket {
     pub roll: f32,
     pub actions: InputActions,
     pub station_interaction: Option<StationInteraction>,
+    /// Bug №216: the session echo. Input is accepted only with the session
+    /// the server delivered in ConnectAccept — an off-path forger that fakes
+    /// the victim's source address cannot echo a value it never saw.
+    pub session: u128,
 }
 
 bitflags::bitflags! {
@@ -590,6 +636,18 @@ pub enum GameEvent {
         normal: Vec3f,
         damage: f32,
     },
+    /// Bug №701: the hull's loss became certain and the ship began to go
+    /// under. Fires ONCE on the crossing edge (the №153 rule), not on every
+    /// tick of the drift; `ShipSunk` stays the last event of the sequence and
+    /// still names the wreck's position. The crew's per-player deaths ride
+    /// `PlayerDied`, which the server fans out separately — the sim cannot
+    /// name players, only its ships.
+    ///
+    /// Appended last so the positional coding of every earlier variant (bug
+    /// №60) stays where it was.
+    ShipSinkingStarted {
+        ship: EntityId,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +668,9 @@ pub struct EventAckPacket {
 pub struct CommandPacket {
     pub command_id: u64,
     pub command: ServerCommand,
+    /// Bug №216: the session echo, same contract as Input's — the command
+    /// executes only with the session the accept carried.
+    pub session: u128,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -722,7 +783,7 @@ pub struct ResyncRequestPacket {
     pub layer: u8,
 }
 
-/// Bug №699: the world's static description, sent once per client.
+/// Bug №698: the world's static description, sent once per client.
 ///
 /// The payload is a volume plus a list of solid volumes. It can be larger
 /// than a datagram (a map with thousands of structures), so it goes through
@@ -733,16 +794,6 @@ pub struct MapDescriptionPacket {
     pub bounds_min: Vec3f,
     pub bounds_max: Vec3f,
     pub obstacles: Vec<crate::world::MapObstacleDescription>,
-}
-
-/// Bug №216: the client's proof that it may connect.
-///
-/// The secret comes from the match configuration on the server side and from
-/// the client's own settings on this side; an empty secret means "this server
-/// asks for none", and a server that asks for none ignores the packet.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthPacket {
-    pub token: String,
 }
 
 pub fn serialize_packet<T: Serializable>(

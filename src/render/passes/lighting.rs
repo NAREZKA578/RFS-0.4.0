@@ -29,6 +29,7 @@ use crate::render::core::RenderContext;
 use crate::render::graph::node::{PassDependency, PassOutcome, RenderPass};
 use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
+use crate::render::lighting::light_buffer;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
 use crate::rhi::{
@@ -88,7 +89,15 @@ const UNIFORM_SIZE: u64 = 24 * 4;
 
 /// One light in the shader's layout, and the size of one in the buffer.
 ///
-/// The shader's struct is
+/// The layout is written down once, in
+/// [`crate::render::lighting::light_buffer`], and every writer and every
+/// reader uses it. It used to be written down in three places, and two of them
+/// disagreed with the third by four bytes — which is enough for the shader to
+/// read a light's intensity out of the padding and find a zero there. A light
+/// with an intensity of zero is a light that is present in the file and
+/// contributes nothing to the picture, and no message says so.
+///
+/// The layout is the one WGSL gives the struct
 ///
 /// ```wgsl
 /// struct Light { position: vec3<f32>, color: vec3<f32>, intensity: f32, radius: f32 };
@@ -101,26 +110,8 @@ const UNIFORM_SIZE: u64 = 24 * 4;
 /// rounded up again — 48.
 ///
 /// Packing the fields tightly, as `position, color, intensity, radius` in
-/// consecutive floats, is the mistake this comment exists to prevent: the
-/// shader then reads the intensity from the padding, every light has an
-/// intensity of zero, and the picture is lit by the ambient term alone — which
-/// looks like a working light that contributes nothing.
-const LIGHT_SIZE: u64 = 48;
-
-/// The offsets of the light's fields inside one element of the buffer.
-mod light_offsets {
-    /// `position: vec3<f32>` — at 0, three floats.
-    pub const POSITION: usize = 0;
-    /// `color: vec3<f32>` — at 16, three floats, because a `vec3` in a struct
-    /// is padded to 16.
-    pub const COLOR: usize = 4;
-    /// `intensity: f32` — at 28.
-    pub const INTENSITY: usize = 7;
-    /// `radius: f32` — at 32.
-    pub const RADIUS: usize = 8;
-    /// The element's stride in floats.
-    pub const STRIDE_FLOATS: usize = 12;
-}
+/// consecutive floats, is the mistake this comment exists to prevent.
+pub use crate::render::lighting::light_buffer::LIGHT_STRIDE_BYTES as LIGHT_SIZE;
 
 /// How many lights the storage buffer holds.
 ///
@@ -379,7 +370,7 @@ impl LightingPass {
         let Ok(state) = state.lock() else {
             return 0;
         };
-        let mut data = vec![0.0f32; MAX_LIGHTS * light_offsets::STRIDE_FLOATS];
+        let mut data = vec![0.0f32; MAX_LIGHTS * light_buffer::LIGHT_STRIDE_FLOATS];
         let mut count = 0usize;
         let limit = state.max_lights.min(MAX_LIGHTS);
 
@@ -398,15 +389,15 @@ impl LightingPass {
                 .transform()
                 .map(|transform| transform.position())
                 .unwrap_or_default();
-            let base = count * light_offsets::STRIDE_FLOATS;
-            data[base + light_offsets::POSITION] = position.x;
-            data[base + light_offsets::POSITION + 1] = position.y;
-            data[base + light_offsets::POSITION + 2] = position.z;
-            data[base + light_offsets::COLOR] = light.color.x;
-            data[base + light_offsets::COLOR + 1] = light.color.y;
-            data[base + light_offsets::COLOR + 2] = light.color.z;
-            data[base + light_offsets::INTENSITY] = light.intensity;
-            data[base + light_offsets::RADIUS] = light.radius;
+            let base = count * light_buffer::LIGHT_STRIDE_FLOATS;
+            data[base + light_buffer::offsets::POSITION] = position.x;
+            data[base + light_buffer::offsets::POSITION + 1] = position.y;
+            data[base + light_buffer::offsets::POSITION + 2] = position.z;
+            data[base + light_buffer::offsets::COLOR] = light.color.x;
+            data[base + light_buffer::offsets::COLOR + 1] = light.color.y;
+            data[base + light_buffer::offsets::COLOR + 2] = light.color.z;
+            data[base + light_buffer::offsets::INTENSITY] = light.intensity;
+            data[base + light_buffer::offsets::RADIUS] = light.radius;
             count += 1;
         }
 

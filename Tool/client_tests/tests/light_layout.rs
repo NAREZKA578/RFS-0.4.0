@@ -18,6 +18,8 @@
 
 use std::sync::Arc;
 
+use glam::Vec3;
+use rfs_client::render::lighting::light_buffer::pack_light;
 use rhi::backend::vulkan::VulkanBackend;
 use rhi::config::RhiConfig;
 use rhi::core::device::{Device, DeviceDesc};
@@ -59,20 +61,78 @@ fn open_device() -> Device {
 
 /// The light, in the layout the scene's light buffer uses: the position at 0,
 /// the colour at 16, the intensity at 28 and the radius at 32.
+///
+/// The writer is the **shared** one, not a copy of it: a copy is a second
+/// place for the layout to be written down, and the repository had three
+/// places, two of which disagreed with the third by four bytes.
 fn a_light() -> [f32; 12] {
-    let mut light = [0f32; 12];
-    // The position's x is 0.5, so that the shader's remap into [0, 1] keeps
-    // it inside the range: a value above 1 would be clamped by the target and
-    // the test would measure the clamp, not the layout.
-    light[0] = 0.5;
-    light[1] = 0.0;
-    light[2] = 0.0;
-    light[4] = 0.25;
-    light[5] = 0.5;
-    light[6] = 0.75;
-    light[7] = 4.0;
-    light[8] = 30.0;
-    light
+    let mut light = vec![0.0f32; 12];
+    pack_light(
+        &mut light,
+        0,
+        Vec3::new(0.5, 0.0, 0.0),
+        Vec3::new(0.25, 0.5, 0.75),
+        4.0,
+        30.0,
+    );
+    light.try_into().expect("the light is twelve floats")
+}
+
+/// Every shader that reads a light has to declare the same one.
+///
+/// The layout is a property of the *buffer*, and the buffer is shared: the
+/// clustering pass fills it and the forward pass reads it. A shader that
+/// declares the struct differently reads a different buffer — the same bytes
+/// at different offsets — and the result is a light with an intensity of zero
+/// and a radius of somebody else's number. Nothing says so.
+///
+/// So the declarations in the repository are compared with the canonical one,
+/// field by field. A drift is a red test, not a dark picture.
+#[test]
+fn every_shader_declares_the_same_light() {
+    let canonical = rfs_client::render::lighting::light_buffer::LIGHT_STRUCT_WGSL;
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
+    let mut checked = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("the shaders' directory") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_none_or(|e| e != "wgsl") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read WGSL");
+        // The declaration, with the comments and the whitespace removed: the
+        // fields and their order are what has to agree.
+        let Some(start) = source.find("struct Light {") else {
+            continue;
+        };
+        let Some(end) = source[start..].find('}') else {
+            panic!("{}: the struct Light is not closed", path.display());
+        };
+        let declared = &source[start..start + end + 1];
+        let normalise = |text: &str| {
+            text.lines()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty() && !line.starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            normalise(declared),
+            normalise(canonical),
+            "{}: the struct Light here is not the canonical one. Every shader that \
+             reads a light has to declare the same one, because they all read the \
+             same buffer, and a difference of four bytes is enough for the shader \
+             to read the intensity out of the padding and find a zero there.",
+            path.display()
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 3,
+        "only {checked} shaders were checked: the ones that read a light are the \
+         clustering one, the forward one and the lighting one, and a check that \
+         silently looks at nothing proves nothing"
+    );
 }
 
 #[test]

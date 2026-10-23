@@ -51,9 +51,10 @@ struct BotReport {
     /// Bug №267 (A): resync requests this bot put on the wire after a stall.
     /// Non-zero next to `stalled_deltas` shows the healing ask is live.
     resync_requests: u64,
-    /// Bug №699: the world the server told this bot about — the name and how
-    /// many structures it holds. Zero structures on a map that has them means
-    /// the description never arrived, and the bot's world is an empty sea.
+    /// Bug №699: whether the one-off world description reached this bot, and
+    /// how many structures it named. This is a connection event, not a stream
+    /// property, so it is counted in the same row as the connections.
+    has_map: bool,
     map_obstacles: u64,
     /// Wall-clock seconds the bot was connected and sampling, so the observed
     /// tick rate can be compared against the nominal one.
@@ -240,6 +241,7 @@ async fn run_bot(
     id: usize,
     server_addr: std::net::SocketAddr,
     duration: Duration,
+    auth_token: Option<String>,
     connected_now: Arc<AtomicUsize>,
     updates_total: Arc<AtomicU64>,
     rejected_server_full: Arc<AtomicUsize>,
@@ -260,10 +262,11 @@ async fn run_bot(
         rtt_samples_ms: Vec::new(),
         first_tick: None,
         tick_advances: 0,
-        missed_tick_publishes: 0,
-        resync_requests: 0,
-        map_obstacles: 0,
-        observed_secs: 0.0,
+            missed_tick_publishes: 0,
+            resync_requests: 0,
+            has_map: false,
+            map_obstacles: 0,
+            observed_secs: 0.0,
         rx_packets: 0,
         tx_packets: 0,
         stalled_deltas: 0,
@@ -278,6 +281,10 @@ async fn run_bot(
     let client = match NetClient::new(ClientConfig {
         server_addr,
         player_name: format!("bot-{id}"),
+        // Bug №700: bots must speak the same dialect the server was started
+        // with; without the flag they run the unsigned one and connect only
+        // to an unkeyed server.
+        auth_token,
         ..ClientConfig::default()
     })
     .await
@@ -432,6 +439,9 @@ async fn run_bot(
                     roll: 0.0,
                     actions: InputActions::NONE,
                     station_interaction: None,
+                    // Bug №216: send_input stamps the real session; the bot
+                    // only fills the movement itself.
+                    session: 0,
                 };
                 client.send_input(input);
                 report.sent += 1;
@@ -537,12 +547,6 @@ fn finish(client: NetClient, mut report: BotReport, live: usize) -> BotReport {
     report.stale_deltas = client.stale_delta_drops();
     // Bug №267 (A): how many immediate-healing asks went out.
     report.resync_requests = client.resync_requests_sent();
-    // Bug №699: the world the server told this bot about. A bot on a map
-    // with structures that reports zero was never told about the world.
-    report.map_obstacles = client
-        .map_description()
-        .map(|description| description.obstacles.len() as u64)
-        .unwrap_or(0);
     report.stalls_by_layer = client.base_mismatch_drops_by_layer();
     report.layers = client.applied_layer_ticks();
     // Bug №274: the honest delivery figure, read alongside `state_updates`.
@@ -550,6 +554,13 @@ fn finish(client: NetClient, mut report: BotReport, live: usize) -> BotReport {
     // not loss on the wire.
     report.applied_deltas = client.applied_delta_count();
     report.applied_deltas_by_layer = client.applied_delta_count_by_layer();
+    // Bug №699: read before shutdown — after it the description may already
+    // be gone with the client.
+    report.has_map = client.map_description().is_some();
+    report.map_obstacles = client
+        .map_description()
+        .map(|d| d.obstacles.len() as u64)
+        .unwrap_or(0);
     report.server_tick = client.server_tick().0;
     report.last_entities = report.last_entities.max(live);
     // Bug №175: capture backpressure before the client goes away.
@@ -586,9 +597,16 @@ async fn main() -> Result<()> {
     );
 
     info!(
-        "stress: {bots} bots -> {server_addr} for {}s",
-        duration.as_secs()
+        "stress: {bots} bots -> {server_addr} for {}s{}",
+        duration.as_secs(),
+        if args.get(4).map(|s| !s.is_empty()).unwrap_or(false) {
+            " with an auth token"
+        } else {
+            " without an auth token (unsigned dialect)"
+        }
     );
+
+    let auth_token = args.get(4).map(String::clone).filter(|s| !s.is_empty());
 
     let connected_now = Arc::new(AtomicUsize::new(0));
     let updates_total = Arc::new(AtomicU64::new(0));
@@ -601,7 +619,13 @@ async fn main() -> Result<()> {
         let updates = updates_total.clone();
         let full = rejected_server_full.clone();
         handles.push(tokio::spawn(run_bot(
-            id, addr, duration, connected, updates, full,
+            id,
+            addr,
+            duration,
+            auth_token.clone(),
+            connected,
+            updates,
+            full,
         )));
         // Stagger connects so the accept path isn't hit by a SYN-like burst.
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -860,16 +884,20 @@ async fn main() -> Result<()> {
     // Bug №267 (A): the healing asks tied to the stalls that caused them.
     let resync_requests: u64 = reports.iter().map(|r| r.resync_requests).sum();
     let stalled_deltas_diag: u64 = reports.iter().map(|r| r.stalled_deltas).sum();
-    // Bug №699: how many structures the bots were told about. Zero on a map
-    // that has structures means the world never reached the clients.
-    let map_obstacles: u64 = reports.iter().map(|r| r.map_obstacles).sum();
-    let bots_with_map = reports.iter().filter(|r| r.map_obstacles > 0).count();
     info!(
         "stress ticks: advances={advances} missed_tick_publishes={missed} \
          bots_with_missed={bots_with_missed}/{n} resync_requests={resync_requests} \
-         stalled_deltas={stalled_deltas_diag} map_obstacles_per_bot={map_obstacles} \
-         bots_with_map={bots_with_map}/{n} \
+         stalled_deltas={stalled_deltas_diag} \
          (compare with the server's rounds_per_tick and packets_per_round)"
+    );
+
+    // Bug №699: did the map reach every connecting bot at all. A zero in
+    // `bots_with_map` next to a running match is the case "the client knows
+    // about ships but the world is somebody else's secret".
+    let bots_with_map = reports.iter().filter(|r| r.has_map).count();
+    let map_obstacles: u64 = reports.iter().map(|r| r.map_obstacles).sum();
+    info!(
+        "stress map: bots_with_map={bots_with_map}/{n} map_obstacles_total={map_obstacles}"
     );
 
     // Bug #267: which layers actually advance, and how far behind the server
@@ -931,6 +959,7 @@ mod summary_accounting_tests {
             tick_advances: 0,
             missed_tick_publishes: 0,
             resync_requests: 0,
+            has_map: false,
             map_obstacles: 0,
             observed_secs: 0.0,
             rx_packets: 0,
@@ -1012,6 +1041,7 @@ mod tick_observation_tests {
             tick_advances: 0,
             missed_tick_publishes: 0,
             resync_requests: 0,
+            has_map: false,
             map_obstacles: 0,
             observed_secs: 0.0,
             rx_packets: 0,

@@ -1,654 +1,911 @@
-﻿//! Direct3D 12 Device and Backend Resources
+﻿//! Direct3D 12 Device Resource
+//!
+//! Implementation of `BackendResource` over a real `ID3D12Device`, its direct
+//! command queue, one fence, and — since M2 (BUGS №706) — one direct command
+//! allocator plus graphics command list that copies buffers and textures
+//! sequentially. Buffers and textures are committed resources: host-visible
+//! buffers live in the UPLOAD heap and stay persistently mapped, device-only
+//! data copies through staging (UPLOAD heap for uploads, READBACK heap for
+//! downloads) with explicit resource barriers.
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
-use crate::backend::common::BackendResource;
-use crate::command::pass::render::{Framebuffer, FramebufferDesc, RenderPass, RenderPassDesc};
-use crate::core::{DeviceDesc, MemoryProperties, PhysicalDevice};
-use crate::descriptor::{DescriptorSet, DescriptorSetLayout, DescriptorSetLayoutDesc, DescriptorWrite};
-use crate::error::*;
-use crate::pipeline::compute::{ComputePipeline, ComputePipelineDesc};
-use crate::pipeline::graphics::{GraphicsPipeline, GraphicsPipelineDesc};
-use crate::resource::{Buffer, BufferDesc, GpuResource, Sampler, SamplerDesc, Texture, TextureDesc, TextureView, TextureViewDesc};
-use crate::shader::module::{ShaderFormat, ShaderModule, ShaderModuleDesc};
-use crate::types::{ClearValue, GraphicsApi, IndexType};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-/// D3D12 Device resource implementation
-pub struct D3D12DeviceResource {
-    // Mock device handle (would be ID3D12Device* in real implementation)
-    device: u64,
-    // Mock memory allocator
-    allocator: D3D12MemoryAllocator,
-    // Queue family index
-    queue_family_index: u32,
-    // Mock queue handle (would be ID3D12CommandQueue* in real implementation)
-    queue: u64,
-    // Physical device properties
-    physical_device: PhysicalDevice,
+use crate::backend::common::BackendResource;
+use crate::error::{RhiError, RhiResult};
+use crate::resource::{Buffer, BufferDesc, GpuResource, Texture, TextureDesc};
+use crate::types::{GraphicsApi, TextureDimensions, TextureUsage};
+
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE, D3D12_HEAP_TYPE_DEFAULT,
+    D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_UNKNOWN,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
+    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+    D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
+    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_SUBRESOURCE_FOOTPRINT,
+    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+    D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+    D3D12_TEXTURE_LAYOUT_UNKNOWN,
+    ID3D12CommandAllocator,
+    ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
+    ID3D12GraphicsCommandList, ID3D12Resource,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+
+use super::convert;
+
+/// A COM object the backend keeps between calls.
+///
+/// The `windows` crate deliberately does not mark its COM wrappers
+/// `Send`/`Sync`: the runtime cannot know that every object is
+/// thread-safe. The D3D12 objects this backend touches are otherwise
+/// created single-threaded and carried by a `Send + Sync` device resource,
+/// so the wrapper is the boundary where that obligation is taken over.
+///
+/// A private twin of the D3D11 `DxCom` on purpose: hoisting the type into
+/// `backend/common.rs` was proposed and deferred until the backend's owner
+/// (GLM2) agrees in the agent chat — the backend folder is the safer
+/// default until then.
+pub(crate) struct DxCom<T>(pub T);
+unsafe impl<T> Send for DxCom<T> {}
+unsafe impl<T> Sync for DxCom<T> {}
+impl<T: Interface> Clone for DxCom<T> {
+    fn clone(&self) -> Self {
+        DxCom(self.0.clone())
+    }
 }
 
-impl D3D12DeviceResource {
-    pub fn new(
-        physical: &PhysicalDevice,
-        desc: &DeviceDesc,
-        memory_properties: &MemoryProperties,
+/// One tracked handle of the D3D12 handle table.
+pub(crate) enum D3DObject {
+    Buffer(BufferEntry),
+    Texture(TextureEntry),
+}
+
+// COM wrappers and a raw persistent mapped pointer are carried across
+// threads only through the handle table below; D3D12 objects are free
+// threaded, and the mapped pointer is only dereferenced while the caller
+// keeps the mapping alive.
+unsafe impl Send for D3DObject {}
+unsafe impl Sync for D3DObject {}
+
+/// A committed buffer: which heap it lives in, how big, and (uploads only)
+/// its persistent mapping.
+pub(crate) struct BufferEntry {
+    resource: DxCom<ID3D12Resource>,
+    size: u64,
+    /// `true` when the buffer lives in the UPLOAD heap and is persistently
+    /// mapped for host writes.
+    upload_heap: bool,
+    /// The mapping returned by `Map` at creation for upload-heap buffers;
+    /// `null` for device-only buffers.
+    mapped: *mut core::ffi::c_void,
+}
+
+/// A committed texture: the resource and the RHI description it was built
+/// from (mip sizes and subresource indexing are computed from the desc).
+pub(crate) struct TextureEntry {
+    resource: DxCom<ID3D12Resource>,
+    desc: TextureDesc,
+}
+
+/// The D3D12 device resource handed to `Device::from_parts`.
+pub struct D3D12Device {
+    device: DxCom<ID3D12Device>,
+    queue: DxCom<ID3D12CommandQueue>,
+    fence: DxCom<ID3D12Fence>,
+    /// One direct allocator the sequential copy path resets per call.
+    allocator: DxCom<ID3D12CommandAllocator>,
+    /// One graphics command list the sequential copy path resets per call.
+    command_list: DxCom<ID3D12GraphicsCommandList>,
+    physical_name: String,
+    handles: Mutex<HashMap<u64, D3DObject>>,
+    next_id: AtomicU64,
+}
+
+impl std::fmt::Debug for D3D12Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3D12Device")
+            .field("physical", &self.physical_name)
+            .finish()
+    }
+}
+
+impl D3D12Device {
+    /// Build the device resource around objects the instance created, and
+    /// create the copy infrastructure: a direct command allocator and a
+    /// graphics command list. The list comes out in the recording state
+    /// (as documented for `CreateCommandList`), so it is closed here to
+    /// make the first `Reset` legal.
+    pub(crate) fn new(
+        device: DxCom<ID3D12Device>,
+        queue: DxCom<ID3D12CommandQueue>,
+        fence: DxCom<ID3D12Fence>,
+        physical: &crate::core::PhysicalDevice,
     ) -> RhiResult<Self> {
-        // In a real implementation, this would:
-        // 1. Create ID3D12Device from the adapter
-        // 2. Create command queues
-        // 3. Initialize memory allocator
-        // For now, we create mock handles
-        
-        let device = 0xDEADBEEF; // Mock device pointer
-        let queue = 0xCAFEBABE; // Mock queue pointer
-        let allocator = D3D12MemoryAllocator::new(memory_properties.clone());
-        
-        Ok(Self {
-            device,
-            allocator,
-            queue_family_index: desc.queue_family_indices.first().copied().unwrap_or(0),
-            queue,
-            physical_device: physical.clone(),
+        unsafe {
+            let allocator: ID3D12CommandAllocator = device
+                .0
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .map_err(|e| {
+                    RhiError::DeviceCreationError(format!(
+                        "CreateCommandAllocator: {e}"
+                    ))
+                })?;
+            let command_list: ID3D12GraphicsCommandList = device
+                .0
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .map_err(|e| {
+                    RhiError::DeviceCreationError(format!("CreateCommandList: {e}"))
+                })?;
+            command_list.Close().map_err(|e| {
+                RhiError::DeviceCreationError(format!("initial command list Close: {e}"))
+            })?; // so the first Reset is legal
+            Ok(Self {
+                device,
+                queue,
+                fence,
+                allocator: DxCom(allocator),
+                command_list: DxCom(command_list),
+                physical_name: physical.name.clone(),
+                handles: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(1),
+            })
+        }
+    }
+
+    /// A handle that never hands out zero, the invalid sentinel.
+    pub(crate) fn next_handle(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Standard heap properties for one of the three heap types.
+    fn heap_properties(heap: D3D12_HEAP_TYPE) -> D3D12_HEAP_PROPERTIES {
+        D3D12_HEAP_PROPERTIES {
+            Type: heap,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 0,
+            VisibleNodeMask: 0,
+        }
+    }
+
+    /// The resource description D3D12 wants for a byte buffer: the layout is
+    /// ROW MAJOR by definition (the documentation calls UNKNOWN invalid for
+    /// `D3D12_RESOURCE_DIMENSION_BUFFER`).
+    fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        }
+    }
+
+    /// The resource description for a texture of the RHI description.
+    ///
+    /// D1 keeps `Height` and `depth`-like fields at their degenerate values;
+    /// Cube is a 2D texture with six array layers; D3 packs its depth into
+    /// `DepthOrArraySize`. Usage bits drive the self-sufficiency flags D3D12
+    /// requires for render targets, depth-stencil views and unordered access.
+    fn texture_desc(desc: &TextureDesc) -> RhiResult<D3D12_RESOURCE_DESC> {
+        let format = convert::dxgi_format(desc.format).ok_or_else(|| {
+            RhiError::TextureCreationError(format!("no D3D12 format for {:?}", desc.format))
+        })?;
+        let dimension = match desc.dimensions {
+            TextureDimensions::D1 => D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+            TextureDimensions::D2 | TextureDimensions::Cube => {
+                D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            }
+            TextureDimensions::D3 => D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+        };
+        let height = match desc.dimensions {
+            TextureDimensions::D1 => 1,
+            _ => desc.height,
+        };
+        let depth_or_array = match desc.dimensions {
+            TextureDimensions::D1 | TextureDimensions::D2 | TextureDimensions::Cube => {
+                desc.array_layers as u16
+            }
+            TextureDimensions::D3 => desc.depth as u16,
+        };
+        let mut flags = D3D12_RESOURCE_FLAG_NONE;
+        if desc.usage.contains(TextureUsage::COLOR_ATTACHMENT) {
+            flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        }
+        if desc.usage.contains(TextureUsage::DEPTH_STENCIL_ATTACHMENT) {
+            flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        }
+        if desc.usage.contains(TextureUsage::STORAGE) {
+            flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
+        Ok(D3D12_RESOURCE_DESC {
+            Dimension: dimension,
+            Alignment: 0,
+            Width: desc.width as u64,
+            Height: height,
+            DepthOrArraySize: depth_or_array,
+            MipLevels: desc.mip_levels as u16,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: desc.sample_count.as_count(),
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: flags,
         })
     }
-    
-    /// Create a staging buffer for upload operations
-    fn create_staging_buffer(&self, size: u64) -> RhiResult<(u64, u64, *mut u8)> {
-        // In a real implementation, this would create:
-        // - ID3D12Resource for the staging buffer
-        // - ID3D12Heap for the backing memory
-        // - Map the memory and return a pointer
-        
-        // For mock purposes, we allocate host memory directly
-        let buffer_handle = 1u64;
-        let memory_handle = 2u64;
-        let ptr = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(size as usize, 256).unwrap()) };
-        
-        // Initialize with zeros
+
+    /// A short-lived staging buffer in the UPLOAD (to copy from the CPU) or
+    /// READBACK (to read back to the CPU) heap. Not tracked in the handle
+    /// table: the object lives only inside one transfer.
+    fn staging_buffer(&self, bytes: u64, for_upload: bool) -> RhiResult<ID3D12Resource> {
+        let (heap, state) = if for_upload {
+            (D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)
+        } else {
+            (D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)
+        };
+        let props = Self::heap_properties(heap);
+        let mut out: Option<ID3D12Resource> = None;
+        let desc = Self::buffer_desc(bytes);
         unsafe {
-            std::ptr::write_bytes(ptr, 0, size as usize);
+            self.device
+                .0
+                .CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    state,
+                    None,
+                    &mut out,
+                )
         }
-        
-        Ok((buffer_handle, memory_handle, ptr))
+        .map_err(|e| {
+            RhiError::BackendError(format!(
+                "D3D12 staging ({}) buffer of {} bytes: {e}",
+                if for_upload { "upload" } else { "readback" },
+                bytes
+            ))
+        })?;
+        out.ok_or_else(|| {
+            RhiError::BackendError("the D3D12 staging buffer was not created".into())
+        })
     }
-    
-    /// Destroy a staging buffer
-    fn destroy_staging_buffer(&self, _buffer: u64, _memory: u64, ptr: *mut u8, size: u64) {
-        // In a real implementation, this would release the resources
-        // For mock purposes, just free the allocated memory
+
+    /// The sequential copy path: reset the one allocator and command list,
+    /// record the callers' commands, close, execute on the direct queue and
+    /// wait on the fence. The plan (TODO.md, M2) wants strictly sequential
+    /// transfers: each call owns the whole list from reset to completion.
+    fn execute_copy(
+        &self,
+        record: impl FnOnce(&ID3D12GraphicsCommandList) -> RhiResult<()>,
+    ) -> RhiResult<()> {
         unsafe {
-            std::alloc::dealloc(ptr, std::alloc::Layout::from_size_align(size as usize, 256).unwrap());
+            self.allocator.0.Reset().map_err(|e| {
+                RhiError::BackendError(format!("command allocator Reset: {e}"))
+            })?;
+            self.command_list
+                .0
+                .Reset(&self.allocator.0, None)
+                .map_err(|e| RhiError::BackendError(format!("command list Reset: {e}")))?;
+            record(&self.command_list.0)?;
+            self.command_list
+                .0
+                .Close()
+                .map_err(|e| RhiError::BackendError(format!("command list Close: {e}")))?;
+            let list: ID3D12CommandList = self.command_list.0.cast().map_err(|e| {
+                RhiError::InternalError(format!("command list cast to raw list: {e}"))
+            })?;
+            self.queue.0.ExecuteCommandLists(&[Some(list)]);
+            self.wait_idle()?;
+        }
+        Ok(())
+    }
+
+    /// A transition barrier from `before` to `after` on all subresources.
+    fn transition(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        resource: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) {
+        let inner = D3D12_RESOURCE_TRANSITION_BARRIER {
+            pResource: std::mem::ManuallyDrop::new(Some(resource.clone())),
+            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            StateBefore: before,
+            StateAfter: after,
+        };
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(inner),
+            },
+        };
+        unsafe { list.ResourceBarrier(&[barrier]) };
+    }
+
+    fn lookup(&self, handle: u64, what: &str) -> RhiResult<D3DObject> {
+        self.handles
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .map(|object| match object {
+                D3DObject::Buffer(entry) => D3DObject::Buffer(BufferEntry {
+                    resource: entry.resource.clone(),
+                    size: entry.size,
+                    upload_heap: entry.upload_heap,
+                    mapped: entry.mapped,
+                }),
+                D3DObject::Texture(entry) => D3DObject::Texture(TextureEntry {
+                    resource: entry.resource.clone(),
+                    desc: entry.desc.clone(),
+                }),
+            })
+            .ok_or_else(|| {
+                RhiError::InternalError(format!("the {} handle {} is not tracked", what, handle))
+            })
+    }
+
+    fn buffer_entry(&self, handle: u64) -> RhiResult<BufferEntry> {
+        match self.lookup(handle, "buffer")? {
+            D3DObject::Buffer(entry) => Ok(entry),
+            D3DObject::Texture(_) => Err(RhiError::InternalError(
+                "a buffer handle lost its kind".into(),
+            )),
         }
     }
-    
-    /// Get bytes per texel for a format
-    fn bytes_per_texel(format: crate::types::Format) -> Option<u8> {
-        use crate::types::Format;
-        match format {
-            Format::R8_UNORM | Format::R8_SNORM | Format::R8_UINT | Format::R8_SINT => Some(1),
-            Format::RG8_UNORM | Format::RG8_SNORM | Format::RG8_UINT | Format::RG8_SINT => Some(2),
-            Format::RGBA8_UNORM | Format::RGBA8_SNORM | 
-            Format::RGBA8_UINT | Format::RGBA8_SINT |
-            Format::B8G8R8A8_UNORM | Format::B8G8R8A8_SRGB => Some(4),
-            Format::R16_UNORM | Format::R16_SNORM | Format::R16_UINT | Format::R16_SINT | Format::R16_SFLOAT => Some(2),
-            Format::RG16_UNORM | Format::RG16_SNORM | Format::RG16_UINT | Format::RG16_SINT | Format::RG16_SFLOAT => Some(4),
-            Format::RGBA16_UNORM | Format::RGBA16_SFLOAT => Some(8),
-            Format::R32_UINT | Format::R32_SINT | Format::R32_SFLOAT => Some(4),
-            Format::R32G32_UINT | Format::R32G32_SINT | Format::R32G32_SFLOAT => Some(8),
-            Format::R32G32B32_UINT | Format::R32G32B32_SINT | Format::R32G32B32_SFLOAT => Some(12),
-            Format::RGBA32_UINT | Format::RGBA32_SINT | Format::RGBA32_SFLOAT => Some(16),
-            Format::D16_UNORM | Format::D24_UNORM => Some(2),
-            Format::D32_SFLOAT | Format::D24_UNORM_S8_UINT | Format::D32_SFLOAT_S8_UINT => Some(4),
-            _ => None,
+
+    fn texture_entry(&self, handle: u64) -> RhiResult<TextureEntry> {
+        match self.lookup(handle, "texture")? {
+            D3DObject::Texture(entry) => Ok(entry),
+            D3DObject::Buffer(_) => Err(RhiError::InternalError(
+                "a texture handle lost its kind".into(),
+            )),
         }
+    }
+
+    /// Subresource index for a mip level and array layer. D3D12 lays
+    /// subresources out mip-major: index = mip + layer * mip_levels, the
+    /// same order the D3D11 backend uses.
+    fn subresource_index(desc: &TextureDesc, mip_level: u32, array_layer: u32) -> u32 {
+        mip_level + array_layer * desc.mip_levels
+    }
+
+    /// The row pitch D3D12 demands inside staging buffers: every row is a
+    /// multiple of `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT` (256).
+    fn aligned_pitch(width_bytes: u32) -> u32 {
+        (width_bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+            & !(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+    }
+
+    /// Raw byte geometry of one mip inside a texture: the mip size, the
+    /// tightly-packed row length, and the D3D12-aligned staging row length.
+    fn texture_region_layout(
+        desc: &TextureDesc,
+        mip_level: u32,
+    ) -> RhiResult<(u32, u32, u32, u32)> {
+        let mip_w = (desc.width >> mip_level.min(31)).max(1);
+        let mip_h = (desc.height >> mip_level.min(31)).max(1);
+        let row_bytes = convert::row_pitch(desc.format, mip_w);
+        Ok((mip_w, mip_h, row_bytes, Self::aligned_pitch(row_bytes)))
+    }
+
+    /// One signal that advances the fence, then a polling wait for it.
+    ///
+    /// Bug №190's Vulkan lesson, applied up front: a single reusable fence
+    /// value per wait, advanced on every wait, not a zero-reset race. The
+    /// polling wait is deliberate for M1/M2: it needs no extra window
+    /// handle and no `Win32_System_Threading` feature in the manifest, and
+    /// `wait_idle` in this backend is a rare, mostly test-facing path. The
+    /// in-flight frame ring (Vulkan №282's shape) will replace this when
+    /// recording and submission become independent.
+    pub(crate) fn fence_signal_wait(&self) -> RhiResult<()> {
+        unsafe {
+            let future = self.fence.0.GetCompletedValue() + 1;
+            self.queue
+                .0
+                .Signal(&self.fence.0, future)
+                .map_err(|e| RhiError::BackendError(format!("fence signal failed: {e}")))?;
+            while self.fence.0.GetCompletedValue() < future {
+                std::thread::yield_now();
+            }
+        }
+        Ok(())
+    }
+
+    /// The one signal that makes `wait_idle` work.
+    pub(crate) fn wait_idle(&self) -> RhiResult<()> {
+        self.fence_signal_wait()
     }
 }
 
-impl BackendResource for D3D12DeviceResource {
+impl BackendResource for D3D12Device {
     fn as_raw(&self) -> *const () {
-        self.device as *const ()
+        (self.device.0.as_raw()) as *const ()
     }
-    
+
     fn backend_type(&self) -> GraphicsApi {
         GraphicsApi::Direct3D12
     }
-    
+
     fn wait_idle(&self) -> RhiResult<()> {
-        // In a real implementation, this would call:
-        // self.queue.Signal(fence).Wait()
-        Ok(())
+        self.wait_idle()
     }
-    
+
     fn create_buffer(&self, desc: &BufferDesc) -> RhiResult<Buffer> {
-        if desc.sharing_mode == crate::types::SharingMode::Concurrent {
-            return Err(RhiError::NotSupported(
-                "concurrent buffer sharing is not supported for buffer creation".into(),
+        if !desc.is_valid() {
+            return Err(RhiError::BufferCreationError(
+                "the buffer description is invalid".into(),
             ));
         }
-        
-        // In a real implementation, this would:
-        // 1. Create ID3D12Resource with D3D12_RESOURCE_DIMENSION_BUFFER
-        // 2. Allocate memory (committed or placed)
-        // 3. Map if host visible
-        
-        let mut buffer = Buffer::from_desc(desc.clone());
-        
-        // Allocate memory
-        let (handle, memory, mapped) = if desc.is_host_mappable() {
-            let size = desc.size;
-            let (buf, mem, ptr) = self.create_staging_buffer(size)?;
-            (buf, mem, ptr as usize)
+        let host_visible = desc.is_host_mappable();
+        let (heap, initial_state) = if host_visible {
+            // UPLOAD heap: CPU writes, GPU reads; the initial state is
+            // GENERIC_READ as the documentation requires for uploads.
+            (D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)
         } else {
-            // Device-local buffer
-            let handle = 100u64;
-            let memory = 101u64;
-            (handle, memory, 0)
+            (D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON)
         };
-        
-        buffer.set_backend(GpuResource {
-            handle,
-            memory,
-            mapped,
-        });
-        
-        // Set device address if requested
-        if desc.usage.contains(crate::types::BufferUsage::SHADER_DEVICE_ADDRESS) {
-            buffer.set_device_address(handle + 0x1000); // Mock address
+        let props = Self::heap_properties(heap);
+        let d3d_desc = Self::buffer_desc(desc.size);
+        let mut buffer: Option<ID3D12Resource> = None;
+        unsafe {
+            self.device
+                .0
+                .CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &d3d_desc,
+                    initial_state,
+                    None,
+                    &mut buffer,
+                )
         }
-        
-        Ok(buffer)
+        .map_err(|e| {
+            RhiError::BufferCreationError(format!(
+                "CreateCommittedResource of a {}-byte buffer: {e}",
+                desc.size
+            ))
+        })?;
+        let buffer = buffer.ok_or_else(|| {
+            RhiError::BufferCreationError("CreateCommittedResource returned no resource".into())
+        })?;
+        let mut mapped = std::ptr::null_mut();
+        if host_visible {
+            // D3D12 upload-heap buffers stay mapped for their whole life
+            // (the API allows it and the pointer stays valid), so host
+            // writes go straight in.
+            unsafe { buffer.Map(0, None, Some(&mut mapped)) }.map_err(|e| {
+                RhiError::BufferCreationError(format!("upload buffer Map: {e}"))
+            })?;
+        }
+        let handle = self.next_handle();
+        self.handles.lock().unwrap().insert(
+            handle,
+            D3DObject::Buffer(BufferEntry {
+                resource: DxCom(buffer),
+                size: desc.size,
+                upload_heap: host_visible,
+                mapped,
+            }),
+        );
+        let mut out = Buffer::from_desc(desc.clone());
+        out.set_backend(GpuResource {
+            handle,
+            memory: 0,
+            mapped: mapped as usize,
+        });
+        Ok(out)
     }
-    
+
     fn upload_buffer(&self, buffer: &Buffer, data: &[u8]) -> RhiResult<()> {
-        let Some(gpu) = buffer.backend() else {
-            return Err(RhiError::BackendError("buffer has no GPU backing".into()));
-        };
-        
+        let gpu = buffer
+            .backend()
+            .ok_or_else(|| RhiError::BackendError("the buffer has no GPU backing".into()))?;
         if data.len() as u64 > buffer.size() {
             return Err(RhiError::BackendError(format!(
-                "upload size {} exceeds buffer size {}",
+                "upload of {} bytes overflows a {}-byte buffer",
                 data.len(),
                 buffer.size()
             )));
         }
-        
-        if gpu.mapped != 0 {
-            // Host-visible buffer: copy directly
+        if data.is_empty() {
+            return Ok(());
+        }
+        let entry = self.buffer_entry(gpu.handle)?;
+        if entry.upload_heap {
+            // Persistently mapped from creation: the pointer stored in the
+            // handle table is valid for the buffer's lifetime.
+            if entry.mapped.is_null() {
+                return Err(RhiError::InternalError(
+                    "the upload-heap buffer lost its persistent mapping".into(),
+                ));
+            }
             unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), gpu.mapped as *mut u8, data.len());
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    entry.mapped as *mut u8,
+                    data.len(),
+                );
             }
             return Ok(());
         }
-        
-        // Device-local buffer: upload through staging
-        if !buffer.supports_transfer() {
-            return Err(RhiError::BackendError(
-                "buffer memory is not host mapped and the buffer lacks transfer usage".into(),
-            ));
-        }
-        
-        let (staging, staging_memory, ptr) = self.create_staging_buffer(data.len() as u64)?;
+        // Device-only buffers copy through the UPLOAD heap.
+        let staging = self.staging_buffer(data.len() as u64, true)?;
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-        
-        // In a real implementation, this would:
-        // 1. Create command list
-        // 2. Copy buffer
-        // 3. Execute and wait
-        
-        self.destroy_staging_buffer(staging, staging_memory, ptr, data.len() as u64);
-        Ok(())
-    }
-    
-    fn create_texture(&self, desc: &TextureDesc) -> RhiResult<Texture> {
-        // In a real implementation, this would:
-        // 1. Create ID3D12Resource with appropriate dimension
-        // 2. Allocate memory
-        // 3. Set up resource states
-        
-        let mut texture = Texture::from_desc(desc.clone());
-        let handle = 3u64;
-        let memory = 4u64;
-        
-        texture.set_backend(GpuResource {
-            handle,
-            memory,
-            mapped: 0,
-        });
-        
-        Ok(texture)
-    }
-    
-    fn create_texture_view(&self, texture: &Texture, desc: &TextureViewDesc) -> RhiResult<TextureView> {
-        let _ = texture; // Use texture to avoid warning
-        let _ = desc; // Use desc to avoid warning
-        
-        // In a real implementation, this would create ID3D12DescriptorHeap and ID3D12CpuDescriptorHandle
-        let mut view = TextureView::from_parts(texture.clone(), desc.clone());
-        view.set_backend(GpuResource {
-            handle: 5u64, // Mock view handle
-            memory: 0,
-            mapped: 0,
-        });
-        
-        Ok(view)
-    }
-    
-    fn create_sampler(&self, desc: &SamplerDesc) -> RhiResult<Sampler> {
-        // In a real implementation, this would create ID3D12Sampler descriptor
-        let mut sampler = Sampler::from_desc(desc.clone());
-        sampler.set_backend(GpuResource {
-            handle: 6u64,
-            memory: 0,
-            mapped: 0,
-        });
-        
-        Ok(sampler)
-    }
-    
-    fn upload_texture(&self, texture: &Texture, data: &[u8]) -> RhiResult<()> {
-        let Some(_gpu) = texture.backend() else {
-            return Err(RhiError::BackendError("texture has no GPU backing".into()));
-        };
-        
-        if texture.array_layers() > 1 {
-            return Err(RhiError::NotSupported(
-                "multi-layer texture upload is not supported yet".into(),
-            ));
-        }
-        
-        let Some(bpp) = Self::bytes_per_texel(texture.format()) else {
-            return Err(RhiError::NotSupported(format!(
-                "unsupported upload format {:?}",
-                texture.format()
-            )));
-        };
-        
-        // In a real implementation, this would:
-        // 1. Create staging buffer
-        // 2. Copy texture data to staging
-        // 3. Use CopyTextureRegion to upload
-        // 4. Transition resource states
-        
-        let total = (texture.width() as u64) * (texture.height() as u64) * (texture.depth() as u64) * (bpp as u64);
-        if total > data.len() as u64 {
-            return Err(RhiError::BackendError(format!(
-                "texture upload data too small: {} bytes, {} needed",
+            let mut ptr = std::ptr::null_mut();
+            staging.Map(0, None, Some(&mut ptr)).map_err(|e| {
+                RhiError::BackendError(format!("staging buffer Map: {e}"))
+            })?;
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                ptr as *mut u8,
                 data.len(),
-                total
-            )));
+            );
+            staging.Unmap(0, None);
         }
-        
-        Err(RhiError::NotSupported("D3D12 texture upload not yet fully implemented".into()))
-    }
-    
-    fn create_shader_module(&self, desc: &ShaderModuleDesc) -> RhiResult<ShaderModule> {
-        // D3D12 uses DXIL (DX Intermediate Language) for shaders
-        // In a real implementation, this would validate DXIL bytecode
-        if desc.format != ShaderFormat::Dxil {
-            return Err(RhiError::NotSupported(format!(
-                "unsupported shader format {:?}; only DXIL is accepted by the D3D12 backend",
-                desc.format
-            )));
-        }
-        
-        let mut module = ShaderModule::new(desc.clone());
-        module.set_backend(GpuResource {
-            handle: 7u64,
-            memory: 0,
-            mapped: 0,
-        });
-        
-        Ok(module)
-    }
-    
-    fn create_descriptor_set_layout(&self, desc: &DescriptorSetLayoutDesc) -> RhiResult<DescriptorSetLayout> {
-        // In a real implementation, this would create descriptor table layout
-        let mut layout = DescriptorSetLayout::new(desc.clone());
-        layout.set_backend(GpuResource {
-            handle: 8u64,
-            memory: 0,
-            mapped: 0,
-        });
-        
-        Ok(layout)
-    }
-    
-    fn create_descriptor_set(&self, layout: &DescriptorSetLayout) -> RhiResult<DescriptorSet> {
-        let Some(layout_backend) = layout.backend() else {
-            return Err(RhiError::BackendError("descriptor set layout has no GPU backing".into()));
-        };
-        
-        // In a real implementation, this would allocate descriptors from a descriptor heap
-        let mut set = DescriptorSet::new(layout.clone());
-        set.set_backend(GpuResource {
-            handle: 9u64,
-            memory: layout_backend.handle + 0x1000, // Heap pointer
-            mapped: 0,
-        });
-        
-        Ok(set)
-    }
-    
-    fn write_descriptors(&self, set: &DescriptorSet, writes: &[DescriptorWrite]) -> RhiResult<()> {
-        let _ = set; // Use set to avoid warning
-        
-        // In a real implementation, this would write to the descriptor heap
-        // For mock purposes, we just validate the writes
-        for write in writes {
-            let binding = set
-                .layout()
-                .binding(write.dst_binding)
-                .ok_or_else(|| {
-                    RhiError::BackendError(format!(
-                        "descriptor binding {} not declared in layout",
-                        write.dst_binding
-                    ))
-                })?;
-            
-            // Validate descriptor count
-            if write.descriptors.len() as u32 > binding.count {
-                return Err(RhiError::BackendError(format!(
-                    "writing {} descriptors to binding {} which only accepts {}",
-                    write.descriptors.len(),
-                    write.dst_binding,
-                    binding.count
-                )));
-            }
-        }
-        
+        let dst = entry.resource.clone();
+        self.execute_copy(|list| {
+            self.transition(
+                list,
+                &dst.0,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            unsafe {
+                list.CopyBufferRegion(&staging, 0, &dst.0, 0, data.len() as u64)
+            };
+            self.transition(
+                list,
+                &dst.0,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            Ok(())
+        })?;
+        // The staging resource releases itself on drop.
         Ok(())
     }
-    
-    fn create_compute_pipeline(
-        &self,
-        desc: &ComputePipelineDesc,
-        layout: &DescriptorSetLayout,
-    ) -> RhiResult<ComputePipeline> {
-        let Some(_shader_backend) = desc.shader_module().backend() else {
-            return Err(RhiError::BackendError(
-                "compute shader module has no GPU backing".into(),
+
+    fn download_buffer(&self, buffer: &Buffer, offset: u64, size: u64) -> RhiResult<Vec<u8>> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let gpu = buffer
+            .backend()
+            .ok_or_else(|| RhiError::BackendError("the buffer has no GPU backing".into()))?;
+        let end = offset.saturating_add(size);
+        if end > buffer.size() {
+            return Err(RhiError::BackendError(format!(
+                "the download of {}..{} overflows a {}-byte buffer",
+                offset,
+                end,
+                buffer.size()
+            )));
+        }
+        let entry = self.buffer_entry(gpu.handle)?;
+        let staging = self.staging_buffer(size, false)?;
+        let src = entry.resource.clone();
+        self.execute_copy(|list| {
+            self.transition(
+                list,
+                &src.0,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            );
+            unsafe {
+                list.CopyBufferRegion(&src.0, offset, &staging, 0, size)
+            };
+            self.transition(
+                list,
+                &src.0,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            Ok(())
+        })?;
+        let mut out = vec![0u8; size as usize];
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            staging.Map(0, None, Some(&mut ptr)).map_err(|e| {
+                RhiError::BackendError(format!("download staging Map: {e}"))
+            })?;
+            std::ptr::copy_nonoverlapping(
+                ptr as *const u8,
+                out.as_mut_ptr(),
+                size as usize,
+            );
+            staging.Unmap(0, None);
+        }
+        Ok(out)
+    }
+
+    fn create_texture(&self, desc: &TextureDesc) -> RhiResult<Texture> {
+        if !desc.is_valid() {
+            return Err(RhiError::TextureCreationError(
+                "the texture description is invalid".into(),
             ));
-        };
-        
-        let Some(layout_backend) = layout.backend() else {
-            return Err(RhiError::BackendError(
-                "descriptor set layout has no GPU backing".into(),
+        }
+        if desc.depth > 1 && desc.array_layers > 1 {
+            return Err(RhiError::TextureCreationError(
+                "D3D12 supports 3D textures or texture arrays, not both at once".into(),
             ));
-        };
-        
-        // In a real implementation, this would:
-        // 1. Create ID3D12PipelineState with D3D12_COMPUTE_PIPELINE_STATE_DESC
-        // 2. Set up root signature (from descriptor layout)
-        // 3. Create PSO (Pipeline State Object)
-        
-        let mut pipeline = ComputePipeline::new(desc.clone());
-        pipeline.set_backend(GpuResource {
-            handle: 10u64,
-            memory: layout_backend.handle, // Root signature
-            mapped: 0,
-        });
-        
-        Ok(pipeline)
+        }
+        let d3d_desc = Self::texture_desc(desc)?;
+        let props = Self::heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+        let mut texture: Option<ID3D12Resource> = None;
+        unsafe {
+            self.device
+                .0
+                .CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &d3d_desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+        }
+        .map_err(|e| {
+            RhiError::TextureCreationError(format!("CreateCommittedResource texture: {e}"))
+        })?;
+        let texture = texture.ok_or_else(|| {
+            RhiError::TextureCreationError("CreateCommittedResource returned no texture".into())
+        })?;
+        let handle = self.next_handle();
+        self.handles.lock().unwrap().insert(
+            handle,
+            D3DObject::Texture(TextureEntry {
+                resource: DxCom(texture),
+                desc: desc.clone(),
+            }),
+        );
+        let mut out = Texture::from_desc(desc.clone());
+        out.set_backend(GpuResource { handle, memory: 0, mapped: 0 });
+        Ok(out)
     }
-    
-    fn dispatch_compute(
-        &self,
-        _pipeline: &ComputePipeline,
-        _sets: &[&DescriptorSet],
-        _group_count_x: u32,
-        _group_count_y: u32,
-        _group_count_z: u32,
-    ) -> RhiResult<()> {
-        // In a real implementation, this would:
-        // 1. Allocate command list
-        // 2. Set pipeline state
-        // 3. Set descriptor heaps
-        // 4. Dispatch
-        // 5. Execute command list
-        
-        Err(RhiError::NotSupported("D3D12 compute dispatch not yet fully implemented".into()))
-    }
-    
-    fn invalidate_mapped_buffer(&self, _buffer: &Buffer) -> RhiResult<()> {
-        // In a real implementation, this would flush the range
-        // For D3D12, host-visible memory doesn't need explicit invalidation
-        // as it uses coherent memory by default
-        Ok(())
-    }
-    
-    fn download_buffer(&self, _buffer: &Buffer, _offset: u64, _size: u64) -> RhiResult<Vec<u8>> {
-        // In a real implementation, this would:
-        // 1. Create staging buffer
-        // 2. Copy from device buffer to staging
-        // 3. Map and read back
-        
-        Err(RhiError::NotSupported("D3D12 buffer download not yet fully implemented".into()))
-    }
-    
-    fn download_texture(
-        &self,
-        _texture: &Texture,
-        _mip_level: u32,
-        _array_layer: u32,
-    ) -> RhiResult<Vec<u8>> {
-        // In a real implementation, similar to upload but in reverse
-        Err(RhiError::NotSupported("D3D12 texture download not yet fully implemented".into()))
-    }
-    
-    fn create_render_pass(&self, desc: &RenderPassDesc) -> RhiResult<RenderPass> {
-        // In D3D12, render passes are implicit - they're defined by the framebuffer state
-        // This is a compatibility layer for the RHI abstraction
-        let mut render_pass = RenderPass::new(desc.clone());
-        render_pass.set_backend(GpuResource {
-            handle: 11u64,
-            memory: 0,
-            mapped: 0,
-        });
-        
-        Ok(render_pass)
-    }
-    
-    fn create_framebuffer(&self, desc: &FramebufferDesc) -> RhiResult<Framebuffer> {
-        // In D3D12, framebuffers are created implicitly
-        // In a real implementation, this would create render target views
-        let mut framebuffer = Framebuffer::new(desc.clone());
-        framebuffer.set_backend(GpuResource {
-            handle: 12u64,
-            memory: 0,
-            mapped: 0,
-        });
-        
-        Ok(framebuffer)
-    }
-    
-    fn create_graphics_pipeline(
-        &self,
-        desc: &GraphicsPipelineDesc,
-        _render_pass: &RenderPass,
-        _set_layouts: &[&DescriptorSetLayout],
-    ) -> RhiResult<GraphicsPipeline> {
-        // In a real implementation, this would:
-        // 1. Create root signature from descriptor set layouts
-        // 2. Create pipeline state with D3D12_GRAPHICS_PIPELINE_STATE_DESC
-        // 3. Create PSO
-        
-        let mut pipeline = GraphicsPipeline::new(desc.clone());
-        pipeline.set_backend(GpuResource {
-            handle: 13u64,
-            memory: 0, // Would be root signature
-            mapped: 0,
-        });
-        
-        Ok(pipeline)
-    }
-    
-    fn submit_commands(&self, commands: &[crate::command::commands::Command]) -> RhiResult<()> {
-        if commands.is_empty() {
-            return Err(RhiError::BackendError(
-                "refusing to submit an empty command list: the recording produced nothing, \
-                 which almost always means the encoder dropped the commands"
+
+    fn upload_texture(&self, texture: &Texture, data: &[u8]) -> RhiResult<()> {
+        let gpu = texture
+            .backend()
+            .ok_or_else(|| RhiError::BackendError("the texture has no GPU backing".into()))?;
+        let entry = self.texture_entry(gpu.handle)?;
+        let desc = entry.desc.clone();
+        if !matches!(
+            desc.dimensions,
+            TextureDimensions::D1 | TextureDimensions::D2
+        ) {
+            return Err(RhiError::NotSupported(
+                "D3D12 texture uploads cover 1D and 2D textures; 3D and cube roofs need a \
+                 different layout and are honest rejections here"
                     .into(),
             ));
         }
-        
-        // In a real implementation, this would:
-        // 1. Allocate command list
-        // 2. Record commands
-        // 3. Execute command list
-        
-        Err(RhiError::NotSupported("D3D12 command submission not yet fully implemented".into()))
+        if texture.is_multisampled() {
+            return Err(RhiError::NotSupported(
+                "multisampled textures have no direct upload path in D3D12; \
+                 uploads go through a resolve"
+                    .into(),
+            ));
+        }
+        // The staging layout: one packed block of rows with D3D12's 256-byte
+        // pitch alignment, offset 0 (which satisfies the 512-byte placement
+        // alignment on its own).
+        let (_, rows, tight_row, aligned_row) = Self::texture_region_layout(&desc, 0)?;
+        let needed = rows as usize * tight_row as usize;
+        if data.len() < needed {
+            return Err(RhiError::BackendError(format!(
+                "the {}-byte upload is too small: the texture needs {} bytes \
+                 (format {:?}, {}x{}@row-pitch {})",
+                data.len(),
+                needed,
+                desc.format,
+                desc.width,
+                desc.height,
+                tight_row
+            )));
+        }
+        let staging_bytes = rows as usize * aligned_row as usize;
+        let staging = self.staging_buffer(staging_bytes as u64, true)?;
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            staging.Map(0, None, Some(&mut ptr))
+                .map_err(|e| RhiError::BackendError(format!("upload staging Map: {e}")))?;
+            let base = ptr as *mut u8;
+            for row in 0..rows as usize {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(row * tight_row as usize),
+                    base.add(row * aligned_row as usize),
+                    tight_row as usize,
+                );
+            }
+            staging.Unmap(0, None);
+        }
+        let tex = entry.resource.clone();
+        let dxgi = convert::dxgi_format(desc.format).ok_or_else(|| {
+            RhiError::BackendError(format!("no D3D12 format for {:?}", desc.format))
+        })?;
+        let src_view = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(staging.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: dxgi,
+                        Width: desc.width,
+                        Height: desc.height,
+                        Depth: 1,
+                        RowPitch: aligned_row,
+                    },
+                },
+            },
+        };
+        let dst_view = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(tex.0.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        self.execute_copy(|list| {
+            self.transition(
+                list,
+                &tex.0,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            unsafe {
+                list.CopyTextureRegion(&dst_view, 0, 0, 0, &src_view, None)
+            };
+            self.transition(
+                list,
+                &tex.0,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            Ok(())
+        })?;
+        Ok(())
     }
-    
-    fn create_window_surface(&self, _hinstance: u64, _hwnd: u64) -> RhiResult<crate::backend::vulkan::WindowSurface> {
-        // In D3D12, we use IDXGISwapChain instead of Vulkan's surface
-        // For compatibility with RHI, we return a mock Vulkan surface
-        // In a real implementation, this would create DXGI swap chain
-        Err(RhiError::NotSupported("D3D12 uses DXGI swap chains, not Vulkan surfaces".into()))
-    }
-    
-    fn create_swapchain(
-        &self,
-        _surface: &crate::backend::vulkan::WindowSurface,
-        _request: crate::backend::vulkan::SwapchainRequest,
-        _old: Option<&mut crate::backend::vulkan::Swapchain>,
-    ) -> RhiResult<crate::backend::vulkan::Swapchain> {
-        // In D3D12, swap chain is created separately
-        Err(RhiError::NotSupported("D3D12 uses DXGI swap chains".into()))
-    }
-    
-    fn presentation_render_pass_desc(&self, format: crate::types::Format) -> RhiResult<RenderPassDesc> {
-        use crate::{SampleCount, TextureLayout};
-        Ok(RenderPassDesc {
-            attachments: vec![crate::command::pass::render::AttachmentDescription {
-                format,
-                samples: SampleCount::X1,
-                load_op: crate::command::pass::render::LoadOp::Clear,
-                store_op: crate::command::pass::render::StoreOp::Store,
-                stencil_load_op: crate::command::pass::render::LoadOp::DontCare,
-                stencil_store_op: crate::command::pass::render::StoreOp::DontCare,
-                initial_layout: TextureLayout::Undefined,
-                final_layout: TextureLayout::PresentSrc,
-            }],
-            subpasses: vec![crate::command::pass::render::SubpassDescription {
-                pipeline_bind_point: crate::command::pass::render::PipelineBindPoint::Graphics,
-                color_attachments: vec![crate::command::pass::render::AttachmentReference {
-                    attachment: 0,
-                    layout: TextureLayout::ColorAttachmentOptimal,
-                }],
-                ..Default::default()
-            }],
-            dependencies: vec![],
-        })
-    }
-    
-    fn presentation_render_pass_desc_with_depth(
-        &self,
-        format: crate::types::Format,
-        depth_format: crate::types::Format,
-    ) -> RhiResult<RenderPassDesc> {
-        use crate::{SampleCount, TextureLayout};
-        let mut desc = self.presentation_render_pass_desc(format)?;
-        desc.attachments.push(crate::command::pass::render::AttachmentDescription {
-            format: depth_format,
-            samples: SampleCount::X1,
-            load_op: crate::command::pass::render::LoadOp::Clear,
-            store_op: crate::command::pass::render::StoreOp::Store,
-            stencil_load_op: crate::command::pass::render::LoadOp::DontCare,
-            stencil_store_op: crate::command::pass::render::StoreOp::DontCare,
-            initial_layout: TextureLayout::Undefined,
-            final_layout: TextureLayout::DepthStencilAttachmentOptimal,
-        });
-        desc.subpasses[0].depth_stencil_attachment = Some(crate::command::pass::render::AttachmentReference {
-            attachment: 1,
-            layout: TextureLayout::DepthStencilAttachmentOptimal,
-        });
-        Ok(desc)
-    }
-    
-    fn draw_framebuffer_indexed(
-        &self,
-        _framebuffer: &Framebuffer,
-        _pipeline: &GraphicsPipeline,
-        _sets: &[&DescriptorSet],
-        _vertex_buffer: Option<(&Buffer, u32)>,
-        _index_buffer: Option<(&Buffer, u32)>,
-        _index_type: IndexType,
-        _vertex_count: u32,
-        _first_vertex: u32,
-        _index_count: u32,
-        _first_index: u32,
-        _vertex_offset: i32,
-        _clear_values: &[ClearValue],
-    ) -> RhiResult<()> {
-        // In a real implementation, this would record and execute draw commands
-        Err(RhiError::NotSupported("D3D12 draw_framebuffer_indexed not yet fully implemented".into()))
-    }
-}
 
-/// D3D12 Memory Allocator (mock implementation)
-pub struct D3D12MemoryAllocator {
-    memory_properties: MemoryProperties,
-}
-
-impl D3D12MemoryAllocator {
-    pub fn new(memory_properties: MemoryProperties) -> Self {
-        Self { memory_properties }
+    fn download_texture(
+        &self,
+        texture: &Texture,
+        mip_level: u32,
+        array_layer: u32,
+    ) -> RhiResult<Vec<u8>> {
+        let gpu = texture
+            .backend()
+            .ok_or_else(|| RhiError::BackendError("the texture has no GPU backing".into()))?;
+        let entry = self.texture_entry(gpu.handle)?;
+        let desc = entry.desc.clone();
+        if mip_level >= desc.mip_levels {
+            return Err(RhiError::BackendError(format!(
+                "mip level {} is outside a {}-level texture",
+                mip_level, desc.mip_levels
+            )));
+        }
+        if array_layer >= desc.array_layers {
+            return Err(RhiError::BackendError(format!(
+                "array layer {} is outside a {}-layer texture",
+                array_layer, desc.array_layers
+            )));
+        }
+        if !matches!(
+            desc.dimensions,
+            TextureDimensions::D1 | TextureDimensions::D2
+        ) {
+            return Err(RhiError::NotSupported(
+                "D3D12 texture downloads cover 1D and 2D textures; 3D and cube roofs need a \
+                 different layout and are honest rejections here"
+                    .into(),
+            ));
+        }
+        if texture.is_multisampled() {
+            return Err(RhiError::NotSupported(
+                "multisampled textures have no direct download path in D3D12; \
+                 downloads go through a resolve"
+                    .into(),
+            ));
+        }
+        let (_, rows, tight_row, aligned_row) =
+            Self::texture_region_layout(&desc, mip_level)?;
+        let staging_bytes = rows as u64 * aligned_row as u64;
+        let staging = self.staging_buffer(staging_bytes, false)?;
+        let tex = entry.resource.clone();
+        let dxgi = convert::dxgi_format(desc.format).ok_or_else(|| {
+            RhiError::BackendError(format!("no D3D12 format for {:?}", desc.format))
+        })?;
+        let dst_view = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(staging.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: dxgi,
+                        Width: (desc.width >> mip_level.min(31)).max(1),
+                        Height: rows,
+                        Depth: 1,
+                        RowPitch: aligned_row,
+                    },
+                },
+            },
+        };
+        let subresource = Self::subresource_index(&desc, mip_level, array_layer);
+        let src_view = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(tex.0.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: subresource },
+        };
+        self.execute_copy(|list| {
+            self.transition(
+                list,
+                &tex.0,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            );
+            unsafe {
+                list.CopyTextureRegion(&dst_view, 0, 0, 0, &src_view, None)
+            };
+            self.transition(
+                list,
+                &tex.0,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            Ok(())
+        })?;
+        let mut out = vec![0u8; rows as usize * tight_row as usize];
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            staging.Map(0, None, Some(&mut ptr))
+                .map_err(|e| RhiError::BackendError(format!("readback staging Map: {e}")))?;
+            let base = ptr as *const u8;
+            for row in 0..rows as usize {
+                std::ptr::copy_nonoverlapping(
+                    base.add(row * aligned_row as usize),
+                    out.as_mut_ptr().add(row * tight_row as usize),
+                    tight_row as usize,
+                );
+            }
+            staging.Unmap(0, None);
+        }
+        Ok(out)
     }
-    
-    /// Find memory type that satisfies requirements
-    pub fn find_memory_type(&self, _allowed_bits: u32, required: crate::types::MemoryPropertyFlags) -> Option<u32> {
-        // In a real implementation, this would match against D3D12 heap properties
-        // For mock purposes, return first type that matches
-        for (index, mem_type) in self.memory_properties.memory_types.iter().enumerate() {
-            if mem_type.flags.contains(required) {
-                return Some(index as u32);
+
+    fn tracked_object_count(&self) -> usize {
+        self.handles.lock().unwrap().len()
+    }
+
+    fn tracked_object_summary(&self) -> String {
+        let handles = self.handles.lock().unwrap();
+        let mut buffers = 0usize;
+        let mut textures = 0usize;
+        for object in handles.values() {
+            match object {
+                D3DObject::Buffer(_) => buffers += 1,
+                D3DObject::Texture(_) => textures += 1,
             }
         }
-        None
-    }
-    
-    /// Allocate memory
-    pub fn allocate(&self, _size: u64, _allowed_bits: u32, required: crate::types::MemoryPropertyFlags) -> RhiResult<(u64, u32)> {
-        let index = self.find_memory_type(0, required).ok_or_else(|| {
-            RhiError::BackendError(
-                "no memory type satisfies the requested properties on this device".into(),
-            )
-        })?;
-        
-        // In a real implementation, this would call ID3D12Device::CreateCommittedResource
-        // or ID3D12Device::CreateHeap + ID3D12Device::CreatePlacedResource
-        Ok((14u64, index))
-    }
-    
-    /// Flush mapped memory (no-op for D3D12 as memory is coherent)
-    pub fn flush(&self, _memory: u64, _size: u64) -> RhiResult<()> {
-        Ok(())
-    }
-    
-    /// Invalidate mapped memory (no-op for D3D12)
-    pub fn invalidate(&self, _memory: u64, _size: u64) -> RhiResult<()> {
-        Ok(())
-    }
-    
-    /// Map memory
-    pub fn map(&self, _memory: u64, size: u64) -> RhiResult<*mut u8> {
-        // In a real implementation, this would call ID3D12Resource::Map
-        let ptr = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(size as usize, 256).unwrap()) };
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, size as usize);
-        }
-        Ok(ptr)
-    }
-    
-    /// Unmap memory
-    pub fn unmap(&self, _memory: u64, ptr: *mut u8, size: u64) {
-        // In a real implementation, this would call ID3D12Resource::Unmap
-        unsafe {
-            std::alloc::dealloc(ptr, std::alloc::Layout::from_size_align(size as usize, 256).unwrap());
-        }
+        format!("buffers: {}, textures: {}", buffers, textures)
     }
 }
-
-

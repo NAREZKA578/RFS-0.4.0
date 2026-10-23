@@ -10,7 +10,6 @@ use crate::render::graph::RenderGraph;
 use crate::render::scene::Scene;
 use crate::rhi::core::{DeviceDesc, Queue};
 use crate::rhi::error::{RhiError, RhiResult};
-use crate::rhi::ash::vk::Handle;
 use crate::rhi::swapchain::{SwapChain, SwapChainDesc};
 use crate::rhi::types::{Extent2D, Format};
 use crate::rhi::{backend::create_backend, Device, GraphicsApi, RhiConfig};
@@ -75,12 +74,12 @@ pub struct Renderer {
 struct Presentation {
     /// Destroyed first, so the surface below is still alive when it happens. That
     /// ordering is required, not stylistic — see the note above.
-    swapchain: crate::rhi::backend::vulkan::Swapchain,
+    swapchain: crate::rhi::present::Swapchain,
     /// Kept, not prefixed with `_`, because `resize` needs the same surface to
     /// rebuild the chain on. A surface is tied to the window handle and outlives
     /// any particular swapchain, so one surface is built once per window and
     /// every rebuild reuses it.
-    surface: crate::rhi::backend::vulkan::WindowSurface,
+    surface: crate::rhi::present::WindowSurface,
 }
 
 impl Renderer {
@@ -159,10 +158,10 @@ impl Renderer {
         height: u32,
     ) -> RhiResult<()> {
         let surface = self.device.create_window_surface(hinstance, hwnd)?;
-        let request = crate::rhi::backend::vulkan::SwapchainRequest {
+        let request = crate::rhi::present::SwapchainRequest {
             width: width.max(1),
             height: height.max(1),
-            present_mode: crate::rhi::ash::vk::PresentModeKHR::FIFO,
+            present_mode: crate::rhi::present::PresentMode::Fifo,
         };
         // Taken by value, not borrowed: the handover needs `&mut` to mark the old
         // chain as handed over, and `self` is borrowed immutably below.
@@ -211,7 +210,7 @@ impl Renderer {
     pub fn presentation_extent(&self) -> Extent2D {
         self.presentation
             .as_ref()
-            .map(|p| Extent2D::new(p.swapchain.extent.width, p.swapchain.extent.height))
+            .map(|p| p.swapchain.extent())
             .unwrap_or(self.context.resolution)
     }
 
@@ -348,17 +347,9 @@ impl Renderer {
                 let swapchain = &presentation.swapchain;
                 self.context.set_presentation(
                     swapchain.rhi_format(),
-                    Extent2D::new(swapchain.extent.width, swapchain.extent.height),
-                    swapchain
-                        .images
-                        .iter()
-                        .map(|image| image.as_raw() as u64)
-                        .collect(),
-                    swapchain
-                        .image_views
-                        .iter()
-                        .map(|view| view.as_raw() as u64)
-                        .collect(),
+                    swapchain.extent(),
+                    swapchain.images(),
+                    swapchain.image_views(),
                 );
                 acquired.image_index
             }
@@ -558,10 +549,10 @@ impl Renderer {
             return;
         }
         if let Some(presentation) = self.presentation.as_mut() {
-            let request = crate::rhi::backend::vulkan::SwapchainRequest {
+            let request = crate::rhi::present::SwapchainRequest {
                 width,
                 height,
-                present_mode: crate::rhi::ash::vk::PresentModeKHR::FIFO,
+                present_mode: crate::rhi::present::PresentMode::Fifo,
             };
             match self
                     .device
@@ -628,10 +619,10 @@ impl Renderer {
         let Some(presentation) = self.presentation.as_mut() else {
             return;
         };
-        let request = crate::rhi::backend::vulkan::SwapchainRequest {
+        let request = crate::rhi::present::SwapchainRequest {
             width,
             height,
-            present_mode: crate::rhi::ash::vk::PresentModeKHR::FIFO,
+            present_mode: crate::rhi::present::PresentMode::Fifo,
         };
         match self
             .device
@@ -671,9 +662,9 @@ impl Renderer {
         let swapchain = &presentation.swapchain;
         self.context.set_presentation(
             swapchain.rhi_format(),
-            Extent2D::new(swapchain.extent.width, swapchain.extent.height),
-            swapchain.images.iter().map(|i| i.as_raw() as u64).collect(),
-            swapchain.image_views.iter().map(|v| v.as_raw() as u64).collect(),
+            swapchain.extent(),
+            swapchain.images(),
+            swapchain.image_views(),
         );
         self.publish_typed_presentation_views();
     }
@@ -700,8 +691,9 @@ impl Renderer {
             return;
         };
         let swapchain = &presentation.swapchain;
-        let width = swapchain.extent.width.max(1);
-        let height = swapchain.extent.height.max(1);
+        let extent = swapchain.extent();
+        let width = extent.width.max(1);
+        let height = extent.height.max(1);
         let Some(format) = swapchain.rhi_format() else {
             crate::error!(
                 "renderer",
@@ -712,7 +704,7 @@ impl Renderer {
             return;
         };
 
-        let mut views = Vec::with_capacity(swapchain.images.len());
+        let mut views = Vec::with_capacity(swapchain.image_count());
 
         // The views published last time are ours — created by this function, not the
         // swapchain's — so nothing else will free them. Releasing them here is not an
@@ -727,7 +719,7 @@ impl Renderer {
             self.device.release_many(&stale);
         }
 
-        for &image in &swapchain.images {
+        for &image in swapchain.images().iter() {
             let texture = self.device.adopt_texture(
                 crate::rhi::TextureDesc {
                     width,
@@ -747,7 +739,7 @@ impl Renderer {
                     sharing_mode: crate::rhi::SharingMode::Exclusive,
                     queue_family_indices: Vec::new(),
                 },
-                image.as_raw() as u64,
+                image,
             );
             match self.device.create_texture_view(
                 &texture,

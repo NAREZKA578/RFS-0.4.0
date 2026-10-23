@@ -407,16 +407,16 @@ impl BackendResource for OpenGLDeviceResource {
         Err(RhiError::NotSupported("OpenGL command submission not yet fully implemented".into()))
     }
     
-    fn create_window_surface(&self, _hinstance: u64, _hwnd: u64) -> RhiResult<crate::backend::vulkan::WindowSurface> {
+    fn create_window_surface(&self, _hinstance: u64, _hwnd: u64) -> RhiResult<crate::present::WindowSurface> {
         Err(RhiError::NotSupported("OpenGL uses WGL/GLX, not Vulkan surfaces".into()))
     }
     
     fn create_swapchain(
         &self,
-        _surface: &crate::backend::vulkan::WindowSurface,
-        _request: crate::backend::vulkan::SwapchainRequest,
-        _old: Option<&mut crate::backend::vulkan::Swapchain>,
-    ) -> RhiResult<crate::backend::vulkan::Swapchain> {
+        _surface: &crate::present::WindowSurface,
+        _request: crate::present::SwapchainRequest,
+        _old: Option<&mut crate::present::Swapchain>,
+    ) -> RhiResult<crate::present::Swapchain> {
         Err(RhiError::NotSupported("OpenGL uses WGL/GLX swap chains".into()))
     }
     

@@ -11,7 +11,7 @@ use rfs_core::entity::{
     StationEntity,
 };
 use rfs_core::math::{Bounds, Quatf, Transform, Vec3f};
-use rfs_core::packet::{GameEvent as CoreGameEvent, PlayerPosture};
+use rfs_core::packet::{CommandPacket, GameEvent as CoreGameEvent, PlayerPosture, ServerCommand};
 use rfs_net::*;
 use rfs_ship::loader::{create_default_destroyer, create_default_frigate, ShipLoader};
 use rfs_ship::ship::{Ship, ShipState};
@@ -519,6 +519,106 @@ pub fn despawn_player(
     }
 }
 
+/// Bug №701: every member of a sinking crew is dead the moment the hull's
+/// loss became certain — not when the wreck is finally removed (№57, up to
+/// 30 s later).
+///
+/// The sim's event names only the ship (`ShipSinkingStarted`): players do not
+/// exist in the sim, so it cannot name them. This is the one place that knows
+/// the binding, and it fans out one honest death per member: `killer` stays
+/// `None` — which hull or gun started the fire is a scoring question, and the
+/// score ledger is separate.
+///
+/// Lives beside `handle_respawn`, not inside `core_game_event`'s pure
+/// translation: the translator gets one event in and one event out, and this
+/// is one-to-many.
+pub fn broadcast_player_deaths(
+    net: &NetServer,
+    players: &HashMap<u32, PlayerMeta>,
+    ship: EntityId,
+) {
+    for meta in players.values().filter(|meta| meta.ship_id == ship) {
+        net.broadcast_event(CoreGameEvent::PlayerDied {
+            player: meta.player_entity_id,
+            killer: None,
+        });
+    }
+}
+
+/// Bug №701: what `Respawn` costs and where exactly the player returns is the
+/// owner's to define later (plan §20.7 leaves it open); until then the
+/// command can decide one thing honestly — a player whose binding is destroyed
+/// is put back under a live hull.
+///
+/// Routes HERE, not through `translate_command`: a respawned player's ship is
+/// by definition gone (№57 removed the wreck) or going under, so the per-ship
+/// path would answer "ship not ready" before the request was even read. Like
+/// VoteKick, this is a server-wide command and sits at this glue's level.
+pub fn handle_respawn(
+    net: &NetServer,
+    sim: &TickSystem,
+    connection_id: u32,
+    command: &CommandPacket,
+    players: &mut HashMap<u32, PlayerMeta>,
+) {
+    let acknowledge = |success: bool, reason: Option<String>| {
+        net.send_command_ack(connection_id, command.command_id, success, reason);
+    };
+
+    let ServerCommand::Respawn { player: claimed } = &command.command else {
+        acknowledge(
+            false,
+            Some("respawn glue received a non-respawn command".into()),
+        );
+        return;
+    };
+
+    let Some(meta) = players.get(&connection_id) else {
+        acknowledge(false, Some("no player to respawn".into()));
+        return;
+    };
+    // The command's `player` field is client-authored, like ChatMessage's was
+    // (№634): the connection decides whose player it is, the payload does not.
+    if *claimed != meta.player_entity_id {
+        acknowledge(false, Some("the command names a different player".into()));
+        return;
+    }
+
+    // Death is exact: the binding is gone (the №57 removal took the ship) or
+    // the hull no longer keeps anyone afloat (`check_sinking` flipped the
+    // flag; health ≤ 0 is the same statement earlier in the same update).
+    // Either way the player is not steering anything, and no ping of the hull
+    // matters — repairs cannot bring back what the point of no return already
+    // fixed.
+    let dead = sim
+        .get_ship(meta.ship_id)
+        .map(|ship| !ship.is_operational())
+        .unwrap_or(true);
+    if !dead {
+        acknowledge(false, Some("player is not dead".into()));
+        return;
+    }
+
+    let Some(target) = sim.first_alive_ship() else {
+        acknowledge(false, Some("nothing to respawn to".into()));
+        return;
+    };
+
+    // The old binding ends the way a disconnect ends it — the same despawn
+    // path, so every rule it already owns (net cleanup, the №58 station
+    // vacate, the broadcasts) holds without a second opinion about what
+    // "leave" means. Then the same `spawn_player` that opened the session
+    // rebinds: the crew broadcast the ServerSpawned, the players map is
+    // rewritten, and the same entity id returns because it is derived from the
+    // connection, not from the binding.
+    let name = meta.name.clone();
+    despawn_player(sim, net, connection_id, players);
+    let fresh = spawn_player(net, &target, connection_id, &name);
+    players.insert(connection_id, fresh);
+
+    acknowledge(true, None);
+}
+
 /// Bug №59: the current helmsman — the player occupying a Helm station.
 pub fn current_helm_occupant(ship: &Ship) -> Option<EntityId> {
     ship.get_state()
@@ -746,6 +846,141 @@ mod ship_classes_args {
                 )
                 .is_err(),
             "an unknown class id must be refused"
+        );
+    }
+}
+
+/// Bug №701: respawn has to be honest in both directions — a dead binding
+/// rebinds onto a floating hull, a live one refuses, a sea without hulls
+/// refuses. The glue runs against a real `NetServer` on an OS-allocated port:
+/// with no client attached, the acks and broadcasts fan out to nobody, which
+/// is a no-op second opinion rather than a test double that could drift from
+/// the production path.
+#[cfg(test)]
+mod respawn_tests {
+    use super::*;
+
+    use rfs_net::{NetServer, ServerConfig};
+
+    fn meta(player: u64, ship_id: u64) -> PlayerMeta {
+        PlayerMeta {
+            player_entity_id: EntityId::new(player),
+            ship_id: EntityId::new(ship_id),
+            name: "tester".into(),
+            spawn_local: Vec3f::ZERO,
+        }
+    }
+
+    /// The entity id a real join gets: it is derived from the connection, so
+    /// a respawned player's id is the one they had before the loss — the test
+    /// meta must claim exactly that, not a convenient small number.
+    fn real_player_id(connection_id: u32) -> EntityId {
+        EntityId::new(PLAYER_ID_BASE + u64::from(connection_id))
+    }
+
+    fn respawn_packet(connection_id: u32) -> CommandPacket {
+        CommandPacket {
+            command_id: 7,
+            command: ServerCommand::Respawn {
+                player: real_player_id(connection_id),
+            },
+            // Bug №216: the server crate never opens command packets itself —
+            // the session echo belongs to the transport, not to commands.
+            session: 0,
+        }
+    }
+
+    fn hittable_hull(entity_id: EntityId) -> Ship {
+        Ship::new(
+            rfs_ship::ship::ShipConfig {
+                max_health: 1000.0,
+                ..Default::default()
+            },
+            entity_id,
+            Arc::new(rfs_damage::damage::DamageSystem::new()),
+        )
+    }
+
+    async fn server() -> NetServer {
+        NetServer::new(ServerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("a loopback address"),
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("server bind")
+    }
+
+    /// A dead binding (the hull no 57 took away) is rebindable: the old
+    /// binding ends through the same despawn path as anything else, and the
+    /// same spawn path that opened the session rebinds under the one hull
+    /// still floating.
+    #[tokio::test]
+    async fn a_dead_player_rebinds_onto_the_floating_hull() {
+        let net = server().await;
+        let sim = TickSystem::new();
+        let floating = EntityId::new(SHIP_ID);
+        sim.add_ship(hittable_hull(floating));
+        let mut players = HashMap::new();
+        // The binding points at a hull the sim does not have: the dead half.
+        players.insert(1, meta(real_player_id(1).0, 999));
+
+        handle_respawn(&net, &sim, 1, &respawn_packet(1), &mut players);
+
+        let rebound = players.get(&1).expect("the player survived the respawn");
+        assert_eq!(
+            rebound.ship_id, floating,
+            "the only floating hull is the fallback target"
+        );
+        assert_eq!(
+            rebound.player_entity_id,
+            real_player_id(1),
+            "the id belongs to the connection, not to the binding it lost"
+        );
+        assert_eq!(rebound.name, "tester", "the loss must not change the name");
+    }
+
+    /// A binding that is still steering an operational hull is NOT dead, and
+    /// respawn has no reason to exist for it — the refusal must leave the
+    /// binding untouched, because a silent rebind would be a kick, not a
+    /// respawn.
+    #[tokio::test]
+    async fn a_live_player_is_refused_and_stays_bound() {
+        let net = server().await;
+        let sim = TickSystem::new();
+        let hull = EntityId::new(SHIP_ID);
+        sim.add_ship(hittable_hull(hull));
+        let mut players = HashMap::new();
+        players.insert(1, meta(real_player_id(1).0, hull.0));
+
+        handle_respawn(&net, &sim, 1, &respawn_packet(1), &mut players);
+
+        let started = players.get(&1).expect("the player stayed");
+        assert_eq!(
+            started.ship_id, hull,
+            "a live player must not be silently rebound"
+        );
+        assert_eq!(started.name, "tester");
+    }
+
+    /// A sea without floating hulls cannot put anyone under any roof: the
+    /// refusal names it, and nothing about the binding moves — the meta keeps
+    /// its last known binding so a later respawn still resolves against it.
+    #[tokio::test]
+    async fn a_world_without_hulls_refuses() {
+        let net = server().await;
+        let sim = TickSystem::new();
+        let mut players = HashMap::new();
+        players.insert(1, meta(real_player_id(1).0, 999));
+
+        handle_respawn(&net, &sim, 1, &respawn_packet(1), &mut players);
+
+        let kept = players
+            .get(&1)
+            .expect("the binding is untouched on refusal");
+        assert_eq!(
+            kept.ship_id,
+            EntityId::new(999),
+            "a refused respawn must not invent a binding either"
         );
     }
 }

@@ -3192,32 +3192,49 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
         &self,
         hinstance: u64,
         hwnd: u64,
-    ) -> RhiResult<crate::backend::vulkan::present::WindowSurface> {
-        crate::backend::vulkan::WindowSurface::new_win32(
+    ) -> RhiResult<crate::present::WindowSurface> {
+        let surface = crate::backend::vulkan::WindowSurface::new_win32(
             &self.instance_guard,
             hinstance as vk::HINSTANCE,
             hwnd as vk::HWND,
-        )
+        )?;
+        // Bug №663: the trait speaks the neutral presentation types; the Vulkan
+        // object rides inside the enum and keeps its owner semantics there.
+        Ok(crate::present::WindowSurface::vulkan(surface))
     }
 
     fn create_swapchain(
         &self,
-        surface: &crate::backend::vulkan::WindowSurface,
-        request: crate::backend::vulkan::SwapchainRequest,
-        old: Option<&mut crate::backend::vulkan::Swapchain>,
-    ) -> RhiResult<crate::backend::vulkan::Swapchain> {
+        surface: &crate::present::WindowSurface,
+        request: crate::present::SwapchainRequest,
+        mut old: Option<&mut crate::present::Swapchain>,
+    ) -> RhiResult<crate::present::Swapchain> {
+        let Some(vulkan_surface) = surface.as_vulkan() else {
+            return Err(RhiError::BackendError(
+                "creating a Vulkan swapchain for a surface from another backend".into(),
+            ));
+        };
+        let vulkan_request = crate::backend::vulkan::SwapchainRequest {
+            width: request.width,
+            height: request.height,
+            present_mode: request.present_mode.as_vulkan(),
+        };
+        // A chain replaced through `oldSwapchain` must genuinely be this
+        // backend's chain; one from another backend cannot be crossed over.
+        let vulkan_old = old.as_mut().and_then(|chain| chain.as_vulkan_mut());
         // SAFETY: device valid; queue_family_index was validated at device creation (advertised family);
         // index 0 matches the single queue requested in DeviceQueueCreateInfo.
         let queue = unsafe { self.device.get_device_queue(self.queue_family_index, 0) };
-        crate::backend::vulkan::Swapchain::create(
+        let swapchain = crate::backend::vulkan::Swapchain::create(
             &self.instance_guard,
             self.device.clone(),
-            surface,
+            vulkan_surface,
             self.physical_device,
             queue,
-            request,
-            old,
-        )
+            vulkan_request,
+            vulkan_old,
+        )?;
+        Ok(crate::present::Swapchain::vulkan(swapchain))
     }
 
     fn presentation_render_pass_desc(

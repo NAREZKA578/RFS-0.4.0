@@ -6,7 +6,7 @@ mod convert;
 mod device;
 mod instance;
 mod memory;
-mod present;
+pub(crate) mod present;
 mod record;
 
 // The presentation types are `pub(crate)`-constructible because building a

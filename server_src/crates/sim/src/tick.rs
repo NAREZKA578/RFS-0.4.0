@@ -334,9 +334,24 @@ impl TickSystem {
             events: Vec::new(),
         };
 
+        // Bug №701: the sinking edge is taken across the WHOLE tick, so the
+        // pre-tick flags are captured before any of the tick's fallout lands.
+        // The trap №701 hit: `apply_pending_damage` runs first, and one of its
+        // paths (`apply_health_damage`, №191's guard) flips `is_sinking` right
+        // on the live state — before `update_ships_parallel` captures its
+        // "pre-update" state. A prev-vs-state comparison inside that update
+        // never sees the crossing, because both sides are already `{ true,
+        // true }`. One boolean per ship per tick is the price of honesty.
+        let pre_sinking: HashMap<EntityId, bool> = self
+            .ships
+            .read()
+            .iter()
+            .map(|(id, ship)| (*id, ship.is_sinking()))
+            .collect();
+
         // Stage 2 fallout of the PREVIOUS tick lands first, on a settled state.
         self.apply_pending_damage(&mut result);
-        self.update_ships_parallel(&mut result);
+        self.update_ships_parallel(&pre_sinking, &mut result);
         self.hold_ships_in_bounds();
         // Bug №308/the design note: in an open sea the only thing a ship can
         // run into is another ship (or a structure on an authored map). The
@@ -623,7 +638,11 @@ impl TickSystem {
         self.world.read().clone()
     }
 
-    fn update_ships_parallel(&self, result: &mut TickResult) {
+    fn update_ships_parallel(
+        &self,
+        pre_sinking: &HashMap<EntityId, bool>,
+        result: &mut TickResult,
+    ) {
         let ships = self.ships.read();
 
         // Bug №153: the pre-tick state is captured so flooding/occupancy
@@ -655,6 +674,20 @@ impl TickSystem {
                 continue;
             }
             if let Some(ship) = ships.get(&id) {
+                // Bug №701: the loss of a hull is fixed when `is_sinking` flips
+                // — by `check_sinking` in the update below, or earlier in the
+                // same tick by `apply_health_damage` (№191's guard). Edge
+                // taken against the PRE-TICK capture (see the comment in
+                // `tick`), per №153's rule; the ~30 s of drift that
+                // `sink_timer` runs must not ring the event again. A ship
+                // cannot reach `has_sunk` on the crossing tick itself (the
+                // timer starts at 30 s), so the removal branch above never
+                // needs to raise this for the crew.
+                if !pre_sinking.get(&id).copied().unwrap_or(false) && state.is_sinking {
+                    result
+                        .events
+                        .push(GameEvent::ShipSinkingStarted { ship: id });
+                }
                 Self::emit_state_transitions(&prev, &state, &mut result.events);
                 ship.apply_state(state);
                 result.ship_updates.push(ShipUpdate {
@@ -1297,6 +1330,23 @@ impl TickSystem {
         self.ships.read().get(&entity_id).cloned()
     }
 
+    /// Bug №701: a ship the server could still bind respawned crew to.
+    ///
+    /// The lower entity id wins so the fallback target does not depend on
+    /// HashMap iteration order — the sim exists to be deterministic, and a
+    /// respawn that lands on a different hull between identical runs is not
+    /// that. A ship that is gone under (`is_sinking`) or has lost its hull is
+    /// not a candidate even though it is still in the map for another few
+    /// seconds.
+    pub fn first_alive_ship(&self) -> Option<Arc<Ship>> {
+        self.ships
+            .read()
+            .iter()
+            .filter(|(_, ship)| ship.is_operational())
+            .min_by_key(|(id, _)| id.0)
+            .map(|(_, ship)| ship.clone())
+    }
+
     /// Spawns a projectile, or reports why it was refused.
     pub fn fire_projectile(&self, projectile: Projectile) -> Result<(), ProjectileRejected> {
         // Unbounded spawn is a DoS/OOM (256 clients x 30Hz x 12s), so the count is
@@ -1561,6 +1611,18 @@ pub enum GameEvent {
         position: Vec3f,
         normal: Vec3f,
     },
+    /// Bug №701: the hull's loss became certain — `is_sinking` flipped, the
+    /// point of no return (the update's `check_sinking`, or earlier in the
+    /// same tick `apply_health_damage`, №191's guard) — and the ship started
+    /// to go under. Edge-triggered like №153's transitions: exactly once per
+    /// crossing, never once per tick of the drift that follows. `ShipSunk`
+    /// keeps naming the position of the wreck when it is finally removed;
+    /// this event only marks the moment the loss BECAME the outcome, which is
+    /// what evacuation and respawn clocks must be read against. Live through
+    /// the server per-crew `PlayerDied` events — the sim cannot name players.
+    ShipSinkingStarted {
+        ship: EntityId,
+    },
 }
 
 #[cfg(test)]
@@ -1772,6 +1834,97 @@ mod tests {
             ship.health(),
             start_health
         );
+    }
+
+    /// Bug №701: the sim tells its consumers WHEN a loss became certain, not
+    /// when the wreck finally leaves. The shell that zeroes the hull is the
+    /// trigger; on the tick that crosses the edge exactly one
+    /// `ShipSinkingStarted` fires, in the drift ticks that follow (the ~30 s
+    /// `sink_timer` from №57 runs during them) the event never repeats, and a
+    /// healthy hull rings nothing at all. A poll-shaped event — one event per
+    /// tick restating `is_sinking` — would be useless to a respawn clock,
+    /// which is what consumes this downstream.
+    ///
+    /// The damage -\> event wiring here is the same one the test above pins:
+    /// the crossing happens on the tick the queued damage lands, one tick
+    /// after the collision was detected (§5.1).
+    #[test]
+    fn the_bell_rings_exactly_once_when_the_loss_becomes_certain() {
+        let mut sim = TickSystem::new();
+        sim.add_ship(rfs_ship::ship::Ship::new(
+            rfs_ship::ship::ShipConfig {
+                // The test's subject is the edge, not the damage model, so the
+                // hull gets just enough health for ONE honest hit to cross it:
+                // a cannonball at a square angle lands on the model's ~50-damage
+                // arm (the plate halves it), which crosses 40 in one blow. The
+                // raw `damage` field of a fired shell is not what lands — the
+                // ballistics model prices the impact itself.
+                max_health: 40.0,
+                // A ship with no compartments has no bounds, so nothing could
+                // ever hit it. One compartment centred on the origin gives
+                // the collision pass something to find.
+                compartments: vec![rfs_core::entity::CompartmentTemplate {
+                    name: "hull".into(),
+                    local_bounds: rfs_core::math::Bounds::new(
+                        Vec3f::new(-20.0, -20.0, -20.0),
+                        Vec3f::new(20.0, 20.0, 20.0),
+                    ),
+                    max_water_level: 100.0,
+                    pump_capacity: 5.0,
+                    connected_compartments: Vec::new(),
+                    bulkheads: Vec::new(),
+                    stations: Vec::new(),
+                }],
+                ..Default::default()
+            },
+            EntityId::new(1),
+            std::sync::Arc::new(rfs_damage::DamageSystem::new()),
+        ));
+
+        sim.fire_projectile(Projectile {
+            entity_id: EntityId::new(500),
+            // A different owner: `check_collisions` skips a projectile whose
+            // owner is the ship it would hit.
+            owner: EntityId::new(999),
+            position: Vec3f::ZERO,
+            prev_position: Vec3f::new(-30.0, 0.0, 0.0),
+            velocity: Vec3f::new(400.0, 0.0, 0.0),
+            damage: 2000.0,
+            ..shell(500)
+        })
+        .expect("the shell was accepted");
+
+        let bell_rings = |events: &[GameEvent]| {
+            events
+                .iter()
+                .filter(|event| matches!(event, GameEvent::ShipSinkingStarted { .. }))
+                .count()
+        };
+
+        // First tick: collision detected, damage queued; the hull is intact.
+        assert_eq!(
+            bell_rings(&sim.tick().events),
+            0,
+            "the bell rang before the hull was even hurt"
+        );
+
+        // Second tick: the queued damage lands, health crosses zero, the flag
+        // flips (through `apply_health_damage`, №191's guard) — one ring, once.
+        assert_eq!(
+            bell_rings(&sim.tick().events),
+            1,
+            "exactly one ring on the crossing edge"
+        );
+
+        // The drift: the wreck keeps sinking for ~30 s of ticks after the
+        // edge; the event must not re-state what the state already carries.
+        for tick in 3..=5 {
+            assert_eq!(
+                bell_rings(&sim.tick().events),
+                0,
+                "the edge fired again on drift tick {tick}"
+            );
+        }
     }
 
     /// The box a shell can hit and the boxes that can take damage are not the

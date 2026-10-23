@@ -1,6 +1,6 @@
 //! The world's static description, and the types that carry it on the wire.
 //!
-//! Bug №699: the server could load a map, but the client never heard of it.
+//! Bug №698: the server could load a map, but the client never heard of it.
 //! The replication layers carry ships, players, stations, compartments and
 //! projectiles — and no structure, so a player watched a shell vanish at a
 //! rock that was not in their world at all.

@@ -20,6 +20,18 @@ bitflags = { version = "2.0", features = ["serde"] }
 # Vulkan bindings (dynamic loading, no SDK required at compile time)
 ash = { version = "0.38", default-features = true }
 
+# Microsoft Win32 / DirectX bindings (Windows-only; cleared feature surface so
+# D3D11/D3D12/DXGI stay optional for every other target)
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", default-features = false, features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
 [lib]
 name = "rhi"
 path = "lib.rs"

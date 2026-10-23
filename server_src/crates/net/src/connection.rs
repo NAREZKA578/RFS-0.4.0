@@ -7,7 +7,7 @@ use rfs_core::packet::*;
 use rfs_core::time::TICK_RATE;
 use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
@@ -17,6 +17,17 @@ use uuid::Uuid;
 /// restatement here would drift silently the next time someone alters either
 /// copy.
 pub const MAX_PACKET_SIZE: usize = rfs_core::packet::MAX_PACKET_SIZE;
+
+/// Bug №700: what one datagram may carry as payload — the wire budget
+/// (the number the builders fragment against, `max_packet_size`) minus the
+/// packet header and minus the authentication block both sides now pay
+/// before the header. One statement, here, so the seven packet builders
+/// never grow private copies of the arithmetic.
+pub fn max_payload_len(config: &ConnectionConfig) -> usize {
+    config
+        .max_packet_size
+        .saturating_sub(HEADER_SIZE + rfs_core::packet::AUTH_WIRE_LEN)
+}
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -207,11 +218,22 @@ pub struct Connection {
     /// by the snapshot pass on the next tick, so a stalled layer heals in one
     /// round trip instead of waiting out the scheduled cadence.
     resync_requests: Mutex<[bool; LAYER_COUNT]>,
-    /// Bug №216: whether this connection proved it may join. A server with a
-    /// secret configured holds the world back until the client answers with
-    /// it; a server without one authenticates everyone by default.
-    authenticated: AtomicBool,
+    /// Bug №700: this connection's outbound auth sequence. Starts at 1 — a
+    /// zero sequence is the unsigned dialect — and skips 0 on wrap.
+    pub(crate) wire_seq: Mutex<u64>,
+    /// Bug №216: this connection's session number. Minted once by whoever
+    /// creates the connection and communicated to the client inside
+    /// `ConnectAcceptPacket`; every inbound Heartbeat/Input/Command must echo
+    /// it and every outbound packet of those types carries it. A value of 0
+    /// means "not negotiated yet" — the client carries that only before its
+    /// first accept.
+    session: Mutex<u128>,
 }
+
+/// Bug №216: the session value meaning "no session negotiated". The accept
+/// always carries a minted (non-zero) value; zero on the wire means the
+/// sender never received an accept and its packets are refused.
+pub const SESSION_UNSET: u128 = 0;
 
 impl Connection {
     pub fn new(id: u32, addr: SocketAddr, mut config: ConnectionConfig) -> Self {
@@ -222,12 +244,23 @@ impl Connection {
             .collect();
         // Bug №10: a max_packet_size below the header size would underflow
         // every `max_packet_size - HEADER_SIZE`. Clamp once, loudly.
+        // Bug №700: the auth block rides on EVERY datagram, so with a key on
+        // the wire the payload room shrinks by AUTH_WIRE_LEN; a maximum that
+        // doesn't acknowledge that would push signed traffic over MTU while
+        // passing an unsigned check.
         if config.max_packet_size <= HEADER_SIZE {
             warn!(
                 "max_packet_size {} <= HEADER_SIZE {}, clamping",
                 config.max_packet_size, HEADER_SIZE
             );
             config.max_packet_size = HEADER_SIZE + 1;
+        }
+        if config.max_packet_size <= HEADER_SIZE + AUTH_WIRE_LEN {
+            warn!(
+                "max_packet_size {} <= HEADER_SIZE {} + AUTH_WIRE_LEN {}, clamping",
+                config.max_packet_size, HEADER_SIZE, AUTH_WIRE_LEN
+            );
+            config.max_packet_size = HEADER_SIZE + AUTH_WIRE_LEN + 1;
         }
 
         let limiter = BandwidthLimiter::new(config.max_bandwidth_bps);
@@ -262,20 +295,24 @@ impl Connection {
             reliable_gaps: Mutex::new(BTreeSet::new()),
             bandwidth_limiter: limiter,
             resync_requests: Mutex::new([false; LAYER_COUNT]),
-            // Bug №216: a connection starts out authenticated; a server that
-            // requires a secret turns that off until the client proves itself.
-            authenticated: AtomicBool::new(true),
+            wire_seq: Mutex::new(0),
+            // Bug №216: every connection mints its own session — never zero,
+            // so an unset session cannot be forged by a value.
+            session: Mutex::new(Uuid::new_v4().as_u128()),
         }
     }
 
-    /// Bug №216: whether this connection proved it may join.
-    pub fn is_authenticated(&self) -> bool {
-        self.authenticated.load(Ordering::Relaxed)
+    /// Bug №216: the session this connection negotiates. Inbound packets of
+    /// the gated types must echo it; read before client-side sends too, so
+    /// both sides stamp their datagrams with the same number.
+    pub fn session(&self) -> u128 {
+        *self.session.lock()
     }
 
-    /// Bug №216: mark the connection as having proved itself.
-    pub fn set_authenticated(&self, authenticated: bool) {
-        self.authenticated.store(authenticated, Ordering::Relaxed);
+    /// Bug №216: the client installs the session it learned from the accept.
+    /// The server never needs this — it minted the value itself.
+    pub fn set_session(&self, session: u128) {
+        *self.session.lock() = session;
     }
 
     pub fn state(&self) -> ConnectionState {
@@ -554,6 +591,7 @@ impl Connection {
         let packet = HeartbeatPacket {
             client_time: 0.0,
             server_time: 0.0,
+            session: self.session(),
         };
         let header = self.ack_header(PacketType::Heartbeat, ChannelType::ReliableOrdered, seq, 0);
         // OutgoingPacket::new refuses on serialize failure, so nothing but a
@@ -571,6 +609,7 @@ impl Connection {
         let packet = HeartbeatPacket {
             client_time: 0.0,
             server_time: 0.0,
+            session: self.session(),
         };
         // The `ack` field of a HeartbeatAck echoes the heartbeat it answers
         // (RTT correlation), so it stays the echoed sequence; the SACK half
@@ -600,6 +639,9 @@ impl Connection {
             assigned_client_id: self.id,
             match_id,
             tick_rate: TICK_RATE,
+            // Bug №216: this is where the client first learns the session it
+            // must echo from now on.
+            session: self.session(),
         };
         let header = self.ack_header(
             PacketType::ConnectAccept,
@@ -627,7 +669,7 @@ impl Connection {
             }
         };
 
-        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+        if serialized.len() <= max_payload_len(&self.config) {
             let seq = self.next_sequence();
             let header =
                 self.ack_header(PacketType::State, ChannelType::UnreliableSequenced, seq, 0);
@@ -665,7 +707,7 @@ impl Connection {
     pub fn send_state_delta_bytes(&self, serialized: Vec<u8>) -> Vec<OutgoingPacket> {
         let mut packets = Vec::new();
 
-        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+        if serialized.len() <= max_payload_len(&self.config) {
             let seq = self.next_sequence();
             let header = self.ack_header(
                 PacketType::StateDelta,
@@ -692,7 +734,7 @@ impl Connection {
             }
         };
 
-        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+        if serialized.len() <= max_payload_len(&self.config) {
             let seq = self.next_sequence();
             // Bug №272: events go out UNRELIABLE, and enter no ledger.
             //
@@ -726,7 +768,7 @@ impl Connection {
         }
     }
 
-    /// Bug №699: the world's static description, sent once when the client
+    /// Bug №698: the world's static description, sent once when the client
     /// connects.
     ///
     /// It goes out UNRELIABLE, like the events: the world does not change, and
@@ -750,7 +792,7 @@ impl Connection {
                 return Vec::new();
             }
         };
-        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+        if serialized.len() <= max_payload_len(&self.config) {
             let seq = self.next_sequence();
             let header = self.ack_header(
                 PacketType::MapDescription,
@@ -788,7 +830,7 @@ impl Connection {
             }
         };
 
-        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+        if serialized.len() <= max_payload_len(&self.config) {
             let seq = self.next_sequence();
             let header = self.ack_header(
                 PacketType::CommandAck,
@@ -821,7 +863,7 @@ impl Connection {
             }
         };
 
-        if serialized.len() <= self.config.max_packet_size.saturating_sub(HEADER_SIZE) {
+        if serialized.len() <= max_payload_len(&self.config) {
             let seq = self.next_sequence();
             // Bug №272: unreliable, and NOT tracked — it was the one send path
             // that declared `ReliableOrdered` without calling
@@ -854,11 +896,7 @@ impl Connection {
 
     fn fragment_large_packet(&self, packet_type: PacketType, data: Vec<u8>) -> Vec<OutgoingPacket> {
         let mut packets = Vec::new();
-        let max_payload = self
-            .config
-            .max_packet_size
-            .saturating_sub(HEADER_SIZE)
-            .saturating_sub(FRAGMENT_HEADER_SIZE);
+        let max_payload = max_payload_len(&self.config).saturating_sub(FRAGMENT_HEADER_SIZE);
         if max_payload == 0 {
             warn!("max_packet_size leaves no room for fragments, dropping");
             return packets;

@@ -10,12 +10,17 @@
 // fragment's depth in the light's space against the map's. Which map depends
 // on how far the fragment is: a directional light's shadow is cut into
 // cascades by distance, and the near cascade is detailed while the far one is
-// coarse. The map is read with a comparison sampler, which is the only
-// sampler a depth image may be filtered by.
+// coarse. The map is read with a comparison sampler, which is the only sampler
+// a depth image may be filtered by.
 //
 // The light is positional: a point with a radius. The attenuation is the
 // inverse square with a radius that fades the light out at its edge, so a
 // light does not light the whole world.
+//
+// The lights are read from the **clustering pass's own buffer** — the same
+// buffer the clustering binned from. Reading a different buffer would give
+// indices that point at other lights, and the picture would be lit by
+// whatever happens to be at those places.
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -32,28 +37,48 @@ struct VertexOutput {
     @location(2) color: vec4<f32>,
 };
 
-struct Uniforms {
-    mvp: mat4x4<f32>,
+// The per-item block: the camera and the item.
+struct ItemUniforms {
+    // The camera's view-projection, without the item's model matrix.
+    //
+    // The model matrix is separate because the cluster of a fragment is found
+    // from its **world** position: the cluster belongs to the screen, and the
+    // screen is the camera's. A matrix with the model in it would put the
+    // fragment in a tile it does not occupy.
+    view_projection: mat4x4<f32>,
     model: mat4x4<f32>,
+};
+
+// The per-frame block: the cascades, the grid and the ambient term.
+struct FrameUniforms {
     // The light's view-projection, one per cascade. The cascade the fragment
     // falls into decides which one is used.
     light_space: array<mat4x4<f32>, 4>,
     // x = the tiles in x, y = the tiles in y, z = the depth slices, w = the near plane.
     grid: vec4<f32>,
-    // x = the far plane, y = the light the shadow map belongs to (-1 for none).
+    // x = the far plane, y and z and w = unused.
     planes: vec4<f32>,
-    // The distances at which the frustum is cut: the cascade a fragment belongs
-    // to is the one whose range holds its distance.
+    // The distance at which each cascade ends.
     splits: vec4<f32>,
+    // The ambient term.
     ambient: vec4<f32>,
+    // x = the light that casts the shadows (the index in the lights buffer),
+    // y = the number of cascades, z and w = unused.
+    control: vec4<u32>,
 };
 
 // The light, in the layout the scene's light buffer uses.
 //
-// `vec3` is 16-aligned inside a struct, so `position` is at 0 and `color` at
-// 16 - and the two floats after them are at **28 and 32**, not at 32 and 36: a
-// member is aligned by its own alignment, and `f32`'s is 4, whereas a `vec3`
-// takes 12 bytes at an alignment of 16. The array's stride is 48.
+// `vec3` is 16-aligned inside a struct, so the fields sit at 0, 16, 28 and 32
+// and the stride is 48. The two floats after the vectors are at **28 and 32**,
+// not at 32 and 36: a member is placed at the next offset that satisfies its
+// own alignment, and `f32`'s is 4, not the struct's 16.
+//
+// The layout is written down once, in `src/render/lighting/light_buffer.rs`,
+// and every shader that reads a light has to declare exactly this one — the
+// test `light_layout.rs` compares the declarations in the repository with the
+// canonical one, so a shader that drifts is caught by a test and not by a
+// picture that comes out black.
 struct Light {
     position: vec3<f32>,
     color: vec3<f32>,
@@ -65,14 +90,15 @@ struct Lights {
     lights: array<Light>,
 };
 
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var shadow_map_0: texture_depth_2d;
-@group(0) @binding(2) var shadow_map_1: texture_depth_2d;
-@group(0) @binding(3) var shadow_map_2: texture_depth_2d;
-@group(0) @binding(4) var shadow_map_3: texture_depth_2d;
-@group(0) @binding(5) var shadow_sampler: sampler_comparison;
-@group(0) @binding(6) var<storage, read> lights: Lights;
-@group(0) @binding(7) var<storage, read> cluster_indices: array<u32>;
+@group(0) @binding(0) var<uniform> item: ItemUniforms;
+@group(0) @binding(1) var<uniform> frame: FrameUniforms;
+@group(0) @binding(2) var shadow_map_0: texture_depth_2d;
+@group(0) @binding(3) var shadow_map_1: texture_depth_2d;
+@group(0) @binding(4) var shadow_map_2: texture_depth_2d;
+@group(0) @binding(5) var shadow_map_3: texture_depth_2d;
+@group(0) @binding(6) var shadow_sampler: sampler_comparison;
+@group(0) @binding(7) var<storage, read> lights: Lights;
+@group(0) @binding(8) var<storage, read> cluster_indices: array<u32>;
 
 // The value that marks a slot as empty.
 //
@@ -87,36 +113,41 @@ const EMPTY_SLOT: u32 = 0xFFFFFFFFu;
 const SLOTS: u32 = 32u;
 const CASCADES: u32 = 4u;
 
-// The distance to the camera, in world units.
+// The linear depth of the fragment: the distance along the camera's forward
+// axis, in world units.
 //
-// The clip space's z is not linear in the distance, and the clusters' slices
-// are linear in the distance, so the distance has to be recovered from it.
+// The cluster's slices are cut in this depth and not in the distance to the
+// camera, and the cascades are cut in it too, so both need it.
 //
-// The form matters: **Vulkan's projection puts the near plane at z = 0 and the
-// far plane at z = 1**, not at -1 and 1 as OpenGL does. The OpenGL form of
-// this formula gives a distance about twice the right one for a fragment near
-// the camera, which puts it in the wrong depth slice - and a fragment in the
-// wrong slice looks at the wrong lights, and the scene comes out black.
-fn distance_to_camera(world_position: vec3<f32>) -> f32 {
-    let clip = uniforms.mvp * vec4<f32>(world_position, 1.0);
-    let ndc = clip.xyz / clip.w;
-    let near = uniforms.grid.w;
-    let far = uniforms.planes.x;
-    return max((near * far) / (far - ndc.z * (far - near)), near);
+// The depth comes from the **world position** and not from the fragment's
+// `@builtin(position)`: that one is the framebuffer coordinate, and its `z` is
+// the depth buffer's value while its `w` is the *reciprocal* of the clip
+// space's w. Dividing one by the other would multiply the depth by the clip
+// w, and a fragment nearer than the far plane would come out deeper than the
+// far plane — in the wrong slice, and in the wrong cascade.
+//
+// The form of the inversion depends on the depth convention: **Vulkan's
+// projection puts the near plane at z = 0 and the far plane at z = 1**, not at
+// -1 and 1 as OpenGL does. The OpenGL form gives a distance about twice the
+// right one for a fragment near the camera.
+fn linear_depth(world_position: vec3<f32>) -> f32 {
+    let clip = item.view_projection * vec4<f32>(world_position, 1.0);
+    let ndc_z = clip.z / clip.w;
+    let near = frame.grid.w;
+    let far = frame.planes.x;
+    return (near * far) / (far - ndc_z * (far - near));
 }
 
 // The cluster this fragment belongs to.
 //
-// The cluster is found from the **world position**, not from the fragment's own
-// position: the world position is an honest varying, and the same matrix the
-// camera uses turns it into the clip space, and from there into the tile and
-// the depth.
+// The cluster is found from the **world position**, projected by the camera's
+// matrix: the cluster belongs to the screen, and the screen is the camera's.
 fn cluster_of(world_position: vec3<f32>) -> u32 {
-    let tiles_x = u32(uniforms.grid.x);
-    let tiles_y = u32(uniforms.grid.y);
-    let slices = u32(uniforms.grid.z);
+    let tiles_x = u32(frame.grid.x);
+    let tiles_y = u32(frame.grid.y);
+    let slices = u32(frame.grid.z);
 
-    let clip = uniforms.mvp * vec4<f32>(world_position, 1.0);
+    let clip = item.view_projection * vec4<f32>(world_position, 1.0);
     let ndc = clip.xyz / clip.w;
 
     // The screen's [0, 1] range. The x grows to the right and the y grows
@@ -126,28 +157,37 @@ fn cluster_of(world_position: vec3<f32>) -> u32 {
     let tile_x = min(u32(screen_x * f32(tiles_x)), tiles_x - 1u);
     let tile_y = min(u32(screen_y * f32(tiles_y)), tiles_y - 1u);
 
-    let distance = distance_to_camera(world_position);
-    let near = uniforms.grid.w;
-    let far = uniforms.planes.x;
-    let slice = min(u32((distance - near) / max(far - near, 0.0001) * f32(slices)), slices - 1u);
+    let depth = linear_depth(world_position);
+    let near = frame.grid.w;
+    let far = frame.planes.x;
+    let slice = min(u32((depth - near) / max(far - near, 0.0001) * f32(slices)), slices - 1u);
 
     return (tile_y * tiles_x + tile_x) * slices + slice;
 }
 
-// The cascade the fragment falls into, by its distance.
-fn cascade_of(distance: f32) -> u32 {
+// The cascade the fragment falls into, by its depth.
+//
+// The cascade boundaries are the distances at which the cascades end, and they
+// are in the same linear depth the cluster's slices are cut in. The cascade
+// count comes from the frame: a light with fewer cascades than the shader
+// knows about must not send the fragment to a map that was never rendered.
+fn cascade_of(depth: f32) -> u32 {
+    let count = min(frame.control.y, CASCADES);
     var cascade = 0u;
     for (var i = 0u; i < CASCADES; i = i + 1u) {
-        if (distance > uniforms.splits[i]) {
+        if (i >= count) {
+            break;
+        }
+        if (depth > frame.splits[i]) {
             cascade = i + 1u;
         }
     }
-    return min(cascade, CASCADES - 1u);
+    return min(cascade, max(count, 1u) - 1u);
 }
 
 // The shadow of one cascade, for a fragment.
 fn cascade_shadow(cascade: u32, world_position: vec3<f32>, distance_to_light: f32) -> f32 {
-    let matrix = uniforms.light_space[cascade];
+    let matrix = frame.light_space[cascade];
     let light_space = matrix * vec4<f32>(world_position, 1.0);
     let ndc = light_space.xyz / light_space.w;
     if (ndc.x <= 0.0 || ndc.x >= 1.0 || ndc.y <= 0.0 || ndc.y >= 1.0 || ndc.z <= 0.0 || ndc.z >= 1.0) {
@@ -176,9 +216,10 @@ fn cascade_shadow(cascade: u32, world_position: vec3<f32>, distance_to_light: f3
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    output.clip_position = uniforms.mvp * vec4<f32>(input.position, 1.0);
-    output.world_position = (uniforms.model * vec4<f32>(input.position, 1.0)).xyz;
-    output.world_normal = normalize((uniforms.model * vec4<f32>(input.normal, 0.0)).xyz);
+    let world = item.model * vec4<f32>(input.position, 1.0);
+    output.world_position = world.xyz;
+    output.clip_position = item.view_projection * world;
+    output.world_normal = normalize((item.model * vec4<f32>(input.normal, 0.0)).xyz);
     output.color = input.color;
     return output;
 }
@@ -187,8 +228,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let normal = normalize(input.world_normal);
     let cluster = cluster_of(input.world_position);
-    let distance = distance_to_camera(input.world_position);
-    let cascade = cascade_of(distance);
+    let depth = linear_depth(input.world_position);
+    let cascade = cascade_of(depth);
 
     // The cluster's lights: the slots that are not marked as empty.
     var lit = vec3<f32>(0.0);
@@ -204,9 +245,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let light_dir = to_light / max(distance_to_light, 0.0001);
         let ndotl = max(dot(normal, light_dir), 0.0);
 
-        // The shadow, for the light the map belongs to.
+        // The shadow, for the light the maps belong to. The other lights have
+        // no map, and a light with no map is not in shadow.
         var shadow = 1.0;
-        if (f32(light_index) == uniforms.planes.y) {
+        if (light_index == frame.control.x) {
             shadow = cascade_shadow(cascade, input.world_position, distance_to_light);
         }
 
@@ -218,5 +260,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         lit = lit + light.color * light.intensity * ndotl * attenuation * shadow;
     }
-    return vec4<f32>(input.color.rgb * (uniforms.ambient.rgb + lit), 1.0);
+    return vec4<f32>(input.color.rgb * (frame.ambient.rgb + lit), 1.0);
 }

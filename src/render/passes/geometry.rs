@@ -398,17 +398,14 @@ impl GeometryPass {
         let (uniform_buffers, descriptor_layout, descriptor_sets) =
             build_uniforms(device, items.len())?;
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("geometry".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the geometry shader module was not created on the device".into(),
-            ));
-        }
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("geometry".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the geometry shader module: {e}")))?;
 
         let mut desc = GraphicsPipelineDesc {
             shader_stages: vec![
@@ -589,7 +586,7 @@ impl GeometryPass {
                 state.framebuffer_image = None;
                 state.framebuffer_extent = None;
                 state.framebuffer_generation = None;
-                let depth = context.device().create_texture(
+                let depth = match context.device().create_texture(
                     width,
                     height,
                     1,
@@ -602,7 +599,13 @@ impl GeometryPass {
                     crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT
                         | crate::rhi::TextureUsage::TRANSFER_SRC,
                     1,
-                );
+                ) {
+                    Ok(texture) => texture,
+                    Err(e) => {
+                        crate::error!("geometry", "depth texture failed: {e}");
+                        return None;
+                    }
+                };
                 // Through the device, not `Texture::create_view`: the latter
                 // builds a CPU-side handle with no GPU backing, and a framebuffer
                 // attachment without backing is rejected — reported as
@@ -1005,19 +1008,21 @@ pub fn build_uniforms(
     DescriptorSetLayout,
     Vec<DescriptorSet>,
 )> {
-    // `create_descriptor_set_layout` is infallible: it falls back to a
-    // descriptor-less layout when the backend refuses, which is the right
-    // behaviour here (a frame with no bindings still draws) but means the
-    // result must be checked before relying on binding 0 being live.
-    let layout = device.create_descriptor_set_layout(&DescriptorSetLayoutDesc {
-        bindings: vec![DescriptorBinding {
-            binding: 0,
-            ty: DescriptorType::UniformBuffer,
-            count: 1,
-            stages: ShaderStage::VERTEX | ShaderStage::FRAGMENT,
-            immutable_samplers: None,
-        }],
-    });
+    // Bug №642: the layout creation is fallible now, and the backend's
+    // refusal travels instead of disappearing behind a stand-in layout.
+    let layout = device
+        .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+            bindings: vec![DescriptorBinding {
+                binding: 0,
+                ty: DescriptorType::UniformBuffer,
+                count: 1,
+                stages: ShaderStage::VERTEX | ShaderStage::FRAGMENT,
+                immutable_samplers: None,
+            }],
+        })
+        .map_err(|e| {
+            crate::rhi::error::RhiError::BackendError(format!("the geometry uniform layout: {e}"))
+        })?;
 
     // Bug №654: one uniform buffer and one descriptor set **per item**, not
     // per pass.
@@ -1035,7 +1040,13 @@ pub fn build_uniforms(
     let mut buffers = Vec::with_capacity(item_count);
     let mut sets = Vec::with_capacity(item_count);
     for _ in 0..item_count {
-        let uniform = device.create_buffer(UNIFORM_SIZE, BufferUsage::UNIFORM, true);
+        let uniform = device
+            .create_buffer(UNIFORM_SIZE, BufferUsage::UNIFORM, true)
+            .map_err(|e| {
+                crate::rhi::error::RhiError::BackendError(format!(
+                    "the geometry uniform buffer: {e}"
+                ))
+            })?;
         let set = device.create_descriptor_set(&layout)?;
 
         device.write_descriptors(

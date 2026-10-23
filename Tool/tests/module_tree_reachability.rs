@@ -52,16 +52,6 @@ const ALLOWED_DEAD: &[AllowedDead] = &[
                  cannot compile even if declared. Delete it rather than connect it.",
     },
     AllowedDead {
-        path: "src/rhi/backend/d3d11/device.rs",
-        reason: "D3D11 backend stub. `Cargo.toml` advertises D3D11 as supported; the \
-                 implementation is not ported. Either port it or drop the feature.",
-    },
-    AllowedDead {
-        path: "src/rhi/backend/d3d12/device.rs",
-        reason: "D3D12 backend stub, same as D3D11. `Cargo.toml` advertises it as \
-                 supported and nothing implements it.",
-    },
-    AllowedDead {
         path: "src/rhi/backend/opengl/device.rs",
         reason: "OpenGL backend stub, same as D3D11/D3D12.",
     },

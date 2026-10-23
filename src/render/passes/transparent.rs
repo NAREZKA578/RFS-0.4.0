@@ -27,6 +27,7 @@ use crate::render::core::RenderContext;
 use crate::render::graph::node::{PassDependency, PassOutcome, RenderPass};
 use crate::render::graph::resource::GraphResource;
 use crate::render::passes::base::BaseRenderPass;
+use crate::render::passes::depth_target::DepthTarget;
 use crate::render::passes::geometry::GeometryItem;
 use crate::render::scene::Scene;
 use crate::rhi::{
@@ -152,6 +153,13 @@ pub struct TransparentItem {
 /// Everything the pass needs to record, shared with the caller.
 pub struct TransparentPassState {
     pub pipelines: HashMap<BlendMode, GraphicsPipeline>,
+    /// The pipelines for the shared-depth mode.
+    ///
+    /// A second set, because a pipeline belongs to a render pass and the two
+    /// modes are two render passes: the standalone one clears the colour and
+    /// the depth and writes the depth, and the shared one loads both and
+    /// writes neither.
+    pub shared_pipelines: HashMap<BlendMode, GraphicsPipeline>,
     pub descriptor_layout: DescriptorSetLayout,
     /// One descriptor set per item, in the same order as `items`.
     pub descriptor_sets: Vec<DescriptorSet>,
@@ -159,6 +167,8 @@ pub struct TransparentPassState {
     pub uniform_buffers: Vec<crate::rhi::Buffer>,
     pub items: Vec<TransparentItem>,
     pub render_pass: crate::rhi::RenderPass,
+    /// The render pass for the shared-depth mode.
+    pub shared_render_pass: Option<crate::rhi::RenderPass>,
     /// The depth the objects are tested against.
     ///
     /// The pass's own, because the image the renderer acquired has no depth
@@ -166,6 +176,12 @@ pub struct TransparentPassState {
     /// exactly.
     pub depth_texture: Option<crate::rhi::Texture>,
     pub depth_view: Option<crate::rhi::TextureView>,
+    /// The frame's shared depth, when the caller gave one.
+    ///
+    /// The transparent objects are then tested against the **opaque**
+    /// geometry's depth, which is the whole point: a transparent object behind
+    /// a wall must not be drawn over the wall.
+    pub depth_target: Option<DepthTarget>,
     /// The framebuffer the objects are drawn into.
     pub framebuffer: Option<Framebuffer>,
     /// Whether the framebuffer was chosen by the caller.
@@ -176,6 +192,8 @@ pub struct TransparentPassState {
     pub framebuffer_extent: Option<(u32, u32)>,
     /// Which swapchain generation it was built for.
     pub framebuffer_generation: Option<u64>,
+    /// The generation of the shared depth the framebuffer was built with.
+    pub framebuffer_depth_generation: Option<u64>,
     pub config: TransparentConfig,
 }
 
@@ -198,7 +216,17 @@ impl TransparentPass {
         // The transparent objects are drawn over the image the opaque pass
         // produced, so the pass comes after it. The depth they are tested
         // against is the opaque pass's depth.
-        base.add_dependency("opaque", "depth", crate::render::graph::types::ResourceUsage::Sampled);
+        //
+        // The dependency names the pass that writes the depth, because the
+        // graph orders by that name. It used to name "opaque", and no pass
+        // has ever been called that: the dependency matched nothing, so the
+        // transparent pass was never ordered after the geometry — and with the
+        // shared depth it has to be, or the pass reads a depth nobody wrote.
+        base.add_dependency(
+            "forward",
+            "shared_depth",
+            crate::render::graph::types::ResourceUsage::Sampled,
+        );
         base.add_output("swapchain");
         Self {
             base,
@@ -211,7 +239,11 @@ impl TransparentPass {
     /// Build a pass around a new shared state and return both.
     pub fn with_state(state: TransparentPassState) -> (Self, SharedState) {
         let mut base = BaseRenderPass::new("transparent");
-        base.add_dependency("opaque", "depth", crate::render::graph::types::ResourceUsage::Sampled);
+        base.add_dependency(
+            "forward",
+            "shared_depth",
+            crate::render::graph::types::ResourceUsage::Sampled,
+        );
         base.add_output("swapchain");
         let shared: SharedState = Arc::new(Mutex::new(state));
         let config = shared
@@ -291,24 +323,91 @@ impl TransparentPass {
             })
             .map_err(|e| RhiError::BackendError(format!("the transparent render pass: {e}")))?;
 
+        // The render pass for the shared-depth mode.
+        //
+        // Two differences from the one above, and both are the point:
+        //
+        // - the colour is **loaded**, not cleared: the opaque picture is
+        //   already in it, and clearing it would throw the picture away and
+        //   draw the transparent objects over black;
+        // - the depth is **read-only**: the transparent objects are tested
+        //   against the opaque geometry's depth, and they do not write it — a
+        //   transparent object that wrote depth would hide the transparent
+        //   objects behind it, and the depth would no longer be the opaque
+        //   geometry's.
+        let shared_render_pass = device
+            .create_gpu_render_pass(&crate::rhi::RenderPassDesc {
+                attachments: vec![
+                    crate::rhi::AttachmentDescription {
+                        format: color_format,
+                        samples: crate::rhi::SampleCount::X1,
+                        load_op: crate::rhi::LoadOp::Load,
+                        store_op: crate::rhi::StoreOp::Store,
+                        stencil_load_op: crate::rhi::LoadOp::DontCare,
+                        stencil_store_op: crate::rhi::StoreOp::DontCare,
+                        initial_layout: crate::rhi::TextureLayout::ColorAttachmentOptimal,
+                        final_layout: crate::rhi::TextureLayout::ColorAttachmentOptimal,
+                    },
+                    crate::rhi::AttachmentDescription {
+                        format: crate::rhi::Format::D32_SFLOAT,
+                        samples: crate::rhi::SampleCount::X1,
+                        load_op: crate::rhi::LoadOp::Load,
+                        store_op: crate::rhi::StoreOp::Store,
+                        stencil_load_op: crate::rhi::LoadOp::DontCare,
+                        stencil_store_op: crate::rhi::StoreOp::DontCare,
+                        initial_layout: crate::rhi::TextureLayout::DepthStencilAttachmentOptimal,
+                        // The attachment stays writable, and the *pipeline* is
+                        // the one that does not write: the RHI's attachment
+                        // reference has no "read only" flag, and a subpass that
+                        // names a read-only layout without the flag is a
+                        // validation error.
+                        final_layout: crate::rhi::TextureLayout::DepthStencilAttachmentOptimal,
+                    },
+                ],
+                subpasses: vec![crate::rhi::SubpassDescription {
+                    pipeline_bind_point: crate::rhi::PipelineBindPoint::Graphics,
+                    color_attachments: vec![crate::rhi::AttachmentReference {
+                        attachment: 0,
+                        layout: crate::rhi::TextureLayout::ColorAttachmentOptimal,
+                    }],
+                    depth_stencil_attachment: Some(crate::rhi::AttachmentReference {
+                        attachment: 1,
+                        layout: crate::rhi::TextureLayout::DepthStencilAttachmentOptimal,
+                    }),
+                    ..Default::default()
+                }],
+                dependencies: vec![],
+            })
+            .map_err(|e| {
+                RhiError::BackendError(format!("the transparent shared-depth render pass: {e}"))
+            })?;
+
         // One uniform buffer and one descriptor set per object: the uniform
         // holds the object's model matrix, and one buffer for the whole pass
         // would make every object use the last one's matrix (§654).
-        let descriptor_layout = device.create_descriptor_set_layout(
-            &crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
-                bindings: vec![crate::rhi::descriptor::layout::DescriptorBinding {
-                    binding: 0,
-                    ty: crate::rhi::DescriptorType::UniformBuffer,
-                    count: 1,
-                    stages: crate::rhi::ShaderStage::VERTEX | crate::rhi::ShaderStage::FRAGMENT,
-                    immutable_samplers: None,
-                }],
-            },
-        );
+        let descriptor_layout = device
+            .create_descriptor_set_layout(
+                &crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
+                    bindings: vec![crate::rhi::descriptor::layout::DescriptorBinding {
+                        binding: 0,
+                        ty: crate::rhi::DescriptorType::UniformBuffer,
+                        count: 1,
+                        stages: crate::rhi::ShaderStage::VERTEX | crate::rhi::ShaderStage::FRAGMENT,
+                        immutable_samplers: None,
+                    }],
+                },
+            )
+            .map_err(|e| {
+                RhiError::BackendError(format!("the transparent descriptor layout: {e}"))
+            })?;
         let mut uniform_buffers = Vec::with_capacity(items.len());
         let mut descriptor_sets = Vec::with_capacity(items.len());
         for _ in 0..items.len() {
-            let uniform = device.create_buffer(UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true);
+            let uniform = device
+                .create_buffer(UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true)
+                .map_err(|e| {
+                    RhiError::BackendError(format!("the transparent uniform buffer: {e}"))
+                })?;
             let set = device.create_descriptor_set(&descriptor_layout)?;
             device.write_descriptors(
                 &set,
@@ -323,21 +422,23 @@ impl TransparentPass {
             descriptor_sets.push(set);
         }
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("transparent".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the transparent shader module was not created on the device".into(),
-            ));
-        }
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("transparent".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the transparent shader module: {e}")))?;
 
         // One pipeline per blend mode: the mode *is* the blend state, and a
         // pipeline is immutable, so four modes mean four pipelines.
         let mut pipelines = HashMap::new();
+        // And four more for the shared-depth mode, because a pipeline belongs
+        // to a render pass, and the shared-depth mode is a different render
+        // pass with a different depth state: the depth is tested and not
+        // written.
+        let mut shared_pipelines = HashMap::new();
         for mode in [
             BlendMode::Alpha,
             BlendMode::Additive,
@@ -380,24 +481,63 @@ impl TransparentPass {
                 ));
             }
             pipelines.insert(mode, pipeline);
+
+            // The shared-depth pipeline: the depth is tested against the
+            // opaque geometry's and not written.
+            desc.depth_stencil_state = Some(DepthStencilState::read_only());
+            let pipeline = device
+                .create_gpu_graphics_pipeline(
+                    &desc,
+                    &shared_render_pass,
+                    &[&descriptor_layout],
+                )
+                .map_err(|e| {
+                    RhiError::BackendError(format!("the transparent shared-depth pipeline: {e}"))
+                })?;
+            if !pipeline.has_gpu_backing() {
+                return Err(RhiError::BackendError(
+                    "the transparent shared-depth graphics pipeline was not created on the \
+                     device"
+                        .into(),
+                ));
+            }
+            shared_pipelines.insert(mode, pipeline);
         }
 
         Ok(Self::with_state(TransparentPassState {
             pipelines,
+            shared_pipelines,
             descriptor_layout,
             descriptor_sets,
             uniform_buffers,
             items,
             render_pass,
+            shared_render_pass: Some(shared_render_pass),
             depth_texture: None,
             depth_view: None,
+            depth_target: None,
             framebuffer: None,
             framebuffer_pinned: false,
             framebuffer_image: None,
             framebuffer_extent: None,
             framebuffer_generation: None,
+            framebuffer_depth_generation: None,
             config,
         }))
+    }
+
+    /// The frame's shared depth, the one the opaque geometry wrote.
+    ///
+    /// With it the transparent objects are tested against the **opaque**
+    /// geometry's depth: a transparent object behind a wall is not drawn over
+    /// the wall, and a transparent object in front of it is.
+    ///
+    /// Without it the pass keeps its own depth, and the transparent objects
+    /// are tested against nothing but each other.
+    pub fn set_depth_target(state: &SharedState, depth: DepthTarget) {
+        if let Ok(mut state) = state.lock() {
+            state.depth_target = Some(depth);
+        }
     }
 
     /// Pin the framebuffer the objects are drawn into.
@@ -545,56 +685,97 @@ fn resolve_target(
         state.framebuffer = None;
         state.framebuffer_extent = Some((width, height));
     }
-    // The depth attachment is the pass's own, and it is rebuilt when the size
-    // changes: a framebuffer's attachments must all be the size of the
-    // render area. The old framebuffer is dropped first, because it holds
-    // the old depth's view.
-    let depth_stale = state
-        .depth_texture
-        .as_ref()
-        .is_none_or(|texture| texture.width() != width || texture.height() != height);
-    if depth_stale {
-        let depth = device.create_texture(
-            width,
-            height,
-            1,
-            crate::rhi::Format::D32_SFLOAT,
-            crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-            1,
-        );
-        let depth_view = match device.create_texture_view(
-            &depth,
-            &crate::rhi::TextureViewDesc {
-                texture: depth.clone(),
-                format: None,
-                view_type: crate::rhi::TextureViewType::D2,
-                aspects: crate::rhi::TextureAspectFlags::DEPTH,
-                base_mip_level: 0,
-                mip_level_count: 1,
-                base_array_layer: 0,
-                array_layer_count: 1,
-            },
-        ) {
-            Ok(view) => view,
-            Err(e) => {
-                crate::error!("transparent", "the depth view could not be created: {e}");
-                return None;
-            }
+    // The depth attachment: the frame's shared depth when the caller gave one,
+    // and the pass's own otherwise.
+    //
+    // The shared depth is the whole point: the transparent objects are tested
+    // against the **opaque** geometry's depth. A depth of their own is a depth
+    // of nothing — the pass would clear it to the far plane, and every
+    // transparent object would be in front of every other, including the ones
+    // behind a wall.
+    let shared = state.depth_target.is_some();
+    let depth_view = if let Some(target) = state.depth_target.clone() {
+        let Some(view) = target.view(device, width, height) else {
+            return None;
         };
-        state.depth_texture = Some(depth);
-        state.depth_view = Some(depth_view);
-        state.framebuffer = None;
-    }
-    let Some(depth_view) = state.depth_view.clone() else {
-        return None;
+        view
+    } else {
+        // The pass's own depth, rebuilt when the size changes: a framebuffer's
+        // attachments must all be the size of the render area. The old
+        // framebuffer is dropped first, because it holds the old depth's view.
+        let depth_stale = state
+            .depth_texture
+            .as_ref()
+            .is_none_or(|texture| texture.width() != width || texture.height() != height);
+        if depth_stale {
+            let depth = match device.create_texture(
+                width,
+                height,
+                1,
+                crate::rhi::Format::D32_SFLOAT,
+                crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                1,
+            ) {
+                Ok(texture) => texture,
+                Err(e) => {
+                    crate::error!("transparent", "the depth texture could not be created: {e}");
+                    return None;
+                }
+            };
+            let view = match device.create_texture_view(
+                &depth,
+                &crate::rhi::TextureViewDesc {
+                    texture: depth.clone(),
+                    format: None,
+                    view_type: crate::rhi::TextureViewType::D2,
+                    aspects: crate::rhi::TextureAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    mip_level_count: 1,
+                    base_array_layer: 0,
+                    array_layer_count: 1,
+                },
+            ) {
+                Ok(view) => view,
+                Err(e) => {
+                    crate::error!("transparent", "the depth view could not be created: {e}");
+                    return None;
+                }
+            };
+            state.depth_texture = Some(depth);
+            state.depth_view = Some(view);
+            state.framebuffer = None;
+        }
+        let Some(view) = state.depth_view.clone() else {
+            return None;
+        };
+        view
     };
+    // The framebuffer is rebuilt when the depth was: the old one holds the old
+    // depth's view.
+    let depth_generation = state
+        .depth_target
+        .as_ref()
+        .map(|target| target.generation())
+        .unwrap_or(0);
+    if state.framebuffer_depth_generation != Some(depth_generation) {
+        state.framebuffer = None;
+        state.framebuffer_depth_generation = Some(depth_generation);
+    }
     if state.framebuffer_image == Some(index) {
         if let Some(framebuffer) = state.framebuffer.clone() {
             return Some(framebuffer);
         }
     }
+    let render_pass = if shared {
+        state.shared_render_pass.clone()
+    } else {
+        Some(state.render_pass.clone())
+    };
+    let Some(render_pass) = render_pass else {
+        return None;
+    };
     let framebuffer = match device.create_gpu_framebuffer(&FramebufferDesc {
-        render_pass: state.render_pass.clone(),
+        render_pass,
         attachments: vec![
             FramebufferAttachment {
                 texture_view: view.clone(),
@@ -710,18 +891,71 @@ impl RenderPass for TransparentPass {
         }
         let mut commands: Vec<Command> = Vec::with_capacity(8 + order.len() * 4);
 
+        // The shared-depth mode: the opaque picture is in the target and the
+        // opaque depth is the depth, so the target is **loaded** and the depth
+        // is **read-only**.
+        //
+        // Clearing either of them here would throw away exactly what the
+        // shared depth is for: a cleared colour throws the opaque picture away,
+        // and a cleared depth makes every transparent object in front of
+        // every other.
+        let shared = state.depth_target.is_some();
+        let render_pass = if shared {
+            state.shared_render_pass.clone()
+        } else {
+            Some(state.render_pass.clone())
+        };
+        let Some(render_pass) = render_pass else {
+            return PassOutcome::skipped("the shared-depth render pass is missing");
+        };
+        let clear_values = if shared {
+            // The load operations ignore the clear values, and a render pass
+            // with a load operation has nothing to clear.
+            Vec::new()
+        } else {
+            vec![
+                crate::rhi::ClearValue::color(0.0, 0.0, 0.0, 0.0),
+                crate::rhi::ClearValue::depth_stencil(1.0, 0),
+            ]
+        };
+        if shared {
+            // The barrier between the opaque pass and this one.
+            //
+            // The order of the passes is not a memory dependency: the forward
+            // pass wrote the depth and the colour, and without this the
+            // transparent pass would read them without being guaranteed to see
+            // them. A render pass's own dependencies do not cover the gap
+            // between two render passes — the second pass's "external" subpass
+            // dependencies would, and this render pass declares none.
+            //
+            // So the barrier is **before** the render pass starts: inside a
+            // render pass instance a barrier needs a self-dependency, and the
+            // render pass has none.
+            commands.push(Command::PipelineBarrier {
+                src_stage: crate::rhi::PipelineStage::COLOR_ATTACHMENT_OUTPUT
+                    | crate::rhi::PipelineStage::LATE_FRAGMENT_TESTS,
+                dst_stage: crate::rhi::PipelineStage::COLOR_ATTACHMENT_OUTPUT
+                    | crate::rhi::PipelineStage::FRAGMENT_SHADER
+                    | crate::rhi::PipelineStage::EARLY_FRAGMENT_TESTS,
+                memory_barriers: vec![crate::rhi::sync::barrier::MemoryBarrier {
+                    src_access: crate::rhi::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | crate::rhi::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    dst_access: crate::rhi::AccessFlags::COLOR_ATTACHMENT_READ
+                        | crate::rhi::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+                }],
+                buffer_barriers: vec![],
+                texture_barriers: vec![],
+            });
+        }
         commands.push(Command::BeginRenderPass(
             crate::rhi::command::pass::render::RenderPassBeginInfo {
-                render_pass: state.render_pass.clone(),
+                render_pass,
                 framebuffer: framebuffer.clone(),
                 render_area: Rect2D {
                     offset: Offset2D { x: 0, y: 0 },
                     extent: crate::rhi::Extent2D { width, height },
                 },
-                clear_values: vec![
-                    crate::rhi::ClearValue::color(0.0, 0.0, 0.0, 0.0),
-                    crate::rhi::ClearValue::depth_stencil(1.0, 0),
-                ],
+                clear_values,
             },
         ));
         commands.push(Command::SetViewport(crate::rhi::Viewport {
@@ -741,7 +975,12 @@ impl RenderPass for TransparentPass {
             let Some(entry) = state.items.get(index) else {
                 continue;
             };
-            let Some(pipeline) = state.pipelines.get(&entry.blend_mode) else {
+            let pipeline = if shared {
+                state.shared_pipelines.get(&entry.blend_mode)
+            } else {
+                state.pipelines.get(&entry.blend_mode)
+            };
+            let Some(pipeline) = pipeline else {
                 continue;
             };
             let Some(descriptor_set) = state.descriptor_sets.get(index) else {
