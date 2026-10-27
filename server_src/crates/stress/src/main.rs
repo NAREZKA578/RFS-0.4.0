@@ -490,7 +490,7 @@ async fn run_bot(
             }
         }
 
-        // Latency and convergence, sampled alongside the input load.
+        // Latency and tick-number delivery, sampled alongside the input load.
         //
         // Both values are read from the client, which already tracks them; the
         // harness simply never asked, so a run could not answer "is the network
@@ -606,7 +606,7 @@ async fn main() -> Result<()> {
         }
     );
 
-    let auth_token = args.get(4).map(String::clone).filter(|s| !s.is_empty());
+    let auth_token = args.get(4).cloned().filter(|s| !s.is_empty());
 
     let connected_now = Arc::new(AtomicUsize::new(0));
     let updates_total = Arc::new(AtomicU64::new(0));
@@ -689,9 +689,13 @@ async fn main() -> Result<()> {
         all_rtt.iter().sum::<f64>() / all_rtt.len() as f64
     };
 
-    // Convergence: a bot saw a live server if the tick it observed actually
-    // moved during the run. `tick_advances == 0` means the server's tick never
-    // changed for that client, whatever the final number happens to be.
+    // Tick-number delivery — renamed from "convergence" (plan item: the
+    // metric measures how the client's observed tick number advanced, i.e.
+    // whether tick numbers arrived, not whether the simulation converged;
+    // the old name overclaimed).
+    // A bot saw a live server if the tick it observed actually moved during
+    // the run. `tick_advances == 0` means the server's tick never changed for
+    // that client, whatever the final number happens to be.
     let live_bots = reports.iter().filter(|r| r.tick_advances > 0).count();
     let stalled_bots = reports
         .iter()
@@ -755,7 +759,7 @@ async fn main() -> Result<()> {
         all_rtt.len(),
     );
     info!(
-        "stress convergence: live_bots={live_bots}/{bots} stalled_bots={stalled_bots} \
+        "stress tick_delivery: live_bots={live_bots}/{bots} stalled_bots={stalled_bots} \
          ticks_advanced={ticks_advanced} observed_hz_aggregate={observed_hz:.2} \
          per_bot_hz_p05={per_bot_p05:.2} per_bot_hz_p50={per_bot_p50:.2} nominal_hz={}",
         rfs_core::time::TICK_RATE as f32,

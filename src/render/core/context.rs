@@ -223,14 +223,27 @@ impl RenderContext {
             self.device.release_texture(&old);
         }
 
-        let texture = self.device.create_texture(
+        let texture = match self.device.create_texture(
             self.resolution.width,
             self.resolution.height,
             1,
             depth_format,
             TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::SAMPLED,
             1,
-        );
+        ) {
+            Ok(texture) => texture,
+            Err(e) => {
+                // Bug №642: the backend's refusal has nowhere to hide. The old
+                // CPU stand-in looked like a texture and drew nothing; the
+                // failure is reported here, from the creation, and the frame
+                // is left without a depth target — which any pass that needs
+                // one will report honestly instead of failing later.
+                eprintln!("[render] depth texture creation failed: {e}");
+                self.depth_texture = None;
+                self.depth_view = None;
+                return;
+            }
+        };
 
         let desc = TextureViewDesc {
             texture: texture.clone(),

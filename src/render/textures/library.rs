@@ -148,14 +148,23 @@ impl TextureLibrary {
                 .as_ref()
                 .expect("No device available to create normal map");
             let normal_data = vec![[128u8, 128u8, 255u8, 255u8]; 256 * 256].concat();
-            let normal_tex = Texture::new_2d(
+            let normal_tex = match Texture::new_2d(
                 "normal_flat",
                 TextureFormat::RGBA8,
                 256,
                 256,
                 TextureUsage::Normal,
                 device,
-            );
+            ) {
+                Ok(texture) => texture,
+                Err(e) => {
+                    crate::error!(
+                        "texture_library",
+                        "normal_flat: the device refused to create the normal map: {e}"
+                    );
+                    return;
+                }
+            };
             // Do not publish a placeholder whose upload failed: an empty normal map is
             // worse than no normal map, because the sampler finds something.
             if normal_tex.upload_data(&normal_data, device) {

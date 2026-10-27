@@ -1171,7 +1171,7 @@ impl NetServer {
             // before any state (ack bookkeeping, liveness, ledgers) is touched.
             if !Self::session_gate(&conn, header.packet_type, payload) {
                 let rejects = session_rejects.fetch_add(1, Ordering::Relaxed);
-                if rejects % SESSION_REJECT_LOG_EVERY == 0 {
+                if rejects.is_multiple_of(SESSION_REJECT_LOG_EVERY) {
                     warn!(
                         "session echo rejected for connection {connection_id} from {addr} \
                          (rejection no. {})",
@@ -1373,12 +1373,12 @@ impl NetServer {
         match PacketType::from_u8(packet_type) {
             Some(PacketType::Heartbeat | PacketType::HeartbeatAck) => {
                 deserialize_limited::<HeartbeatPacket>(payload)
-                    .map_or(false, |p| p.session == expected)
+                    .is_ok_and(|p| p.session == expected)
             }
             Some(PacketType::Input) => deserialize_limited::<InputPacket>(payload)
-                .map_or(false, |p| p.session == expected),
+                .is_ok_and(|p| p.session == expected),
             Some(PacketType::Command) => deserialize_limited::<CommandPacket>(payload)
-                .map_or(false, |p| p.session == expected),
+                .is_ok_and(|p| p.session == expected),
             _ => true,
         }
     }
@@ -1990,8 +1990,11 @@ impl NetServer {
             Vec<ProjectileSnapshot>,
             Vec<u8>,
         );
-        let delta_cache: std::sync::Mutex<HashMap<DeltaCacheKey, DeltaCacheValue>> =
-            std::sync::Mutex::new(HashMap::new());
+        // Bug №714: parking_lot — a poisoned std lock (a panic in another
+        // handler) used to surface as a panicking unwrap on the snapshot
+        // path; parking_lot reports the plain state instead.
+        let delta_cache: Mutex<HashMap<DeltaCacheKey, DeltaCacheValue>> =
+            Mutex::new(HashMap::new());
 
         // Bug №29: snapshot the client list first, then take the layers lock        // per client and only for map access. Serialization, fragmentation
         // and delta diffing (the expensive parts at 200 clients) run without
@@ -2128,7 +2131,7 @@ impl NetServer {
                         hasher.finish()
                     };
                     let key = (layer_u8, resync, last_sent_tick, tick, content_hash);
-                    let cached = delta_cache.lock().unwrap().get(&key).and_then(
+                    let cached = delta_cache.lock().get(&key).and_then(
                         |(b_e, b_p, c_e, c_p, bytes)| {
                             if *b_e == base_entities
                                 && *b_p == base_projectiles
@@ -2197,7 +2200,7 @@ impl NetServer {
                             Some(b) => b,
                             None => continue,
                         };
-                        delta_cache.lock().unwrap().insert(
+                        delta_cache.lock().insert(
                             key,
                             (
                                 cached_base_entities,
@@ -2717,6 +2720,7 @@ mod intro_timeout_tests {
         let by_addr = Arc::new(RwLock::new(HashMap::new()));
         let delta = Arc::new(DeltaCompressor::default());
         let layers = Arc::new(RwLock::new(HashMap::new()));
+        let pending_challenges = Arc::new(RwLock::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(64);
         let dropped = AtomicU64::new(0);
 
@@ -2746,7 +2750,15 @@ mod intro_timeout_tests {
         by_addr.write().insert(stale_addr, 5);
         by_addr.write().insert(registered_addr, 7);
 
-        NetServer::sweep_timeouts(&connections, &by_addr, &delta, &layers, &tx, &dropped);
+        NetServer::sweep_timeouts(
+            &connections,
+            &by_addr,
+            &delta,
+            &layers,
+            &tx,
+            &dropped,
+            &pending_challenges,
+        );
 
         assert_eq!(
             dropped.load(Ordering::Relaxed),

@@ -50,6 +50,66 @@ pub fn ui_ortho_projection(width: u32, height: u32) -> [f32; 16] {
     ]
 }
 
+/// The description of the pass the UI overlays a finished 3D frame with (bug №647).
+///
+/// Free-standing — like [`ui_ortho_projection`] — because the shape is data,
+/// and the weakest link of the bug is exactly a struct-literal constant: the
+/// built pass used to copy the *frame-starting* description (`LoadOp::Clear`,
+/// `initial_layout: Undefined`) from the presentation geometry pass, which is
+/// the operator for an image whose contents may be discarded. An overlay is the
+/// opposite operator, and both endpoints here are facts about the recorded
+/// frame around the UI pass rather than choices of this code:
+///
+///  - `initial_layout`: the geometry pass that records before the UI — its own
+///    presentation description — ends the swapchain image in `PresentSrc`, and
+///    both passes go into the same recorded submission. `Undefined` was the
+///    only legal-but-lying initial layout: the wildcard that discards previous
+///    contents, and the frame the UI must sit on was the previous contents.
+///    (`ColorAttachmentOptimal` would lie differently: with the image coming
+///    from pass end in `PresentSrc`, naming it at pass begin is a conformance
+///    error, not an operator.)
+///  - `final_layout`: `PresentSrc` — what `vkQueuePresentKHR` needs, and what
+///    the next frame's geometry pass then starts from again.
+///
+/// The subpass itself stays `ColorAttachmentOptimal` and the store stays
+/// `Store`: the UI paints into it as into any colour attachment.
+pub(crate) fn overlay_pass_desc(format: Format) -> crate::command::pass::render::RenderPassDesc {
+    use crate::command::pass::render::{
+        AttachmentDescription, AttachmentReference, LoadOp, PipelineBindPoint, StoreOp,
+        SubpassDescription,
+    };
+    use crate::resource::TextureLayout;
+
+    crate::command::pass::render::RenderPassDesc {
+        attachments: vec![AttachmentDescription {
+            format,
+            samples: crate::types::SampleCount::X1,
+            // Load, not Clear: the UI composites *over* what is already there.
+            // Clear is right only for the offscreen variant, which has nothing
+            // to preserve — see `new_offscreen`.
+            // Load, not Clear: the UI composites *over* what is already there.
+            // Clear is right only for the offscreen variant, which has nothing
+            // to preserve — see `new_offscreen`.
+            load_op: LoadOp::Load,
+            store_op: StoreOp::Store,
+            stencil_load_op: LoadOp::DontCare,
+            stencil_store_op: StoreOp::DontCare,
+            initial_layout: TextureLayout::PresentSrc,
+            final_layout: TextureLayout::PresentSrc,
+        }],
+        subpasses: vec![SubpassDescription {
+            pipeline_bind_point: PipelineBindPoint::Graphics,
+            color_attachments: vec![AttachmentReference {
+                attachment: 0,
+                layout: TextureLayout::ColorAttachmentOptimal,
+            }],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        }],
+        dependencies: vec![],
+    }
+}
+
 /// Render pass and projection for UI drawn over a finished frame.
 pub struct UiRenderPass {
     render_pass: RenderPass,
@@ -65,21 +125,9 @@ impl UiRenderPass {
     ///
     /// See [`Self::new_offscreen`] for the variant that can be read back.
     pub fn new(device: &Device, format: Format, width: u32, height: u32) -> UiResult<Self> {
-        // Deliberately the SAME helper the geometry pass uses, with the same
-        // `LoadOp::Clear` / `initial_layout: Undefined` / no subpass dependencies.
-        //
-        // This is a bisect, not a considered choice. `LoadOp::Load` is the
-        // semantically right operator for an overlay — it is what preserves the
-        // 3D frame underneath — but the geometry pass renders correctly with
-        // `Clear` and no dependencies, so until a `Load` UI pass is seen drawing,
-        // the difference in operator is the only variable left worth testing.
-        //
-        // Known cost of `Clear` here: it wipes the 3D frame the UI is meant to sit
-        // on. That has to be fixed properly — an acquire barrier plus `Load` — but
-        // only after the UI is drawing at all.
-        let render_pass = device.presentation_render_pass(format).map_err(|e| {
-            UiError::BackendError(format!("UI presentation render pass: {e}"))
-        })?;
+        let render_pass = device
+            .create_gpu_render_pass(&overlay_pass_desc(format))
+            .map_err(|e| UiError::BackendError(format!("UI presentation render pass: {e}")))?;
 
         Self::from_render_pass(render_pass, format, width, height)
     }
@@ -205,6 +253,35 @@ impl UiRenderPass {
 #[cfg(test)]
 mod tests {
     use super::ui_ortho_projection;
+
+    use super::overlay_pass_desc;
+    use crate::command::pass::render::LoadOp;
+    use crate::resource::TextureLayout;
+
+    /// Bug №647 negative control: the overlay's shape is data here, so the
+    /// old behaviour — `LoadOp::Clear` plus an `Undefined` initial layout, the
+    /// operator for an image whose contents may be discarded — reds this test
+    /// on every assert. The old builder shipped exactly that while its own
+    /// comment named the cost: "wipes the 3D frame the UI is meant to sit on".
+    #[test]
+    fn the_overlay_preserves_the_frame_instead_of_clearing() {
+        let desc = overlay_pass_desc(crate::types::Format::B8G8R8A8_UNORM);
+        let attachment = &desc.attachments[0];
+        assert!(matches!(attachment.load_op, LoadOp::Load));
+        assert!(matches!(attachment.initial_layout, TextureLayout::PresentSrc));
+        assert!(matches!(attachment.final_layout, TextureLayout::PresentSrc));
+        // The subpass paints into the attachment as into any colour target.
+        assert!(matches!(
+            desc.subpasses[0]
+                .color_attachments
+                .first()
+                .expect("the overlay describes exactly one colour attachment"),
+            crate::command::pass::render::AttachmentReference {
+                layout: TextureLayout::ColorAttachmentOptimal,
+                ..
+            }
+        ));
+    }
 
     /// Applies the column-major matrix to a point the way the shader does.
     fn project(m: &[f32; 16], x: f32, y: f32) -> [f32; 4] {

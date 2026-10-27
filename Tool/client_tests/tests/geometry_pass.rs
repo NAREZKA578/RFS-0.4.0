@@ -289,14 +289,16 @@ fn the_geometry_pass_records_a_full_draw_sequence() {
     );
 
     // Offscreen target, so the test needs no window.
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT,
+            1,
+        )
+        .expect("the offscreen colour target must be created");
     assert!(texture.has_gpu_backing());
     let view = device
         .create_texture_view(&texture, texture.create_default_view().desc())
@@ -353,12 +355,14 @@ fn the_geometry_pass_records_a_full_draw_sequence() {
     let (uniform_buffers, descriptor_layout, descriptor_sets) =
         build_uniforms(&device, 1).expect("uniforms");
 
-    let module = device.create_shader_module(&ShaderModuleDesc {
-        code: GEOMETRY_SHADER.to_vec(),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("geometry".into()),
-    });
+    let module = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: GEOMETRY_SHADER.to_vec(),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("geometry".into()),
+        })
+        .expect("the geometry module must be created");
     assert!(module.has_gpu_backing(), "the geometry shader must load on the GPU");
 
     let mut desc = GraphicsPipelineDesc {

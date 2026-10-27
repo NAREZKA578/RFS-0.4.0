@@ -130,14 +130,16 @@ fn the_resolve_pass_copies_the_lit_image_where_it_belongs() {
     // The offscreen target the copy lands in. The resolve pass's own render
     // pass is used for the framebuffer, because a framebuffer's attachments
     // must match its render pass's formats.
-    let target = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let target = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the resolve target must be created");
     let target_view = device
         .create_texture_view(&target, target.create_default_view().desc())
         .expect("colour attachment view");

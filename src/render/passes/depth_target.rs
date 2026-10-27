@@ -83,14 +83,23 @@ impl DepthTarget {
             .as_ref()
             .is_none_or(|texture| texture.width() != width || texture.height() != height);
         if stale {
-            let texture = device.create_texture(
+            let texture = match device.create_texture(
                 width,
                 height,
                 1,
                 Format::D32_SFLOAT,
                 TextureUsage::DEPTH_STENCIL_ATTACHMENT,
                 1,
-            );
+            ) {
+                Ok(texture) => texture,
+                Err(e) => {
+                    // Bug №642: the refusal of the backend reaches the caller,
+                    // and the honest reaction here is "no depth target this
+                    // frame", not a stand-in that would bind nothing.
+                    crate::error!("depth", "the depth texture could not be created: {e}");
+                    return None;
+                }
+            };
             let view = match device.create_texture_view(
                 &texture,
                 &crate::rhi::TextureViewDesc {

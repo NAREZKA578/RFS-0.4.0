@@ -204,28 +204,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-epoch",
- "crossbeam-queue",
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-channel"
-version = "0.5.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -240,15 +218,6 @@ name = "crossbeam-epoch"
 version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-queue"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -307,12 +276,6 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
-
-[[package]]
-name = "fastrand"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fixedbitset"
@@ -700,7 +663,6 @@ name = "rfs_damage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "fastrand",
  "parking_lot",
  "petgraph",
  "rfs_core",
@@ -715,9 +677,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
- "bytes",
  "criterion",
- "crossbeam",
  "hmac",
  "parking_lot",
  "rayon",
@@ -747,6 +707,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]
@@ -754,7 +715,6 @@ name = "rfs_ship"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "fastrand",
  "parking_lot",
  "rfs_core",
  "rfs_damage",
@@ -771,7 +731,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "criterion",
- "crossbeam",
  "parking_lot",
  "rayon",
  "rfs_core",

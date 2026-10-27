@@ -37,11 +37,13 @@ fn d3d11_buffer_host_upload_roundtrip() {
     // storage shape is refused at creation on purpose, that is proven by
     // `d3d11_device_only_buffer_contents_survive_a_download` and the refusal
     // test below.
-    let buffer = device.create_buffer(
-        64,
-        BufferUsage::UNIFORM | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
-        true,
-    );
+    let buffer = device
+        .create_buffer(
+            64,
+            BufferUsage::UNIFORM | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+            true,
+        )
+        .expect("the host-visible uniform buffer must be created");
     assert!(buffer.has_gpu_backing());
     assert!(buffer.is_host_visible());
 
@@ -77,7 +79,9 @@ fn d3d11_buffer_host_upload_roundtrip() {
 #[test]
 fn d3d11_the_upload_refuses_a_device_only_buffer_instead_of_writing_nothing() {
     let device = open_d3d11_device();
-    let buffer = device.create_buffer(64, BufferUsage::VERTEX, false);
+    let buffer = device
+        .create_buffer(64, BufferUsage::VERTEX, false)
+        .expect("the device-only vertex buffer must be created");
     assert!(buffer.has_gpu_backing());
     assert!(!buffer.is_host_visible());
 
@@ -100,7 +104,9 @@ fn d3d11_device_only_buffer_contents_survive_a_download() {
     // `upload_buffer` (no upload path), but its backing store is still
     // readable through the staging download; zero fill is the content until
     // something draws into it.
-    let buffer = device.create_buffer(256, BufferUsage::VERTEX, false);
+    let buffer = device
+        .create_buffer(256, BufferUsage::VERTEX, false)
+        .expect("the download-test vertex buffer must be created");
     let bytes = device.download_buffer(&buffer, 0, 256).expect("readback");
     assert_eq!(bytes.len(), 256);
     assert!(bytes.iter().all(|byte| *byte == 0), "a fresh buffer is zeroed");
@@ -109,14 +115,16 @@ fn d3d11_device_only_buffer_contents_survive_a_download() {
 #[test]
 fn d3d11_texture_creation_roundtrip() {
     let device = open_d3d11_device();
-    let texture = device.create_texture(
-        64,
-        64,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the tracked texture must be created");
     assert!(texture.has_gpu_backing());
     assert_eq!(texture.width(), 64);
     assert_eq!(texture.height(), 64);
@@ -128,14 +136,16 @@ fn d3d11_texture_creation_roundtrip() {
     // handle landed on the texture kind and reported a lost kind instead —
     // invisible to compile and unit tests, fatal on the first draw.
     let before = device.tracked_object_count();
-    let texture2 = device.create_texture(
-        32,
-        32,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT,
-        1,
-    );
+    let texture2 = device
+        .create_texture(
+            32,
+            32,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT,
+            1,
+        )
+        .expect("the released texture must be created");
     assert_eq!(
         device.tracked_object_count(),
         before + 1,
@@ -185,14 +195,16 @@ fn d3d11_texture_upload_download_roundtrip() {
     // TRANSFER_* alone produce no D3D11 bind flag: D3D11 has no image-layout
     // barrier culture, copies are always legal, so the usage needs something
     // real to back the object (SAMPLED is the honest carrier here).
-    let texture = device.create_texture(
-        64,
-        64,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the upload texture must be created");
     let data: Vec<u8> = (0..64 * 64 * 4).map(|i| (i & 0xff) as u8).collect();
     device
         .upload_texture(&texture, &data)
@@ -217,14 +229,16 @@ fn d3d11_exact_width_forced_row_pitch_is_arbitrary() {
     // the original pattern by luck.
     let width = 61u32;
     let height = 61u32;
-    let texture = device.create_texture(
-        width,
-        height,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            width,
+            height,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the pitch-test texture must be created");
     let mut data = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
         for x in 0..width {
@@ -303,7 +317,9 @@ fn d3d11_a_view_of_a_texture_without_an_image_is_an_error() {
 #[test]
 fn d3d11_sampler_creation() {
     let device = open_d3d11_device();
-    let sampler = device.create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 16.0);
+    let sampler = device
+        .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 16.0)
+        .expect("the anisotropy-unclamped sampler must be created");
     assert!(sampler.has_gpu_backing());
     assert!(sampler.is_linear());
 }

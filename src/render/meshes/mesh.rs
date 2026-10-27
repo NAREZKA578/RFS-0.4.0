@@ -232,11 +232,15 @@ impl Mesh {
         }
 
         let size = (std::mem::size_of::<Vertex>() * self.vertices.len()) as u64;
-        let buffer = device.create_buffer(
-            size,
-            BufferUsage::VERTEX | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
-            false,
-        );
+        let buffer = device
+            .create_buffer(
+                size,
+                BufferUsage::VERTEX | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+                false,
+            )
+            .map_err(|e| {
+                crate::rhi::RhiError::BackendError(format!("the mesh's vertex buffer: {e}"))
+            })?;
         // Vertex data is written once, so a one-shot staging upload is enough;
         // a persistently mapped buffer would only add a flush to maintain.
         // A failed upload must not leave a buffer installed: the draw would then
@@ -279,11 +283,15 @@ impl Mesh {
         }
 
         let size = self.index_type.size() as u64 * self.indices.len() as u64;
-        let buffer = device.create_buffer(
-            size,
-            BufferUsage::INDEX | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
-            false,
-        );
+        let buffer = device
+            .create_buffer(
+                size,
+                BufferUsage::INDEX | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+                false,
+            )
+            .map_err(|e| {
+                crate::rhi::RhiError::BackendError(format!("the mesh's index buffer: {e}"))
+            })?;
         match self.index_type {
             IndexType::U16 => {
                 // The pool stores `u32` indices; narrow them to what the

@@ -91,14 +91,16 @@ fn the_transparent_pass_blends_what_it_draws() {
     // the frame. The depth is there because the pass's render pass has a depth
     // attachment, and a framebuffer's attachment count must match its render
     // pass's exactly.
-    let colour = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let colour = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     let colour_view = device
         .create_texture_view(
             &colour,
@@ -114,14 +116,16 @@ fn the_transparent_pass_blends_what_it_draws() {
             },
         )
         .expect("colour view");
-    let depth = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-        1,
-    );
+    let depth = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+            1,
+        )
+        .expect("the depth target must be created");
     let depth_view = device
         .create_texture_view(
             &depth,

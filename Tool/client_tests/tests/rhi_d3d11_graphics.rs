@@ -68,12 +68,14 @@ fn open_d3d11_device() -> Device {
 fn dx_module(device: &Device, code: &[u8], target: &str, name: &str) -> ShaderModule {
     let container = compile_hlsl(code, "main", target)
         .expect("the HLSL compile must succeed for the draw to mean anything");
-    device.create_shader_module(&ShaderModuleDesc {
-        code: container,
-        format: ShaderFormat::Dxil,
-        entry_point: Some("main".into()),
-        name: Some(name.into()),
-    })
+    device
+        .create_shader_module(&ShaderModuleDesc {
+            code: container,
+            format: ShaderFormat::Dxil,
+            entry_point: Some("main".into()),
+            name: Some(name.into()),
+        })
+        .expect("the shader module must be created for the draw to mean anything")
 }
 
 fn all_channels() -> ColorComponentFlags {
@@ -88,27 +90,31 @@ fn d3d11_offscreen_indexed_depth_roundtrip() {
     let device = open_d3d11_device();
 
     const EXTENT: u32 = 64;
-    let color = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let color = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour attachment must be created");
     assert!(color.has_gpu_backing());
     let color_view = device
         .create_texture_view(&color, color.create_default_view().desc())
         .expect("color attachment view");
 
-    let depth = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-        1,
-    );
+    let depth = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+            1,
+        )
+        .expect("the depth attachment must be created");
     assert!(depth.has_gpu_backing());
     let depth_view = device
         .create_texture_view(&depth, depth.create_default_view().desc())
@@ -123,7 +129,7 @@ fn d3d11_offscreen_indexed_depth_roundtrip() {
                     load_op: LoadOp::Clear,
                     store_op: StoreOp::Store,
                     stencil_load_op: LoadOp::DontCare,
-                    stencil_store_op: LoadOp::DontCare,
+                    stencil_store_op: StoreOp::DontCare,
                     initial_layout: TextureLayout::Undefined,
                     final_layout: TextureLayout::ColorAttachmentOptimal,
                 },
@@ -133,7 +139,7 @@ fn d3d11_offscreen_indexed_depth_roundtrip() {
                     load_op: LoadOp::Clear,
                     store_op: StoreOp::DontCare,
                     stencil_load_op: LoadOp::DontCare,
-                    stencil_store_op: LoadOp::DontCare,
+                    stencil_store_op: StoreOp::DontCare,
                     initial_layout: TextureLayout::Undefined,
                     final_layout: TextureLayout::DepthAttachmentOptimal,
                 },
@@ -227,11 +233,13 @@ fn d3d11_offscreen_indexed_depth_roundtrip() {
     for index in &indices {
         index_bytes.extend_from_slice(&index.to_le_bytes());
     }
-    let index_buffer = device.create_buffer(
-        index_bytes.len() as u64,
-        BufferUsage::INDEX | BufferUsage::TRANSFER_DST,
-        true,
-    );
+    let index_buffer = device
+        .create_buffer(
+            index_bytes.len() as u64,
+            BufferUsage::INDEX | BufferUsage::TRANSFER_DST,
+            true,
+        )
+        .expect("the index buffer must be created");
     device
         .upload_buffer(&index_buffer, &index_bytes)
         .expect("the index buffer must be uploaded before the indexed draw");

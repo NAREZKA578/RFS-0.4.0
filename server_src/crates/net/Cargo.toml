@@ -7,11 +7,9 @@ edition = "2021"
 rfs_core = { path = "../core" }
 serde = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
-bytes = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 parking_lot = { workspace = true }
-crossbeam = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

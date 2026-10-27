@@ -26,9 +26,10 @@ pub const MAX_REPAIR_PER_ACTION: f32 = 25.0;
 
 /// Bug №634: chat text is client-supplied and is re-broadcast to other
 /// players as-is. Without a ceiling one packet costs every recipient's
-/// outbox the whole string — and `broadcast_event` has no per-connection
-/// queue bound (Bug №217 territory, still open). 200 chars is a sentence,
-/// well under the round-trip budget of anything the ack waits for.
+/// outbox the whole string — and the outbox bound has a documented drop
+/// policy only since the №217 re-check (2026-10-20): the queues are
+/// bounded and over-full drops are counted (bug №217). 200 chars is a
+/// sentence, well under the round-trip budget of anything the ack waits for.
 pub const MAX_CHAT_MESSAGE_LEN: usize = 200;
 
 /// Applies a station action, returning a reason if the shot was refused.

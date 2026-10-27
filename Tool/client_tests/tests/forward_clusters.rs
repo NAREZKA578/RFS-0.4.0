@@ -193,14 +193,16 @@ fn render_with_light(device: &Arc<rhi::Device>, light: SceneLight) -> f32 {
     }
 
     // The target the scene is drawn into.
-    let colour = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        rhi::Format::RGBA8_UNORM,
-        rhi::TextureUsage::COLOR_ATTACHMENT | rhi::TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let colour = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            rhi::Format::RGBA8_UNORM,
+            rhi::TextureUsage::COLOR_ATTACHMENT | rhi::TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     let colour_view = device
         .create_texture_view(
             &colour,
@@ -216,14 +218,16 @@ fn render_with_light(device: &Arc<rhi::Device>, light: SceneLight) -> f32 {
             },
         )
         .expect("colour view");
-    let depth = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        rhi::Format::D32_SFLOAT,
-        rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-        1,
-    );
+    let depth = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            rhi::Format::D32_SFLOAT,
+            rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+            1,
+        )
+        .expect("the depth target must be created");
     let depth_view = device
         .create_texture_view(
             &depth,

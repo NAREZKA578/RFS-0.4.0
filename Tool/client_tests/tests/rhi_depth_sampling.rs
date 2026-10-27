@@ -41,14 +41,16 @@ fn open_vulkan_device() -> Device {
 
 /// A depth image, as a shadow map is: a depth attachment that is also read.
 fn shadow_map(device: &Device) -> (rhi::Texture, rhi::TextureView) {
-    let texture = device.create_texture(
-        256,
-        256,
-        1,
-        Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::SAMPLED,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            256,
+            256,
+            1,
+            Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::SAMPLED,
+            1,
+        )
+        .expect("the shadow map's depth texture must be created");
     assert!(
         texture.has_gpu_backing(),
         "the shadow map must be a real image: a stand-in has no depth to read"
@@ -72,15 +74,17 @@ fn shadow_map(device: &Device) -> (rhi::Texture, rhi::TextureView) {
 }
 
 fn descriptor_layout(device: &Device) -> rhi::DescriptorSetLayout {
-    device.create_descriptor_set_layout(&DescriptorSetLayoutDesc {
-        bindings: vec![DescriptorBinding {
-            binding: 0,
-            ty: DescriptorType::SampledTexture,
-            count: 1,
-            stages: ShaderStage::FRAGMENT,
-            immutable_samplers: None,
-        }],
-    })
+    device
+        .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+            bindings: vec![DescriptorBinding {
+                binding: 0,
+                ty: DescriptorType::SampledTexture,
+                count: 1,
+                stages: ShaderStage::FRAGMENT,
+                immutable_samplers: None,
+            }],
+        })
+        .expect("the shadow map's descriptor layout must be created")
 }
 
 /// A depth view must be bindable: the shadow map is the reason this exists.

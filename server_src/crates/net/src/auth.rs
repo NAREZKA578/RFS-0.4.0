@@ -120,19 +120,10 @@ pub fn unseal_unsigned(datagram: &[u8]) -> Option<&[u8]> {
 /// at 1 on both senders; 0 is what the unsigned dialect repeats and never
 /// reaches this window, because the window is only consulted when a key
 /// is present.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReplayWindow {
     highest: u64,
     seen: u64,
-}
-
-impl Default for ReplayWindow {
-    fn default() -> Self {
-        Self {
-            highest: 0,
-            seen: 0,
-        }
-    }
 }
 
 impl ReplayWindow {
@@ -233,7 +224,7 @@ mod auth_tests {
         );
         assert!(
             unseal(
-                Some(&b"the other match's secret".to_vec()),
+                Some(b"the other match's secret".as_ref()),
                 Direction::ClientToServer,
                 &wire
             )

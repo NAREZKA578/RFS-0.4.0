@@ -70,6 +70,7 @@ fn make_shell(x: f32, vx: f32) -> Projectile {
         damage: 100.0,
         penetration: 50.0,
         explosion_radius: 0.0,
+        ricochet_count: 0,
     }
 }
 

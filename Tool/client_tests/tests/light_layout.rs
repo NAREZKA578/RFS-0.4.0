@@ -16,8 +16,6 @@
 //! what was written. Nothing about the layout is assumed by the test - the
 //! layout is what is being checked.
 
-use std::sync::Arc;
-
 use glam::Vec3;
 use rfs_client::render::lighting::light_buffer::pack_light;
 use rhi::backend::vulkan::VulkanBackend;
@@ -32,7 +30,7 @@ use rhi::resource::texture::TextureViewDesc;
 use rhi::shader::module::{ShaderFormat, ShaderModuleDesc};
 use rhi::types::{Format, SampleCount, ShaderStage, TextureUsage};
 use rhi::{
-    AttachmentDescription, AttachmentReference, Backend, BufferUsage, ClearValue, DescriptorInfo,
+    AttachmentDescription, AttachmentReference, Backend, ClearValue, DescriptorInfo,
     DescriptorType, FramebufferAttachment, FramebufferDesc, InputAssemblyState, LoadOp,
     MultisampleState, PipelineBindPoint, RenderPassDesc, StoreOp, SubpassDescription,
     TextureAspectFlags, TextureLayout, TextureViewType,
@@ -165,14 +163,16 @@ fn the_shader_reads_the_light_where_it_was_written() {
         .expect("the light's upload must succeed");
 
     // The target the shader draws into.
-    let target = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let target = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the probe target must be created");
     let view = device
         .create_texture_view(
             &target,
@@ -228,15 +228,17 @@ fn the_shader_reads_the_light_where_it_was_written() {
         .expect("framebuffer");
 
     // The descriptor: the lights' buffer.
-    let layout = device.create_descriptor_set_layout(&DescriptorSetLayoutDesc {
-        bindings: vec![DescriptorBinding {
-            binding: 0,
-            ty: DescriptorType::StorageBuffer,
-            count: 1,
-            stages: ShaderStage::FRAGMENT,
-            immutable_samplers: None,
-        }],
-    });
+    let layout = device
+        .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+            bindings: vec![DescriptorBinding {
+                binding: 0,
+                ty: DescriptorType::StorageBuffer,
+                count: 1,
+                stages: ShaderStage::FRAGMENT,
+                immutable_samplers: None,
+            }],
+        })
+        .expect("the descriptor set layout must be created");
     let set = device.create_descriptor_set(&layout).expect("descriptor set");
     device
         .write_descriptors(
@@ -250,12 +252,14 @@ fn the_shader_reads_the_light_where_it_was_written() {
         )
         .expect("the descriptor write must succeed");
 
-    let module = device.create_shader_module(&ShaderModuleDesc {
-        code: SHADER.to_vec(),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("light probe".into()),
-    });
+    let module = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: SHADER.to_vec(),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("light probe".into()),
+        })
+        .expect("the probe's shader module must compile into a module");
     assert!(module.has_gpu_backing());
 
     let pipeline = device

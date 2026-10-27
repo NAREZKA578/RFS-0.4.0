@@ -525,9 +525,12 @@ fn every_declared_pass_is_instantiated_somewhere() {
         // (`Tool/client_tests/tests/water_pixels.rs`).
         //
         // What the water pass does *not* have yet is whoever renders the
-        // scene into the reflection and the refraction: a pass cannot render
-        // the scene, it can only draw what it is given, so the scene from the
-        // mirrored camera is the caller's job and is in the TODO.
+        // scene into the refraction: a pass cannot render the scene, it can
+        // only draw what it is given. The reflection side got its renderer:
+        // `MirrorPass` builds and drives the mirrored camera itself (wired
+        // №721; `Tool/client_tests/tests/mirror_pixels.rs` proves the picture
+        // it renders is the *mirrored* camera's, not the main one), so what
+        // is still missing is only the under-water view the refraction wants.
         //
         // That is the last of the three. The allowlist is empty.
     ];

@@ -17,7 +17,7 @@
 
 use rhi::ash::vk::Handle;
 use winit::raw_window_handle::HasWindowHandle;
-use rhi::backend::vulkan::{Swapchain, SwapchainRequest};
+use rhi::present::{PresentMode, Swapchain, SwapchainRequest};
 // `PrimitiveTopology` exists in both `rhi::types` and `rhi::pipeline::graphics`,
 // so the glob re-exports make the short name ambiguous; named explicitly.
 use rhi::pipeline::graphics::PrimitiveTopology;
@@ -95,24 +95,25 @@ fn run() -> RhiResult<()> {
     let request = SwapchainRequest {
         width: size.width.max(1),
         height: size.height.max(1),
-        // MAILBOX is tear-free; `present.rs` falls back to FIFO itself.
-        present_mode: rhi::ash::vk::PresentModeKHR::MAILBOX,
+        // MAILBOX is tear-free; the chain falls back to FIFO itself when the
+        // surface cannot provide it.
+        present_mode: PresentMode::Mailbox,
     };
     let mut swapchain = device.create_swapchain(&surface, request, None)?;
 
     // The swapchain chose the format, so the pass has to follow it.
     let Some(format) = swapchain.rhi_format() else {
-        return Err(rhi::RhiError::BackendError(format!(
-            "surface offered {:?}, which the RHI cannot express",
-            swapchain.format
-        )));
+        return Err(rhi::RhiError::BackendError(
+            "the surface offered a format the RHI cannot express".into(),
+        ));
     };
     let render_pass = device.presentation_render_pass(format)?;
     let pipeline = build_pipeline(&device, &render_pass)?;
 
+    let extent = swapchain.extent();
     println!(
         "presenting {}x{} as {:?} — Esc to quit",
-        swapchain.extent.width, swapchain.extent.height, swapchain.format
+        extent.width, extent.height, format
     );
 
     // Recreate on resize. Reported rather than ignored, because a stale chain
@@ -144,7 +145,7 @@ fn run() -> RhiResult<()> {
                     let request = SwapchainRequest {
                         width: size.width.max(1),
                         height: size.height.max(1),
-                        present_mode: rhi::ash::vk::PresentModeKHR::MAILBOX,
+                        present_mode: PresentMode::Mailbox,
                     };
                     match device.create_swapchain(&surface, request, Some(&mut swapchain)) {
                         Ok(next) => swapchain = next,
@@ -186,22 +187,28 @@ fn draw_frame(
     // into a single shared command buffer and waits on the submit fence, so
     // handing the acquire over to a semaphore it never waits on would be wrong.
     let acquired = swapchain.acquire(u64::MAX, rhi::ash::vk::Semaphore::null())?;
-    let width = swapchain.extent.width;
-    let height = swapchain.extent.height;
+    let extent = swapchain.extent();
+    let (width, height) = (extent.width, extent.height);
     let Some(format) = swapchain.rhi_format() else {
-        return Err(rhi::RhiError::BackendError(format!(
-            "surface offered {:?}, which the RHI cannot express",
-            swapchain.format
-        )));
+        return Err(rhi::RhiError::BackendError(
+            "the surface offered a format the RHI cannot express".into(),
+        ));
     };
 
     // The framebuffer wraps a swapchain image, so it is rebuilt for the image
     // actually acquired. Correct but wasteful; caching per image index is the
     // obvious next step once more than one frame is in flight.
+    let images = swapchain.images();
+    let image = *images.get(acquired.image_index as usize).ok_or_else(|| {
+        rhi::RhiError::BackendError(format!(
+            "the swapchain has no image {}",
+            acquired.image_index
+        ))
+    })?;
     let framebuffer = device.swapchain_image_framebuffer(
         render_pass,
-        swapchain.images[acquired.image_index as usize].as_raw(),
-        acquired.image_view.as_raw(),
+        image,
+        acquired.image_view,
         format,
         width,
         height,
@@ -232,12 +239,16 @@ fn draw_frame(
 }
 
 fn build_pipeline(device: &Device, render_pass: &RenderPass) -> RhiResult<GraphicsPipeline> {
-    let module = device.create_shader_module(&ShaderModuleDesc {
-        code: SHADER.to_vec(),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("fullscreen".into()),
-    });
+    let module = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: SHADER.to_vec(),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("fullscreen".into()),
+        })
+        .map_err(|e| {
+            rhi::RhiError::BackendError(format!("the fullscreen shader module: {e}"))
+        })?;
     device.create_gpu_graphics_pipeline(
         &GraphicsPipelineDesc {
             shader_stages: vec![

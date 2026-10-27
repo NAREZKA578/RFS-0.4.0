@@ -472,26 +472,47 @@
 
 ## H4. Что мешает 200 ботам — порядок действий
 
-- [ ] Вынести построение первого полного снапшота из горячего пути. Сейчас оно
-      выполняется один раз на клиента, но внутри тикового publish-цикла.
-- [ ] Батчить или откладывать пересчёт интереса на входе, а не делать его на
-      каждый `Connect`.
-- [ ] Рассмотреть ограниченную очередь допуска, чтобы шторм из 200 подключений
-      не съедал бюджет тика.
-- [ ] Не умножать `rounds_per_tick`, когда цикл отстал, а давать отставать
-      честно (drop-back вместо набивания раундов).
-- [ ] Разнеять шторм подключений.
+- [x] Вынести построение первого полного снапшота из горячего пути — №710:
+      `FirstFullQueue` + `admit_first_fulls()`, бюджет `FIRST_FULL_BUDGET_PER_ROUND`
+      (4) на publish-раунд; работа outside тик-цикла, дорогое per-client дело
+      больше не в горячем пути (проверка по коду 2026-10-27.
+- [x] Батчить или откладывать пересчёт интереса на входе — `compute_interest(id)`
+      переехал из Connect-пути в admit-стадию publish-раунда (`admit_first_fulls()`),
+      на входе — только регистрация (проверка по коду 2026-10-27).
+- [x] Рассмотреть ограниченную очередь допуска — сделано (№710): очередь
+      допуска с бюджетом 4/раунд; «из кода»: «drains a 200-join storm in ~1.7 s»,
+      шторм не съедает бюджет тика.
+- [x] Не умножать `rounds_per_tick`, когда цикл отстал — реализовано иначе и
+      ГЛАВНОЕ: publish-цикл пропускает раунды, когда тик не сменился
+      (unchanged-tick skip, net/server.rs), т.е. честно даёт отставать, пока
+      симуляция не прыгнет; clamp `MissedTickBehavior::Delay` пробован (п. 505-508
+      ниже) и откачен потому, что ломал здоровый случай 50 ботов 18.5 → 0.82 Гц.
+- [~] Разнеять шторм подключений — бюджет первого полного (4/раунд) уже
+      развивает шторм по раундам; полноценный ранний stagger (N подключений/тик)
+      не делается, т.к. (проверка 2026-10-27) следующие пункты уже закрывают
+      проблему шторма.
 
-Пока это не сделано, свежая частота тиков на 200 ботах держится ~3-4 Гц, а
-средние по диапазону очень шумные (зависят от тайминга подключений).
+*Обновление 2026-10-27 (AGENT-FIX, замер 200 ботов × 30 с, release): оценка
+«держится ~3-4 Гц» устарела — сервер в бюджете (skipped 43/900), applied
+289 749 = 48.3 Гц на бота, подключение 200/200, потерь ноль; каденс
+публикации (rounds_per_tick 0.60–0.67) и RTT ~400 мс на loopback —
+разбирается в №697. Стена шторма снята: самое дорогое (per-client работа,
+first full) уже не в опубликованных[].*
 
 ## H5. Серверная структура
 
-- [ ] Разделить `crates/server/src/main.rs` (963 строки, бинарник без библиотеки)
+- [x] Разделить `crates/server/src/main.rs` (963 строки, бинарник без библиотеки)
       на четыре модуля из плана: `tick/`, `net/`, `match_`, `control/`.
-- [ ] Добавить `[lib]` в `rfs_server`. Без него тик-цикл нельзя ни измерить, ни
+- [x] Добавить `[lib]` в `rfs_server`. Без него тик-цикл нельзя ни измерить, ни
       прогнать headless.
-- [ ] Считать память сервера.
+      (см. «Server structure» ниже — GLM_1, 2026-10-19: lib-based split
+      `src/{match_,tick,net,control}.rs` + `lib.rs`, workspace 207/0, clippy чист;
+      та же запись в `- [x]`-версии этого же списка).
+- [x] Считать память сервера.
+      (2026-10-27, AGENT-FIX: windows-sys 0.61 как target-dep крейта сервера,
+      `working_set_mb()` через `ProcessStatus::PROCESS_MEMORY_COUNTERS`, метрика
+      вех — `…entities={…} ws_mb=29.1` в perf-строке; проверено живьём смоуком
+      5 ботов × 10 с: ws_mb=29.1 → 31.3 → 31.6 на первых трёх окнах.)
 
 ## Статус на 2026-10-01
 
@@ -537,20 +558,26 @@
 `cargo test --workspace` pass in all three workspaces: `C:\RFS-0.4.0`,
 `C:\RFS-0.4.0\server_src`, `C:\RFS-0.4.0\Tool`.
 
-## In progress тАФ network tick-observation chain (тДЦ264 тЖТ тДЦ265 тЖТ тДЦ266)
+## In progress — network tick-observation chain (№264 → №265 → №266)
 
-- [ ] Per-layer delta receive counters in the client. The client's observed
+- [x] Per-layer delta receive counters in the client. The client's observed
       tick number is driven by deltas, not by full states: a full state is
       dropped by the stale guard when `incoming <= max(last_applied_layer)`,
       and deltas fill that array every tick. Observed 20 Hz against a published
       30 Hz is therefore a real shortfall of roughly 10 delta ticks per second
       at ~990 packets/s per client. Count deltas received per layer to tell loss
       on the wire from a client that cannot drain its socket.
-- [ ] Count "tick not received" explicitly instead of silently skipping a tick.
+      (2026-10-27, AGENT-FIX: `applied_delta_count_by_layer()`/`stalls_by_layer`
+      в `net/src/client.rs`, собираются стрессом в `applied_deltas_by_layer`;
+      в замере 200 ботов отчёт печатает `by_layer=[74813, 107854, 107082, 0]`.)
+- [x] Count "tick not received" explicitly instead of silently skipping a tick.
+      (2026-10-20, GLM_1 №266: `record_tick_observation` + `missed_tick_publishes`
+      в стрессе, свод `stress ticks: advances=… missed_tick_publishes=…`.)
 - [ ] Distinguish UDP loss from socket-buffer overflow. Both look identical from
       the outside; only the counters separate them.
-- [ ] Rename the stress metric. It measures delivery of the tick number to the
+- [x] Rename the stress metric. It measures delivery of the tick number to the
       client, not simulation convergence. The current name overclaims.
+      (2026-10-27, AGENT-FIX: строка свода теперь `stress tick_delivery: …`).
 
 ## Server structure (blocks everything else on the server)
 
@@ -594,10 +621,14 @@
 
 ## Server defects not yet audited
 
-- [ ] тДЦ30 тАФ LayerBase advanced before send. Requires ACK/retransmit mechanism.
-      Related to тДЦ167 (SACK/retransmit).
-- [ ] тДЦ187 тАФ GPU tests panic in CI. VulkanBackend::new().unwrap() without
-      checking for Vulkan availability. rhi_backend test has empty Ok branch.
+- [ ] №30 — LayerBase advanced before send. Requires ACK/retransmit mechanism.
+      Related to №167 (SACK/retransmit).
+- [~] №187 — GPU tests panic in CI. Частично (2026-10-27, AGENT-FIX): пустая
+      Ok-ветка теста `rhi_creation_requires_working_backend` заполнена — при
+      рабочем Vulkan ветка проверяет перечисленные устройства и дефолтное
+      устройство (негативный контроль: перевёрнутый ассерт краснил тест).
+      Осталось: guard отсутствия Vulkan на ~8 сайтах `VulkanBackend::new().unwrap()`
+      в 7 файлах (см. «Не сделано» в реестре №187).
 
 ## Render, the failures that lie
 
@@ -841,10 +872,16 @@ by it yet — that is what the clustering is for.
       (`request_inner_size`); `cube` should follow.
 - [ ] The deferred example's resize self-check must become a pixel check
       (see §682): the validator is quiet while the picture is wrong.
-- [ ] `pass_reachability.rs`: the allowlist reasons must stay honest. They
+- [x] `pass_reachability.rs`: the allowlist reasons must stay honest. They
       are checked for staleness, and the reason for each of the three passes
       is "the pipeline was never written" — the shaders exist, the pipelines
       do not, and the wording should say which is missing.
+      (Resolved by the work itself, 2026-10-21/27: every former entry has been
+      removed after its own staleness check — shadow, transparent, water, then
+      gbuffer/lighting (SBF1, №698 wave) and MirrorPass (№721); `known_unwired`
+      is empty since then, each ex-entry remains in the file as a comment saying
+      honestly what is still missing, and the staleness loop
+      (`pass_reachability.rs:588-611`) is intact.)
 
 ### Decision still open
 
@@ -994,20 +1031,29 @@ by it yet — that is what the clustering is for.
 
 ## Process, worth fixing before more code
 
-- [ ] `BUGS.md` cannot be trusted as a work list: 13 entries marked open are
+- [~] `BUGS.md` cannot be trusted as a work list: 13 entries marked open are
       already fixed, and line numbers point at code that has since moved.
-      `TODO.md` is also stale тАФ it still says there is no window, no swapchain,
-      no shaders and no GPU path, and that тДЦ203 blocks rendering. All of that
+      `TODO.md` is also stale — it still says there is no window, no swapchain,
+      no shaders and no GPU path, and that №203 blocks rendering. All of that
       changed.
-- [ ] One registry entry has a status value 24 characters long, matching none
+      (2026-10-27: backlog pass over the registry — ~65-70 of 103 «Не сделано»
+      живых, остальное STALE с указателями перекрытий (№93 закрывает №77-92,
+      №228 дубликат №182 и т. д.); TODO этого файла выправляется по ходу. До
+      полной доверенности ещё далеко — номера строк в реестре продолжают стареть.)
+- [x] One registry entry has a status value 24 characters long, matching none
       of the three expected words.
-- [ ] Do not type Cyrillic into a PowerShell command line: it arrives corrupted
+      (Re-checked 2026-10-27 by grep: every real status is exactly
+      «Сделано»/«Не сделано», no trailing text; the only non-standard lines are
+      the two format templates themselves — BUGS.md:115 and :2023.)
+- [x] Do not type Cyrillic into a PowerShell command line: it arrives corrupted
       and every match then fails silently with "0 results" rather than an
       error. Write a script with the `write` tool (UTF-8), or avoid Cyrillic by
       keying off field lengths and value shape. PowerShell 5.1 also reads a
       `.ps1` without a BOM as ANSI, so a saved script with Cyrillic fails to
       parse. The bug header prefix is 4 characters, not 3 (that one wrong
       assumption silently picked the wrong registry section once).
+      (Enforced since: чтение кириллических файлов только через `read`/`grep`,
+      команды не получают кириллицу ни в аргументах, ни в выводе.)
 - [ ] Server per-client state share under load: observed tick delivery is
       26 Hz at 5 bots, 19.6 Hz at 30 (target >20). Loss counters are zero,
       layers reach the server's max tick, so delivery is lossless тАФ the gap is

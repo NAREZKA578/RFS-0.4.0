@@ -149,28 +149,28 @@ impl ResolvePass {
 
         let render_pass = device.presentation_render_pass(color_format)?;
 
-        let descriptor_layout =
-            device.create_descriptor_set_layout(&crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
-                bindings: vec![crate::rhi::descriptor::layout::DescriptorBinding {
-                    binding: 0,
-                    ty: DescriptorType::SampledTexture,
-                    count: 1,
-                    stages: ShaderStage::FRAGMENT,
-                    immutable_samplers: None,
-                }],
-            });
+        let descriptor_layout = device
+            .create_descriptor_set_layout(
+                &crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
+                    bindings: vec![crate::rhi::descriptor::layout::DescriptorBinding {
+                        binding: 0,
+                        ty: DescriptorType::SampledTexture,
+                        count: 1,
+                        stages: ShaderStage::FRAGMENT,
+                        immutable_samplers: None,
+                    }],
+                },
+            )
+            .map_err(|e| RhiError::BackendError(format!("the resolve descriptor layout: {e}")))?;
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("resolve".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the resolve shader module was not created on the device".into(),
-            ));
-        }
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("resolve".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the resolve shader module: {e}")))?;
 
         let mut desc = GraphicsPipelineDesc {
             shader_stages: vec![
@@ -217,11 +217,7 @@ impl ResolvePass {
 
         let pipeline =
             device.create_gpu_graphics_pipeline(&desc, &render_pass, &[&descriptor_layout])?;
-        if !pipeline.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the resolve graphics pipeline was not created on the device".into(),
-            ));
-        }
+        // №642: an Ok pipeline is one the backend built — the refusal is an Err.
 
         Ok(Self::with_state(
             ResolvePassState {

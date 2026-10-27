@@ -161,15 +161,17 @@ impl GBufferPass {
         let render_pass = device.create_gpu_render_pass(&render_pass_desc())?;
 
         // One uniform buffer and one descriptor set per item. See `ItemUniform`.
-        let descriptor_layout = device.create_descriptor_set_layout(&crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
-            bindings: vec![crate::rhi::descriptor::layout::DescriptorBinding {
-                binding: 0,
-                ty: DescriptorType::UniformBuffer,
-                count: 1,
-                stages: ShaderStage::VERTEX | ShaderStage::FRAGMENT,
-                immutable_samplers: None,
-            }],
-        });
+        let descriptor_layout = device
+            .create_descriptor_set_layout(&crate::rhi::descriptor::layout::DescriptorSetLayoutDesc {
+                bindings: vec![crate::rhi::descriptor::layout::DescriptorBinding {
+                    binding: 0,
+                    ty: DescriptorType::UniformBuffer,
+                    count: 1,
+                    stages: ShaderStage::VERTEX | ShaderStage::FRAGMENT,
+                    immutable_samplers: None,
+                }],
+            })
+            .map_err(|e| RhiError::BackendError(format!("the gbuffer descriptor layout: {e}")))?;
         let mut uniforms = Vec::with_capacity(items.len());
         for _ in 0..items.len() {
             // The uniform is host-visible: the frame writes it directly, every
@@ -186,11 +188,9 @@ impl GBufferPass {
                 sharing_mode: crate::rhi::types::SharingMode::Exclusive,
                 queue_family_indices: Vec::new(),
             })?;
-            if !buffer.has_gpu_backing() {
-                return Err(RhiError::BackendError(
-                    "the gbuffer uniform buffer was not created on the device".into(),
-                ));
-            }
+            // №642: `create_buffer_from_desc` returns the backend's refusal
+            // as an Err now, so the_ok value is one the backend built and the
+            // has_gpu_backing() guard had nothing left to catch.
             let set = device.create_descriptor_set(&descriptor_layout)?;
             device.write_descriptors(
                 &set,
@@ -204,17 +204,14 @@ impl GBufferPass {
             uniforms.push(ItemUniform { buffer, descriptor_set: set });
         }
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("gbuffer".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the gbuffer shader module was not created on the device".into(),
-            ));
-        }
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("gbuffer".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the gbuffer shader module: {e}")))?;
 
         let mut desc = GraphicsPipelineDesc {
             shader_stages: vec![
@@ -263,11 +260,7 @@ impl GBufferPass {
 
         let pipeline =
             device.create_gpu_graphics_pipeline(&desc, &render_pass, &[&descriptor_layout])?;
-        if !pipeline.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the gbuffer graphics pipeline was not created on the device".into(),
-            ));
-        }
+        // №642: an Ok pipeline is one the backend built — the refusal is an Err.
 
         Ok(Self::with_state(GBufferPassState {
             pipeline,

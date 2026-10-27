@@ -59,33 +59,37 @@ fn wgsl_to_spirv(source: &str) -> Vec<u8> {
 fn vulkan_compute_shader_and_descriptor_layout() {
     let device = open_vulkan_device(Features::default());
 
-    let module = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("main".into()),
-        name: Some("compute test".into()),
-    });
+    let module = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("main".into()),
+            name: Some("compute test".into()),
+        })
+        .expect("the compute module must be created");
     assert!(module.has_gpu_backing());
     assert!(module.has_code());
 
-    let layout = device.create_descriptor_set_layout(&DescriptorSetLayoutDesc {
-        bindings: vec![
-            DescriptorBinding {
-                binding: 0,
-                ty: DescriptorType::StorageBuffer,
-                count: 1,
-                stages: ShaderStage::COMPUTE,
-                immutable_samplers: None,
-            },
-            DescriptorBinding {
-                binding: 1,
-                ty: DescriptorType::StorageBuffer,
-                count: 1,
-                stages: ShaderStage::COMPUTE,
-                immutable_samplers: None,
-            },
-        ],
-    });
+    let layout = device
+        .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+            bindings: vec![
+                DescriptorBinding {
+                    binding: 0,
+                    ty: DescriptorType::StorageBuffer,
+                    count: 1,
+                    stages: ShaderStage::COMPUTE,
+                    immutable_samplers: None,
+                },
+                DescriptorBinding {
+                    binding: 1,
+                    ty: DescriptorType::StorageBuffer,
+                    count: 1,
+                    stages: ShaderStage::COMPUTE,
+                    immutable_samplers: None,
+                },
+            ],
+        })
+        .expect("the compute layout must be created");
     assert!(layout.has_gpu_backing());
     assert_eq!(layout.binding_count(), 2);
     assert_eq!(layout.total_descriptors(), 2);
@@ -102,39 +106,47 @@ fn vulkan_compute_roundtrip() {
     let source: Vec<u32> = (1..=count).collect();
     let source_bytes: Vec<u8> = source.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-    let src = device.create_buffer(byte_size, BufferUsage::STORAGE | BufferUsage::TRANSFER_DST, false);
-    let dst = device.create_buffer(byte_size, BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC, false);
+    let src = device
+        .create_buffer(byte_size, BufferUsage::STORAGE | BufferUsage::TRANSFER_DST, false)
+        .expect("the source storage buffer must be created");
+    let dst = device
+        .create_buffer(byte_size, BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC, false)
+        .expect("the destination storage buffer must be created");
     device
         .upload_buffer(&src, &source_bytes)
         .expect("the dispatch's input must be uploaded; a discarded error would \
                  run the shader against whatever was in the buffer and the result \
                  would look like a shader bug");
 
-    let layout = device.create_descriptor_set_layout(&DescriptorSetLayoutDesc {
-        bindings: vec![
-            DescriptorBinding {
-                binding: 0,
-                ty: DescriptorType::StorageBuffer,
-                count: 1,
-                stages: ShaderStage::COMPUTE,
-                immutable_samplers: None,
-            },
-            DescriptorBinding {
-                binding: 1,
-                ty: DescriptorType::StorageBuffer,
-                count: 1,
-                stages: ShaderStage::COMPUTE,
-                immutable_samplers: None,
-            },
-        ],
-    });
+    let layout = device
+        .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+            bindings: vec![
+                DescriptorBinding {
+                    binding: 0,
+                    ty: DescriptorType::StorageBuffer,
+                    count: 1,
+                    stages: ShaderStage::COMPUTE,
+                    immutable_samplers: None,
+                },
+                DescriptorBinding {
+                    binding: 1,
+                    ty: DescriptorType::StorageBuffer,
+                    count: 1,
+                    stages: ShaderStage::COMPUTE,
+                    immutable_samplers: None,
+                },
+            ],
+        })
+        .expect("the compute layout must be created");
 
-    let module = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("main".into()),
-        name: Some("compute test".into()),
-    });
+    let module = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("main".into()),
+            name: Some("compute test".into()),
+        })
+        .expect("the compute module must be created");
     assert!(module.has_gpu_backing());
 
     let pipeline = device

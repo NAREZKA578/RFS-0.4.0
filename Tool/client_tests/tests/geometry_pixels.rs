@@ -62,14 +62,16 @@ fn a_geometry_framebuffer_accepts_a_device_created_depth_view() {
     // backing. Nothing complained at the point of the mistake — the frame that
     // used it failed with "framebuffer attachment has no GPU backing", reported
     // from the draw rather than from the creation.
-    let depth = device.create_texture(
-        64,
-        64,
-        1,
-        Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-        1,
-    );
+    let depth = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+            1,
+        )
+        .expect("the depth fixture's texture must be created");
     let depth_view = device
         .create_texture_view(
             &depth,
@@ -140,14 +142,16 @@ fn the_geometry_pass_actually_lights_pixels() {
         })
         .expect("render pass");
 
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     let view = device
         .create_texture_view(&texture, texture.create_default_view().desc())
         .expect("colour attachment view");
@@ -347,14 +351,16 @@ fn the_geometry_pass_honours_the_items_model_matrix() {
         })
         .expect("render pass");
 
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     let view = device
         .create_texture_view(&texture, texture.create_default_view().desc())
         .expect("colour attachment view");
@@ -523,14 +529,16 @@ fn the_scenes_entities_land_where_the_scene_says() {
             dependencies: vec![],
         })
         .expect("render pass");
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     let view = device
         .create_texture_view(&texture, texture.create_default_view().desc())
         .expect("colour attachment view");

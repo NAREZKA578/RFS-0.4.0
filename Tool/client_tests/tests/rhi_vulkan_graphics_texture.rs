@@ -96,14 +96,16 @@ fn vulkan_offscreen_textured_quad_roundtrip() {
     let device = open_vulkan_device(Features::default());
 
     const EXTENT: u32 = 64;
-    let color = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        rhi::Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let color = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            rhi::Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     let color_view = device
         .create_texture_view(&color, color.create_default_view().desc())
         .expect("color attachment view");
@@ -153,14 +155,16 @@ fn vulkan_offscreen_textured_quad_roundtrip() {
         0, 0, 255, 255, // bottom-left blue
         255, 255, 255, 255, // bottom-right white
     ];
-    let sampled = device.create_texture(
-        2,
-        2,
-        1,
-        rhi::Format::RGBA8_UNORM,
-        TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-        1,
-    );
+    let sampled = device
+        .create_texture(
+            2,
+            2,
+            1,
+            rhi::Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            1,
+        )
+        .expect("the 2x2 sampled texture must be created");
     assert!(sampled.has_gpu_backing());
     device
         .upload_texture(&sampled, &texel_data)
@@ -173,31 +177,35 @@ fn vulkan_offscreen_textured_quad_roundtrip() {
         .expect("sampled view");
     assert!(sampled_view.has_gpu_backing());
 
-    let sampler = device.create_sampler(
-        rhi::AddressMode::ClampToEdge,
-        rhi::FilterMode::Nearest,
-        0.0,
-    );
+    let sampler = device
+        .create_sampler(
+            rhi::AddressMode::ClampToEdge,
+            rhi::FilterMode::Nearest,
+            0.0,
+        )
+        .expect("the sampling descriptor's sampler must be created");
     assert!(sampler.has_gpu_backing());
 
-    let layout = device.create_descriptor_set_layout(&DescriptorSetLayoutDesc {
-        bindings: vec![
-            DescriptorBinding {
-                binding: 0,
-                ty: DescriptorType::SampledTexture,
-                count: 1,
-                stages: ShaderStage::FRAGMENT,
-                immutable_samplers: None,
-            },
-            DescriptorBinding {
-                binding: 1,
-                ty: DescriptorType::Sampler,
-                count: 1,
-                stages: ShaderStage::FRAGMENT,
-                immutable_samplers: None,
-            },
-        ],
-    });
+    let layout = device
+        .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+            bindings: vec![
+                DescriptorBinding {
+                    binding: 0,
+                    ty: DescriptorType::SampledTexture,
+                    count: 1,
+                    stages: ShaderStage::FRAGMENT,
+                    immutable_samplers: None,
+                },
+                DescriptorBinding {
+                    binding: 1,
+                    ty: DescriptorType::Sampler,
+                    count: 1,
+                    stages: ShaderStage::FRAGMENT,
+                    immutable_samplers: None,
+                },
+            ],
+        })
+        .expect("the texture-sampling layout must be created");
     assert!(layout.has_gpu_backing());
     assert_eq!(layout.total_descriptors(), 2);
 
@@ -223,18 +231,22 @@ fn vulkan_offscreen_textured_quad_roundtrip() {
         )
         .expect("write texture descriptor");
 
-    let module = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("texture sample test".into()),
-    });
-    let frag = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("fs_main".into()),
-        name: Some("texture sample test".into()),
-    });
+    let module = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("texture sample test".into()),
+        })
+        .expect("the vertex module must be created");
+    let frag = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("fs_main".into()),
+            name: Some("texture sample test".into()),
+        })
+        .expect("the fragment module must be created");
     assert!(module.has_gpu_backing());
     assert!(frag.has_gpu_backing());
 
@@ -279,11 +291,13 @@ fn vulkan_offscreen_textured_quad_roundtrip() {
 
     let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let index_buffer = device.create_buffer(
-        index_bytes.len() as u64,
-        rhi::BufferUsage::INDEX | rhi::BufferUsage::TRANSFER_DST,
-        false,
-    );
+    let index_buffer = device
+        .create_buffer(
+            index_bytes.len() as u64,
+            rhi::BufferUsage::INDEX | rhi::BufferUsage::TRANSFER_DST,
+            false,
+        )
+        .expect("the index buffer must be created");
     device
         .upload_buffer(&index_buffer, &index_bytes)
         .expect("the index buffer must be uploaded before the indexed draw; \

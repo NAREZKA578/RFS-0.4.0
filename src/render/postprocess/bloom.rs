@@ -6,7 +6,9 @@
 
 use super::BloomConfig;
 use crate::render::core::RenderContext;
-use crate::rhi::{CommandEncoder, Device, Format, Pipeline, Texture, TextureView};
+use crate::rhi::{
+    CommandEncoder, Device, Format, Pipeline, RhiError, RhiResult, Texture, TextureView,
+};
 use std::sync::Arc;
 
 /// Bloom effect
@@ -63,65 +65,48 @@ impl BloomEffect {
         self.enabled = enabled;
     }
 
-    /// Initialize the effect
-    pub fn initialize(&mut self, device: &Arc<Device>, context: &RenderContext, _input_format: Format) {
+    /// Initialize the effect.
+    ///
+    /// Returns the backend's refusal (bug №642): the old code dropped it and
+    /// installed handle-less stand-ins that looked like working targets.
+    pub fn initialize(
+        &mut self,
+        device: &Arc<Device>,
+        context: &RenderContext,
+        _input_format: Format,
+    ) -> RhiResult<()> {
         // Bug №651: the size comes from the presentation extent, not from
         // `context.resolution` — see `RenderContext::drawable_extent`.
         let (width, height) = context.drawable_size();
+        let usage = crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED;
 
         // Create bright pass texture
-        self.bright_pass_texture = Some(device.create_texture(
-            width,
-            height,
-            1,
-            Format::RGBA32_SFLOAT,
-            crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
-            1,
-        ));
-        self.bright_pass_view = Some(
-            self.bright_pass_texture
-                .as_ref()
-                .unwrap()
-                .create_view(Default::default()),
-        );
+        let bright_pass = device
+            .create_texture(width, height, 1, Format::RGBA32_SFLOAT, usage, 1)
+            .map_err(|e| RhiError::BackendError(format!("the bloom bright-pass texture: {e}")))?;
+        self.bright_pass_texture = Some(bright_pass.clone());
+        self.bright_pass_view = Some(bright_pass.create_view(Default::default()));
 
         // Create blur textures (ping-pong buffers)
         for i in 0..2 {
-            self.blur_textures[i] = Some(device.create_texture(
-                width,
-                height,
-                1,
-                Format::RGBA32_SFLOAT,
-                crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
-                1,
-            ));
-            self.blur_views[i] = Some(
-                self.blur_textures[i]
-                    .as_ref()
-                    .unwrap()
-                    .create_view(Default::default()),
-            );
+            let blur = device
+                .create_texture(width, height, 1, Format::RGBA32_SFLOAT, usage, 1)
+                .map_err(|e| RhiError::BackendError(format!("the bloom blur texture: {e}")))?;
+            self.blur_views[i] = Some(blur.create_view(Default::default()));
+            self.blur_textures[i] = Some(blur);
         }
 
         // Create output texture
-        self.output_texture = Some(device.create_texture(
-            width,
-            height,
-            1,
-            Format::RGBA32_SFLOAT,
-            crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
-            1,
-        ));
-        self.output_view = Some(
-            self.output_texture
-                .as_ref()
-                .unwrap()
-                .create_view(Default::default()),
-        );
+        let output = device
+            .create_texture(width, height, 1, Format::RGBA32_SFLOAT, usage, 1)
+            .map_err(|e| RhiError::BackendError(format!("the bloom output texture: {e}")))?;
+        self.output_view = Some(output.create_view(Default::default()));
+        self.output_texture = Some(output);
 
         // Create pipelines
         // These would be created with appropriate shaders
         // For now, we'll leave them as None
+        Ok(())
     }
 
     /// Apply the bloom effect
@@ -273,9 +258,14 @@ impl BloomEffect {
     }
 
     /// Resize the effect
-    pub fn resize(&mut self, device: &Arc<Device>, context: &RenderContext, input_format: Format) {
+    pub fn resize(
+        &mut self,
+        device: &Arc<Device>,
+        context: &RenderContext,
+        input_format: Format,
+    ) -> RhiResult<()> {
         // Recreate all textures with new dimensions
-        self.initialize(device, context, input_format);
+        self.initialize(device, context, input_format)
     }
 
     /// Clean up resources

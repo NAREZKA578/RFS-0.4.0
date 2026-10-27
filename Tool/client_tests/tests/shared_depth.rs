@@ -211,14 +211,16 @@ fn the_transparent_object_is_behind_the_opaque_one() {
     TransparentPass::set_depth_target(&transparent_state, depth.clone());
 
     // The target: a colour image and the shared depth.
-    let colour = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let colour = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the shared colour target must be created");
     let colour_view = device
         .create_texture_view(
             &colour,

@@ -224,8 +224,9 @@ impl LightingPass {
         let configured_lights =
             config.max_direction_lights + config.max_point_lights + config.max_spot_lights;
 
-        let descriptor_layout =
-            device.create_descriptor_set_layout(&descriptor_set_layout_desc());
+        let descriptor_layout = device
+            .create_descriptor_set_layout(&descriptor_set_layout_desc())
+            .map_err(|e| RhiError::BackendError(format!("the lighting descriptor layout: {e}")))?;
 
         // The uniform and the lights are written every frame, so they are
         // host-visible: a device-local buffer would need a staging copy per
@@ -260,17 +261,14 @@ impl LightingPass {
             &[-1.0f32, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0],
         )?;
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("lighting".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the lighting shader module was not created on the device".into(),
-            ));
-        }
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("lighting".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the lighting shader module: {e}")))?;
 
         let mut desc = GraphicsPipelineDesc {
             shader_stages: vec![
@@ -335,11 +333,7 @@ impl LightingPass {
 
         let pipeline =
             device.create_gpu_graphics_pipeline(&desc, &render_pass, &[&descriptor_layout])?;
-        if !pipeline.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the lighting graphics pipeline was not created on the device".into(),
-            ));
-        }
+        // №642: an Ok pipeline is one the backend built — the refusal is an Err.
 
         Ok(Self::with_state(LightingPassState {
             pipeline,

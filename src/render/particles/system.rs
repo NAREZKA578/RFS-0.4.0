@@ -6,13 +6,16 @@
 
 use super::emitter::ParticleEmitter;
 use super::particle::Particle;
-use crate::render::core::RenderContext;
-use crate::render::meshes::Mesh;
-use crate::rhi::{Buffer, BufferUsage, CommandEncoder, Device, Pipeline, Texture, TextureView};
+use crate::rhi::{Buffer, BufferUsage, Device};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Particle system
+///
+/// The data side of the particles: emitters, the live pool, the upload of the
+/// live particles into the GPU buffer. It deliberately renders nothing — the
+/// drawing is the particle pass's (`crate::render::passes::particles`), which
+/// binds this buffer and draws the live count instanced.
 pub struct ParticleSystem {
     /// Device reference
     device: Arc<Device>,
@@ -22,18 +25,10 @@ pub struct ParticleSystem {
     particle_buffer: Option<Buffer>,
     /// Particle count buffer
     particle_count_buffer: Option<Buffer>,
-    /// Pipeline
-    pipeline: Option<Pipeline>,
-    /// Particle mesh (for mesh-based particles)
-    particle_mesh: Option<Arc<Mesh>>,
     /// Maximum particles
     max_particles: u32,
     /// Current particle count
     particle_count: u32,
-    /// Particle texture atlas
-    texture_atlas: Option<Arc<Texture>>,
-    /// Texture atlas view
-    texture_view: Option<Arc<TextureView>>,
 }
 
 impl ParticleSystem {
@@ -43,12 +38,8 @@ impl ParticleSystem {
             emitters: Vec::new(),
             particle_buffer: None,
             particle_count_buffer: None,
-            pipeline: None,
-            particle_mesh: None,
             max_particles,
             particle_count: 0,
-            texture_atlas: None,
-            texture_view: None,
         }
     }
 
@@ -60,30 +51,41 @@ impl ParticleSystem {
         self.particle_count
     }
 
+    /// The buffer the live particles are uploaded into, for the pass that
+    /// draws them. `None` until [`Self::initialize`] ran; the particle pass
+    /// refuses to draw without one rather than binding nothing.
+    pub(crate) fn particle_buffer(&self) -> Option<&Buffer> {
+        self.particle_buffer.as_ref()
+    }
+
     /// Initialize the particle system
-    pub fn initialize(&mut self) {
+    pub fn initialize(&mut self) -> crate::rhi::RhiResult<()> {
         // Create particle buffer
         let particle_size = std::mem::size_of::<Particle>() as u64;
         let buffer_size = particle_size * self.max_particles as u64;
 
-        self.particle_buffer = Some(self.device.create_buffer(
-            buffer_size,
-            BufferUsage::VERTEX | BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
-            false,
-        ));
+        self.particle_buffer = Some(
+            self.device
+                .create_buffer(
+                    buffer_size,
+                    BufferUsage::VERTEX | BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
+                    false,
+                )
+                .map_err(|e| {
+                    crate::rhi::RhiError::BackendError(format!("the particle buffer: {e}"))
+                })?,
+        );
 
         // Create particle count buffer
-        self.particle_count_buffer = Some(self.device.create_buffer(
-            4,
-            BufferUsage::UNIFORM | BufferUsage::TRANSFER_DST,
-            false,
-        ));
+        self.particle_count_buffer = Some(
+            self.device
+                .create_buffer(4, BufferUsage::UNIFORM | BufferUsage::TRANSFER_DST, false)
+                .map_err(|e| {
+                    crate::rhi::RhiError::BackendError(format!("the particle count buffer: {e}"))
+                })?,
+        );
 
-        // Create particle mesh (simple quad)
-        self.particle_mesh = Some(Arc::new(Mesh::fullscreen_quad("particle_quad")));
-
-        // Create pipeline
-        // This would create a pipeline for rendering particles
+        Ok(())
     }
 
     /// Add an emitter
@@ -111,12 +113,13 @@ impl ParticleSystem {
     }
 
     /// Update all emitters
+    ///
+    /// The count this leaves behind is the count **in the buffer** — what the
+    /// particle pass draws — not the sum of the emitters' live pools; the two
+    /// differ exactly when the buffer could not hold everything.
     pub fn update(&mut self, delta_time: Duration) {
-        self.particle_count = 0;
-
         for emitter in &mut self.emitters {
             emitter.update(delta_time);
-            self.particle_count += emitter.particle_count();
         }
 
         // Update particle buffer. If the upload failed the GPU holds the previous
@@ -140,6 +143,28 @@ impl ParticleSystem {
             particles.extend(emitter.live_particles());
         }
 
+        // The buffer holds `max_particles` entries, and several emitters can
+        // be alive at once: the sum of their pools can exceed the buffer. The
+        // pass draws `particle_count` instances and the shader indexes the
+        // buffer by the instance index, so the count may never name more
+        // particles than the buffer holds — the excess is dropped here rather
+        // than read out of bounds on the GPU.
+        let capacity = self.max_particles as usize;
+        if particles.len() > capacity {
+            crate::warn!(
+                "particles",
+                "{} live particles for a buffer of {capacity} entries: the excess is not drawn",
+                particles.len()
+            );
+            particles.truncate(capacity);
+        }
+
+        // The count the pass draws is the count **in the buffer**, not the
+        // count in the emitters: the two differ exactly when the buffer could
+        // not hold everything, and the draw must agree with what was
+        // uploaded.
+        self.particle_count = particles.len() as u32;
+
         let mut uploaded = true;
 
         // Upload to GPU
@@ -154,58 +179,6 @@ impl ParticleSystem {
         }
 
         uploaded
-    }
-
-    /// Render all particles
-    pub fn render(&self, encoder: &mut CommandEncoder, _context: &RenderContext) {
-        if self.particle_count == 0 {
-            return;
-        }
-        let Some(pipeline) = self.pipeline.as_ref() else {
-            return;
-        };
-
-        // Bind pipeline
-        encoder.bind_pipeline(pipeline);
-
-        // Bind particle buffer
-        if let Some(buffer) = &self.particle_buffer {
-            encoder.bind_vertex_buffer(buffer);
-        }
-
-        // Bind particle count buffer
-        if let Some(buffer) = &self.particle_count_buffer {
-            encoder.bind_uniform_buffer(buffer, 0);
-        }
-
-        // Bind texture atlas
-        if let Some(view) = &self.texture_view {
-            encoder.bind_texture(view, 0);
-        }
-
-        // Set camera matrices
-        // This would set the view and projection matrices
-
-        // Draw particles (no unwrap in frame path; U8 indices unsupported).
-        if let Some(mesh) = &self.particle_mesh {
-            let (Some(vb), Some(ib)) = (mesh.vertex_buffer(), mesh.index_buffer()) else {
-                return;
-            };
-            let index_type = match mesh.index_type() {
-                crate::render::meshes::IndexType::U16 => crate::rhi::IndexType::U16,
-                crate::render::meshes::IndexType::U32 => crate::rhi::IndexType::U32,
-                crate::render::meshes::IndexType::U8 => return,
-            };
-            encoder.bind_vertex_buffer(vb);
-            encoder.bind_index_buffer(ib, index_type);
-            encoder.draw_indexed_instanced(mesh.index_count(), self.particle_count, 0, 0, 0);
-        }
-    }
-
-    /// Set texture atlas
-    pub fn set_texture_atlas(&mut self, texture: Arc<Texture>) {
-        self.texture_atlas = Some(texture.clone());
-        self.texture_view = Some(Arc::new(texture.create_view(Default::default())));
     }
 
     /// Clear all emitters

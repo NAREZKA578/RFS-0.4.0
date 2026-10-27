@@ -40,7 +40,7 @@ use glam::{Mat4, Vec3};
 use crate::rhi::sync::barrier::MemoryBarrier;
 use crate::rhi::{
     AccessFlags, Command, CommandEncoder, Framebuffer, FramebufferAttachment, FramebufferDesc,
-    PipelineStage,
+    PipelineStage, TextureLayout,
 };
 
 use super::cluster::{ClusterConfig, ClusterPass};
@@ -127,6 +127,11 @@ pub struct MirrorPass {
     cluster_pass: Option<ClusterPass>,
     /// The forward pass the mirror camera drives.
     forward_pass: Option<ForwardPass>,
+    /// The pass's own state, shared with the caller: the reflection's image,
+    /// the config, and everything the per-frame updates touch. The pass keeps
+    /// it because only the pass knows when the reflection has been drawn and
+    /// what layout its render pass left it in.
+    state: Option<std::sync::Arc<std::sync::Mutex<MirrorPassState>>>,
 }
 
 impl MirrorPass {
@@ -155,6 +160,7 @@ impl MirrorPass {
             base,
             cluster_pass: None,
             forward_pass: None,
+            state: None,
         }
     }
 
@@ -180,21 +186,18 @@ impl MirrorPass {
         let height = config.height.max(1);
 
         // The image the mirror camera draws into, and the depth it writes.
-        let reflection_texture = device.create_texture(
-            width,
-            height,
-            1,
-            color_format,
-            crate::rhi::TextureUsage::COLOR_ATTACHMENT
-                | crate::rhi::TextureUsage::SAMPLED
-                | crate::rhi::TextureUsage::TRANSFER_SRC,
-            1,
-        );
-        if !reflection_texture.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the reflection's image was not created on the device".into(),
-            ));
-        }
+        let reflection_texture = device
+            .create_texture(
+                width,
+                height,
+                1,
+                color_format,
+                crate::rhi::TextureUsage::COLOR_ATTACHMENT
+                    | crate::rhi::TextureUsage::SAMPLED
+                    | crate::rhi::TextureUsage::TRANSFER_SRC,
+                1,
+            )
+            .map_err(|e| RhiError::BackendError(format!("the reflection's image: {e}")))?;
         let reflection_view = device
             .create_texture_view(
                 &reflection_texture,
@@ -211,14 +214,16 @@ impl MirrorPass {
             )
             .map_err(|e| RhiError::BackendError(format!("the reflection's view: {e}")))?;
 
-        let depth_texture = device.create_texture(
-            width,
-            height,
-            1,
-            crate::rhi::Format::D32_SFLOAT,
-            crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-            1,
-        );
+        let depth_texture = device
+            .create_texture(
+                width,
+                height,
+                1,
+                crate::rhi::Format::D32_SFLOAT,
+                crate::rhi::TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                1,
+            )
+            .map_err(|e| RhiError::BackendError(format!("the reflection's depth image: {e}")))?;
         let depth_view = device
             .create_texture_view(
                 &depth_texture,
@@ -272,16 +277,16 @@ impl MirrorPass {
         // draws with, and the mirror camera's view is not the main one.
         let (cluster_pass, cluster_state) =
             ClusterPass::create(device, ClusterConfig::default(), cluster_spirv)?;
-        let lights_buffer = cluster_state
-            .lock()
-            .map(|state| state.lights_buffer.clone())
-            .unwrap_or_else(|_| {
-                device.create_buffer(
+        let lights_buffer = match cluster_state.lock() {
+            Ok(state) => state.lights_buffer.clone(),
+            Err(_) => device
+                .create_buffer(
                     1024 * crate::render::lighting::light_buffer::LIGHT_STRIDE_BYTES,
                     crate::rhi::BufferUsage::STORAGE,
                     true,
                 )
-            });
+                .map_err(|e| RhiError::BackendError(format!("the mirror lights buffer: {e}")))?,
+        };
 
         // The forward pass reads the clusters the clustering pass wrote, and
         // the lights from the same buffer the clustering binned from.
@@ -330,6 +335,7 @@ impl MirrorPass {
                 base,
                 cluster_pass: Some(cluster_pass),
                 forward_pass: Some(forward_pass),
+                state: Some(shared.clone()),
             },
             shared,
         ))
@@ -493,7 +499,45 @@ impl crate::render::graph::node::RenderPass for MirrorPass {
             return PassOutcome::skipped("the encoder rejected a command");
         }
 
-        forward_pass.execute(encoder, context, scene, resources)
+        let outcome = forward_pass.execute(encoder, context, scene, resources);
+
+        // The reflection is about to be sampled by the water pass later in the
+        // frame. The render pass leaves the image in `ColorAttachmentOptimal`
+        // — the layout of the attachment it was drawn as — and a sampler
+        // cannot read that. The backend's layout map cannot see a render pass
+        // boundary (the known limit stated in the Vulkan backend), so this
+        // barrier does not ask the tracker: it names the layout the render
+        // pass itself declares as its `final_layout` — a fact from the pass's
+        // own description — and moves the image to where its consumer samples
+        // it.
+        if outcome.recorded {
+            if let Some(state) = self.state.as_ref() {
+                if let Ok(state) = state.lock() {
+                    if let Some(texture) = state.reflection_texture.clone() {
+                        let recorded = encoder.record(Command::PipelineBarrier {
+                            src_stage: PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+                            dst_stage: PipelineStage::FRAGMENT_SHADER,
+                            memory_barriers: vec![],
+                            buffer_barriers: vec![],
+                            texture_barriers: vec![crate::rhi::sync::barrier::TextureBarrier {
+                                texture,
+                                src_access: AccessFlags::COLOR_ATTACHMENT_WRITE,
+                                dst_access: AccessFlags::SHADER_READ,
+                                old_layout: TextureLayout::ColorAttachmentOptimal,
+                                new_layout: TextureLayout::ShaderReadOnlyOptimal,
+                            }],
+                        });
+                        if !recorded {
+                            return PassOutcome::skipped(
+                                "the encoder rejected the reflection's barrier",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        outcome
     }
 
     fn is_enabled(&self) -> bool {

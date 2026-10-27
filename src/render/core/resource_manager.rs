@@ -122,8 +122,16 @@ impl ResourceManager {
         Some(texture)
     }
 
-    /// Creates a solid color texture
-    pub fn create_color_texture(&mut self, name: &str, color: Vec4, size: Vec2) -> Arc<Texture> {
+    /// Creates a solid color texture.
+    ///
+    /// Returns the backend's refusal (bug №642) — the texture either exists on
+    /// the device or the caller gets an error; there is no handle-less stand-in.
+    pub fn create_color_texture(
+        &mut self,
+        name: &str,
+        color: Vec4,
+        size: Vec2,
+    ) -> crate::rhi::RhiResult<Arc<Texture>> {
         let width = size.x.max(1.0) as u32;
         let height = size.y.max(1.0) as u32;
         let data = vec![color; (width * height) as usize];
@@ -146,7 +154,8 @@ impl ResourceManager {
             height,
             crate::render::textures::TextureUsage::Sampled,
             &self.device,
-        );
+        )
+        .map_err(|e| crate::rhi::RhiError::BackendError(format!("the '{name}' texture: {e}")))?;
         // The counter must not claim a texture arrived when the upload failed:
         // it is used as evidence that assets are present on the GPU.
         // Registered in the library rather than wrapped in a bare `Arc`: an
@@ -155,15 +164,16 @@ impl ResourceManager {
         if texture.upload_data(&data_bytes, &self.device) {
             self.stats.textures_loaded += 1;
         }
-        self.texture_library.add(name, texture)
+        Ok(self.texture_library.add(name, texture))
     }
 
-    /// Creates a procedural texture
+    /// Creates a procedural texture (bug №642: the backend's refusal is
+    /// returned instead of dropped).
     pub fn create_procedural_texture(
         &mut self,
         name: &str,
         generator: ProceduralTextureGenerator,
-    ) -> Arc<Texture> {
+    ) -> crate::rhi::RhiResult<Arc<Texture>> {
         let width = 256u32;
         let height = 256u32;
         let data: Vec<Vec4> = match generator {
@@ -251,13 +261,14 @@ impl ResourceManager {
             height,
             crate::render::textures::TextureUsage::Sampled,
             &self.device,
-        );
+        )
+        .map_err(|e| crate::rhi::RhiError::BackendError(format!("the '{name}' texture: {e}")))?;
         // Same reason as `create_color_texture`: the library owns the texture, so
         // `clear()` can actually reach it.
         if texture.upload_data(&data_bytes, &self.device) {
             self.stats.textures_loaded += 1;
         }
-        self.texture_library.add(name, texture)
+        Ok(self.texture_library.add(name, texture))
     }
 
     /// Loads a material
@@ -333,20 +344,25 @@ impl ResourceManager {
             return None;
         }
 
-        let shader = self.device.create_shader_module(&ShaderModuleDesc {
+        let shader = match self.device.create_shader_module(&ShaderModuleDesc {
             code,
             format: crate::rhi::ShaderFormat::SpirV,
             entry_point: None,
             name: Some(name.to_string()),
-        });
-        if !shader.has_gpu_backing() {
-            crate::error!(
-                "resource_manager",
-                "shader {}: created without GPU backing; a pipeline built on it cannot draw",
-                name
-            );
-            return None;
-        }
+        }) {
+            Ok(shader) => shader,
+            Err(e) => {
+                // Bug №642: the backend's refusal is the caller's answer —
+                // there is no handle-less stand-in to guard against with
+                // has_gpu_backing() any more.
+                crate::error!(
+                    "resource_manager",
+                    "shader {}: the device refused to create the module: {e}",
+                    name
+                );
+                return None;
+            }
+        };
         let arc_shader = Arc::new(shader);
         self.shaders.insert(key, arc_shader.clone());
         self.stats.shaders_loaded += 1;

@@ -8,7 +8,6 @@ rfs_core = { path = "../core" }
 serde = { workspace = true, features = ["derive"] }
 smallvec = { workspace = true }
 parking_lot = { workspace = true }
-fastrand = { workspace = true }
 petgraph = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

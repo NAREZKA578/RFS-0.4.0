@@ -180,6 +180,15 @@ impl FragmentAssembler {
         let mut group = self.groups.remove(&key)?;
         self.buffered_bytes = self.buffered_bytes.saturating_sub(group.buffered);
 
+        // Bug №715: the type byte keys the group, and it is attacker-controlled
+        // wire data. `from_u8(orig_type).unwrap()` used to turn one lying byte
+        // into a panic of the packet worker; a completed group with an unknown
+        // type is a drop with a report instead.
+        let Some(packet_type) = PacketType::from_u8(orig_type) else {
+            warn!("fragment group {key:?} carries an unknown packet type, dropping");
+            return None;
+        };
+
         let mut message = Vec::with_capacity(group.total_len);
         for slot in &group.chunks {
             match slot {
@@ -214,7 +223,7 @@ impl FragmentAssembler {
         if frag_newer(msg_id, *last) {
             *last = msg_id;
         }
-        Some((PacketType::from_u8(orig_type).unwrap(), message))
+        Some((packet_type, message))
     }
 
     fn evict_stale(&mut self) {

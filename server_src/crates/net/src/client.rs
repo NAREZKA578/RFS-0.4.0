@@ -247,8 +247,6 @@ impl EventSink {
 pub struct NetClient {
     socket: Arc<UdpSocket>,
     config: ClientConfig,
-    #[allow(dead_code)]
-    server_addr: SocketAddr,
     connection: Arc<Mutex<Option<Connection>>>,
     connection_id: Arc<Mutex<Option<u32>>>,
     /// Set while a Connect is unanswered; cleared on Accept/Reject/timeout.
@@ -305,7 +303,7 @@ pub struct NetClient {
     applied_delta_count: Arc<AtomicU64>,
     /// Bug №274: the same, per layer, so one slow layer is distinguishable
     /// from a slow client.
-    applied_delta_count_by_layer: Arc<std::sync::Mutex<Vec<u64>>>,
+    applied_delta_count_by_layer: Arc<parking_lot::Mutex<Vec<u64>>>,
     /// Bug #267: how many deltas were dropped because their base tick did not
     /// match what this client had applied. Each one stalls its layer until the
     /// next scheduled resync, so this is the closest thing to a health figure
@@ -314,9 +312,9 @@ pub struct NetClient {
     /// Same drops as `base_mismatch_drops`, split per layer. A single total
     /// cannot distinguish "one busy layer" from "every layer briefly stalling",
     /// and those need different fixes.
-    base_mismatch_drops_by_layer: Arc<std::sync::Mutex<Vec<u64>>>,
+    base_mismatch_drops_by_layer: Arc<parking_lot::Mutex<Vec<u64>>>,
     /// Latch so a stalled layer is logged once, not once per rejected delta.
-    stall_logged: Arc<std::sync::Mutex<Vec<bool>>>,
+    stall_logged: Arc<parking_lot::Mutex<Vec<bool>>>,
     /// Deltas dropped by the ordinary out-of-order/stale guard (server_tick of
     /// the delta already applied). Distinct from `base_mismatch_drops`; both
     /// were added while chasing #267 and base-mismatch measured zero, making
@@ -378,7 +376,7 @@ struct ResyncRequestChannel {
     /// Bit `layer` set means: a resync request for that layer is due out.
     bitmask: Arc<AtomicU32>,
     /// Per-arm cooldown state, one slot per layer.
-    last_arm: Arc<std::sync::Mutex<Vec<Instant>>>,
+    last_arm: Arc<parking_lot::Mutex<Vec<Instant>>>,
 }
 
 /// A stalled layer waits half a second before it asks again — the server's
@@ -396,7 +394,7 @@ impl ResyncRequestChannel {
             .unwrap_or_else(Instant::now);
         Self {
             bitmask: Arc::new(AtomicU32::new(0)),
-            last_arm: Arc::new(std::sync::Mutex::new(vec![epoch; LAYER_COUNT])),
+            last_arm: Arc::new(parking_lot::Mutex::new(vec![epoch; LAYER_COUNT])),
         }
     }
 
@@ -405,7 +403,7 @@ impl ResyncRequestChannel {
         if layer >= LAYER_COUNT {
             return false;
         }
-        let mut last = self.last_arm.lock().unwrap();
+        let mut last = self.last_arm.lock();
         let now = Instant::now();
         let due = last
             .get(layer)
@@ -541,7 +539,6 @@ impl NetClient {
         let client = Self {
             socket,
             config: config.clone(),
-            server_addr: config.server_addr,
             connection: Arc::new(Mutex::new(None)),
             connection_id: Arc::new(Mutex::new(None)),
             connect_attempt: Arc::new(Mutex::new(None)),
@@ -574,10 +571,10 @@ impl NetClient {
             projectile_states: Arc::new(RwLock::new(HashMap::new())),
             last_applied_layer: Arc::new(Mutex::new([0; LAYER_COUNT])),
             applied_delta_count: Arc::new(AtomicU64::new(0)),
-            applied_delta_count_by_layer: Arc::new(std::sync::Mutex::new(vec![0u64; LAYER_COUNT])),
+            applied_delta_count_by_layer: Arc::new(parking_lot::Mutex::new(vec![0u64; LAYER_COUNT])),
             base_mismatch_drops: Arc::new(AtomicU64::new(0)),
-            base_mismatch_drops_by_layer: Arc::new(std::sync::Mutex::new(vec![0u64; LAYER_COUNT])),
-            stall_logged: Arc::new(std::sync::Mutex::new(vec![false; LAYER_COUNT])),
+            base_mismatch_drops_by_layer: Arc::new(parking_lot::Mutex::new(vec![0u64; LAYER_COUNT])),
+            stall_logged: Arc::new(parking_lot::Mutex::new(vec![false; LAYER_COUNT])),
             stale_delta_drops: Arc::new(AtomicU64::new(0)),
             match_id: Arc::new(Mutex::new(None)),
             session_resets: Arc::new(AtomicU64::new(0)),
@@ -850,6 +847,7 @@ impl NetClient {
     /// the drop would be permanent. It waits for tokens instead, up to
     /// `RELIABLE_ADMIT_BUDGET`; exceeding that is reported as an error rather
     /// than silently losing the message.
+    #[allow(clippy::too_many_arguments)]
     async fn send_packet_static(
         socket: &Arc<UdpSocket>,
         bandwidth: &BandwidthTracker,
@@ -1193,10 +1191,10 @@ impl NetClient {
         // Bug №274: the honest delivery counter. The `latest_state` slot
         // coalesces, so it cannot measure how much arrived.
         applied_delta_count: &Arc<AtomicU64>,
-        applied_delta_count_by_layer: &Arc<std::sync::Mutex<Vec<u64>>>,
+        applied_delta_count_by_layer: &Arc<parking_lot::Mutex<Vec<u64>>>,
         base_mismatch_drops: &Arc<AtomicU64>,
-        base_mismatch_drops_by_layer: &Arc<std::sync::Mutex<Vec<u64>>>,
-        stall_logged: &Arc<std::sync::Mutex<Vec<bool>>>,
+        base_mismatch_drops_by_layer: &Arc<parking_lot::Mutex<Vec<u64>>>,
+        stall_logged: &Arc<parking_lot::Mutex<Vec<bool>>>,
         stale_delta_drops: &Arc<AtomicU64>,
         // Bug №636: the session this connection belongs to, and how many times
         // the applied world has been thrown away for a new one.
@@ -1349,15 +1347,13 @@ impl NetClient {
                     // Per-session diagnostics reset with the world they
                     // measured, otherwise the next session starts with a
                     // "stalled" latch it never earned.
-                    stall_logged
-                        .lock()
-                        .unwrap()
+                    stall_logged.lock()
                         .iter_mut()
                         .for_each(|f| *f = false);
                     applied_delta_count.store(0, Ordering::Relaxed);
-                    applied_delta_count_by_layer.lock().unwrap().fill(0);
+                    applied_delta_count_by_layer.lock().fill(0);
                     base_mismatch_drops.store(0, Ordering::Relaxed);
-                    base_mismatch_drops_by_layer.lock().unwrap().fill(0);
+                    base_mismatch_drops_by_layer.lock().fill(0);
                     stale_delta_drops.store(0, Ordering::Relaxed);
                     stale_full_state_drops.store(0, Ordering::Relaxed);
                     // Bug №636: the discard is observable, not just counted —
@@ -1750,10 +1746,10 @@ impl NetClient {
         // Bug №274: counted where a delta's base advances, so the figure
         // cannot be lost to the coalescing `latest_state` slot.
         applied_delta_count: &Arc<AtomicU64>,
-        applied_delta_count_by_layer: &Arc<std::sync::Mutex<Vec<u64>>>,
+        applied_delta_count_by_layer: &Arc<parking_lot::Mutex<Vec<u64>>>,
         base_mismatch_drops: &Arc<AtomicU64>,
-        base_mismatch_drops_by_layer: &Arc<std::sync::Mutex<Vec<u64>>>,
-        stall_logged: &Arc<std::sync::Mutex<Vec<bool>>>,
+        base_mismatch_drops_by_layer: &Arc<parking_lot::Mutex<Vec<u64>>>,
+        stall_logged: &Arc<parking_lot::Mutex<Vec<bool>>>,
         stale_delta_drops: &Arc<AtomicU64>,
         stale_full_state_drops: &Arc<AtomicU64>,
         // Bug №267 (A): armed here when a layer stalls on a base mismatch.
@@ -1909,7 +1905,7 @@ impl NetClient {
                 // queue to recover in the first place. The counter below stays
                 // exact and is what the stress report reads.
                 {
-                    let mut logged = stall_logged.lock().unwrap();
+                    let mut logged = stall_logged.lock();
                     if !logged.get(layer).copied().unwrap_or(false) {
                         if let Some(slot) = logged.get_mut(layer) {
                             *slot = true;
@@ -1924,7 +1920,7 @@ impl NetClient {
                     }
                 }
                 base_mismatch_drops.fetch_add(1, Ordering::Relaxed);
-                if let Some(c) = base_mismatch_drops_by_layer.lock().unwrap().get_mut(layer) {
+                if let Some(c) = base_mismatch_drops_by_layer.lock().get_mut(layer) {
                     *c += 1;
                 }
                 // Bug №267 (A): the stalled layer asks the server for an
@@ -2014,7 +2010,7 @@ impl NetClient {
                 // report 6.10 Hz while its layers had reached the server's own
                 // tick with zero stalls.
                 applied_delta_count.fetch_add(1, Ordering::Relaxed);
-                if let Some(counts) = applied_delta_count_by_layer.lock().unwrap().get_mut(layer) {
+                if let Some(counts) = applied_delta_count_by_layer.lock().get_mut(layer) {
                     *counts += 1;
                 }
 
@@ -2392,7 +2388,7 @@ impl NetClient {
 
     /// Per-layer breakdown of `base_mismatch_drops`.
     pub fn base_mismatch_drops_by_layer(&self) -> Vec<u64> {
-        self.base_mismatch_drops_by_layer.lock().unwrap().clone()
+        self.base_mismatch_drops_by_layer.lock().clone()
     }
 
     /// Bug №267 (A): resync requests this client put on the wire. Compare
@@ -2438,7 +2434,7 @@ impl NetClient {
     /// Bug №274: `applied_delta_count` broken down per layer, so a slow layer
     /// can be told apart from a slow client.
     pub fn applied_delta_count_by_layer(&self) -> Vec<u64> {
-        self.applied_delta_count_by_layer.lock().unwrap().clone()
+        self.applied_delta_count_by_layer.lock().clone()
     }
 
     /// Bug #267 follow-up: deltas dropped purely as stale/out-of-order

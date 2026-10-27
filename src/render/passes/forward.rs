@@ -319,7 +319,8 @@ impl ForwardPass {
                     },
                 ],
             },
-        );
+        )
+        .map_err(|e| RhiError::BackendError(format!("the forward descriptor layout: {e}")))?;
 
         // The comparison sampler: a depth image may only be filtered by one,
         // and the RHI refuses anything else for a depth view (§683).
@@ -333,16 +334,18 @@ impl ForwardPass {
             ..Default::default()
         })?;
 
-        let frame_uniform = device.create_buffer(
-            FRAME_UNIFORM_SIZE,
-            crate::rhi::BufferUsage::UNIFORM,
-            true,
-        );
+        let frame_uniform = device
+            .create_buffer(FRAME_UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true)
+            .map_err(|e| RhiError::BackendError(format!("the forward frame uniform: {e}")))?;
 
         let mut uniform_buffers = Vec::with_capacity(items.len());
         let mut descriptor_sets = Vec::with_capacity(items.len());
         for _ in 0..items.len() {
-            let uniform = device.create_buffer(ITEM_UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true);
+            let uniform = device
+                .create_buffer(ITEM_UNIFORM_SIZE, crate::rhi::BufferUsage::UNIFORM, true)
+                .map_err(|e| {
+                    RhiError::BackendError(format!("the forward item uniform: {e}"))
+                })?;
             let set = device.create_descriptor_set(&descriptor_layout)?;
             device.write_descriptors(
                 &set,
@@ -369,17 +372,14 @@ impl ForwardPass {
             descriptor_sets.push(set);
         }
 
-        let module = device.create_shader_module(&ShaderModuleDesc {
-            code: spirv.to_vec(),
-            format: ShaderFormat::SpirV,
-            entry_point: Some("vs_main".into()),
-            name: Some("forward".into()),
-        });
-        if !module.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the forward shader module was not created on the device".into(),
-            ));
-        }
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("forward".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the forward shader module: {e}")))?;
 
         let mut desc = GraphicsPipelineDesc {
             shader_stages: vec![
@@ -423,12 +423,10 @@ impl ForwardPass {
             ..Default::default()
         };
         desc.depth_stencil_state = Some(DepthStencilState::enabled());
+        // №642: the refusal of the backend is a returned Err now, so the old
+        // has_gpu_backing() guard has nothing to guard against — an Ok value
+        // is one the backend built.
         let pipeline = device.create_gpu_graphics_pipeline(&desc, &render_pass, &[&descriptor_layout])?;
-        if !pipeline.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the forward graphics pipeline was not created on the device".into(),
-            ));
-        }
 
         Ok(Self::with_state(ForwardPassState {
             pipeline,

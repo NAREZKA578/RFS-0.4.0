@@ -186,7 +186,12 @@ pub struct Texture {
 }
 
 impl Texture {
-    /// Create a new texture
+    /// Create a new texture.
+    ///
+    /// Returns the backend's refusal (bug №642) instead of a handle-less
+    /// stand-in: the old signature had nowhere to carry a failed
+    /// `create_texture`, so a texture that could not be created looked
+    /// exactly like one that was.
     pub fn new(
         name: &str,
         texture_type: TextureType,
@@ -198,17 +203,18 @@ impl Texture {
         mip_levels: u32,
         usage: TextureUsage,
         device: &Arc<crate::rhi::Device>,
-    ) -> Self {
+    ) -> crate::rhi::RhiResult<Self> {
         let rhi_format = Format::from(format);
         let rhi_usage = RhiTextureUsage::from(usage);
 
-        let rhi_texture =
-            device.create_texture(width, height, depth, rhi_format, rhi_usage, mip_levels);
+        let rhi_texture = device
+            .create_texture(width, height, depth, rhi_format, rhi_usage, mip_levels)
+            .map_err(|e| crate::rhi::RhiError::BackendError(format!("the texture '{name}': {e}")))?;
 
         let rhi_texture = Arc::new(rhi_texture);
         let default_view = Arc::new(rhi_texture.create_view(Default::default()));
 
-        Self {
+        Ok(Self {
             name: name.to_string(),
             texture_type,
             format,
@@ -222,7 +228,7 @@ impl Texture {
             default_view,
             views: Vec::new(),
             sampler: None,
-        }
+        })
     }
 
     /// Create a 2D texture
@@ -233,8 +239,8 @@ impl Texture {
         height: u32,
         usage: TextureUsage,
         device: &Arc<crate::rhi::Device>,
-    ) -> Self {
-        Self::new(
+    ) -> crate::rhi::RhiResult<Self> {
+        Ok(Self::new(
             name,
             TextureType::Texture2D,
             format,
@@ -245,7 +251,7 @@ impl Texture {
             1,
             usage,
             device,
-        )
+        )?)
     }
 
     /// Create a cube texture
@@ -256,8 +262,8 @@ impl Texture {
         mip_levels: u32,
         usage: TextureUsage,
         device: &Arc<crate::rhi::Device>,
-    ) -> Self {
-        Self::new(
+    ) -> crate::rhi::RhiResult<Self> {
+        Ok(Self::new(
             name,
             TextureType::TextureCube,
             format,
@@ -268,7 +274,7 @@ impl Texture {
             mip_levels,
             usage,
             device,
-        )
+        )?)
     }
 
     /// Create a depth texture
@@ -277,15 +283,15 @@ impl Texture {
         width: u32,
         height: u32,
         device: &Arc<crate::rhi::Device>,
-    ) -> Self {
-        Self::new_2d(
+    ) -> crate::rhi::RhiResult<Self> {
+        Ok(Self::new_2d(
             name,
             TextureFormat::Depth32,
             width,
             height,
             TextureUsage::Depth,
             device,
-        )
+        )?)
     }
 
     /// Create a render target texture
@@ -295,15 +301,15 @@ impl Texture {
         height: u32,
         format: TextureFormat,
         device: &Arc<crate::rhi::Device>,
-    ) -> Self {
-        Self::new_2d(
+    ) -> crate::rhi::RhiResult<Self> {
+        Ok(Self::new_2d(
             name,
             format,
             width,
             height,
             TextureUsage::RenderTarget,
             device,
-        )
+        )?)
     }
 
     /// Get the RHI texture
@@ -347,8 +353,16 @@ impl Texture {
         view
     }
 
-    /// Create a sampler
-    pub fn create_sampler(&mut self, device: &Arc<crate::rhi::Device>, desc: &SamplerDesc) {
+    /// Create a sampler.
+    ///
+    /// Returns the backend's refusal (bug №642) instead of dropping it: a
+    /// sampler that could not be created used to look installed while it
+    /// sampled nothing.
+    pub fn create_sampler(
+        &mut self,
+        device: &Arc<crate::rhi::Device>,
+        desc: &SamplerDesc,
+    ) -> crate::rhi::RhiResult<()> {
         let wrap_mode = match desc.wrap_mode {
             TextureWrapMode::Repeat => crate::rhi::AddressMode::Repeat,
             TextureWrapMode::MirroredRepeat => crate::rhi::AddressMode::MirroredRepeat,
@@ -366,8 +380,13 @@ impl Texture {
             TextureFilterMode::Anisotropic => crate::rhi::FilterMode::Linear,
         };
 
-        let sampler = device.create_sampler(wrap_mode, filter_mode, desc.anisotropy);
+        let sampler = device
+            .create_sampler(wrap_mode, filter_mode, desc.anisotropy)
+            .map_err(|e| {
+                crate::rhi::RhiError::BackendError(format!("the sampler for '{}': {e}", self.name))
+            })?;
         self.sampler = Some(Arc::new(sampler));
+        Ok(())
     }
 
     /// Get the sampler
@@ -474,8 +493,8 @@ impl TextureBuilder {
         self
     }
 
-    pub fn build(self, device: &Arc<crate::rhi::Device>) -> Texture {
-        Texture::new(
+    pub fn build(self, device: &Arc<crate::rhi::Device>) -> crate::rhi::RhiResult<Texture> {
+        Ok(Texture::new(
             &self.name,
             self.texture_type,
             self.format,
@@ -486,6 +505,6 @@ impl TextureBuilder {
             self.mip_levels,
             self.usage,
             device,
-        )
+        )?)
     }
 }

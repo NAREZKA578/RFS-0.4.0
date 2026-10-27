@@ -5,7 +5,9 @@
 //! Fast Approximate Anti-Aliasing (FXAA) for post-process anti-aliasing.
 
 use crate::render::core::RenderContext;
-use crate::rhi::{CommandEncoder, Device, Format, Pipeline, Texture, TextureView};
+use crate::rhi::{
+    CommandEncoder, Device, Format, Pipeline, RhiError, RhiResult, Texture, TextureView,
+};
 use std::sync::Arc;
 
 /// FXAA effect
@@ -36,24 +38,28 @@ impl FXAAEffect {
         self.enabled = enabled;
     }
 
-    pub fn initialize(&mut self, device: &Arc<Device>, context: &RenderContext, _input_format: Format) {
+    pub fn initialize(
+        &mut self,
+        device: &Arc<Device>,
+        context: &RenderContext,
+        _input_format: Format,
+    ) -> RhiResult<()> {
         // Bug №651: the size comes from the presentation extent, not from
         // `context.resolution` — see `RenderContext::drawable_extent`.
         let (width, height) = context.drawable_size();
-        self.output_texture = Some(device.create_texture(
-            width,
-            height,
-            1,
-            Format::RGBA8_UNORM,
-            crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
-            1,
-        ));
-        self.output_view = Some(
-            self.output_texture
-                .as_ref()
-                .unwrap()
-                .create_view(Default::default()),
-        );
+        let output = device
+            .create_texture(
+                width,
+                height,
+                1,
+                Format::RGBA8_UNORM,
+                crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
+                1,
+            )
+            .map_err(|e| RhiError::BackendError(format!("the FXAA output texture: {e}")))?;
+        self.output_view = Some(output.create_view(Default::default()));
+        self.output_texture = Some(output);
+        Ok(())
     }
 
     pub fn apply(
@@ -72,8 +78,13 @@ impl FXAAEffect {
         }
     }
 
-    pub fn resize(&mut self, device: &Arc<Device>, context: &RenderContext, input_format: Format) {
-        self.initialize(device, context, input_format);
+    pub fn resize(
+        &mut self,
+        device: &Arc<Device>,
+        context: &RenderContext,
+        input_format: Format,
+    ) -> RhiResult<()> {
+        self.initialize(device, context, input_format)
     }
 
     pub fn cleanup(&mut self) {

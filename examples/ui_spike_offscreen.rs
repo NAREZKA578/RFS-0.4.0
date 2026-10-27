@@ -167,14 +167,16 @@ fn run() -> RhiResult<u32> {
         Err(_) => UI_GEOM_SPV.to_vec(),
     };
 
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        format,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            format,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .map_err(|e| RhiError::BackendError(format!("the offscreen colour texture: {e}")))?;
     let view: TextureView = device
         .create_texture_view(&texture, texture.create_default_view().desc())
         .map_err(|e| RhiError::BackendError(format!("colour view: {e}")))?;

@@ -39,7 +39,6 @@
 pub mod camera;
 pub mod core;
 pub mod diagnostics;
-pub mod effects;
 pub mod graph;
 pub mod lighting;
 pub mod materials;
@@ -55,9 +54,6 @@ pub mod water;
 // Re-export commonly used types
 pub use camera::{Camera, CameraController, OrthographicCamera, PerspectiveCamera};
 pub use core::{RenderContext, RenderStats, Renderer, RendererConfig};
-pub use effects::{
-    EffectManager, EffectQuality, EffectSettings, GlobalEffectSettings, VisualEffectType,
-};
 pub use graph::RenderGraph;
 pub use lighting::{DirectionalLight, Light, LightProbe, PointLight, ShadowConfig, SpotLight};
 pub use materials::{Material, MaterialLibrary, PbrMaterial};

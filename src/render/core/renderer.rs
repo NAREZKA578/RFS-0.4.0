@@ -11,7 +11,7 @@ use crate::render::scene::Scene;
 use crate::rhi::core::{DeviceDesc, Queue};
 use crate::rhi::error::{RhiError, RhiResult};
 use crate::rhi::swapchain::{SwapChain, SwapChainDesc};
-use crate::rhi::types::{Extent2D, Format};
+use crate::rhi::types::{Extent2D, Features, Format};
 use crate::rhi::{backend::create_backend, Device, GraphicsApi, RhiConfig};
 
 /// Main renderer that orchestrates all rendering operations
@@ -92,7 +92,27 @@ impl Renderer {
             .into_iter()
             .next()
             .ok_or(RhiError::NoPhysicalDevices)?;
-        let device = Arc::new(backend.create_device(&physical_device, &DeviceDesc::default())?);
+        // The particle pass's shader reads its system's storage buffer in the
+        // VERTEX stage (one quad per particle, picked by
+        // `@builtin(instance_index)`). Vulkan gates vertex-stage storage reads
+        // behind `vertexPipelineStoresAndAtomics`, which the backend maps onto
+        // exactly this flag (`features.storage_buffer`). Without the flag the
+        // particle draw is undefined behaviour: the driver survives the
+        // submissions that happen never to read and loses the device at the
+        // first one that does — bisected against an RTX 2070 Super, see the
+        // composite pixel test for the matrix. The D3D backends do not read
+        // device features at creation time at all, so asking for the feature
+        // costs nothing there.
+        let device = Arc::new(backend.create_device(
+            &physical_device,
+            &DeviceDesc {
+                features: Features {
+                    storage_buffer: true,
+                    ..Features::default()
+                },
+                ..Default::default()
+            },
+        )?);
 
         let graphics_queue = device.graphics_queue().cloned().unwrap_or(Queue {
             family_index: 0,

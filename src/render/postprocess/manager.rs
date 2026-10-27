@@ -10,7 +10,7 @@ use super::{
 };
 use crate::render::core::RenderContext;
 use crate::render::scene::Scene;
-use crate::rhi::{CommandEncoder, Device, Format, TextureView};
+use crate::rhi::{CommandEncoder, Device, Format, RhiResult, TextureView};
 use std::sync::Arc;
 
 /// Post-processing manager
@@ -37,14 +37,19 @@ impl PostProcessManager {
         }
     }
 
-    pub fn initialize(&mut self, context: &RenderContext, input_format: Format) {
-        self.bloom.initialize(&self.device, context, input_format);
+    pub fn initialize(
+        &mut self,
+        context: &RenderContext,
+        input_format: Format,
+    ) -> RhiResult<()> {
+        self.bloom.initialize(&self.device, context, input_format)?;
         self.motion_blur
-            .initialize(&self.device, context, input_format);
+            .initialize(&self.device, context, input_format)?;
         self.depth_of_field
-            .initialize(&self.device, context, input_format);
-        self.hdr.initialize(&self.device, context, input_format);
-        self.fxaa.initialize(&self.device, context, input_format);
+            .initialize(&self.device, context, input_format)?;
+        self.hdr.initialize(&self.device, context, input_format)?;
+        self.fxaa.initialize(&self.device, context, input_format)?;
+        Ok(())
     }
 
     pub fn apply(

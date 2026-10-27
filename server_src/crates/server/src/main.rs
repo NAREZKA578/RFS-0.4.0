@@ -27,6 +27,34 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// План H5 («Считать память сервера» / TODO: «Track server memory»): память
+/// сервера берётся у ОС, а не оценивается. Рабочее множество читается раз
+/// за отчётное окно и едет в той же `perf:` строке, что и фазы тика —
+/// рост памяти сравним с ходом тиков того же окна.
+#[cfg(windows)]
+fn working_set_mb() -> f64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+            pmc.WorkingSetSize as f64 / (1024.0 * 1024.0)
+        } else {
+            // Failed read is reported as zero — visible, not silently absent:
+            // a stuck-at-zero series is distinguishable from real growth.
+            0.0
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn working_set_mb() -> f64 {
+    0.0
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -593,7 +621,7 @@ async fn main() -> Result<()> {
             let skipped_this_report = cadence.skipped().saturating_sub(last_skipped);
             last_skipped = cadence.skipped();
             info!(
-                "perf: tick={} sim+sync avg={:.2}ms max={:.2}ms | phases events={event_drain_ms:.2}ms sim={sim_ms:.2}ms entity_sync={entity_sync_ms:.2}ms interest={interest_ms:.2}ms broadcast={broadcast_ms:.2}ms | loop avg={loop_avg_ms:.2}ms max={:.2}ms budget={:.2}ms | ticks ran={ran_this_report} skipped={skipped_this_report} | publish rounds={rounds_delta} packets={packets_delta} rounds_per_tick={:.2} packets_per_round={:.2} sent_deltas_by_layer={sent_by_layer:?} first_fulls={first_fulls_delta} ships={} players={} entities={{ships:{},players:{},stations:{},compartments:{},projectiles:{}}}",
+                "perf: tick={} sim+sync avg={:.2}ms max={:.2}ms | phases events={event_drain_ms:.2}ms sim={sim_ms:.2}ms entity_sync={entity_sync_ms:.2}ms interest={interest_ms:.2}ms broadcast={broadcast_ms:.2}ms | loop avg={loop_avg_ms:.2}ms max={:.2}ms budget={:.2}ms | ticks ran={ran_this_report} skipped={skipped_this_report} | publish rounds={rounds_delta} packets={packets_delta} rounds_per_tick={:.2} packets_per_round={:.2} sent_deltas_by_layer={sent_by_layer:?} first_fulls={first_fulls_delta} ships={} players={} entities={{ships:{},players:{},stations:{},compartments:{},projectiles:{}}} ws_mb={:.1}",
                 result.tick.0,
                 avg_ms,
                 tick_time_max.as_secs_f64() * 1000.0,
@@ -608,6 +636,7 @@ async fn main() -> Result<()> {
                 stats.stations,
                 stats.compartments,
                 stats.projectiles,
+                working_set_mb(),
             );
             if skipped_this_report > 0 {
                 // Bug №614: `MissedTickBehavior::Skip` drops these by

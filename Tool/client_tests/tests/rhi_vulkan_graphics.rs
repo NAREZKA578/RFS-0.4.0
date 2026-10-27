@@ -67,14 +67,16 @@ fn vulkan_offscreen_graphics_roundtrip() {
     let device = open_vulkan_device(Features::default());
 
     const EXTENT: u32 = 64;
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        rhi::Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            rhi::Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     assert!(texture.has_gpu_backing());
 
     let view = device
@@ -122,19 +124,23 @@ fn vulkan_offscreen_graphics_roundtrip() {
         .expect("framebuffer");
     assert!(framebuffer.has_gpu_backing());
 
-    let vs = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("graphics test".into()),
-    });
+    let vs = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("graphics test".into()),
+        })
+        .expect("the vertex module must be created");
     assert!(vs.has_gpu_backing());
-    let fs = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("fs_main".into()),
-        name: Some("graphics test".into()),
-    });
+    let fs = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("fs_main".into()),
+            name: Some("graphics test".into()),
+        })
+        .expect("the fragment module must be created");
     assert!(fs.has_gpu_backing());
 
     let pipeline = device
@@ -237,14 +243,16 @@ fn repeated_submits_do_not_reuse_a_previously_signalled_fence() {
     const EXTENT: u32 = 64;
     const FRAMES: u32 = 8;
 
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        rhi::Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            rhi::Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the frame target must be created");
     let view = device
         .create_texture_view(&texture, texture.create_default_view().desc())
         .expect("color attachment view");
@@ -287,18 +295,22 @@ fn repeated_submits_do_not_reuse_a_previously_signalled_fence() {
         })
         .expect("framebuffer");
 
-    let vs = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("repeated submit".into()),
-    });
-    let fs = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("fs_main".into()),
-        name: Some("repeated submit".into()),
-    });
+    let vs = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("repeated submit".into()),
+        })
+        .expect("the vertex module must be created");
+    let fs = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("fs_main".into()),
+            name: Some("repeated submit".into()),
+        })
+        .expect("the fragment module must be created");
 
     let pipeline = device
         .create_gpu_graphics_pipeline(
@@ -409,18 +421,22 @@ fn a_pipeline_with_the_wrong_attachment_count_is_refused() {
         })
         .expect("render pass");
 
-    let vs = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("mismatch".into()),
-    });
-    let fs = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("fs_main".into()),
-        name: Some("mismatch".into()),
-    });
+    let vs = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("mismatch".into()),
+        })
+        .expect("the vertex module must be created");
+    let fs = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("fs_main".into()),
+            name: Some("mismatch".into()),
+        })
+        .expect("the fragment module must be created");
 
     // No colour blend state at all: zero attachments against a render pass with
     // one.

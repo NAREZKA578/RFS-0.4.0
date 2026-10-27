@@ -24,3 +24,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "server"
 path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+# План H5: «считать память сервера» — рабочее множество процесса читается
+# напрямую (GetProcessMemoryInfo) и попадает в `perf:` строку (main.rs,
+# working_set_mb); никаких оценок.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

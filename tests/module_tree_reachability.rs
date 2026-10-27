@@ -107,8 +107,27 @@ fn declared_stems(dir: &Path) -> Option<Vec<String>> {
     let mut stems = Vec::new();
     for line in source.lines() {
         let line = line.trim();
-        // `mod foo;` and `pub mod foo;`, ignoring anything with a body (`mod foo {`).
-        let rest = line.strip_prefix("mod ").or_else(|| line.strip_prefix("pub mod "));
+        // Bug №713: `pub(crate) mod foo;` declares a module like any other,
+        // but the prefixes below only knew `mod` and `pub mod`, so the walk
+        // reported `vulkan/present.rs` — declared `pub(crate) mod` in
+        // `vulkan/mod.rs` — as unconnected: a false alarm that hid the real
+        // signal. Strip the visibility the way the compiler does first:
+        // `pub`, an optional parenthesised scope, or nothing.
+        let line = if let Some(after_pub) = line.strip_prefix("pub") {
+            let after_pub = after_pub.trim_start();
+            if let Some(paren) = after_pub.strip_prefix('(') {
+                match paren.find(')') {
+                    Some(end) => paren[end + 1..].trim_start(),
+                    None => paren,
+                }
+            } else {
+                after_pub
+            }
+        } else {
+            line
+        };
+        // `mod foo;`, any visibility, ignoring anything with a body (`mod foo {`).
+        let rest = line.strip_prefix("mod ");
         if let Some(rest) = rest {
             let rest = rest.trim();
             if rest.ends_with(';') {

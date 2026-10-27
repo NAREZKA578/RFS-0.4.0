@@ -51,11 +51,13 @@ fn open_vulkan_device_with_validation(features: Features, validation: bool) -> D
 #[test]
 fn vulkan_buffer_host_upload_roundtrip() {
     let device = open_vulkan_device(Features::default());
-    let mut buffer = device.create_buffer(
-        64,
-        BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
-        true,
-    );
+    let mut buffer = device
+        .create_buffer(
+            64,
+            BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+            true,
+        )
+        .expect("the host-visible storage buffer must be created");
     assert!(buffer.has_gpu_backing());
     assert!(buffer.is_storage());
     assert!(buffer.is_host_visible());
@@ -85,7 +87,9 @@ fn vulkan_buffer_host_upload_roundtrip() {
 #[test]
 fn vulkan_device_local_buffer() {
     let device = open_vulkan_device(Features::default());
-    let buffer = device.create_buffer(1 << 20, BufferUsage::VERTEX, false);
+    let buffer = device
+        .create_buffer(1 << 20, BufferUsage::VERTEX, false)
+        .expect("the device-local vertex buffer must be created");
     assert!(buffer.has_gpu_backing());
     assert!(buffer.is_vertex());
     assert!(!buffer.is_host_visible());
@@ -99,11 +103,13 @@ fn vulkan_buffer_device_address() {
         ..Default::default()
     };
     let device = open_vulkan_device(features);
-    let buffer = device.create_buffer(
-        256,
-        BufferUsage::STORAGE | BufferUsage::SHADER_DEVICE_ADDRESS,
-        false,
-    );
+    let buffer = device
+        .create_buffer(
+            256,
+            BufferUsage::STORAGE | BufferUsage::SHADER_DEVICE_ADDRESS,
+            false,
+        )
+        .expect("the device-address buffer must be created");
     assert!(buffer.has_gpu_backing());
     assert!(buffer.device_address().is_some());
 }
@@ -111,14 +117,16 @@ fn vulkan_buffer_device_address() {
 #[test]
 fn vulkan_texture_image_creation() {
     let device = open_vulkan_device(Features::default());
-    let texture = device.create_texture(
-        256,
-        256,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::SAMPLED,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            256,
+            256,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED,
+            1,
+        )
+        .expect("the sampled texture must be created");
     assert!(texture.has_gpu_backing());
     assert!(texture.is_sampled());
     assert_eq!(texture.width(), 256);
@@ -134,14 +142,16 @@ fn vulkan_texture_view_and_sampler() {
     };
     let device = open_vulkan_device(features);
 
-    let texture = device.create_texture(
-        128,
-        128,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::SAMPLED | TextureUsage::COLOR_ATTACHMENT,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            128,
+            128,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED | TextureUsage::COLOR_ATTACHMENT,
+            1,
+        )
+        .expect("the sampled texture must be created");
     assert!(texture.has_gpu_backing());
 
     let view_desc = TextureViewDesc {
@@ -158,7 +168,9 @@ fn vulkan_texture_view_and_sampler() {
     assert!(view.has_gpu_backing());
     assert_eq!(view.view_type(), TextureViewType::D2);
 
-    let sampler = device.create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 8.0);
+    let sampler = device
+        .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 8.0)
+        .expect("the anisotropic sampler must be created");
     assert!(sampler.has_gpu_backing());
     assert!(sampler.is_anisotropic());
     assert!(sampler.is_linear());
@@ -179,7 +191,9 @@ fn vulkan_sampler_desc_helpers() {
 #[test]
 fn vulkan_buffer_upload_through_backend_trait() {
     let device = open_vulkan_device(Features::default());
-    let buffer = device.create_buffer(16, BufferUsage::UNIFORM | BufferUsage::TRANSFER_DST, true);
+    let buffer = device
+        .create_buffer(16, BufferUsage::UNIFORM | BufferUsage::TRANSFER_DST, true)
+        .expect("the host-visible uniform buffer must be created");
     let backend = device.backend_resource().unwrap();
     backend
         .upload_buffer(&buffer, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66])
@@ -191,8 +205,9 @@ fn vulkan_buffer_upload_through_backend_trait() {
 #[test]
 fn vulkan_buffer_upload_to_device_local_buffer_via_staging() {
     let device = open_vulkan_device(Features::default());
-    let buffer =
-        device.create_buffer(32, BufferUsage::STORAGE | BufferUsage::TRANSFER_DST, false);
+    let buffer = device
+        .create_buffer(32, BufferUsage::STORAGE | BufferUsage::TRANSFER_DST, false)
+        .expect("the device-local storage buffer must be created");
     assert!(buffer.has_gpu_backing());
     assert!(!buffer.is_host_visible());
     assert!(buffer.supports_transfer());
@@ -206,7 +221,9 @@ fn vulkan_buffer_upload_to_device_local_buffer_via_staging() {
 #[test]
 fn vulkan_texture_upload_with_mip_chain() {
     let device = open_vulkan_device(Features::default());
-    let texture = device.create_texture(64, 64, 1, Format::RGBA8_UNORM, TextureUsage::SAMPLED, 4);
+    let texture = device
+        .create_texture(64, 64, 1, Format::RGBA8_UNORM, TextureUsage::SAMPLED, 4)
+        .expect("the mip-chained texture must be created");
     assert!(texture.has_gpu_backing());
 
     let total = (64 * 64 + 32 * 32 + 16 * 16 + 8 * 8) * 4;
@@ -255,14 +272,16 @@ fn vulkan_released_texture_leaves_the_teardown_list() {
     let device = open_vulkan_device_with_validation(Features::default(), true);
 
     let before = device.tracked_object_count();
-    let texture = device.create_texture(
-        256,
-        256,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            256,
+            256,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT,
+            1,
+        )
+        .expect("the tracked texture must be created");
     assert_eq!(
         device.tracked_object_count(),
         before + 1,
@@ -287,27 +306,31 @@ fn vulkan_texture_churn_does_not_grow_the_teardown_list() {
     // Settle first so the baseline cannot include one-off allocations from device
     // creation that land later on their own.
     {
-        let warmup = device.create_texture(
-            64,
-            64,
-            1,
-            Format::RGBA8_UNORM,
-            TextureUsage::COLOR_ATTACHMENT,
-            1,
-        );
+        let warmup = device
+            .create_texture(
+                64,
+                64,
+                1,
+                Format::RGBA8_UNORM,
+                TextureUsage::COLOR_ATTACHMENT,
+                1,
+            )
+            .expect("the warmup texture must be created");
         device.release_texture(&warmup);
     }
     let baseline = device.tracked_object_count();
 
     for step in 1..=32 {
-        let texture = device.create_texture(
-            64 + step,
-            64,
-            1,
-            Format::RGBA8_UNORM,
-            TextureUsage::COLOR_ATTACHMENT,
-            1,
-        );
+        let texture = device
+            .create_texture(
+                64 + step,
+                64,
+                1,
+                Format::RGBA8_UNORM,
+                TextureUsage::COLOR_ATTACHMENT,
+                1,
+            )
+            .expect("the churn texture must be created");
         device.release_texture(&texture);
         assert_eq!(
             device.tracked_object_count(),
@@ -329,14 +352,16 @@ fn vulkan_texture_churn_does_not_grow_the_teardown_list() {
 fn vulkan_double_release_is_harmless() {
     let device = open_vulkan_device_with_validation(Features::default(), true);
 
-    let texture = device.create_texture(
-        32,
-        32,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            32,
+            32,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT,
+            1,
+        )
+        .expect("the release-test texture must be created");
 
     device.release_texture(&texture);
     let after_first = device.tracked_object_count();
@@ -374,22 +399,26 @@ fn vulkan_double_release_is_harmless() {
 fn vulkan_texture_barrier_uses_the_aspect_the_image_actually_has() {
     let device = open_vulkan_device_with_validation(Features::default(), true);
 
-    let color = device.create_texture(
-        64,
-        64,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT,
-        1,
-    );
-    let depth = device.create_texture(
-        64,
-        64,
-        1,
-        Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-        1,
-    );
+    let color = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT,
+            1,
+        )
+        .expect("the colour texture must be created");
+    let depth = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+            1,
+        )
+        .expect("the depth texture must be created");
     let before_errors = rhi::validation_error_count();
 
     // Sanity check on the predicate the translator keys off, so a failure below
@@ -446,14 +475,16 @@ fn vulkan_texture_barrier_uses_the_aspect_the_image_actually_has() {
 fn vulkan_depth_barrier_transitions_to_read_only_layout() {
     let device = open_vulkan_device_with_validation(Features::default(), true);
 
-    let depth = device.create_texture(
-        128,
-        128,
-        1,
-        Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-        1,
-    );
+    let depth = device
+        .create_texture(
+            128,
+            128,
+            1,
+            Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+            1,
+        )
+        .expect("the read-only depth texture must be created");
     let before_errors = rhi::validation_error_count();
 
     let commands = [Command::PipelineBarrier {
@@ -507,22 +538,26 @@ fn vulkan_clear_names_only_the_aspect_the_format_has() {
     let device = open_vulkan_device_with_validation(Features::default(), true);
 
     // TRANSFER_DST is required to clear (`VUID-vkCmdClearColorImage-image-00002`).
-    let color = device.create_texture(
-        32,
-        32,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_DST,
-        1,
-    );
-    let depth = device.create_texture(
-        32,
-        32,
-        1,
-        Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::TRANSFER_DST,
-        1,
-    );
+    let color = device
+        .create_texture(
+            32,
+            32,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_DST,
+            1,
+        )
+        .expect("the cleared colour texture must be created");
+    let depth = device
+        .create_texture(
+            32,
+            32,
+            1,
+            Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::TRANSFER_DST,
+            1,
+        )
+        .expect("the cleared depth texture must be created");
     let color_view = device
         .create_texture_view(&color, color.create_default_view().desc())
         .expect("colour view");
@@ -585,14 +620,16 @@ fn vulkan_clear_names_only_the_aspect_the_format_has() {
 fn vulkan_refuses_a_partial_clear_instead_of_clearing_everything() {
     let device = open_vulkan_device_with_validation(Features::default(), false);
 
-    let color = device.create_texture(
-        32,
-        32,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_DST,
-        1,
-    );
+    let color = device
+        .create_texture(
+            32,
+            32,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_DST,
+            1,
+        )
+        .expect("the texture the clear is refused on must be created");
     let color_view = device
         .create_texture_view(&color, color.create_default_view().desc())
         .expect("colour view");
@@ -721,14 +758,16 @@ fn vulkan_the_tracker_learns_where_an_upload_left_the_image() {
         "the validation layer has to be up for this test to mean anything: a clean \
          readback with no layer is a readback nobody checked"
     );
-    let texture = device.create_texture(
-        64,
-        64,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the upload-tracker texture must be created");
     assert!(texture.has_gpu_backing());
 
     // A freshly created image has no contents yet, and the tracker says so.
@@ -791,14 +830,16 @@ fn vulkan_the_tracker_learns_where_an_upload_left_the_image() {
 #[test]
 fn vulkan_a_created_framebuffer_has_a_native_handle() {
     let device = open_vulkan_device(Features::default());
-    let color = device.create_texture(
-        64,
-        64,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT,
-        1,
-    );
+    let color = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT,
+            1,
+        )
+        .expect("the framebuffer test's colour target must be created");
     let view = device
         .create_texture_view(&color, color.create_default_view().desc())
         .expect("colour attachment view");
@@ -898,7 +939,9 @@ fn vulkan_a_sampler_asking_for_anisotropy_is_legal_without_the_feature() {
          changed, it is testing nothing"
     );
     let before = rhi::validation_error_count();
-    let sampler = device.create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 8.0);
+    let sampler = device
+        .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 8.0)
+        .expect("the sampler must still be created; the request is clamped, not refused");
     assert!(
         sampler.has_gpu_backing(),
         "the sampler must still be created; the request is clamped, not refused"
@@ -921,7 +964,9 @@ fn vulkan_a_sampler_asking_for_anisotropy_is_legal_with_the_feature() {
     };
     let device = open_vulkan_device_with_validation(features, true);
     let before = rhi::validation_error_count();
-    let sampler = device.create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 8.0);
+    let sampler = device
+        .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 8.0)
+        .expect("the anisotropic sampler must be created");
     assert!(sampler.has_gpu_backing());
     assert_eq!(
         rhi::validation_error_count(),

@@ -266,7 +266,28 @@ fn rhi_creation_requires_working_backend() {
     // a Vulkan loader a proper error is reported instead of panicking.
     let cfg = RhiConfig::default();
     let result = rhi::core::instance::Rhi::new(cfg);
-    if result.is_err() {
-        assert!(matches!(result, Err(RhiError::NoBackendForApi(_))));
+    match result {
+        Err(e) => {
+            // Bug №187 — the err side was always checked: a proper error is
+            // reported instead of panicking.
+            assert!(
+                matches!(e, RhiError::NoBackendForApi(_)),
+                "no-backend failure must be NoBackendForApi, got {e:?}"
+            );
+        }
+        Ok(rhi) => {
+            // Bug №187 — the Ok branch used to be empty: on a machine with a
+            // working Vulkan loader the test could not fail at all, so it
+            // proved nothing there. A successful creation must actually see
+            // hardware.
+            assert!(
+                !rhi.physical_devices().is_empty(),
+                "Rhi::new succeeded but physical_devices() is empty"
+            );
+            assert!(
+                rhi.default_physical_device().is_some(),
+                "Rhi::new succeeded but default_physical_device() is none"
+            );
+        }
     }
 }

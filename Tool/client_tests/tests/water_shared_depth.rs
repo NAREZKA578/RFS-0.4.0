@@ -112,14 +112,16 @@ fn flat_texture(device: &rhi::Device, colour: [u8; 4]) -> rhi::Texture {
     for _ in 0..size * size {
         pixels.extend_from_slice(&colour);
     }
-    let texture = device.create_texture(
-        size as u32,
-        size as u32,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            size as u32,
+            size as u32,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            1,
+        )
+        .expect("the flat colour texture must be created");
     device
         .upload_texture(&texture, &pixels)
         .expect("the texture's upload must succeed");
@@ -270,14 +272,16 @@ fn render(device: &Arc<rhi::Device>, water_z: f32) -> Picture {
     );
 
     // The target: a colour image and the shared depth.
-    let colour = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let colour = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the shared colour target must be created");
     let colour_image_view = colour_view(device, &colour);
     let depth_view = depth
         .view(device, EXTENT, EXTENT)

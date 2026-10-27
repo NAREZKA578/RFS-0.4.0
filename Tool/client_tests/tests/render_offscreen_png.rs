@@ -69,14 +69,16 @@ fn renders_a_frame_and_writes_a_png() {
     let device = open_vulkan_device();
     let spirv = shader_spv();
 
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     assert!(texture.has_gpu_backing(), "texture must be GPU backed");
 
     let view = device
@@ -118,12 +120,14 @@ fn renders_a_frame_and_writes_a_png() {
         .expect("framebuffer");
 
     // One module, two entry points.
-    let module = device.create_shader_module(&ShaderModuleDesc {
-        code: spirv,
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("fullscreen".into()),
-    });
+    let module = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: spirv,
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("fullscreen".into()),
+        })
+        .expect("the fullscreen module must be created");
     assert!(module.has_gpu_backing(), "shader module must be GPU backed");
 
     let pipeline = device

@@ -59,14 +59,23 @@ impl TextureLoader {
             .unwrap_or("unnamed")
             .to_string();
 
-        let texture = Texture::new_2d(
+        let texture = match Texture::new_2d(
             &name,
             TextureFormat::RGBA8,
             256,
             256,
             TextureUsage::Diffuse,
             device,
-        );
+        ) {
+            Ok(texture) => texture,
+            Err(e) => {
+                crate::error!(
+                    "texture_loader",
+                    "{name}: the device refused to create the placeholder texture: {e}"
+                );
+                return None;
+            }
+        };
 
         // Upload some placeholder data (white texture)
         let data = vec![255u8; 256 * 256 * 4];
@@ -89,14 +98,23 @@ impl TextureLoader {
         // and create a cube map texture
 
         // For now, create a placeholder cube map
-        let texture = Texture::new_cube(
+        let texture = match Texture::new_cube(
             "cube_map",
             TextureFormat::RGBA8,
             256,
             1,
             TextureUsage::Diffuse,
             device,
-        );
+        ) {
+            Ok(texture) => texture,
+            Err(e) => {
+                crate::error!(
+                    "texture_loader",
+                    "cube_map: the device refused to create the placeholder cube map: {e}"
+                );
+                return None;
+            }
+        };
 
         // Upload placeholder data
         let data = vec![255u8; 256 * 256 * 4 * 6];
@@ -112,7 +130,17 @@ impl TextureLoader {
         height: u32,
         device: &Arc<crate::rhi::Device>,
     ) -> Option<Texture> {
-        Some(Texture::new_depth("depth", width, height, device))
+        let texture = match Texture::new_depth("depth", width, height, device) {
+            Ok(texture) => texture,
+            Err(e) => {
+                crate::error!(
+                    "texture_loader",
+                    "depth: the device refused to create the depth texture: {e}"
+                );
+                return None;
+            }
+        };
+        Some(texture)
     }
 
     /// Load a render target texture
@@ -123,13 +151,23 @@ impl TextureLoader {
         format: TextureFormat,
         device: &Arc<crate::rhi::Device>,
     ) -> Option<Texture> {
-        Some(Texture::new_render_target(
+        let texture = match Texture::new_render_target(
             "render_target",
             width,
             height,
             format,
             device,
-        ))
+        ) {
+            Ok(texture) => texture,
+            Err(e) => {
+                crate::error!(
+                    "texture_loader",
+                    "render_target: the device refused to create the render target: {e}"
+                );
+                return None;
+            }
+        };
+        Some(texture)
     }
 
     /// Create a solid color texture
@@ -141,14 +179,23 @@ impl TextureLoader {
         height: u32,
         device: &Arc<crate::rhi::Device>,
     ) -> Option<Texture> {
-        let texture = Texture::new_2d(
+        let texture = match Texture::new_2d(
             name,
             TextureFormat::RGBA8,
             width,
             height,
             TextureUsage::Diffuse,
             device,
-        );
+        ) {
+            Ok(texture) => texture,
+            Err(e) => {
+                crate::error!(
+                    "texture_loader",
+                    "{name}: the device refused to create the solid color texture: {e}"
+                );
+                return None;
+            }
+        };
 
         let data: Vec<u8> = (0..width * height).flat_map(|_| color.to_vec()).collect();
         if !texture.upload_data(&data, device) { return None; }
@@ -163,14 +210,23 @@ impl TextureLoader {
         size: u32,
         device: &Arc<crate::rhi::Device>,
     ) -> Option<Texture> {
-        let texture = Texture::new_2d(
+        let texture = match Texture::new_2d(
             name,
             TextureFormat::RGBA8,
             size,
             size,
             TextureUsage::Diffuse,
             device,
-        );
+        ) {
+            Ok(texture) => texture,
+            Err(e) => {
+                crate::error!(
+                    "texture_loader",
+                    "{name}: the device refused to create the checkerboard texture: {e}"
+                );
+                return None;
+            }
+        };
 
         let mut data = vec![0u8; (size * size * 4) as usize];
         for y in 0..size {

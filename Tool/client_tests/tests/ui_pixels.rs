@@ -100,14 +100,16 @@ fn build_target() -> UiTarget {
     let device = open_device();
     let format = Format::RGBA8_UNORM;
 
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        format,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            format,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the UI target must be created");
     let view = device
         .create_texture_view(&texture, texture.create_default_view().desc())
         .expect("colour attachment view");
@@ -327,14 +329,17 @@ fn the_ui_rasterises_exactly_its_rectangle() {
     // one image forever while the swapchain presented the rest untouched.
     // Asserting equality with this test's own rendered pixel sidesteps knowing
     // the expected colour: wrong-image garbage does not match four exact bytes.
-    let second = target.device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let second = target
+        .device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the second image must be created");
     let second_view = target
         .device
         .create_texture_view(&second, second.create_default_view().desc())
@@ -447,14 +452,16 @@ fn a_registered_image_is_actually_sampled_and_drawn() {
     let format = Format::RGBA8_UNORM;
 
     // 1. A texture to draw, filled with a known colour.
-    let image_texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        format,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-        1,
-    );
+    let image_texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            format,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            1,
+        )
+        .expect("the sampled image must be created");
     let image_view = device
         .create_texture_view(
             &image_texture,
@@ -489,14 +496,16 @@ fn a_registered_image_is_actually_sampled_and_drawn() {
     device.wait_idle().expect("wait idle");
 
     // 2. The target the UI draws into.
-    let target = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        format,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let target = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            format,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the UI target must be created");
     let target_view = device
         .create_texture_view(&target, target.create_default_view().desc())
         .expect("target view");
@@ -605,14 +614,16 @@ fn a_registered_image_is_actually_sampled_and_drawn() {
 fn build_empty_target() -> UiTarget {
     let device = open_device();
     let format = Format::RGBA8_UNORM;
-    let texture = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        format,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let texture = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            format,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the UI target must be created");
     let view = device
         .create_texture_view(&texture, texture.create_default_view().desc())
         .expect("colour attachment view");

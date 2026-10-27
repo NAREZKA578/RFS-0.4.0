@@ -585,6 +585,81 @@ images: Vec::new(),
     }
 }
 
+/// The facts a sampled-image barrier needs, from the layout the backend
+/// currently holds (bug №650, variant Б).
+///
+/// Returns the `(old_layout, src_stage, src_access)` trio to record the move
+/// into `ShaderReadOnlyOptimal`, or `None` when recording anything would itself
+/// be wrong:
+///
+///  - `Some(ShaderReadOnlyOptimal)` — the image already *is* in the layout the
+///    sampler declares (an upload of a sampleable image ends there on its own,
+///    tracker noted). A barrier would have to name a layout the image is not
+///    in — exactly the `VUID-vkCmdPipelineBarrier-oldLayout-01152` report the
+///    old constant-layout code produced, with its cause in the upload and the
+///    blame landing at the barrier.
+///  - `Some(PresentSrc | General | Preinitialized)` — the tracker holds a
+///    layout the UI does not produce; sampling such an image is not a designed
+///    case here, and emitting a barrier would be a guess wearing the tracker's
+///    authority. Refusing is the loud, honest step: the descriptor-conformance
+///    check names the mismatch with the truth rather than this code inventing
+///    one.
+///
+/// `None` as *input* means the backend has no layout tracker for this image at
+/// all: nothing truer exists to ask, so the historical `TransferDstOptimal`
+/// guess stands, as on any backend that reports untracked images.
+fn sample_transition_barrier(
+    layout: Option<TextureLayout>,
+) -> Option<(TextureLayout, PipelineStage, AccessFlags)> {
+    match layout {
+        Some(TextureLayout::ShaderReadOnlyOptimal) => None,
+        None => Some((
+            TextureLayout::TransferDstOptimal,
+            PipelineStage::TRANSFER,
+            AccessFlags::TRANSFER_WRITE,
+        )),
+        // From `Undefined` the contents are undefined: no producer to
+        // synchronise with, and a barrier from `Undefined` takes no source
+        // access.
+        Some(TextureLayout::Undefined) => Some((
+            TextureLayout::Undefined,
+            PipelineStage::TOP_OF_PIPE,
+            AccessFlags::NONE,
+        )),
+        Some(TextureLayout::TransferDstOptimal) => Some((
+            TextureLayout::TransferDstOptimal,
+            PipelineStage::TRANSFER,
+            AccessFlags::TRANSFER_WRITE,
+        )),
+        Some(TextureLayout::TransferSrcOptimal) => Some((
+            TextureLayout::TransferSrcOptimal,
+            PipelineStage::TRANSFER,
+            AccessFlags::TRANSFER_READ,
+        )),
+        Some(TextureLayout::ColorAttachmentOptimal) => Some((
+            TextureLayout::ColorAttachmentOptimal,
+            PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+            AccessFlags::COLOR_ATTACHMENT_WRITE,
+        )),
+        Some(layout @ (TextureLayout::DepthStencilAttachmentOptimal
+        | TextureLayout::DepthAttachmentOptimal
+        | TextureLayout::StencilAttachmentOptimal)) => Some((
+            layout,
+            PipelineStage::LATE_FRAGMENT_TESTS,
+            AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )),
+        Some(layout @ (TextureLayout::DepthStencilReadOnlyOptimal
+        | TextureLayout::DepthReadOnlyOptimal
+        | TextureLayout::StencilReadOnlyOptimal)) => Some((
+            layout,
+            PipelineStage::EARLY_FRAGMENT_TESTS,
+            AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+        )),
+        // PresentSrc / General / Preinitialized — see above.
+        Some(_) => None,
+    }
+}
+
 /// The UI renderer.
 pub struct UiRenderer {
     device: Arc<Device>,
@@ -2333,28 +2408,30 @@ impl UiRenderer {
         }
 
         // Move the newly sampled images to `ShaderReadOnlyOptimal` before the
-        // pass opens. `TRANSFER` is where the upload left them and where the
-        // transfer write happened; `FRAGMENT_SHADER` is where the sampler reads
-        // them. Emitted outside the render pass on purpose: a sampled image is
-        // not an attachment, so it can change layout here without a subpass
-        // dependency.
-        if !sample_transitions.is_empty() {
-            commands.push(Command::PipelineBarrier {
-                src_stage: PipelineStage::TRANSFER,
-                dst_stage: PipelineStage::FRAGMENT_SHADER,
-                memory_barriers: Vec::new(),
-                buffer_barriers: Vec::new(),
-                texture_barriers: sample_transitions
-                    .iter()
-                    .map(|texture| TextureBarrier {
+        // pass opens. Which layout each image is in is the backend's fact, not
+        // an assumption here: an upload of a sampleable image already ends in
+        // `ShaderReadOnlyOptimal` (nothing left to move), a cleared one is in
+        // `TransferDstOptimal` and needs the write→read move. Emitted outside
+        // the render pass on purpose: a sampled image is not an attachment, so
+        // it can change layout here without a subpass dependency.
+        for texture in &sample_transitions {
+            if let Some((old_layout, src_stage, src_access)) =
+                sample_transition_barrier(self.device.texture_layout(texture))
+            {
+                commands.push(Command::PipelineBarrier {
+                    src_stage,
+                    dst_stage: PipelineStage::FRAGMENT_SHADER,
+                    memory_barriers: Vec::new(),
+                    buffer_barriers: Vec::new(),
+                    texture_barriers: vec![TextureBarrier {
                         texture: texture.clone(),
-                        src_access: AccessFlags::TRANSFER_WRITE,
+                        src_access,
                         dst_access: AccessFlags::SHADER_READ,
-                        old_layout: TextureLayout::TransferDstOptimal,
+                        old_layout,
                         new_layout: TextureLayout::ShaderReadOnlyOptimal,
-                    })
-                    .collect(),
-            });
+                    }],
+                });
+            }
         }
 
         // Without a framebuffer there is no image to draw into. The state
@@ -2784,6 +2861,36 @@ fn grow(current: usize, needed: usize, minimum: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bug №650 negative control: the barrier's facts come from the backend's
+    /// layout tracker, and an image already in the sampler's declared layout
+    /// must produce **no barrier at all** — the old code recorded one naming
+    /// `TransferDstOptimal` for exactly that case. Restoring a constant that
+    /// ignores `Some(ShaderReadOnlyOptimal)` reds the first assert; the rest
+    /// pin the truthful staging for the layouts the engine leaves behind.
+    #[test]
+    fn the_sampled_image_barrier_names_the_tracked_layout() {
+        assert!(sample_transition_barrier(Some(TextureLayout::ShaderReadOnlyOptimal)).is_none());
+        let (old, stage, access) =
+            sample_transition_barrier(Some(TextureLayout::TransferDstOptimal)).unwrap();
+        assert!(matches!(old, TextureLayout::TransferDstOptimal));
+        assert!(matches!(stage, PipelineStage::TRANSFER));
+        assert!(matches!(access, AccessFlags::TRANSFER_WRITE));
+
+        let (old, _, access) =
+            sample_transition_barrier(Some(TextureLayout::Undefined)).unwrap();
+        assert!(matches!(old, TextureLayout::Undefined));
+        // A transition out of `Undefined` carries no source access at all.
+        assert!(matches!(access, AccessFlags::NONE));
+
+        let (old, _, _) =
+            sample_transition_barrier(Some(TextureLayout::ColorAttachmentOptimal)).unwrap();
+        assert!(matches!(old, TextureLayout::ColorAttachmentOptimal));
+
+        // Backends with no tracker at all: the historical guess, named as such.
+        let (old, _, _) = sample_transition_barrier(None).unwrap();
+        assert!(matches!(old, TextureLayout::TransferDstOptimal));
+    }
 
     const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 

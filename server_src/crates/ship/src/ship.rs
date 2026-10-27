@@ -458,8 +458,16 @@ impl Ship {
     }
 
     fn update_compartments(&self, dt: f32, state: &mut ShipState) {
+        // Bug №716: the compartments live in a HashMap, and the iteration order
+        // decided which compartment saw which mid-tick value and in which order
+        // the collected transfers later hit the map — the same tick produced
+        // different water distributions between runs. Sort by EntityId so the
+        // model is a function of the state, not of hash order.
+        let mut ordered: Vec<_> = self.compartments.values().collect();
+        ordered.sort_by_key(|comp| comp.entity_id().0);
+
         // Phase 1: per-compartment intake / pump outflow / fire decay.
-        for comp in self.compartments.values() {
+        for comp in &ordered {
             if let Some(comp_state) = state.compartment_states.get_mut(&comp.entity_id()) {
                 comp.update(dt, comp_state);
             }
@@ -472,7 +480,7 @@ impl Ship {
         // neighbours). Fire spread was computed and then discarded.
         let mut water_transfers: Vec<WaterTransfer> = Vec::new();
         let mut fire_spreads: Vec<(EntityId, f32)> = Vec::new();
-        for comp in self.compartments.values() {
+        for comp in &ordered {
             let comp_id = comp.entity_id();
             if let Some(cs) = state.compartment_states.get(&comp_id) {
                 water_transfers.extend(comp.compute_water_spread(

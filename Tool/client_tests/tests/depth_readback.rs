@@ -55,14 +55,16 @@ fn the_depth_buffer_holds_the_geometry_and_nothing_else() {
     let device = open_device();
 
     // The colour target and the depth target, both readable.
-    let colour = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let colour = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the colour target must be created");
     let colour_view = device
         .create_texture_view(
             &colour,
@@ -78,14 +80,16 @@ fn the_depth_buffer_holds_the_geometry_and_nothing_else() {
             },
         )
         .expect("colour view");
-    let depth = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let depth = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the depth target must be created");
     let depth_view = device
         .create_texture_view(
             &depth,

@@ -97,28 +97,32 @@ fn vulkan_offscreen_indexed_depth_roundtrip() {
     let device = open_vulkan_device(Features::default());
 
     const EXTENT: u32 = 64;
-    let color = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        rhi::Format::RGBA8_UNORM,
-        TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
-        1,
-    );
+    let color = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            rhi::Format::RGBA8_UNORM,
+            TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the color attachment must be created");
     assert!(color.has_gpu_backing());
     let color_view = device
         .create_texture_view(&color, color.create_default_view().desc())
         .expect("color attachment view");
     assert!(color_view.has_gpu_backing());
 
-    let depth = device.create_texture(
-        EXTENT,
-        EXTENT,
-        1,
-        rhi::Format::D32_SFLOAT,
-        TextureUsage::DEPTH_STENCIL_ATTACHMENT,
-        1,
-    );
+    let depth = device
+        .create_texture(
+            EXTENT,
+            EXTENT,
+            1,
+            rhi::Format::D32_SFLOAT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+            1,
+        )
+        .expect("the depth attachment must be created");
     assert!(depth.has_gpu_backing());
     let depth_view = device
         .create_texture_view(&depth, depth.create_default_view().desc())
@@ -188,18 +192,22 @@ fn vulkan_offscreen_indexed_depth_roundtrip() {
         .expect("framebuffer");
     assert!(framebuffer.has_gpu_backing());
 
-    let module = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("vs_main".into()),
-        name: Some("indexed/depth test".into()),
-    });
-    let frag = device.create_shader_module(&ShaderModuleDesc {
-        code: wgsl_to_spirv(SHADER),
-        format: ShaderFormat::SpirV,
-        entry_point: Some("fs_main".into()),
-        name: Some("indexed/depth test".into()),
-    });
+    let module = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("vs_main".into()),
+            name: Some("indexed/depth test".into()),
+        })
+        .expect("the vertex module must be created");
+    let frag = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: wgsl_to_spirv(SHADER),
+            format: ShaderFormat::SpirV,
+            entry_point: Some("fs_main".into()),
+            name: Some("indexed/depth test".into()),
+        })
+        .expect("the fragment module must be created");
     assert!(module.has_gpu_backing());
     assert!(frag.has_gpu_backing());
 
@@ -245,11 +253,13 @@ fn vulkan_offscreen_indexed_depth_roundtrip() {
 
     let indices: [u16; 12] = [0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let index_buffer = device.create_buffer(
-        index_bytes.len() as u64,
-        rhi::BufferUsage::INDEX | rhi::BufferUsage::TRANSFER_DST,
-        false,
-    );
+    let index_buffer = device
+        .create_buffer(
+            index_bytes.len() as u64,
+            rhi::BufferUsage::INDEX | rhi::BufferUsage::TRANSFER_DST,
+            false,
+        )
+        .expect("the index buffer must be created");
     device
         .upload_buffer(&index_buffer, &index_bytes)
         .expect("the index buffer must be uploaded before the indexed draw");
