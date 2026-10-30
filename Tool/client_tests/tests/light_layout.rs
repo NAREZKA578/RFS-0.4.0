@@ -39,22 +39,22 @@ use rhi::{
 const EXTENT: u32 = 16;
 const SHADER: &[u8] = include_bytes!("../assets/shaders/lightprobe.spv");
 
-fn open_device() -> Device {
+fn open_device() -> Option<Device> {
     let backend = VulkanBackend::new(&RhiConfig {
         validation: true,
         ..Default::default()
     })
-    .unwrap();
-    let devices = backend.enumerate_physical_devices().unwrap();
+    .ok()?;
+    let devices = backend.enumerate_physical_devices().ok()?;
     backend
         .create_device(
-            &devices[0],
+            devices.first()?,
             &DeviceDesc {
                 features: Default::default(),
                 ..Default::default()
             },
         )
-        .unwrap()
+        .ok()
 }
 
 /// The light, in the layout the scene's light buffer uses: the position at 0,
@@ -135,7 +135,12 @@ fn every_shader_declares_the_same_light() {
 
 #[test]
 fn the_shader_reads_the_light_where_it_was_written() {
-    let device = open_device();
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_device() else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     // The buffer the shader reads: the clustering pass's own lights buffer,
     // because that is the one the forward shader reads. Reading a buffer this

@@ -2,9 +2,16 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
+use crate::rhi::ui::UiCommand;
 use crate::render::textures::Texture;
 use glam::{Vec2, Vec3, Vec4};
 use std::sync::Arc;
+
+use super::model::{rgba, UiBatch};
+
+/// How far the fog-of-war image is tinted down. The old stub carried exactly
+/// (0.5, 0.5, 0.5, 0.5), so the compiled command keeps exactly that.
+const FOG_OF_WAR_TINT: [f32; 4] = [0.5, 0.5, 0.5, 0.5];
 
 /// Minimap
 pub struct Minimap {
@@ -173,76 +180,79 @@ impl Minimap {
             )
     }
 
-    pub fn render(&self, encoder: &mut crate::rhi::CommandEncoder) {
+    /// Compiles the minimap into `UiCommand`s, replacing the stub `render`
+    /// and its six `render_*` helpers this once replaced (Bug №724).
+    ///
+    /// Order: background image, fog-of-war image (the same half-grey tint the
+    /// stub documented), then the elements stable-sorted by `z_index`
+    /// ascending — so equal indices keep insertion order, and higher indices
+    /// draw on top. Every element is centred on its `world_to_minimap`
+    /// position, `icon` textures going out as `Image` commands, the rest as
+    /// flat quads; an `Area` is drawn at its screen `size` like any other
+    /// element, world-footprint mapping being v2.
+    pub fn to_commands(&self, batch: &mut UiBatch) {
         if !self.visible {
             return;
         }
+
         if let Some(texture) = &self.background_texture {
-            self.render_texture(encoder, texture, self.position, self.size, Vec4::ONE);
+            push_image(batch, texture, self.position, self.size, [1.0, 1.0, 1.0, 1.0]);
         }
         if let Some(texture) = &self.fog_of_war_texture {
-            self.render_texture(
-                encoder,
+            push_image(
+                batch,
                 texture,
                 self.position,
                 self.size,
-                Vec4::new(0.5, 0.5, 0.5, 0.5),
+                FOG_OF_WAR_TINT,
             );
         }
-        for element in &self.elements {
-            if element.visible {
-                self.render_element(encoder, element);
+
+        let mut order: Vec<&MinimapElement> = self.elements.iter().filter(|e| e.visible).collect();
+        order.sort_by_key(|e| e.z_index);
+        for element in order {
+            let center = self.world_to_minimap(element.world_position);
+            let at = Vec2::new(
+                center.x - element.size.x * 0.5,
+                center.y - element.size.y * 0.5,
+            );
+            if let Some(icon) = &element.icon {
+                push_image(batch, icon, at, element.size, rgba(element.color));
+            } else {
+                batch.commands.push(UiCommand::Rectangle {
+                    x: at.x,
+                    y: at.y,
+                    width: element.size.x,
+                    height: element.size.y,
+                    color: rgba(element.color),
+                    corner_radius: 0.0,
+                });
             }
         }
     }
+}
 
-    fn render_texture(
-        &self,
-        encoder: &mut crate::rhi::CommandEncoder,
-        texture: &Arc<Texture>,
-        position: Vec2,
-        size: Vec2,
-        color: Vec4,
-    ) {
-        let _ = (encoder, texture, position, size, color);
-    }
-
-    fn render_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
-        match &element.element_type {
-            MinimapElementType::Ship => self.render_ship_element(encoder, element),
-            MinimapElementType::Objective => self.render_objective_element(encoder, element),
-            MinimapElementType::Marker => self.render_marker_element(encoder, element),
-            MinimapElementType::Area => self.render_area_element(encoder, element),
-        }
-    }
-
-    fn render_ship_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
-        let pos = self.world_to_minimap(element.world_position);
-        let size = element.size;
-        let color = element.color;
-        let _ = (encoder, pos, size, color);
-    }
-
-    fn render_objective_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
-        let pos = self.world_to_minimap(element.world_position);
-        let size = element.size;
-        let color = element.color;
-        let _ = (encoder, pos, size, color);
-    }
-
-    fn render_marker_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
-        let pos = self.world_to_minimap(element.world_position);
-        let size = element.size;
-        let color = element.color;
-        let _ = (encoder, pos, size, color);
-    }
-
-    fn render_area_element(&self, encoder: &mut crate::rhi::CommandEncoder, element: &MinimapElement) {
-        let pos = self.world_to_minimap(element.world_position);
-        let size = element.size;
-        let color = element.color;
-        let _ = (encoder, pos, size, color);
-    }
+/// Emits one full-UV image command and registers the texture behind it. The
+/// texture id is the `Arc`'s address, so the same texture shared by the
+/// background and an icon carries one stable id.
+fn push_image(
+    batch: &mut UiBatch,
+    texture: &Arc<Texture>,
+    at: Vec2,
+    size: Vec2,
+    color: [f32; 4],
+) {
+    let id = batch.push_texture(texture);
+    batch.commands.push(UiCommand::Image {
+        texture_id: id,
+        x: at.x,
+        y: at.y,
+        width: size.x,
+        height: size.y,
+        uv_min: [0.0, 0.0],
+        uv_max: [1.0, 1.0],
+        color,
+    });
 }
 
 impl Default for Minimap {

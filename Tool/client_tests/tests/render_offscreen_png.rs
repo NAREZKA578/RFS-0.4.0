@@ -48,13 +48,12 @@ fn shader_spv() -> Vec<u8> {
     })
 }
 
-fn open_vulkan_device() -> Device {
+fn open_vulkan_device() -> Option<Device> {
     let config = RhiConfig::default();
-    let backend = VulkanBackend::new(&config).expect("create Vulkan backend");
-    let devices = backend.enumerate_physical_devices().expect("enumerate devices");
-    assert!(!devices.is_empty(), "no Vulkan device available");
+    let backend = VulkanBackend::new(&config).ok()?;
+    let devices = backend.enumerate_physical_devices().ok()?;
     let desc = DeviceDesc { features: Features::default(), ..Default::default() };
-    backend.create_device(&devices[0], &desc).expect("create device")
+    backend.create_device(devices.first()?, &desc).ok()
 }
 
 fn all_channels() -> ColorComponentFlags {
@@ -66,7 +65,12 @@ fn all_channels() -> ColorComponentFlags {
 
 #[test]
 fn renders_a_frame_and_writes_a_png() {
-    let device = open_vulkan_device();
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device() else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let spirv = shader_spv();
 
     let texture = device

@@ -7,7 +7,7 @@ use rfs_core::packet::*;
 use rfs_core::time::TICK_RATE;
 use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
@@ -17,6 +17,17 @@ use uuid::Uuid;
 /// restatement here would drift silently the next time someone alters either
 /// copy.
 pub const MAX_PACKET_SIZE: usize = rfs_core::packet::MAX_PACKET_SIZE;
+
+/// Bug №239 (addendum): the deserialize cap for one message — the number the
+/// DoS guard in `server.rs` and `client.rs` enforces before any payload is
+/// believed (bug №732 reworded the guard from a bincode Option to an explicit
+/// length check; the number and its authority did not move). Those two files
+/// used to restate `1024 * 1024` independently, which is precisely the defect
+/// an alias exists to stop: a wire number lives here, once, and the framings
+/// alias it. (The fragment
+/// reassembly ceiling, `MAX_REASSEMBLED_SIZE`, is a different limit by role
+/// and stays its own statement — see the registry entry.)
+pub const WIRE_LIMIT: u64 = 1024 * 1024;
 
 /// Bug №700: what one datagram may carry as payload — the wire budget
 /// (the number the builders fragment against, `max_packet_size`) minus the
@@ -218,6 +229,19 @@ pub struct Connection {
     /// by the snapshot pass on the next tick, so a stalled layer heals in one
     /// round trip instead of waiting out the scheduled cadence.
     resync_requests: Mutex<[bool; LAYER_COUNT]>,
+    /// Bug №30 (B): the applied ticks this client REPORTED per layer
+    /// (LayerSync). Monotonic by merge: a duplicated or reordered report can
+    /// only be stale, never a rewind — the confirmed base of a layer moves
+    /// forward onto these numbers, never across them. This is the server's
+    /// half of №30's fix: it is what replaces the old "the base is whatever
+    /// we last queued" bookkeeping.
+    reported_applied: Mutex<[u64; LAYER_COUNT]>,
+    /// Bug №742: has ANY LayerSync report arrived yet. Applied tick 0 is a
+    /// real, reportable value (the client applied a full state whose tick
+    /// happened to be 0), so "no measurement yet" cannot be read off
+    /// `reported_applied` itself — the applied-lag gauge needs this one bit
+    /// to know it holds a datapoint and not the pre-first-report void.
+    report_seen: AtomicBool,
     /// Bug №700: this connection's outbound auth sequence. Starts at 1 — a
     /// zero sequence is the unsigned dialect — and skips 0 on wrap.
     pub(crate) wire_seq: Mutex<u64>,
@@ -295,6 +319,8 @@ impl Connection {
             reliable_gaps: Mutex::new(BTreeSet::new()),
             bandwidth_limiter: limiter,
             resync_requests: Mutex::new([false; LAYER_COUNT]),
+            reported_applied: Mutex::new([0; LAYER_COUNT]),
+            report_seen: AtomicBool::new(false),
             wire_seq: Mutex::new(0),
             // Bug №216: every connection mints its own session — never zero,
             // so an unset session cannot be forged by a value.
@@ -342,6 +368,60 @@ impl Connection {
             return false;
         }
         std::mem::replace(&mut self.resync_requests.lock()[layer], false)
+    }
+
+    /// Bug №30 (B): record a LayerSync report — the ticks the client says it
+    /// has applied per layer. The merge is `max` per layer: the report is an
+    /// absolute tick, so a duplicate or reordered datagram can only be
+    /// stale, never a rewind. (A layer whose report reads 0 has simply never
+    /// applied anything; an OLDER value than the stored one is ignored, not
+    /// zeroed.)
+    pub fn report_applied(&self, applied: [u32; LAYER_COUNT]) {
+        let mut reported = self.reported_applied.lock();
+        for (slot, value) in reported.iter_mut().zip(applied) {
+            // u32 on the wire, u64 in bookkeeping: every server tick ever
+            // serialized is u32, so the cast is lossless by dataflow.
+            let value = value as u64;
+            if value > *slot {
+                *slot = value;
+            }
+        }
+        // Bug №742: the gauge is live from the first report, even an
+        // all-zero one — "the client applied tick 0 of every layer" is a
+        // measurement, not silence.
+        self.report_seen.store(true, Ordering::Relaxed);
+    }
+
+    /// Bug №30 (B): the last applied tick the client reported for `layer`.
+    /// Zero means the client has never reported this layer (or never
+    /// applied it) — the snapshot pass must not treat that as a
+    /// confirmation of anything.
+    pub fn reported_applied(&self, layer: usize) -> u64 {
+        if layer >= LAYER_COUNT {
+            return 0;
+        }
+        self.reported_applied.lock()[layer]
+    }
+
+    /// Bug №742: the applied-lag gauge — how far behind the server's current
+    /// tick the client's last REPORTED applied ticks sit, per layer. This is
+    /// the end-to-end freshness the heartbeat RTT never carried: it totals
+    /// the wire both ways plus the client's own apply pipeline, sampled where
+    /// the actually-applied state intersects the server's clock — in TICKS,
+    /// with no timestamps of ours to drift against. None until the first
+    /// report lands (see `report_seen`); per-layer 0 means "at the server's
+    /// tick exactly", and a value greater than the tick itself is impossible
+    /// by `saturating_sub` (an ahead-of-clock report reads 0, not a negative
+    /// lag — it cannot happen through the dataflow anyway: a client applies
+    /// ticks this server sent).
+    pub fn applied_lag(&self, server_tick: u64) -> Option<[u64; LAYER_COUNT]> {
+        if !self.report_seen.load(Ordering::Relaxed) {
+            return None;
+        }
+        let reported = self.reported_applied.lock();
+        Some(std::array::from_fn(|i| {
+            server_tick.saturating_sub(reported[i])
+        }))
     }
 
     pub fn client_id(&self) -> Option<u32> {
@@ -661,7 +741,8 @@ impl Connection {
         let mut packets = Vec::new();
         // Bug №8: a masked serialize error used to go out as an empty
         // State that the peer drops in deserialize. Skip loudly instead.
-        let serialized = match bincode::serialize(&state) {
+        // Bug №732: postcard; the error stays a bincode::Error (Custom).
+        let serialized = match rfs_core::packet::encode(&state) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!("send_state serialize failed, skipping: {e}");
@@ -689,7 +770,7 @@ impl Connection {
     }
 
     pub fn serialize_state_delta(&self, delta: StateDeltaPacket) -> Option<Vec<u8>> {
-        match bincode::serialize(&delta) {
+        match rfs_core::packet::encode(&delta) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
                 warn!("send_state_delta serialize failed, skipping: {e}");
@@ -726,7 +807,7 @@ impl Connection {
         // Bug №28: large events are fragmentable just like State/Delta —
         // previously they overflowed the MTU guard and were dropped by the
         // `let _` at the call site.
-        let serialized = match bincode::serialize(&event) {
+        let serialized = match rfs_core::packet::encode(&event) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!("send_event serialize failed, skipping: {e}");
@@ -785,7 +866,7 @@ impl Connection {
             bounds_max: description.bounds_max,
             obstacles: description.obstacles.clone(),
         };
-        let serialized = match bincode::serialize(&packet) {
+        let serialized = match rfs_core::packet::encode(&packet) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!("send_map_description serialize failed, skipping: {e}");
@@ -822,7 +903,7 @@ impl Connection {
             success,
             error,
         };
-        let serialized = match bincode::serialize(&packet) {
+        let serialized = match rfs_core::packet::encode(&packet) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!("send_command_ack serialize failed, skipping: {e}");
@@ -855,7 +936,7 @@ impl Connection {
     }
 
     pub fn send_input_ack(&self, ack: InputAckPacket) -> Vec<OutgoingPacket> {
-        let serialized = match bincode::serialize(&ack) {
+        let serialized = match rfs_core::packet::encode(&ack) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!("send_input_ack serialize failed, skipping: {e}");
@@ -1206,7 +1287,7 @@ impl OutgoingPacket {
     /// masked (`unwrap_or_default` + `as u16`) into a corrupt packet the
     /// peer drops in deserialize. Now it refuses loudly instead.
     pub fn new(header: PacketHeader, packet: impl Serializable) -> Option<Self> {
-        let payload = match bincode::serialize(&packet) {
+        let payload = match rfs_core::packet::encode(&packet) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!("OutgoingPacket serialize failed, dropping: {e}");
@@ -1242,6 +1323,11 @@ mod wire_budget_tests {
     /// an alias, not a restated number. A change of the core budget that the
     /// net side failed to follow would silently split the truth about the
     /// wire again, which is what this guards against by construction.
+    ///
+    /// №239 addendum: the deserialize cap is under the same rule —
+    /// the two framing files alias the one statement in this file, and the
+    /// value stays what the builders fragment against. (Bug №732 turned the
+    /// guard into an explicit length check; the number is the one here still.)
     #[test]
     fn the_wire_budget_is_not_a_second_number() {
         assert_eq!(
@@ -1249,6 +1335,17 @@ mod wire_budget_tests {
             rfs_core::packet::MAX_PACKET_SIZE,
             "connection::MAX_PACKET_SIZE must alias the core constant"
         );
+        assert_eq!(
+            super::WIRE_LIMIT,
+            crate::server::WIRE_LIMIT,
+            "server::WIRE_LIMIT must alias connection::WIRE_LIMIT"
+        );
+        assert_eq!(
+            super::WIRE_LIMIT,
+            crate::client::WIRE_LIMIT,
+            "client::WIRE_LIMIT must alias connection::WIRE_LIMIT"
+        );
+        assert_eq!(super::WIRE_LIMIT, 1024 * 1024, "the wire budget stays the number the framings fragment against");
     }
 }
 
@@ -1508,6 +1605,43 @@ mod sack_tests {
             "the contiguous mark must wrap with the sequence space"
         );
         assert_eq!(bits, 0);
+    }
+
+    #[test]
+    fn the_lag_gauge_says_nothing_until_the_first_report() {
+        // Bug №742: before any LayerSync report there is no measurement — a
+        // fabricated lag of the whole server tick count would read as if the
+        // client were infinitely behind from the moment it connected.
+        let conn = test_connection();
+        assert!(conn.applied_lag(41).is_none(), "no report yet, no gauge");
+        // After the first report the gauge is live, measured against the
+        // caller's current tick.
+        conn.report_applied([10, 9, 8, 7]);
+        assert_eq!(conn.applied_lag(41), Some([31, 32, 33, 34]));
+        // A later tick reads a fresher lag — the gauge samples now, it is
+        // not a stamp frozen at report time.
+        assert_eq!(conn.applied_lag(45), Some([35, 36, 37, 38]));
+    }
+
+    #[test]
+    fn an_all_zero_report_is_a_measurement_not_silence() {
+        // Bug №742: applied tick 0 is real (a full state whose tick was 0);
+        // a zero must not read as "never reported". NC for this ход removed
+        // the flag and returned the array outright — this and the None test
+        // above went red together.
+        let conn = test_connection();
+        conn.report_applied([0, 0, 0, 0]);
+        assert_eq!(conn.applied_lag(40), Some([40; LAYER_COUNT]));
+    }
+
+    #[test]
+    fn an_ahead_of_clock_report_reads_zero_lag_not_underflow() {
+        // Bug №742: impossible through the dataflow, but a wrap-adjacent or
+        // otherwise ahead report must saturate, not flip into u64 arithmetic
+        // garbage.
+        let conn = test_connection();
+        conn.report_applied([100, 100, 100, 100]);
+        assert_eq!(conn.applied_lag(90), Some([0; LAYER_COUNT]));
     }
 
     #[test]

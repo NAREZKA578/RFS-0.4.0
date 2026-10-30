@@ -63,12 +63,16 @@ pub struct WaterTransfer {
 }
 
 impl CompartmentState {
+    // Bug №727: the thresholds are the one statement in `rfs_damage::graph`,
+    // not two literals per file. The comparison form is kept (multiply, not
+    // divide) so this file's existing semantics stay byte-for-byte: what was
+    // `water_level > max * 0.9` is now `water_level > max * FLOODED_FILL_RATIO`.
     pub fn is_flooded(&self) -> bool {
-        self.water_level > self.max_water_level * 0.9
+        self.water_level > self.max_water_level * rfs_damage::graph::FLOODED_FILL_RATIO
     }
 
     pub fn is_critical(&self) -> bool {
-        self.water_level > self.max_water_level * 0.5
+        self.water_level > self.max_water_level * rfs_damage::graph::CRITICAL_FILL_RATIO
     }
 
     pub fn fill_ratio(&self) -> f32 {

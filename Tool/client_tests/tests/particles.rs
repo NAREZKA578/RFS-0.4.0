@@ -1,21 +1,15 @@
 //! Integration tests for the render::particles module.
 //!
 //! Covers: Particle, ParticleEmitter, ParticleEmitterConfig,
-//! ParticleEmitterBuilder, EmitterShape, EffectHandle and all built-in
-//! particle effect configs/effects (Smoke, Fire, Splash, Explosion, Sparks,
-//! Dust, Blood, Magic).
+//! ParticleEmitterBuilder and EmitterShape. The built-in effect presets
+//! (Smoke, Fire, Splash, Explosion, Sparks, Dust, Blood, Magic) and
+//! `ParticleEffectManager` were removed 2026-10-28 by owner decision
+//! (№4 of the owner's list): the manager was never constructed anywhere in
+//! the crate, and the presets spawned particles that nothing drew.
 
 use glam::{Vec2, Vec3, Vec4};
-use rfs_client::render::particles::effects::{
-    BloodEffect, BloodEffectConfig, DustEffect, DustEffectConfig, ExplosionEffect,
-    ExplosionEffectConfig, FireEffect, FireEffectConfig, MagicEffect, MagicEffectConfig,
-    ParticleEffect as ParticleEffectTrait, ParticleEffectType, SmokeEffect, SmokeEffectConfig,
-    SparksEffect, SparksEffectConfig, SplashEffect, SplashEffectConfig,
-};
 use rfs_client::render::particles::emitter::ParticleEmitterBuilder;
-use rfs_client::render::particles::{
-    EffectHandle, EmitterShape, Particle, ParticleEmitter, ParticleEmitterConfig,
-};
+use rfs_client::render::particles::{EmitterShape, Particle, ParticleEmitter, ParticleEmitterConfig};
 use std::time::Duration;
 
 const EPSILON: f32 = 1e-3;
@@ -189,64 +183,6 @@ fn emitter_can_be_paused() {
     emitter.update(Duration::from_secs_f32(1.0));
     assert_eq!(emitter.particle_count(), 0);
     assert!(!emitter.is_emitting());
-}
-
-#[test]
-fn effect_handle_id() {
-    let handle = EffectHandle::new(42);
-    assert_eq!(handle.id(), 42);
-}
-
-#[test]
-fn effect_configs_and_types() {
-    let smoke = SmokeEffect::new(SmokeEffectConfig::default());
-    assert_eq!(smoke.effect_type(), ParticleEffectType::Smoke);
-
-    let fire = FireEffect::new(FireEffectConfig::default());
-    assert_eq!(fire.effect_type(), ParticleEffectType::Fire);
-
-    let splash = SplashEffect::new(SplashEffectConfig::default());
-    assert_eq!(splash.effect_type(), ParticleEffectType::Splash);
-
-    let explosion = ExplosionEffect::new(ExplosionEffectConfig::default());
-    assert_eq!(explosion.effect_type(), ParticleEffectType::Explosion);
-
-    let sparks = SparksEffect::new(SparksEffectConfig::default());
-    assert_eq!(sparks.effect_type(), ParticleEffectType::Sparks);
-
-    let dust = DustEffect::new(DustEffectConfig::default());
-    assert_eq!(dust.effect_type(), ParticleEffectType::Dust);
-
-    let blood = BloodEffect::new(BloodEffectConfig::default());
-    assert_eq!(blood.effect_type(), ParticleEffectType::Blood);
-
-    let magic = MagicEffect::new(MagicEffectConfig::default());
-    assert_eq!(magic.effect_type(), ParticleEffectType::Magic);
-}
-
-#[test]
-fn effects_can_be_enabled_and_disabled() {
-    let mut effect = ExplosionEffect::new(ExplosionEffectConfig::default());
-    assert!(effect.is_enabled());
-    effect.set_enabled(false);
-    assert!(!effect.is_enabled());
-    effect.set_enabled(true);
-    assert!(effect.is_enabled());
-}
-
-#[test]
-fn explosion_config_defaults_are_sane() {
-    let config = ExplosionEffectConfig::default();
-    assert!(config.radius > 0.0);
-    assert!(config.lifetime > 0.0);
-}
-
-#[test]
-fn dust_config_defaults_are_sane() {
-    let config = DustEffectConfig::default();
-    assert!(config.lifetime > 0.0);
-    assert!(config.spread >= 0.0);
-    assert!(config.height > 0.0);
 }
 
 #[test]

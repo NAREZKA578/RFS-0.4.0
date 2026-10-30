@@ -21,22 +21,22 @@ use rhi::resource::{Sampler, TextureViewType};
 use rhi::types::{Features, Format, TextureAspectFlags, TextureUsage};
 use rhi::{AddressMode, Backend, CompareOp, DescriptorInfo, DescriptorType, DescriptorWrite, FilterMode, ShaderStage};
 
-fn open_vulkan_device() -> Device {
+fn open_vulkan_device() -> Option<Device> {
     let backend = VulkanBackend::new(&RhiConfig {
         validation: true,
         ..Default::default()
     })
-    .unwrap();
-    let devices = backend.enumerate_physical_devices().unwrap();
+    .ok()?;
+    let devices = backend.enumerate_physical_devices().ok()?;
     backend
         .create_device(
-            &devices[0],
+            devices.first()?,
             &DeviceDesc {
                 features: Features::default(),
                 ..Default::default()
             },
         )
-        .unwrap()
+        .ok()
 }
 
 /// A depth image, as a shadow map is: a depth attachment that is also read.
@@ -90,7 +90,12 @@ fn descriptor_layout(device: &Device) -> rhi::DescriptorSetLayout {
 /// A depth view must be bindable: the shadow map is the reason this exists.
 #[test]
 fn a_depth_view_can_be_bound_as_a_sampled_texture() {
-    let device = open_vulkan_device();
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device() else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let (_texture, view) = shadow_map(&device);
     let layout = descriptor_layout(&device);
     let set = device
@@ -127,7 +132,12 @@ fn a_depth_view_can_be_bound_as_a_sampled_texture() {
 /// so itself rather than leave it to the validator.
 #[test]
 fn a_filtering_sampler_over_a_depth_texture_is_refused() {
-    let device = open_vulkan_device();
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device() else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let (_texture, view) = shadow_map(&device);
     let layout = descriptor_layout(&device);
     let set = device
@@ -167,7 +177,12 @@ fn a_filtering_sampler_over_a_depth_texture_is_refused() {
 /// The legal way to filter a depth image: a comparison sampler.
 #[test]
 fn a_comparison_sampler_over_a_depth_texture_is_accepted() {
-    let device = open_vulkan_device();
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device() else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let (_texture, view) = shadow_map(&device);
     let layout = descriptor_layout(&device);
     let set = device

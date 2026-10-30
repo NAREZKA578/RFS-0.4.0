@@ -58,7 +58,7 @@ const PATTERN_SHADER: &[u8] = include_bytes!("../assets/shaders/fullscreen.spv")
 // The composite draws no shader of its own: it reuses the resolve program —
 // one oversized triangle from the vertex index, the source read with
 // `textureLoad`.
-const COMPOSITE_SHADER: &[u8] = include_bytes!("../assets/shaders/resolve.spv");
+const COMPOSITE_SHADER: &[u8] = include_bytes!("../assets/shaders/composite.spv");
 
 fn open_device() -> Arc<rhi::Device> {
     let backend = rhi::backend::create_backend(&RhiConfig {

@@ -59,17 +59,30 @@ impl CompartmentNode {
     }
 
     pub fn is_flooded(&self) -> bool {
-        self.fill_ratio() > 0.9
+        self.fill_ratio() > FLOODED_FILL_RATIO
     }
 
     pub fn is_critical(&self) -> bool {
-        self.fill_ratio() > 0.5
+        self.fill_ratio() > CRITICAL_FILL_RATIO
     }
 
     pub fn can_pump(&self) -> bool {
         self.pump_active && self.current_level > 0.0 && !self.is_breached
     }
 }
+
+/// Bug №727: the fill ratios that decide "flooded" and "critical".
+///
+/// These were two pairs of literals — `> 0.9` / `> 0.5` here and the same
+/// measured against `water_level > max_water_level * x` in
+/// `ship::compartment::CompartmentState` — with nothing enforcing that the two
+/// readers agree. The water model and the per-ship state answer the same
+/// question ("is this compartment flooded"), and if one pair edits without
+/// the other, `CompartmentFlooded` events arrive at fill ratios the renderer
+/// does not treat as flooded. One statement, both readers import it.
+pub const FLOODED_FILL_RATIO: f32 = 0.9;
+/// See [`FLOODED_FILL_RATIO`] — the "critical, flooding is winning" threshold.
+pub const CRITICAL_FILL_RATIO: f32 = 0.5;
 
 impl BulkheadEdge {
     /// Creates an intact bulkhead in the CLOSED (sealed) state.
@@ -767,5 +780,37 @@ mod tests {
             assert_eq!(node.damage, 0.0, "{bad} dealt damage");
             assert!(!node.is_breached, "{bad} breached the compartment");
         }
+    }
+
+    /// Bug №727: the thresholds are the named constants, and the pair reads
+    /// the way both readers must agree on. The ordering of the constants is
+    /// not asserted directly (a const-vs-const assert clippy flags as
+    /// vacuous) — the fills below walk the ordering behaviourally: quarter is
+    /// neither, exactly-threshold is below, 0.7 is critical-not-flooded, past
+    /// 0.9 is both.
+    #[test]
+    fn the_thresholds_are_the_named_constants_and_the_pair_is_ordered() {
+        let mut node = compartment(1);
+
+        node.max_capacity = 100.0;
+        node.current_level = 25.0;
+        assert!(!node.is_critical(), "a quarter full is not critical");
+        assert!(!node.is_flooded(), "a quarter full is never flooded");
+
+        // Exactly at the threshold is below it: the predicate is strict `>`.
+        node.current_level = CRITICAL_FILL_RATIO * node.max_capacity;
+        assert!(!node.is_critical(), "exactly at the critical ratio is below it");
+        assert!(!node.is_flooded());
+
+        node.current_level = 70.0;
+        assert!(node.is_critical(), "criticality long since passed");
+        assert!(!node.is_flooded(), "seventy percent is not flooded");
+
+        node.current_level = FLOODED_FILL_RATIO * node.max_capacity;
+        assert!(!node.is_flooded(), "exactly at the flood ratio is still below it");
+
+        node.current_level = FLOODED_FILL_RATIO * node.max_capacity + 0.01;
+        assert!(node.is_flooded(), "past the named ratio it is flooded");
+        assert!(node.is_critical());
     }
 }

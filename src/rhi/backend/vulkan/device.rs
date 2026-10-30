@@ -1203,6 +1203,102 @@ let _guard = lock_submit_lock(&self.submit_lock, &self.submit_lock_poison_report
             Some(bpp)
         }
     }
+
+    /// Bytes one texel of the DEPTH aspect occupies in transfer data.
+    ///
+    /// Per the Vulkan copy rules the DEPTH plane of a depth/stencil image is
+    /// sized by its depth texel alone — `D16_UNORM` takes 2, every other depth
+    /// format takes 4 — and the STENCIL plane takes 1. `format_size` cannot
+    /// stand in for this: it reports a whole-format number (8 for
+    /// `D32_SFLOAT_S8_UINT`), which is neither plane's transfer size, so
+    /// dual-aspect copies cannot reuse it.
+    fn depth_plane_bytes_per_texel(format: crate::types::Format) -> u32 {
+        if format == crate::types::Format::D16_UNORM {
+            2
+        } else {
+            4
+        }
+    }
+
+    /// The buffer planes a copy of this format moves, in order.
+    ///
+    /// The upload data contract follows this list plane by plane: every mip of
+    /// the first plane, then every mip of the second. Depth and stencil always
+    /// travel as separate regions — one `BufferImageCopy` naming both aspects
+    /// is not what the copy rules define, and a single stride cannot describe
+    /// two aspects of different texel sizes anyway (Bug №177: the upload used
+    /// to name `DEPTH | STENCIL` in one region and size the data with
+    /// `format_size`, which for `D32_SFLOAT_S8_UINT` is 8 bytes per texel —
+    /// double the depth plane, no stencil plane, an invalid layout).
+    ///
+    /// `None` for the compressed formats: a texel size cannot describe a
+    /// block, and this backend refuses those uploads outright.
+    fn copy_planes_for(
+        format: crate::types::Format,
+    ) -> Option<Vec<(vk::ImageAspectFlags, u32)>> {
+        if format.is_depth() && format.is_stencil() {
+            return Some(vec![
+                (
+                    vk::ImageAspectFlags::DEPTH,
+                    Self::depth_plane_bytes_per_texel(format),
+                ),
+                (vk::ImageAspectFlags::STENCIL, 1),
+            ]);
+        }
+        if format.is_depth() {
+            return Some(vec![(
+                vk::ImageAspectFlags::DEPTH,
+                Self::depth_plane_bytes_per_texel(format),
+            )]);
+        }
+        if format.is_stencil() {
+            return Some(vec![(vk::ImageAspectFlags::STENCIL, 1)]);
+        }
+        let bpp = Self::bytes_per_texel(format)?;
+        Some(vec![(vk::ImageAspectFlags::COLOR, bpp)])
+    }
+
+    /// The copy regions and the total staged size for an upload of this shape.
+    ///
+    /// `mip_dims` carries the mip extents in order (the caller takes them from
+    /// the texture). Each region names exactly one aspect; per plane the rows
+    /// are 4-byte aligned, the same stride the code has always staged. The
+    /// planes are laid out back to back: the DEPTH plane's mips first, then
+    /// the STENCIL plane's.
+    ///
+    /// Pure on purpose, so the offsets are unit-testable without a device.
+    fn texture_upload_regions(
+        format: crate::types::Format,
+        mip_dims: &[(u32, u32, u32)],
+    ) -> RhiResult<(Vec<vk::BufferImageCopy>, u64)> {
+        let planes = Self::copy_planes_for(format).ok_or_else(|| {
+            RhiError::NotSupported(format!("unsupported upload format {format:?}"))
+        })?;
+        let mut regions: Vec<vk::BufferImageCopy> = Vec::new();
+        let mut total: u64 = 0;
+        for &(aspect, bpp) in &planes {
+            let mut plane_offset = total;
+            for (mip, &(w, h, d)) in mip_dims.iter().enumerate() {
+                let row_pitch = align_up(w as u64 * bpp as u64, 4);
+                regions.push(vk::BufferImageCopy {
+                    buffer_offset: plane_offset,
+                    buffer_row_length: (row_pitch / bpp as u64) as u32,
+                    buffer_image_height: 0,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: aspect,
+                        mip_level: mip as u32,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: vk::Offset3D::default(),
+                    image_extent: vk::Extent3D { width: w, height: h, depth: d },
+                });
+                plane_offset += row_pitch * h as u64 * d as u64;
+            }
+            total = plane_offset;
+        }
+        Ok((regions, total))
+    }
 }
 
 impl BackendResource for VulkanLogicalDeviceResource {
@@ -1873,56 +1969,36 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
                 "multi-layer texture upload is not supported yet".into(),
             ));
         }
-        let Some(bpp) = Self::bytes_per_texel(texture.format()) else {
-            return Err(RhiError::NotSupported(format!(
-                "unsupported upload format {:?}",
-                texture.format()
-            )));
-        };
+        let mip_dims: Vec<(u32, u32, u32)> =
+            (0..texture.mip_levels()).map(|m| texture.mip_size(m)).collect();
+        let (regions, total) = Self::texture_upload_regions(texture.format(), &mip_dims)?;
 
-        let mut regions = Vec::new();
-        let mut total: u64 = 0;
-        let mut aspects = crate::types::TextureAspectFlags::COLOR;
-        if texture.format().is_depth() {
-            aspects = crate::types::TextureAspectFlags::DEPTH;
-        }
-        if texture.format().is_stencil() {
-            aspects |= crate::types::TextureAspectFlags::STENCIL;
-        }
-        let aspects = convert::image_aspects(aspects);
-        for mip in 0..texture.mip_levels() {
-            let (w, h, d) = texture.mip_size(mip);
-            let row_pitch = align_up(w as u64 * bpp as u64, 4) as u32;
-            regions.push(vk::BufferImageCopy {
-                buffer_offset: total,
-                buffer_row_length: row_pitch / bpp,
-                buffer_image_height: 0,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: aspects,
-                    mip_level: mip,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: vk::Offset3D::default(),
-                image_extent: vk::Extent3D { width: w, height: h, depth: d },
-            });
-            total += row_pitch as u64 * h as u64 * d as u64;
-        }
-        if total > data.len() as u64 {
+        // Bug №177: the size is the plane contract, exactly — data larger than
+        // the planes is refused with the same message, because a bigger buffer
+        // means the caller believes a different layout than the one this
+        // backend copies planes for, and copy-completing half of it silently
+        // is how misaligned data gets into a depth image.
+        if data.len() as u64 != total {
             return Err(RhiError::BackendError(format!(
-                "texture upload data too small: {} bytes, {total} needed for {:?} {}x{}x{} ({} mips)",
+                "texture upload data size mismatch: {} bytes, {total} needed for \
+                 {:?} ({} mips); the contract is plane-ordered — DEPTH plane \
+                 first, then STENCIL plane",
                 data.len(),
                 texture.format(),
-                texture.width(),
-                texture.height(),
-                texture.depth(),
                 texture.mip_levels()
             )));
         }
+        let range_aspect_mask = Self::copy_planes_for(texture.format())
+            .map(|planes| {
+                planes
+                    .iter()
+                    .fold(vk::ImageAspectFlags::empty(), |m, &(a, _)| m | a)
+            })
+            .unwrap_or_else(vk::ImageAspectFlags::empty);
 
         let image = vk::Image::from_raw(gpu.handle);
         let range = vk::ImageSubresourceRange {
-            aspect_mask: aspects,
+            aspect_mask: range_aspect_mask,
             base_mip_level: 0,
             level_count: texture.mip_levels(),
             base_array_layer: 0,
@@ -2528,12 +2604,23 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
         let Some(backend) = texture.backend() else {
             return Err(RhiError::BackendError("texture has no GPU backing".into()));
         };
-        let bpp = Self::bytes_per_texel(texture.format()).ok_or_else(|| {
+        let planes = Self::copy_planes_for(texture.format()).ok_or_else(|| {
             RhiError::NotSupported(format!(
                 "downloads for texture format {:?} are not supported",
                 texture.format()
             ))
-        })? as u64;
+        })?;
+        // Bug №177: the readback plane follows the FORMAT, not the usage
+        // flags. `is_depth_stencil()` is a usage predicate, so a depth format
+        // without the attachment usage took the COLOR branch (an invalid
+        // aspect for a depth image) and `S8_UINT` took DEPTH. The first plane
+        // of the copy planes is the one the readback returns: DEPTH for a
+        // depth format, STENCIL for a stencil-only one, COLOR otherwise. Its
+        // size is the plane's transfer size — 4 bytes per texel for D32S8's
+        // depth plane, not format_size's whole-format 8 — so the readback
+        // returns that plane and nothing else.
+        let (aspect, plane_bpp) = planes[0];
+        let bpp = plane_bpp as u64;
         let (width, height, depth) = texture.mip_size(mip_level);
         let row_pitch = align_up(width as u64 * bpp, 4);
         let total = row_pitch
@@ -2630,11 +2717,7 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
                     dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     image,
                     subresource_range: vk::ImageSubresourceRange {
-                        aspect_mask: if texture.is_depth_stencil() {
-                            vk::ImageAspectFlags::DEPTH
-                        } else {
-                            vk::ImageAspectFlags::COLOR
-                        },
+                        aspect_mask: aspect,
                         base_mip_level: mip_level,
                         level_count: 1,
                         base_array_layer: array_layer,
@@ -2662,11 +2745,7 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
                     buffer_row_length: (row_pitch / bpp) as u32,
                     buffer_image_height: 0,
                     image_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: if texture.is_depth_stencil() {
-                            vk::ImageAspectFlags::DEPTH
-                        } else {
-                            vk::ImageAspectFlags::COLOR
-                        },
+                        aspect_mask: aspect,
                         mip_level,
                         base_array_layer: array_layer,
                         layer_count: 1,
@@ -3790,5 +3869,123 @@ mod presentation_semaphores {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod depth_stencil_copy_planes {
+    use super::VulkanLogicalDeviceResource;
+    use crate::types::Format;
+    use ash::vk;
+
+    /// Bug №177: a dual-aspect format copies through two planes, each sized
+    /// by its own aspect — not by `format_size`'s whole-format number.
+    #[test]
+    fn a_dual_aspect_format_copies_two_planes_each_with_its_own_size() {
+        let planes = VulkanLogicalDeviceResource::copy_planes_for(Format::D32_SFLOAT_S8_UINT)
+            .expect("a depth/stencil format must be uploadable");
+        assert_eq!(
+            planes,
+            vec![(vk::ImageAspectFlags::DEPTH, 4), (vk::ImageAspectFlags::STENCIL, 1)],
+            "D32S8: the DEPTH plane takes 4 bytes per texel, STENCIL takes 1 — \
+             format_size's whole-format 8 describes neither plane"
+        );
+        let planes = VulkanLogicalDeviceResource::copy_planes_for(Format::D24_UNORM_S8_UINT)
+            .expect("a depth/stencil format must be uploadable");
+        assert_eq!(
+            planes,
+            vec![(vk::ImageAspectFlags::DEPTH, 4), (vk::ImageAspectFlags::STENCIL, 1)]
+        );
+    }
+
+    /// Single-aspect formats keep one plane each, and the pure depth plane is
+    /// its own size, not format_size's (which matches here, but the contract
+    /// must not depend on that coincidence).
+    #[test]
+    fn single_aspect_formats_copy_one_plane() {
+        assert_eq!(
+            VulkanLogicalDeviceResource::copy_planes_for(Format::D32_SFLOAT),
+            Some(vec![(vk::ImageAspectFlags::DEPTH, 4)]),
+        );
+        assert_eq!(
+            VulkanLogicalDeviceResource::copy_planes_for(Format::D16_UNORM),
+            Some(vec![(vk::ImageAspectFlags::DEPTH, 2)]),
+        );
+        assert_eq!(
+            VulkanLogicalDeviceResource::copy_planes_for(Format::S8_UINT),
+            Some(vec![(vk::ImageAspectFlags::STENCIL, 1)]),
+        );
+        assert_eq!(
+            VulkanLogicalDeviceResource::copy_planes_for(Format::RGBA8_UNORM),
+            Some(vec![(vk::ImageAspectFlags::COLOR, 4)]),
+        );
+        assert_eq!(
+            VulkanLogicalDeviceResource::copy_planes_for(Format::BC1_RGB_UNORM),
+            None,
+            "the compressed formats are refused outright, as before"
+        );
+    }
+
+    /// The upload layout splits a dual-aspect format into separate regions per
+    /// aspect, with the planes back to back and every mip of a plane inside
+    /// that plane's own slice of the buffer.
+    ///
+    /// For a 64x64 D32S8 texture with two mips: the DEPTH plane is
+    /// 256*64 + 128*32 = 16384 + 4096 bytes, the STENCIL plane is
+    /// 64*64 + 32*32 = 4096 + 1024, in that order.
+    #[test]
+    fn the_upload_layout_splits_dual_aspects_at_plane_offsets() {
+        let (regions, total) = VulkanLogicalDeviceResource::texture_upload_regions(
+            Format::D32_SFLOAT_S8_UINT,
+            &[(64, 64, 1), (32, 32, 1)],
+        )
+        .expect("the layout must build");
+        assert_eq!(
+            regions.len(),
+            4,
+            "two mips × two planes — one region per aspect, never both in one"
+        );
+        assert_eq!(
+            regions[0].image_subresource.aspect_mask,
+            vk::ImageAspectFlags::DEPTH
+        );
+        assert_eq!(regions[0].buffer_offset, 0);
+        assert_eq!(regions[0].image_subresource.mip_level, 0);
+        assert_eq!(regions[0].buffer_row_length, 64, "row pitch in texels");
+        assert_eq!(
+            regions[1].image_subresource.aspect_mask,
+            vk::ImageAspectFlags::DEPTH
+        );
+        assert_eq!(regions[1].buffer_offset, 16384, "mip 1 sits after mip 0 of the depth plane");
+        assert_eq!(
+            regions[2].image_subresource.aspect_mask,
+            vk::ImageAspectFlags::STENCIL
+        );
+        assert_eq!(
+            regions[2].buffer_offset, 20480,
+            "the stencil plane starts where the depth plane ends"
+        );
+        assert_eq!(
+            regions[3].image_subresource.aspect_mask,
+            vk::ImageAspectFlags::STENCIL
+        );
+        assert_eq!(regions[3].buffer_offset, 24576);
+        assert_eq!(total, 25600);
+    }
+
+    /// A single-plane format's layout matches the stride math the code has
+    /// always staged, so the existing color and pure-depth callers do not
+    /// change size.
+    #[test]
+    fn a_single_plane_layout_keeps_the_previous_stride_math() {
+        let (regions, total) = VulkanLogicalDeviceResource::texture_upload_regions(
+            Format::RGBA8_UNORM,
+            &[(64, 64, 1)],
+        )
+        .expect("the layout must build");
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].buffer_offset, 0);
+        assert_eq!(regions[0].buffer_row_length, 64);
+        assert_eq!(total, 64 * 64 * 4);
     }
 }

@@ -15,7 +15,6 @@
 //! An `example` rather than a `bin` on purpose: the crate is a library and this
 //! must not change what ships.
 
-use rhi::ash::vk::Handle;
 use winit::raw_window_handle::HasWindowHandle;
 use rhi::present::{PresentMode, Swapchain, SwapchainRequest};
 // `PrimitiveTopology` exists in both `rhi::types` and `rhi::pipeline::graphics`,

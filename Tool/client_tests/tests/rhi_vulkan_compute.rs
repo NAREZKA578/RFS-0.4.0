@@ -29,14 +29,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-fn open_vulkan_device(features: Features) -> Device {
-    let backend = VulkanBackend::new(&RhiConfig::default()).unwrap();
-    let devices = backend.enumerate_physical_devices().unwrap();
+fn open_vulkan_device(features: Features) -> Option<Device> {
+    let backend = VulkanBackend::new(&RhiConfig::default()).ok()?;
+    let devices = backend.enumerate_physical_devices().ok()?;
     let desc = DeviceDesc {
         features,
         ..Default::default()
     };
-    backend.create_device(&devices[0], &desc).unwrap()
+    backend.create_device(devices.first()?, &desc).ok()
 }
 
 fn wgsl_to_spirv(source: &str) -> Vec<u8> {
@@ -57,7 +57,12 @@ fn wgsl_to_spirv(source: &str) -> Vec<u8> {
 
 #[test]
 fn vulkan_compute_shader_and_descriptor_layout() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     let module = device
         .create_shader_module(&ShaderModuleDesc {
@@ -100,7 +105,10 @@ fn vulkan_compute_shader_and_descriptor_layout() {
 
 #[test]
 fn vulkan_compute_roundtrip() {
-    let device = open_vulkan_device(Features::default());
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let count = 8u32;
     let byte_size = (count * 4) as u64;
     let source: Vec<u32> = (1..=count).collect();

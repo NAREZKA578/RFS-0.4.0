@@ -28,8 +28,18 @@ pub struct MatchConfig {
     /// Bug №700: the shared secret HMAC-SHA256 keys every datagram with.
     /// A blank value or a missing field runs the server in the unsigned
     /// dialect — accepted framing, no key — and `main` says so in the log.
+    ///
+    /// Bug №216: blank is also a *decision* now. See `allow_unsigned`.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Bug №216: the operator's explicit answer to "the shared secret is
+    /// blank". `false` (the serde default — a missing field means it) refuses
+    /// to start a server the config file cannot name as keyed; `true` states
+    /// the unsigned dialect deliberately, and the log still announces it.
+    /// Fail-closed by construction: convenience cannot silently outrun the
+    /// №700 hole every fresh install would otherwise reopen.
+    #[serde(default)]
+    pub allow_unsigned: bool,
 }
 
 /// The VoteKick feature: master switch, counting rule and window rule.
@@ -102,6 +112,23 @@ impl MatchConfig {
         }
         if vk.window_ticks == 0 {
             anyhow::bail!("vote_kick.window_ticks must be at least 1");
+        }
+        // Bug №216 (fail closed): a blank secret is a choice the file must
+        // own. `main` cannot tell "the operator never wrote a token" from
+        // "the operator declines auth", and the №700 hole was exactly the
+        // first of those running as the second — so the distinction lives
+        // here, in the only gate that runs before the network starts.
+        let token_set = self
+            .auth_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        if !token_set && !self.allow_unsigned {
+            anyhow::bail!(
+                "auth_token is empty and allow_unsigned is false — every datagram would \
+                 be accepted on framing alone. Set `auth_token` to a shared secret, or \
+                 set \"allow_unsigned\": true explicitly if the unsigned dialect is the \
+                 intended arrangement"
+            );
         }
         Ok(())
     }
@@ -179,7 +206,10 @@ mod config_tests {
     fn an_unknown_section_keeps_the_file_loadable() {
         let dir = temp_dir("forward");
         let path = dir.join("server_config.json");
-        let text = r#"{"vote_kick": {"enabled": false, "min_votes": 3, "majority": 0.5, "window_ticks": 10}, "future_section": {}}"#;
+        // The fixture names a token (bug №216): a file that predates the auth
+        // fields loads blank and is refused at that door by design — the
+        // fail-closed contract — so this legacy-format test carries it.
+        let text = r#"{"vote_kick": {"enabled": false, "min_votes": 3, "majority": 0.5, "window_ticks": 10}, "auth_token": "station-secret", "future_section": {}}"#;
         std::fs::write(&path, text).expect("fixture file is writable");
 
         let config = MatchConfig::load(&path).expect("an unknown section is not fatal");
@@ -212,5 +242,34 @@ mod config_tests {
                 "the refusal must name {field}: {err:#}"
             );
         }
+    }
+
+    /// Bug №216: a blank secret with no explicit opt-out refuses to start —
+    /// that exact combination was the №700 hole running live. The explicit
+    /// `allow_unsigned = true` is the operator's deliberate answer and is
+    /// honoured; a named secret needs no opt-out at all.
+    #[test]
+    fn a_blank_token_is_refused_unless_unsigned_is_explicit() {
+        let blank = MatchConfig::default();
+        assert!(
+            blank.validate().is_err(),
+            "a blank secret without the opt-out must refuse to start"
+        );
+
+        let explicit = MatchConfig {
+            allow_unsigned: true,
+            ..MatchConfig::default()
+        };
+        assert!(
+            explicit.validate().is_ok(),
+            "the explicit unsigned dialect is the operator's choice"
+        );
+
+        let keyed = MatchConfig {
+            auth_token: Some("station-secret".to_string()),
+            allow_unsigned: false,
+            ..MatchConfig::default()
+        };
+        assert!(keyed.validate().is_ok(), "a named secret courts no opt-out");
     }
 }

@@ -135,7 +135,23 @@ pub struct TickSystem {
     /// The world, if one is loaded. `None` means "no map": projectiles pass
     /// through empty space and ships are held nowhere. That is the state every
     /// test starts in, so a missing map cannot break one.
-    world: RwLock<Option<crate::map::WorldMap>>,
+    ///
+    /// The map and its broadphase grid (bug №731) travel together under this
+    /// one lock: a separate cache could be half-updated against a reloaded
+    /// map, and grid indices read against another map's obstacle list are an
+    /// out-of-bounds read waiting to happen.
+    world: RwLock<Option<WorldSlot>>,
+}
+
+/// One installed world: the map, plus the broadphase grid built over it
+/// (bug №731). Written together by `set_world`, read together everywhere
+/// else, so the pair is never inconsistent with itself.
+struct WorldSlot {
+    map: crate::map::WorldMap,
+    /// Built in `set_world` and never rebuilt on the tick path; the grid is
+    /// immutable once built, so cloning nothing and sharing this one instance
+    /// across readers is free of sync concerns.
+    broadphase: std::sync::Arc<crate::map::ObstacleGrid>,
 }
 
 /// Why a projectile was not accepted.
@@ -386,9 +402,10 @@ impl TickSystem {
     /// its centre is outside too, and the centre is what gets brought back.
     fn hold_ships_in_bounds(&self) {
         let world = self.world.read();
-        let Some(map) = world.as_ref() else {
+        let Some(slot) = world.as_ref() else {
             return;
         };
+        let map = &slot.map;
         let margin = SHIP_BOUNDS_MARGIN;
         // Bug №611: this used to clone the whole map — obstacles included — and
         // then build an inset map with `obstacles: Vec::new()`, so the clone's
@@ -563,15 +580,42 @@ impl TickSystem {
     /// protocol decision, not a physics fix.
     fn resolve_obstacle_contacts(&self, ships: &[Arc<Ship>], _result: &mut TickResult) {
         let world = self.world.read();
-        let Some(map) = world.as_ref() else {
+        let Some(slot) = world.as_ref() else {
             return;
         };
+        let map = &slot.map;
         if map.obstacles.is_empty() {
             return;
         }
-
+        // Bug №731: the walk used to run over every obstacle of the map for
+        // every hull; it now runs the grid's candidates for the hull box,
+        // and keeps the everything-walk only as the fallback for a query the
+        // grid cannot bound. Either way the loop keeps the two guarantees
+        // that are the whole of the old loop's behaviour:
+        //   - an obstacle is tested at most once per ship per pass (a push
+        //     that lands the hull on an already-tested rock is not re-tested,
+        //     exactly what a full scan did: one test, ascending, done), and
+        //   - every push the old scan would have applied is still applied,
+        //     because the candidate set of a query contains every obstacle
+        //     whose box overlaps the hull box as it stands at that moment.
         for ship in ships {
-            for obstacle in &map.obstacles {
+            let initial = match slot
+                .broadphase
+                .box_candidates(ship.bounds().min, ship.bounds().max)
+            {
+                Some(candidates) => candidates,
+                // A query the grid refuses to bound: walk everything, the
+                // pre-№731 behaviour.
+                None => (0..map.obstacles.len() as u32).collect(),
+            };
+            // Ordered worklist: `pop_first` processes pending candidates in
+            // ascending obstacle order; a requery after a push adds more,
+            // still ordered against what is left.
+            let mut queue: std::collections::BTreeSet<u32> = initial.into_iter().collect();
+            let mut done: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            while let Some(index) = queue.pop_first() {
+                done.insert(index);
+                let obstacle = &map.obstacles[index as usize];
                 let Some((normal, penetration)) =
                     aabb_penetration(&ship.bounds(), &obstacle.bounds)
                 else {
@@ -618,6 +662,22 @@ impl TickSystem {
                 }
                 state.velocity = Vec3f::new(velocity[0], velocity[1], velocity[2]);
                 ship.apply_state(state);
+
+                // The push changed where the hull is. Requery the grid around
+                // it, so an obstacle the push newly overlaps is handled in
+                // this pass too — the old single full scan could not see one
+                // below its cursor and would leave a hull inside that rock.
+                let hull = ship.bounds();
+                let discovered = match slot.broadphase.box_candidates(hull.min, hull.max) {
+                    Some(found) => found,
+                    // Same degenerate-query contract as the initial query.
+                    None => (0..map.obstacles.len() as u32).collect(),
+                };
+                for found in discovered {
+                    if !done.contains(&found) {
+                        queue.insert(found);
+                    }
+                }
             }
         }
     }
@@ -629,13 +689,18 @@ impl TickSystem {
     /// process's life.
     pub fn set_world(&self, map: crate::map::WorldMap) -> Result<(), crate::map::MapError> {
         map.validated(&map.name)?;
-        *self.world.write() = Some(map);
+        // Bug №731: the broadphase is built here, once per world install,
+        // not once per query. Built before the write, and written together
+        // with the map, the pair stays consistent: no tick can ever hold a
+        // grid that describes a world that is no longer the one installed.
+        let broadphase = std::sync::Arc::new(crate::map::ObstacleGrid::build(&map));
+        *self.world.write() = Some(WorldSlot { map, broadphase });
         Ok(())
     }
 
     /// The loaded map, if any.
     pub fn world(&self) -> Option<crate::map::WorldMap> {
-        self.world.read().clone()
+        self.world.read().as_ref().map(|slot| slot.map.clone())
     }
 
     fn update_ships_parallel(
@@ -844,7 +909,9 @@ impl TickSystem {
         let projectiles = self.projectiles.read();
         let ships: Vec<Arc<Ship>> = self.ships.read().values().cloned().collect();
         let world = self.world.read();
-        let map = world.as_ref();
+        // Bug №731: one grid lookup for the whole pass, not per projectile.
+        let map = world.as_ref().map(|slot| &slot.map);
+        let broadphase = world.as_ref().map(|slot| slot.broadphase.as_ref());
 
         let mut collisions = Vec::new();
 
@@ -854,7 +921,13 @@ impl TickSystem {
             // makes that hold without comparing depths afterwards.
             let obstacle_hit = map
                 .as_ref()
-                .and_then(|m| m.swept_obstacle(proj.prev_position, proj.position));
+                .and_then(|m| {
+                    m.swept_obstacle(
+                        proj.prev_position,
+                        proj.position,
+                        broadphase,
+                    )
+                });
             if let Some((target, kind, position, penetration)) = obstacle_hit {
                 collisions.push(CollisionEvent {
                     tick: self.current_tick,

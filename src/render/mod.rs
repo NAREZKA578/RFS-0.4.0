@@ -58,14 +58,12 @@ pub use graph::RenderGraph;
 pub use lighting::{DirectionalLight, Light, LightProbe, PointLight, ShadowConfig, SpotLight};
 pub use materials::{Material, MaterialLibrary, PbrMaterial};
 pub use meshes::{Mesh, MeshLibrary};
-pub use particles::{
-    EmitterShape, ParticleEffect, ParticleEmitter, ParticleEmitterConfig, ParticleSystem,
-};
+pub use particles::{EmitterShape, ParticleEmitter, ParticleEmitterConfig, ParticleSystem};
 pub use postprocess::{
     BloomConfig, BloomEffect, DepthOfFieldEffect, DofConfig, FXAAEffect, HDREffect, HdrConfig,
     MotionBlurConfig, MotionBlurEffect, PostProcessConfig, PostProcessManager, ToneMapping,
 };
-pub use passes::{GBufferPass, GeometryPass, LightingPass, ResolvePass};
+pub use passes::GeometryPass;
 pub use scene::{Entity, Renderable, Scene, Transform};
 pub use textures::{SamplerDesc, Texture, TextureLibrary};
 pub use ui::{HUDAlignment, Menu, MenuItem, MenuItemType, MenuType, Minimap, HUD};

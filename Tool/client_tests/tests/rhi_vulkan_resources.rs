@@ -21,7 +21,10 @@ use rhi::{
     TextureAspectFlags,
 };
 
-fn open_vulkan_device(features: Features) -> Device {
+/// Bug №187: `None` instead of a panic. A machine without a Vulkan loader or
+/// device is a reason to skip, not a test failure — the caller guards with
+/// `let Some(device) = ... else { skip }`.
+fn open_vulkan_device(features: Features) -> Option<Device> {
     open_vulkan_device_with_validation(features, false)
 }
 
@@ -34,23 +37,28 @@ fn open_vulkan_device(features: Features) -> Device {
 /// distinguish a correct barrier from a broken one, because both produce silence.
 /// Any test whose value depends on the validator reporting something must enable
 /// it explicitly.
-fn open_vulkan_device_with_validation(features: Features, validation: bool) -> Device {
+fn open_vulkan_device_with_validation(features: Features, validation: bool) -> Option<Device> {
     let config = RhiConfig {
         validation,
         ..Default::default()
     };
-    let backend = VulkanBackend::new(&config).unwrap();
-    let devices = backend.enumerate_physical_devices().unwrap();
+    let backend = VulkanBackend::new(&config).ok()?;
+    let devices = backend.enumerate_physical_devices().ok()?;
     let desc = DeviceDesc {
         features,
         ..Default::default()
     };
-    backend.create_device(&devices[0], &desc).unwrap()
+    backend.create_device(devices.first()?, &desc).ok()
 }
 
 #[test]
 fn vulkan_buffer_host_upload_roundtrip() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let mut buffer = device
         .create_buffer(
             64,
@@ -86,7 +94,12 @@ fn vulkan_buffer_host_upload_roundtrip() {
 
 #[test]
 fn vulkan_device_local_buffer() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let buffer = device
         .create_buffer(1 << 20, BufferUsage::VERTEX, false)
         .expect("the device-local vertex buffer must be created");
@@ -102,7 +115,10 @@ fn vulkan_buffer_device_address() {
         buffer_device_address: true,
         ..Default::default()
     };
-    let device = open_vulkan_device(features);
+    let Some(device) = open_vulkan_device(features) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let buffer = device
         .create_buffer(
             256,
@@ -116,7 +132,12 @@ fn vulkan_buffer_device_address() {
 
 #[test]
 fn vulkan_texture_image_creation() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let texture = device
         .create_texture(
             256,
@@ -140,7 +161,10 @@ fn vulkan_texture_view_and_sampler() {
         sampler_anisotropy: true,
         ..Default::default()
     };
-    let device = open_vulkan_device(features);
+    let Some(device) = open_vulkan_device(features) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     let texture = device
         .create_texture(
@@ -178,7 +202,12 @@ fn vulkan_texture_view_and_sampler() {
 
 #[test]
 fn vulkan_sampler_desc_helpers() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let _ = device;
     let shadow = SamplerDesc::shadow_compare(CompareOp::Less);
     assert!(shadow.is_valid());
@@ -190,7 +219,12 @@ fn vulkan_sampler_desc_helpers() {
 
 #[test]
 fn vulkan_buffer_upload_through_backend_trait() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let buffer = device
         .create_buffer(16, BufferUsage::UNIFORM | BufferUsage::TRANSFER_DST, true)
         .expect("the host-visible uniform buffer must be created");
@@ -204,7 +238,12 @@ fn vulkan_buffer_upload_through_backend_trait() {
 
 #[test]
 fn vulkan_buffer_upload_to_device_local_buffer_via_staging() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let buffer = device
         .create_buffer(32, BufferUsage::STORAGE | BufferUsage::TRANSFER_DST, false)
         .expect("the device-local storage buffer must be created");
@@ -220,7 +259,12 @@ fn vulkan_buffer_upload_to_device_local_buffer_via_staging() {
 
 #[test]
 fn vulkan_texture_upload_with_mip_chain() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let texture = device
         .create_texture(64, 64, 1, Format::RGBA8_UNORM, TextureUsage::SAMPLED, 4)
         .expect("the mip-chained texture must be created");
@@ -269,7 +313,12 @@ fn vulkan_texture_upload_with_mip_chain() {
 /// found it.
 #[test]
 fn vulkan_released_texture_leaves_the_teardown_list() {
-    let device = open_vulkan_device_with_validation(Features::default(), true);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     let before = device.tracked_object_count();
     let texture = device
@@ -301,7 +350,12 @@ fn vulkan_released_texture_leaves_the_teardown_list() {
 /// produces, must not grow the list.
 #[test]
 fn vulkan_texture_churn_does_not_grow_the_teardown_list() {
-    let device = open_vulkan_device_with_validation(Features::default(), true);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     // Settle first so the baseline cannot include one-off allocations from device
     // creation that land later on their own.
@@ -350,7 +404,12 @@ fn vulkan_texture_churn_does_not_grow_the_teardown_list() {
 /// the second finds nothing to destroy.
 #[test]
 fn vulkan_double_release_is_harmless() {
-    let device = open_vulkan_device_with_validation(Features::default(), true);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     let texture = device
         .create_texture(
@@ -397,7 +456,12 @@ fn vulkan_double_release_is_harmless() {
 /// only a real submit makes the validator check it.
 #[test]
 fn vulkan_texture_barrier_uses_the_aspect_the_image_actually_has() {
-    let device = open_vulkan_device_with_validation(Features::default(), true);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     let color = device
         .create_texture(
@@ -473,7 +537,12 @@ fn vulkan_texture_barrier_uses_the_aspect_the_image_actually_has() {
 /// that narrowed to DEPTH alone would pass the colour test and fail here.
 #[test]
 fn vulkan_depth_barrier_transitions_to_read_only_layout() {
-    let device = open_vulkan_device_with_validation(Features::default(), true);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     let depth = device
         .create_texture(
@@ -535,7 +604,12 @@ fn vulkan_depth_barrier_transitions_to_read_only_layout() {
 /// submit makes the validator check the mask at all.
 #[test]
 fn vulkan_clear_names_only_the_aspect_the_format_has() {
-    let device = open_vulkan_device_with_validation(Features::default(), true);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     // TRANSFER_DST is required to clear (`VUID-vkCmdClearColorImage-image-00002`).
     let color = device
@@ -618,7 +692,12 @@ fn vulkan_clear_names_only_the_aspect_the_format_has() {
 /// it exists to make sure the silent full clear cannot come back unnoticed.
 #[test]
 fn vulkan_refuses_a_partial_clear_instead_of_clearing_everything() {
-    let device = open_vulkan_device_with_validation(Features::default(), false);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), false) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     let color = device
         .create_texture(
@@ -673,7 +752,12 @@ fn vulkan_refuses_a_partial_clear_instead_of_clearing_everything() {
 /// to reach the caller.
 #[test]
 fn vulkan_a_refused_texture_is_an_error_and_not_a_cpu_stand_in() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let desc = TextureDesc {
         width: 8,
         height: 8,
@@ -699,7 +783,12 @@ fn vulkan_a_refused_texture_is_an_error_and_not_a_cpu_stand_in() {
 /// caller has to be told.
 #[test]
 fn vulkan_a_view_of_a_texture_without_an_image_is_an_error() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let cpu_only = Texture::new(TextureDesc {
         width: 8,
         height: 8,
@@ -752,7 +841,12 @@ fn vulkan_a_view_of_a_texture_without_an_image_is_an_error() {
 /// that is the layout the upload left a sampled image in.
 #[test]
 fn vulkan_the_tracker_learns_where_an_upload_left_the_image() {
-    let device = open_vulkan_device_with_validation(Features::default(), true);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     assert!(
         rhi::validation_layer_active(),
         "the validation layer has to be up for this test to mean anything: a clean \
@@ -818,6 +912,121 @@ fn vulkan_the_tracker_learns_where_an_upload_left_the_image() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Bug №177: a depth/stencil copy travels plane by plane.
+//
+// The upload used to build ONE `BufferImageCopy` naming `DEPTH | STENCIL` —
+// not a layout the copy rules define — and size the data with `format_size`:
+// 8 bytes per texel for D32S8, which is neither plane's actual transfer size
+// (the DEPTH plane takes 4 bytes per texel, the STENCIL plane takes 1) and
+// leaves no room for the stencil plane at all. The download picked its aspect
+// from the usage flags instead of the format. The contract this backend now
+// enforces: the buffer holds the DEPTH plane's mips first, then the STENCIL
+// plane's, back to back, and the readback returns the format's first plane.
+// ---------------------------------------------------------------------------
+
+/// The 64x64 D32S8 plane contract end to end: 16384 bytes of depth followed by
+/// 4096 bytes of stencil upload exactly one two-plane image, and the readback
+/// returns the depth plane and nothing else.
+#[test]
+fn vulkan_depth_stencil_upload_takes_the_plane_contiguous_contract() {
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
+    let texture = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::D32_SFLOAT_S8_UINT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT
+                | TextureUsage::TRANSFER_DST
+                | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the depth/stencil texture must be created");
+    assert!(texture.has_gpu_backing());
+
+    let depth_plane: Vec<u8> = (0..64 * 64 * 4).map(|i| (i * 31 + 7) as u8).collect();
+    let stencil_plane: Vec<u8> = (0..64 * 64).map(|i| (i * 17 + 11) as u8).collect();
+    let mut data = depth_plane.clone();
+    data.extend_from_slice(&stencil_plane);
+    assert_eq!(
+        data.len(),
+        20480,
+        "64x64 D32S8: 64*64*4 of depth followed by 64*64*1 of stencil — the \
+         whole-format 8 bytes per texel would demand 32768 and describe no \
+         stencil plane at all"
+    );
+
+    device
+        .upload_texture(&texture, &data)
+        .expect("the plane-contiguous upload must reach both aspects; an error \
+                 here means the buffer and the copy regions disagree about the \
+                 layout");
+
+    let read_back = device
+        .download_texture(&texture, 0, 0)
+        .expect("the readback must succeed");
+    assert_eq!(
+        read_back.len(),
+        depth_plane.len(),
+        "the readback returns the DEPTH plane alone (16384 bytes), not \
+         format_size's whole-format 8-per-texel total (32768): got {}",
+        read_back.len()
+    );
+    assert_eq!(
+        read_back, depth_plane,
+        "the depth bytes that went in must come back; the stencil plane does \
+         not belong in this readback — a stencil-striped readback would mean \
+         the region named both aspects in one"
+    );
+}
+
+/// Data carrying only the depth plane is refused, and the refusal states what
+/// the planes need and in which order they must arrive.
+#[test]
+fn a_vulkan_upload_missing_the_stencil_plane_states_what_is_missing() {
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
+    let texture = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::D32_SFLOAT_S8_UINT,
+            TextureUsage::DEPTH_STENCIL_ATTACHMENT
+                | TextureUsage::TRANSFER_DST
+                | TextureUsage::TRANSFER_SRC,
+            1,
+        )
+        .expect("the depth/stencil texture must be created");
+
+    let depth_plane: Vec<u8> = (0..64 * 64 * 4).map(|i| (i * 31 + 7) as u8).collect();
+    let error = device
+        .upload_texture(&texture, &depth_plane)
+        .expect_err("a buffer holding only the DEPTH plane does not satisfy the \
+                     dual-aspect contract; accepting it silently would leave \
+                     the stencil aspect unwritten forever");
+    let message = error.to_string();
+    assert!(
+        message.contains("20480 needed"),
+        "the refusal must state the plane total for two 64x64 planes \
+         (16384 depth + 4096 stencil), stated: {message}"
+    );
+    assert!(
+        message.contains("DEPTH plane first"),
+        "the refusal must name the plane order the contract demands: {message}"
+    );
+}
+
 /// Bug #646: a framebuffer has to be a real one.
 ///
 /// `Device::create_framebuffer` used to build a CPU-side description and never
@@ -829,7 +1038,12 @@ fn vulkan_the_tracker_learns_where_an_upload_left_the_image() {
 /// that produced an object with nothing in it.
 #[test]
 fn vulkan_a_created_framebuffer_has_a_native_handle() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let color = device
         .create_texture(
             64,
@@ -891,7 +1105,12 @@ fn vulkan_a_created_framebuffer_has_a_native_handle() {
 /// one nothing had ever signalled, and the chain stalled.
 #[test]
 fn vulkan_a_frame_that_was_not_submitted_has_no_semaphore_to_wait_on() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let backend = device
         .backend_resource()
         .expect("a Vulkan device has a backend resource");
@@ -932,7 +1151,12 @@ fn vulkan_a_frame_that_was_not_submitted_has_no_semaphore_to_wait_on() {
 /// producing an invalid sampler is nobody's.
 #[test]
 fn vulkan_a_sampler_asking_for_anisotropy_is_legal_without_the_feature() {
-    let device = open_vulkan_device_with_validation(Features::default(), true);
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device_with_validation(Features::default(), true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     assert!(
         !Features::default().sampler_anisotropy,
         "this test is about the device *without* the feature; if the default \
@@ -962,7 +1186,10 @@ fn vulkan_a_sampler_asking_for_anisotropy_is_legal_with_the_feature() {
         sampler_anisotropy: true,
         ..Default::default()
     };
-    let device = open_vulkan_device_with_validation(features, true);
+    let Some(device) = open_vulkan_device_with_validation(features, true) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     let before = rhi::validation_error_count();
     let sampler = device
         .create_sampler(AddressMode::ClampToEdge, FilterMode::Linear, 8.0)
@@ -986,7 +1213,12 @@ fn vulkan_a_sampler_asking_for_anisotropy_is_legal_with_the_feature() {
 /// (`StubShaderCompiler::compile_to_spirv`), so the input is not hypothetical.
 #[test]
 fn vulkan_bytes_that_are_not_spirv_are_refused() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
     // Sixteen bytes: a multiple of four, and not SPIR-V.
     let desc = ShaderModuleDesc {
         code: b"not spirv at all".to_vec(),

@@ -34,14 +34,27 @@ pub struct CollisionShape {
     pub local_transform: Transform,
 }
 
+/// Bug №726: the shapes the narrow phase and the raycast actually solve.
+///
+/// The enum used to also list `Cylinder = 3`, `ConvexHull = 4` and
+/// `TriangleMesh = 5`. No narrow-phase pairing matched them, no raycast
+/// handled them, and nothing anywhere in server_src constructed a shape with
+/// them — so a constructor, if anyone had called one, would have quietly
+/// produced an object that never collides and never gets hit, which is the
+/// worst failure mode a collision type has. Listed-but-unhandled is not an
+/// extension point, it is a trap: they are removed until an implementation
+/// exists.
+///
+/// The discriminants `3..=5` stay retired, deliberately not reused: these
+/// values have existed on the wire, and an old serialized shape with one of
+/// them must now fail deserialization — the honest answer — rather than
+/// reattach silently to whatever gets added next. New variants continue the
+/// sequence when they are actually implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CollisionShapeType {
     Box = 0,
     Sphere = 1,
     Capsule = 2,
-    Cylinder = 3,
-    ConvexHull = 4,
-    TriangleMesh = 5,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -953,5 +966,43 @@ mod broadphase_tests {
                 assert!(seen.insert(*a), "duplicate id {a:?} in one cell");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shape_type_tests {
+    use super::*;
+
+    /// Bug №726: the retired discriminants (3..=5 — Cylinder, ConvexHull,
+    /// TriangleMesh) must refuse deserialization. They once existed on the
+    /// wire, so a serialized shape with one of them has to fail loudly, not
+    /// reattach to whatever variant is added next.
+    #[test]
+    fn a_retired_discriminant_refuses_to_deserialize() {
+        for retired in ["3", "4", "5"] {
+            assert!(
+                serde_json::from_str::<CollisionShapeType>(retired).is_err(),
+                "discriminant {retired} deserialized — the slot came back to life"
+            );
+        }
+        for retired in ["\"Cylinder\"", "\"ConvexHull\"", "\"TriangleMesh\""] {
+            assert!(
+                serde_json::from_str::<CollisionShapeType>(retired).is_err(),
+                "the variant name {retired} deserialized"
+            );
+        }
+        // The live ones stay usable by their wire (name) form.
+        assert_eq!(
+            serde_json::from_str::<CollisionShapeType>("\"Box\"").expect("Box"),
+            CollisionShapeType::Box
+        );
+        assert_eq!(
+            serde_json::from_str::<CollisionShapeType>("\"Sphere\"").expect("Sphere"),
+            CollisionShapeType::Sphere
+        );
+        assert_eq!(
+            serde_json::from_str::<CollisionShapeType>("\"Capsule\"").expect("Capsule"),
+            CollisionShapeType::Capsule
+        );
     }
 }

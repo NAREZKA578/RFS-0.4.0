@@ -185,56 +185,6 @@ impl RenderGraph {
             ),
         );
 
-        // Add GBuffer resources
-        //
-        // The formats are the GBuffer's, not a default: the position and normal
-        // targets hold world-space positions and normals, which need 32-bit
-        // floats. A `RGBA8` position target would quantise them to a few
-        // millimetres and the lighting pass would read noise.
-        self.add_resource(
-            "gbuffer_position",
-            GraphResource::new_texture(
-                "gbuffer_position".to_string(),
-                width,
-                height,
-                Format::RGBA32_SFLOAT,
-                ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-            ),
-        );
-
-        self.add_resource(
-            "gbuffer_normal",
-            GraphResource::new_texture(
-                "gbuffer_normal".to_string(),
-                width,
-                height,
-                Format::RGBA32_SFLOAT,
-                ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-            ),
-        );
-
-        self.add_resource(
-            "gbuffer_albedo",
-            GraphResource::new_texture(
-                "gbuffer_albedo".to_string(),
-                width,
-                height,
-                Format::RGBA8_UNORM,
-                ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-            ),
-        );
-
-        self.add_resource(
-            "gbuffer_material",
-            GraphResource::new_texture(
-                "gbuffer_material".to_string(),
-                width,
-                height,
-                Format::RGBA8_UNORM,
-                ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
-            ),
-        );
-
         // Add shadow map resource
         //
         // A shadow map is not window-sized: it covers the part of the world the
@@ -250,23 +200,6 @@ impl RenderGraph {
                 ResourceUsage::DepthStencil | ResourceUsage::Sampled,
                 2048,
                 2048,
-            ),
-        );
-
-        // Add lighting resource
-        //
-        // HDR, because the lighting sums contributions: an 8-bit target would
-        // clip the result before the tone mapping that comes after it, and
-        // there is no tone mapping yet — which is exactly why the lit image
-        // has to be able to hold more than one.
-        self.add_resource(
-            "lighting",
-            GraphResource::new_texture(
-                "lighting".to_string(),
-                width,
-                height,
-                Format::RGBA16_SFLOAT,
-                ResourceUsage::ColorAttachment | ResourceUsage::Sampled,
             ),
         );
 

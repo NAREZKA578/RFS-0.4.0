@@ -14,7 +14,12 @@ use uuid::Uuid;
 // the meaning of every replicated packet, so a cross-version pair must not
 // try to talk: the old client would send session-less packets that the new
 // server honestly drops, and the game would look like random lag.
-pub const PROTOCOL_VERSION: u16 = 3;
+// Bug №732: the version moves a third time — payloads now encode with
+// postcard (varint framing) instead of bincode's fixed-width fixint, so a
+// cross-version pair would be two encoders saying the same words in different
+// shapes. The header itself stays a hand-rolled 24 bytes (see HEADER_SIZE);
+// the bump is for the payload half.
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Bug №239: the single statement of the per-datagram wire budget. It does
 /// not deliberately enforce itself inside core — core only serializes — but
 /// the net crate re-exports exactly this value as `connection::MAX_PACKET_SIZE`
@@ -30,10 +35,12 @@ pub const HEADER_SIZE: usize = 24;
 pub const AUTH_WIRE_LEN: usize = 24;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-// Bug №60: bincode 1.3 codes this enum POSITIONALLY on the wire — the
-// explicit `= N` discriminants are for `from_u8` only and DO NOT stabilize
-// the marker channel. Keep declaration order stable (pinned by
-// Tool/harness/tests/protocol.rs); a reorder requires a PROTOCOL_VERSION bump.
+// Bug №60: this enum's wire code is POSITIONAL in the declaration order —
+// bincode 1.3 (which carried the wire across №9..№700) ignored the `= N`
+// discriminants, and postcard since bug №732 does the same (an enum encodes
+// as the varint ordinal of the declaration order). Keep declaration order
+// stable (pinned by Tool/harness/tests/protocol.rs); a reorder requires a
+// PROTOCOL_VERSION bump.
 pub enum PacketType {
     Connect = 0x01,
     ConnectAccept = 0x02,
@@ -75,6 +82,13 @@ pub enum PacketType {
     /// challenge; only a matching nonce promotes Connect to a real
     /// connection.
     ConnectConfirm = 0x55,
+    /// Bug №30 (B): the client's per-layer applied report. Appended after
+    /// ConnectConfirm, so the positional coding of every earlier variant
+    /// stays exactly where it was — no PROTOCOL_VERSION bump is needed for
+    /// an append (the same contract ResyncRequest documents above). An
+    /// older binary receiving it drops it at the type gate (degrade to the
+    /// pre-№30 behavior); an older SENDER simply never emits it.
+    LayerSync = 0x56,
 }
 
 impl PacketType {
@@ -102,6 +116,7 @@ impl PacketType {
             0x53 => Self::MapDescription,
             0x54 => Self::ConnectChallenge,
             0x55 => Self::ConnectConfirm,
+            0x56 => Self::LayerSync,
             _ => return None,
         })
     }
@@ -163,22 +178,111 @@ impl PacketHeader {
     pub fn is_valid(&self) -> bool {
         self.magic == Self::MAGIC && self.version == PROTOCOL_VERSION
     }
+
+    /// Bug №732: the header's wire form, written by hand and a constant
+    /// [`HEADER_SIZE`] bytes.
+    ///
+    /// It used to be `bincode::serialize(&self)` — fixint, big-endian, the
+    /// exact bytes this writer emits. Moving payloads to postcard cannot
+    /// move the header: postcard frames integers as varints, the header
+    /// would stop being a fixed-width slice, and every MTU, fragmentation
+    /// and size-cap argument built on `HEADER_SIZE` across the net crate
+    /// would have to be rewritten for nothing. Nine plain integers carry no
+    /// schema that a self-describing format could compact.
+    ///
+    /// The layout matches what bincode 1.3 emitted (fields in declaration
+    /// order, big-endian), so the constant, the reader below and any wire
+    /// dump agree field for field:
+    /// `magic u32, version u16, packet_type u8, channel u8, sequence u32,
+    /// ack u32, ack_bitfield u32, payload_size u16, flags u16`.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        let start = out.len();
+        out.resize(start + HEADER_SIZE, 0);
+        out[start..start + 4].copy_from_slice(&self.magic.to_be_bytes());
+        out[start + 4..start + 6].copy_from_slice(&self.version.to_be_bytes());
+        out[start + 6] = self.packet_type;
+        out[start + 7] = self.channel;
+        out[start + 8..start + 12].copy_from_slice(&self.sequence.to_be_bytes());
+        out[start + 12..start + 16].copy_from_slice(&self.ack.to_be_bytes());
+        out[start + 16..start + 20].copy_from_slice(&self.ack_bitfield.to_be_bytes());
+        out[start + 20..start + 22].copy_from_slice(&self.payload_size.to_be_bytes());
+        out[start + 22..start + 24].copy_from_slice(&self.flags.to_be_bytes());
+    }
+
+    /// The fixed wire bytes on their own, for the call sites that build a
+    /// raw datagram header-first and append the payload after it.
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_SIZE);
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Parses exactly [`HEADER_SIZE`] prefix bytes as the fixed header. The
+    /// bytes have to agree with [`PacketHeader::encode_into`] field for
+    /// field; a datagram shorter than the header is refused the same way
+    /// `deserialize_packet` refused it before the hand codec existed.
+    pub fn decode(data: &[u8]) -> Result<Self, bincode::Error> {
+        if data.len() < HEADER_SIZE {
+            return Err(bincode::Error::new(bincode::ErrorKind::Custom(
+                "Packet too small".into(),
+            )));
+        }
+        Ok(Self {
+            magic: u32::from_be_bytes(data[0..4].try_into().unwrap()),
+            version: u16::from_be_bytes(data[4..6].try_into().unwrap()),
+            packet_type: data[6],
+            channel: data[7],
+            sequence: u32::from_be_bytes(data[8..12].try_into().unwrap()),
+            ack: u32::from_be_bytes(data[12..16].try_into().unwrap()),
+            ack_bitfield: u32::from_be_bytes(data[16..20].try_into().unwrap()),
+            payload_size: u16::from_be_bytes(data[20..22].try_into().unwrap()),
+            flags: u16::from_be_bytes(data[22..24].try_into().unwrap()),
+        })
+    }
 }
 
 pub trait Serializable: Serialize + for<'de> Deserialize<'de> {
     fn serialize(&self) -> Result<Vec<u8>, bincode::Error> {
-        bincode::serialize(self)
+        // Bug №732: payload wire is postcard — the error still boxes into the
+        // `bincode::Error` carrier every signature on the path declares.
+        // (NCPC-732-TEMP proved the wire reacts: bincode reintroduced here
+        // and in `encode` left the loopback pair timing out at Connect.)
+        postcard::to_allocvec(self).map_err(encoding_error)
     }
 
     fn deserialize(data: &[u8]) -> Result<Self, bincode::Error>
     where
         Self: Sized,
     {
-        bincode::deserialize(data)
+        // Trailing bytes are refused here: postcard reads exactly the frame
+        // its varints asked for, and what is left over is a corrupt frame,
+        // not a second message.
+        postcard::from_bytes(data).map_err(encoding_error)
     }
 }
 
 impl<T: Serialize + for<'de> Deserialize<'de>> Serializable for T {}
+
+/// Bug №732: postcard's error, boxed into the error carrier the wire stack
+/// already speaks. `Serialization(#[from] bincode::Error)` and the dozen
+/// `Result<_, bincode::Error>` signatures across connection/client/server
+/// stay as they are; nothing downstream matches on the finer bincode kinds —
+/// the failure sites log or wrap, never branch — so `Custom` is lossless.
+pub fn encoding_error(error: postcard::Error) -> bincode::Error {
+    bincode::Error::new(bincode::ErrorKind::Custom(error.to_string()))
+}
+
+/// Bug №732: the one payload encoder for the wire. Every production call
+/// site funnels here (or through the identical `Serializable` trait default),
+/// so a future format change is this one spot plus a protocol bump.
+pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, bincode::Error> {
+    // Bug №732: the one payload encoder for the wire. Every production call
+    // site funnels here (or through the identical `Serializable` trait
+    // default), so a future format change is this one spot plus a protocol
+    // bump. (NCPC-732-TEMP proved the tests react: with bincode here the
+    // loopback pair's handshake goes red.)
+    postcard::to_allocvec(value).map_err(encoding_error)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectPacket {
@@ -783,6 +887,36 @@ pub struct ResyncRequestPacket {
     pub layer: u8,
 }
 
+/// Bug №30 (B): the client's answer to the server's blind base advance. The
+/// server used to move each layer's diff base to the last queued send; a
+/// queued send is not a delivered one, so a loss left the server declaring a
+/// base tick the client never applied — every following delta of that layer
+/// was dropped until a resync healed it. This report carries the ticks the
+/// client has actually APPLIED per layer (the same numbers its own base-mismatch
+/// guard checks deltas against), so the server can diff against truth.
+///
+/// Deliberately tiny and absolute: four plain ticks beat any incremental
+/// scheme the way the resync request does — losing a report costs one report
+/// interval of freshness, never a corrupting gap; the server merges reports
+/// with `max` (bug №30: duplicate or reordered datagrams cannot rewind it).
+///
+/// The lens `[u32; 4]` is the replication layer count. Core cannot see
+/// `crate::snapshot::LAYER_COUNT`, so the net crate pins its own
+/// `LAYER_COUNT == 4` at compile time next to every encode/decode site; if
+/// the replication layer count ever changes, that pin fails the build
+/// instead of the wire drifting from it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerSyncPacket {
+    /// One applied tick per replication layer, in `LAYER_COUNT` order. A
+    /// value of 0 means that layer has never applied anything (the client's
+    /// default before its first full state).
+    pub applied: [u32; 4],
+    /// Bug №216: the session echo, same contract as Input's — a report is
+    /// accepted only with the session the accept carried, or an off-path
+    /// forger could drive the server's confirmed bases wherever it likes.
+    pub session: u128,
+}
+
 /// Bug №698: the world's static description, sent once per client.
 ///
 /// The payload is a volume plus a list of solid volumes. It can be larger
@@ -800,25 +934,22 @@ pub fn serialize_packet<T: Serializable>(
     packet: &T,
     header: PacketHeader,
 ) -> Result<Vec<u8>, bincode::Error> {
-    let payload = bincode::serialize(packet)?;
+    // Bug №732: payload postcard, header hand-rolled (see `encode_into`) —
+    // the framing stays header-then-payload, and the payload length the
+    // header declared stays the truth signed off above.
+    let payload = postcard::to_allocvec(packet).map_err(encoding_error)?;
     let mut header = header;
     // Bug №9: `as u16` truncation used to let a lying header reach the wire.
     header.payload_size = u16::try_from(payload.len())
         .map_err(|_| bincode::Error::new(bincode::ErrorKind::SizeLimit))?;
     let mut buffer = Vec::with_capacity(HEADER_SIZE + payload.len());
-    buffer.extend_from_slice(&bincode::serialize(&header)?);
+    header.encode_into(&mut buffer);
     buffer.extend_from_slice(&payload);
     Ok(buffer)
 }
 
 pub fn deserialize_packet(data: &[u8]) -> Result<(PacketHeader, &[u8]), bincode::Error> {
-    if data.len() < HEADER_SIZE {
-        return Err(bincode::Error::new(bincode::ErrorKind::Custom(
-            "Packet too small".into(),
-        )));
-    }
-
-    let header: PacketHeader = bincode::deserialize(&data[..HEADER_SIZE])?;
+    let header = PacketHeader::decode(data)?;
 
     if !header.is_valid() {
         return Err(bincode::Error::new(bincode::ErrorKind::Custom(

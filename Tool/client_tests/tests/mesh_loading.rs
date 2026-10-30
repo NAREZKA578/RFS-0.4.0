@@ -414,3 +414,56 @@ fn an_unknown_extension_loads_nothing() {
     assert!(loader.load(&path).is_none());
     let _ = std::fs::remove_file(&path);
 }
+
+// ------------------------------------------------------------ real assets
+
+/// The owner's probe asset, loaded end to end through the glTF loader.
+///
+/// Facts about the file on disk (probed 2026-10-30): a 5 565 596-byte GLB
+/// container, one mesh (`geometry_0`) with one TRIANGLES primitive whose only
+/// attribute is POSITION — indices accessor present, no NORMAL, no TEXCOORD_0,
+/// no images/textures/materials. The loader's contract makes both attribute
+/// families optional and fills the vertex defaults, so a position-only
+/// primitive is a complete load within the documented scope, not a partial
+/// one — and the single-mesh/single-primitive scope loses nothing here.
+#[test]
+fn the_real_explosive_glb_loads_as_geometry() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("Model")
+        .join("TestModel")
+        .join("EXPLOSIVE.glb");
+    if !path.exists() {
+        eprintln!("skipped: {path:?} is not on this machine");
+        return;
+    }
+
+    // The path must be the asset this test is about: a mistyped root would
+    // pick another file of a different size or none, and a vacuous skip below
+    // would then hide the mistake.
+    let size = std::fs::metadata(&path).expect("the asset must be readable").len();
+    assert_eq!(
+        size, 5_565_596,
+        "Model/TestModel/EXPLOSIVE.glb changed size ({size}); if the asset was \
+         regenerated on purpose, update this pin together with the loader facts"
+    );
+    let mut header = [0u8; 4];
+    std::fs::File::open(&path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+        .expect("the asset must be readable");
+    assert_eq!(&header, b"glTF", "the GLB magic must be intact");
+
+    let mesh = gltf::load(&path).expect(
+        "EXPLOSIVE.glb must load: GLB container, one mesh, TRIANGLES with \
+         POSITION and indices — every optional attribute the loader also reads \
+         is simply absent",
+    );
+    assert!(mesh.vertex_count() > 0, "the position accessor fed vertices");
+    assert!(mesh.index_count() > 0, "the indices accessor fed an index list");
+    assert_eq!(
+        mesh.index_count() % 3,
+        0,
+        "TRIANGLES: the index count must be a multiple of three"
+    );
+}

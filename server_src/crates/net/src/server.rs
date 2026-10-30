@@ -26,18 +26,31 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Wire cap for a single bincode message (DoS: Vec len prefix could OOM).
-const WIRE_LIMIT: u64 = 1024 * 1024;
+/// Wire cap for a single postcard message (bug №732 rewords it; DoS: a
+/// corrupted message framing could still OOM, so the cap keeps guarding the
+/// length of the bytes we hand to a deserializer).
+/// №239 addendum: an alias of the one statement in `connection` — the local
+/// restatement is gone; making the alias unequal would be a compile-visible
+/// act of renumbering, which is what the alias-for-number swap is for.
+pub(crate) const WIRE_LIMIT: u64 = crate::connection::WIRE_LIMIT;
 
+/// Bug №732: postcard has no Options dial, so the wire cap (№239 family)
+/// keeps its job with a new shape — an explicit length check on the bytes we
+/// are about to hand to a deserializer, then one decode. Trailing bytes are
+/// refused by postcard; the pad → exact payload slice → this helper, so the
+/// bytes checked here are exactly the bytes decoded.
 fn deserialize_limited<T: serde::de::DeserializeOwned>(
     payload: &[u8],
 ) -> Result<T, bincode::Error> {
-    use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_limit(WIRE_LIMIT)
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .deserialize(payload)
+    if payload.len() as u64 > WIRE_LIMIT {
+        return Err(bincode::Error::new(bincode::ErrorKind::Custom(
+            format!(
+                "payload of {} bytes exceeds the {WIRE_LIMIT}-byte parse cap",
+                payload.len()
+            ),
+        )));
+    }
+    postcard::from_bytes(payload).map_err(encoding_error)
 }
 
 pub struct NetServer {
@@ -75,6 +88,11 @@ pub struct NetServer {
     sent_deltas_by_layer: Arc<[AtomicU64; LAYER_COUNT]>,
     delta_compressor: Arc<DeltaCompressor>,
     client_layers: Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+    /// Bug №30 (B): per-client queued sends awaiting the applied report, plus
+    /// the self-shield's cooldown clock. The send pass queues here what went
+    /// on the wire; the LayerSync dispatch installs from here the base the
+    /// client actually holds — `client_layers` moves only on those installs.
+    pending_confirms: Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
     interest_manager: Arc<InterestManager>,
     bandwidth_tracker: Arc<BandwidthTracker>,
     tick_rate: u32,
@@ -267,11 +285,140 @@ fn apply_resync_request(conn: &Connection, payload: &[u8]) -> bool {
     }
 }
 
+/// Bug №30 (B): the queued sends awaiting the client's applied report, per
+/// client. Each layer's ring holds one entry per send that went on the wire:
+/// entry `i` says "if the client applies this send, it holds exactly this
+/// content, and its applied clock reads `base_tick`". A LayerSync report
+/// names exactly such a tick; the matching entry is then PROOF of what the
+/// client holds and is installed into `client_layers` as that layer's
+/// confirmed base — which displaces the old blind "advance the base on every
+/// queue" bookkeeping, because a queued send is not a delivered send.
+#[derive(Debug, Default)]
+struct ClientLayerTrack {
+    /// Per layer, the queued-but-unconfirmed sends, oldest first.
+    pending: [VecDeque<LayerBase>; LAYER_COUNT],
+    /// Per layer, the tick of the last self-shield firing (its cooldown stamp).
+    last_self_resync: [u64; LAYER_COUNT],
+}
+
+/// Bug №30 (B): how many pending-confirmation entries one layer's ring keeps.
+/// Reports travel every ~100 ms and layers queue at their own intervals, so a
+/// healthy ring is a few entries deep; the cap exists for the worst case (a
+/// client that never reports), where the ring would otherwise keep whatever
+/// the pass queued for as long as the connection lived.
+pub(crate) const MAX_PENDING_CONFIRMS: usize = 4;
+
+/// Bug №30 (B): the self-shield spacing. When the oldest queued send has gone
+/// this many ticks without the client confirming anything, arm a resync:
+/// either the report path is dead and the client's base has drifted away from
+/// what the send chain assumes, or the client stalled outright — a full layer
+/// heals both. The same span is the cooldown, so an unreporting client
+/// settles into one full resync per interval instead of a resync storm.
+const LAYER_CONFIRM_RESYNC_TICKS: [u64; LAYER_COUNT] = [30; LAYER_COUNT];
+
+/// Bug №30 (B): pure rule for the self-shield. `oldest_pending_age` is the
+/// age of the oldest still-unconfirmed send (0 = nothing pending — never
+/// due); `since_self_resync` is the ticks since the shield last fired for
+/// this layer. Extracted from the snapshot pass so the cadence is testable
+/// the way `layer_needs_resync` is.
+fn layer_confirm_self_resync_due(
+    layer: usize,
+    oldest_pending_age: u64,
+    since_self_resync: u64,
+) -> bool {
+    oldest_pending_age >= LAYER_CONFIRM_RESYNC_TICKS[layer]
+        && since_self_resync >= LAYER_CONFIRM_RESYNC_TICKS[layer]
+}
+
+/// Bug №30 (B): match an applied report against a layer's pending ring.
+///
+/// The report names the tick the client applied. An exact match with a ring
+/// entry is proof of the client's state: that entry is returned for install.
+/// Entries BELOW the applied tick are consumed either way — a send that was
+/// superseded (the client has applied something newer) or dropped outright
+/// has left the client's state past them, and no future report can name them
+/// again, because applied clocks only move forward. No exact match means no
+/// install: the confirmed base never moves on a guess.
+fn take_confirmed_base(pending: &mut VecDeque<LayerBase>, applied: u64) -> Option<LayerBase> {
+    let confirmed = pending
+        .iter()
+        .position(|entry| entry.base_tick == applied)
+        .and_then(|pos| pending.remove(pos));
+    while pending
+        .front()
+        .is_some_and(|entry| entry.base_tick < applied)
+    {
+        pending.pop_front();
+    }
+    confirmed
+}
+
+/// Bug №742: the applied-lag rows behind the stats surface. One current-tick
+/// stamp and one read lock: every row's lag is measured against the SAME
+/// server tick, so the rows stay comparable to each other — per-connection
+/// stamps would sample different NOWs and turn the table into noise.
+fn applied_lag_rows(
+    server_tick: u64,
+    connections: &RwLock<HashMap<u32, Arc<Connection>>>,
+) -> Vec<(u32, Option<[u64; LAYER_COUNT]>)> {
+    let connections = connections.read();
+    let mut rows: Vec<(u32, Option<[u64; LAYER_COUNT]>)> = connections
+        .iter()
+        .map(|(&id, conn)| (id, conn.applied_lag(server_tick)))
+        .collect();
+    rows.sort_by_key(|(id, _)| *id);
+    rows
+}
+
+/// Bug №30 (B): merge an incoming report into the connection and install
+/// what it confirms.
+///
+/// The session echo is checked before dispatch (the №216 gate); what remains
+/// is the merge — `max` per layer, so duplicates and reordering cannot rewind
+/// a confirmed base — and the install: for every layer whose merged value
+/// matches a pending ring entry, that entry becomes the layer's confirmed
+/// base in `client_layers`. No row yet (a report racing the first full)
+/// simply skips the install: the admit path writes the base the full state
+/// carries, and the next report re-confirms it.
+fn apply_layer_sync_report(
+    conn: &Connection,
+    pending_confirms: &Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
+    client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+    client_id: u32,
+    payload: &[u8],
+) -> bool {
+    match deserialize_limited::<LayerSyncPacket>(payload) {
+        Ok(report) => {
+            conn.report_applied(report.applied);
+            for layer in 0..LAYER_COUNT {
+                // Read back the MERGED value, not the packet's field: a stale
+                // report arriving out of order must not take an entry for a
+                // tick the connection has already confirmed.
+                let applied = conn.reported_applied(layer);
+                let confirmed = {
+                    let mut confirms = pending_confirms.lock();
+                    confirms
+                        .get_mut(&client_id)
+                        .and_then(|track| take_confirmed_base(&mut track.pending[layer], applied))
+                    // Released before `client_layers` is touched — the two
+                    // maps are never held in one hand (bug №79 discipline).
+                };
+                if let Some(entry) = confirmed {
+                    if let Some(row) = client_layers.write().get_mut(&client_id) {
+                        row[layer] = entry;
+                    }
+                }
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Token bucket for inbound Connects from one source address (bug №27).
 /// Burst 4, refill 4/sec: a legitimate client (1 Connect + 250 ms retries
 /// while the Accept is in flight) never notices; a sprayer is capped.
-const CONNECT_BURST: f64 = 4.0;
-const CONNECT_REFILL_PER_SEC: f64 = 4.0;
+const CONNECT_BURST: f64 = 4.0;const CONNECT_REFILL_PER_SEC: f64 = 4.0;
 /// Upper bound for the limiter table itself; oldest entries are evicted past it.
 const CONNECT_TABLE_CAP: usize = 4096;
 /// Bug №700: the same shape for the per-peer auth tables — a window entry
@@ -443,6 +590,10 @@ fn admit_first_fulls(
         let mut layers = client_layers.write();
         layers.entry(id).or_insert_with(|| {
             // First contact: full state now, layer bases start from it.
+            // Under bug №30 (B) the write itself stays trusted: the full
+            // carries `tick`, the client applies it and its first report
+            // re-confirms the very same base_tick. The ring is empty here,
+            // so nothing double-books this state.
             for packet in conn.send_state(filtered.to_state_packet()) {
                 out.push((conn.clone(), packet));
             }
@@ -485,6 +636,13 @@ pub struct ServerConfig {
     /// own tracker (bug №671) — before that, `with_window` had no caller at
     /// all and the trackers carried a hardcoded second.
     pub bandwidth_window: Duration,
+    /// Bug №216: the shared secret the wire is keyed with, straight from the
+    /// match config. `new` applies it while the server is being built —
+    /// before the live receiver exists — so no datagram is ever processed in
+    /// the unsigned dialect while `main` was still reading the disk. The
+    /// gap is closed by construction; `set_auth_token` remains the runtime
+    /// knob for callers that already hold a running server.
+    pub auth_token: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -499,6 +657,7 @@ impl Default for ServerConfig {
             max_bandwidth_bps: 1024.0 * 1024.0,
             enable_bandwidth_limit: false,
             bandwidth_window: Duration::from_secs(1),
+            auth_token: None,
         }
     }
 }
@@ -572,6 +731,7 @@ impl NetServer {
             sent_deltas_by_layer: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             delta_compressor: Arc::new(DeltaCompressor::new()),
             client_layers: Arc::new(RwLock::new(HashMap::new())),
+            pending_confirms: Arc::new(Mutex::new(HashMap::new())),
             interest_manager: Arc::new(InterestManager::new(config.interest_config)),
             bandwidth_tracker: Arc::new(BandwidthTracker::with_window(config.bandwidth_window)),
             // Bug №31: tick_rate 0 panics on 1000/0 and >1000 busy-loops the
@@ -592,7 +752,15 @@ impl NetServer {
             dropped_events: Arc::new(AtomicU64::new(0)),
             dropped_outbox: Arc::new(AtomicU64::new(0)),
             world_description: Arc::new(RwLock::new(None)),
-            wire_auth: Arc::new(WireAuth::new()),
+            // Bug №216: the token is part of construction, not an afterthought
+            // — the receiver that exists the moment this struct does already
+            // holds the key, so the unsigned window between "bind" and "apply
+            // config" is closed by ordering alone.
+            wire_auth: Arc::new({
+                let auth = WireAuth::new();
+                auth.set_token(config.auth_token.clone());
+                auth
+            }),
             pending_challenges: Arc::new(RwLock::new(HashMap::new())),
             session_rejects: Arc::new(AtomicU64::new(0)),
         };
@@ -807,7 +975,8 @@ impl NetServer {
         let current_tick = self.current_tick.clone();
         let server_time = self.server_time.clone();
         let match_id = self.match_id;
-        let delta_compressor = self.delta_compressor.clone();
+        // Bug №30 (B): the receive path installs confirmed bases on reports.
+        let pending_confirms = self.pending_confirms.clone();
         let client_layers = self.client_layers.clone();
         // Bug №700: the auth key goes with the loop, and every datagram
         // opens its block before any packet parsing. A datagram that does
@@ -886,7 +1055,7 @@ impl NetServer {
                             &current_tick,
                             &server_time,
                             match_id,
-                            &delta_compressor,
+                            &pending_confirms,
                             &client_layers,
                             &auth,
                             &world_description,
@@ -968,7 +1137,8 @@ impl NetServer {
         current_tick: &Arc<Mutex<Tick>>,
         server_time: &Arc<Mutex<f64>>,
         match_id: Uuid,
-        delta_compressor: &Arc<DeltaCompressor>,
+        // Bug №30 (B): the receive path installs confirmed bases on reports.
+        pending_confirms: &Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
         client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
         // Bug №700: unsealing happens in the receive loop; what reaches here
         // is an already-verified payload. The auth handle serves the OUTGOING
@@ -1328,6 +1498,20 @@ impl NetServer {
                     // pass consumes it on the next tick.
                     apply_resync_request(&conn, payload);
                 }
+                Some(PacketType::LayerSync) => {
+                    // Bug №30 (B): the client's applied-layer report — the same
+                    // numbers its own guard checked deltas against. The session
+                    // echo has passed the gate; merge the report and install
+                    // whatever pending send it confirms as the layer's new
+                    // diff base.
+                    apply_layer_sync_report(
+                        &conn,
+                        pending_confirms,
+                        client_layers,
+                        connection_id,
+                        payload,
+                    );
+                }
                 Some(PacketType::Disconnect) => {
                     // Bug №68: a client Disconnect used to fall into `_ => {}` —
                     // only `last_received` was refreshed (extending the timeout!)
@@ -1339,7 +1523,7 @@ impl NetServer {
                     if Self::remove_connection(
                         connection_by_addr,
                         connections,
-                        delta_compressor,
+                        pending_confirms,
                         client_layers,
                         connection_id,
                         addr,
@@ -1363,11 +1547,12 @@ impl NetServer {
 
     /// Bug №216: whether an inbound packet's session echo matches the
     /// connection its source address is bound to. Types a spoofed source
-    /// could act through (Heartbeat, HeartbeatAck, Input, Command) must echo
-    /// the session the server minted and delivered over the accept; every
-    /// other type is ungated. A payload of a gated type that fails to
-    /// deserialize is refused too — an unverifiable claim of identity is not
-    /// an identity.
+    /// could act through (Heartbeat, HeartbeatAck, Input, Command, and — bug
+    /// №30 (B) — LayerSync, whose numbers become the server's confirmed diff
+    /// bases) must echo the session the server minted and delivered over the
+    /// accept; every other type is ungated. A payload of a gated type that
+    /// fails to deserialize is refused too — an unverifiable claim of
+    /// identity is not an identity.
     fn session_gate(conn: &Connection, packet_type: u8, payload: &[u8]) -> bool {
         let expected = conn.session();
         match PacketType::from_u8(packet_type) {
@@ -1378,6 +1563,10 @@ impl NetServer {
             Some(PacketType::Input) => deserialize_limited::<InputPacket>(payload)
                 .is_ok_and(|p| p.session == expected),
             Some(PacketType::Command) => deserialize_limited::<CommandPacket>(payload)
+                .is_ok_and(|p| p.session == expected),
+            // Bug №30 (B): the applied report turns into the confirmed base
+            // of every layer — it gates exactly like the rest of the set.
+            Some(PacketType::LayerSync) => deserialize_limited::<LayerSyncPacket>(payload)
                 .is_ok_and(|p| p.session == expected),
             _ => true,
         }
@@ -1557,7 +1746,9 @@ impl NetServer {
         // sends. A reconnect makes a fresh connection with a fresh counter,
         // and the CLIENT's window remembers the old numbers, so a stale
         // datagram cannot pass for new at the far end.
-        let mut packet_bytes = bincode::serialize(&packet.header)?;
+        // Bug №732: the header is the hand-rolled fixed 24-byte codec
+        // (`PacketHeader::to_wire`); nothing here can fail, no `?` needed.
+        let mut packet_bytes = packet.header.to_wire();
         packet_bytes.extend_from_slice(&packet.payload);
         let seq = {
             let mut seq = conn.wire_seq.lock();
@@ -1586,6 +1777,9 @@ impl NetServer {
         let connections = self.connections.clone();
         let connection_by_addr = self.connection_by_addr.clone();
         let client_layers = self.client_layers.clone();
+        // Bug №30 (B): the pass queues pending confirms and reads the live
+        // diff anchor (the newest queued send) from here.
+        let pending_confirms = self.pending_confirms.clone();
         let snapshot_buffer = self.snapshot_buffer.clone();
         // Bug №266: counted so the publication rate is measurable, not assumed.
         let snapshot_rounds = self.snapshot_rounds.clone();
@@ -1672,7 +1866,7 @@ impl NetServer {
                     Self::sweep_timeouts(
                         &connections,
                         &connection_by_addr,
-                        &delta_compressor,
+                        &pending_confirms,
                         &client_layers,
                         &event_sender,
                         &dropped_events,
@@ -1693,6 +1887,7 @@ impl NetServer {
                         &socket,
                         &connections,
                         &client_layers,
+                        &pending_confirms,
                         &snapshot_buffer,
                         &delta_compressor,
                         &interest_manager,
@@ -1747,7 +1942,9 @@ impl NetServer {
     fn sweep_timeouts(
         connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
         connection_by_addr: &Arc<RwLock<HashMap<SocketAddr, u32>>>,
-        delta_compressor: &Arc<DeltaCompressor>,
+        // Bug №30 (B): the sweep deletes the rings of the connections it reaps,
+        // where the delta compressor's remove_client used to sit.
+        pending_confirms: &Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
         client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
         event_sender: &mpsc::Sender<ServerEvent>,
         // Bug №613: the bounded event queue drops what it cannot hold, and
@@ -1823,7 +2020,7 @@ impl NetServer {
             if Self::remove_connection(
                 connection_by_addr,
                 connections,
-                delta_compressor,
+                pending_confirms,
                 client_layers,
                 id,
                 addr,
@@ -1855,7 +2052,7 @@ impl NetServer {
             if Self::remove_connection(
                 connection_by_addr,
                 connections,
-                delta_compressor,
+                pending_confirms,
                 client_layers,
                 id,
                 addr,
@@ -1891,14 +2088,17 @@ impl NetServer {
     fn remove_connection(
         connection_by_addr: &Arc<RwLock<HashMap<SocketAddr, u32>>>,
         connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
-        delta_compressor: &Arc<DeltaCompressor>,
+        // Bug №30 (B): the pending rings die with their client — a reconnect
+        // must not inherit sends queued for a predecessor. Takes the spot the
+        // stateless delta compressor's remove_client used to hold.
+        pending_confirms: &Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
         client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
         connection_id: u32,
         addr: SocketAddr,
     ) -> bool {
         let removed = connections.write().remove(&connection_id);
         connection_by_addr.write().remove(&addr);
-        delta_compressor.remove_client(connection_id);
+        pending_confirms.lock().remove(&connection_id);
         client_layers.write().remove(&connection_id);
         removed.is_some()
     }
@@ -1940,6 +2140,9 @@ impl NetServer {
         socket: &Arc<UdpSocket>,
         connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
         client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+        // Bug №30 (B): the rings the pass queues into and reads the live diff
+        // anchor (the newest queued send) from, plus the self-shield clocks.
+        pending_confirms: &Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
         snapshot_buffer: &Arc<SnapshotBuffer>,
         delta_compressor: &Arc<DeltaCompressor>,
         interest_manager: &Arc<InterestManager>,
@@ -2052,15 +2255,59 @@ impl NetServer {
 
                 for layer in 0..LAYER_COUNT {
                     let layer_u8 = layer as u8;
-                    let (base_entities, base_projectiles, last_sent_tick) = {
+                    // Bug №30 (B): the CONFIRMED base — what the client has
+                    // reported applied — lives in `client_layers` and moves
+                    // only on a report install (or the first full). It is what
+                    // the pass knows the client once held. The live diff
+                    // anchor, though, is the newest QUEUED send: the client's
+                    // applied clock advances with every send it applies, so
+                    // until the next report re-anchors, the next delta must
+                    // diff from the last send — exactly the ring's newest
+                    // entry, content and tick. `base_empty` (the cadence's
+                    // "does the client hold anything to heal") stays pinned
+                    // to the confirmed copy.
+                    let (base_entities, base_projectiles, base_tick, base_empty) = {
                         let layers = client_layers.read();
                         match layers.get(client_id) {
                             Some(entry) => (
                                 entry[layer].entities.clone(),
                                 entry[layer].projectiles.clone(),
-                                entry[layer].last_sent_tick,
+                                entry[layer].base_tick,
+                                entry[layer].is_empty(),
                             ),
                             None => continue,
+                        }
+                    };
+                    // Second map read on its own — `client_layers` and
+                    // `pending_confirms` are never held in one hand (№79).
+                    // While the ring is unconfirmed, its newest entry REPLACES
+                    // the confirmed copy as the diff source (same chain the
+                    // old per-queue write built, now kept visibly apart from
+                    // the confirmed base). `shield` is (oldest unconfirmed
+                    // age, ticks since the shield last fired) — None when the
+                    // ring is dry: nothing awaits confirmation, nothing stalls.
+                    let (base_entities, base_projectiles, last_sent_tick, shield) = {
+                        let confirms = pending_confirms.lock();
+                        match confirms.get(client_id) {
+                            Some(track) => {
+                                let ring = &track.pending[layer];
+                                match ring.back() {
+                                    Some(sent) => (
+                                        sent.entities.clone(),
+                                        sent.projectiles.clone(),
+                                        sent.base_tick,
+                                        Some((
+                                            tick.saturating_sub(
+                                                ring.front()
+                                                    .map_or(sent.base_tick, |e| e.base_tick),
+                                            ),
+                                            tick.saturating_sub(track.last_self_resync[layer]),
+                                        )),
+                                    ),
+                                    None => (base_entities, base_projectiles, base_tick, None),
+                                }
+                            }
+                            None => (base_entities, base_projectiles, base_tick, None),
                         }
                     };
                     let since = tick.saturating_sub(last_sent_tick);
@@ -2079,7 +2326,6 @@ impl NetServer {
                             Vec::new()
                         };
                     let content_empty = cur_entities.is_empty() && cur_projectiles.is_empty();
-                    let base_empty = base_entities.is_empty() && base_projectiles.is_empty();
 
                     // Layer 1 has no fixed rate: it goes out on change, plus resync.
                     let scheduled = since >= LAYER_INTERVAL_TICKS[layer];
@@ -2097,6 +2343,27 @@ impl NetServer {
                     // waiting out 15 ticks on a known-stalled layer is the delay
                     // the packet exists to remove. Consumed here, so one request
                     // drives exactly one pass.
+                    // Bug №30 (B): the self-shield. A queued send that has
+                    // gone unconfirmed for a full span means the client's
+                    // applied clock and the send chain have parted ways —
+                    // reports lost, or the client stalled mid-chain. Arm the
+                    // same resync lane the client's own packet uses; the
+                    // cooldown stamp keeps one unreporting client at one full
+                    // layer per span instead of a storm.
+                    if let Some((oldest_pending_age, since_self_resync)) = shield {
+                        if layer_confirm_self_resync_due(
+                            layer,
+                            oldest_pending_age,
+                            since_self_resync,
+                        ) {
+                            conn.request_resync(layer_u8);
+                            // Stamp where it fired; the next chance is a full
+                            // span away.
+                            if let Some(track) = pending_confirms.lock().get_mut(client_id) {
+                                track.last_self_resync[layer] = tick;
+                            }
+                        }
+                    }
                     let requested = conn.take_resync_request(layer);
                     let resync =
                         layer_needs_resync(layer, since, content_empty, base_empty, requested);
@@ -2148,13 +2415,13 @@ impl NetServer {
                         for packet in conn.send_state_delta_bytes(bytes) {
                             out.push((conn.clone(), packet));
                         }
-                        // The cached payload was serialized for another client, so
-                        // `create_delta` never ran for this one and its base ring
-                        // would stay behind the tick just sent. That makes the next
-                        // real diff declare a base tick the client has already
-                        // applied, which it rejects as a base mismatch. Move the
-                        // ring to the same tick the cached delta targets.
-                        delta_compressor.advance_base(*client_id, layer_u8, tick);
+                        // Bug №30 (B): the cached payload was serialized for
+                        // another client, but confirmation is per client: what
+                        // THIS send owes THIS client is "content as of `tick`".
+                        // The unified queue below records it in this client's
+                        // ring exactly like the fresh branch. (The compressor's
+                        // private ring advance is gone: queued is not applied,
+                        // and only the client's report moves a base.)
                         // Bug №274: a cached payload is still a delta that went on
                         // the wire to THIS client. It was left uncounted at first,
                         // which made the send-side figure disagree with the
@@ -2188,6 +2455,8 @@ impl NetServer {
                             &base_snapshot,
                             &target_snapshot,
                         );
+                        // Bug №30 (B): nothing on the wire buys nothing in the
+                        // ring — the client's base stays exactly where it is.
                         if delta.is_empty() {
                             continue;
                         }
@@ -2224,14 +2493,25 @@ impl NetServer {
                         // layer to nothing, not a client-side loss.
                         sent_deltas_by_layer[layer_u8 as usize].fetch_add(1, Ordering::Relaxed);
                     }
+                    // Bug №30 (B): replace the old blind base write ("queued
+                    // ⇒ applied") with the pending-confirmation queue: the
+                    // send went on the wire, so if the client applies it, it
+                    // will hold exactly this content and its report will name
+                    // `tick`; that report installs the entry as the confirmed
+                    // base. The cap bounds a client that never reports (old
+                    // binary worst case): oldest entries give way, and the
+                    // self-shield covers the stall.
                     {
-                        let mut layers = client_layers.write();
-                        if let Some(entry) = layers.get_mut(client_id) {
-                            entry[layer] = LayerBase {
-                                entities: cur_entities,
-                                projectiles: cur_projectiles,
-                                last_sent_tick: tick,
-                            };
+                        let mut confirms = pending_confirms.lock();
+                        let track = confirms.entry(*client_id).or_default();
+                        let ring = &mut track.pending[layer];
+                        ring.push_back(LayerBase {
+                            entities: cur_entities,
+                            projectiles: cur_projectiles,
+                            base_tick: tick,
+                        });
+                        if ring.len() > MAX_PENDING_CONFIRMS {
+                            ring.pop_front();
                         }
                     }
                 }
@@ -2268,7 +2548,9 @@ impl NetServer {
         }
         out[crate::snapshot::LAYER_PROJECTILE as usize].projectiles = filtered.projectiles.clone();
         for base in out.iter_mut() {
-            base.last_sent_tick = tick;
+            // Bug №30 (B): the tick names the state the client holds once it
+            // applies THIS full — its first report re-confirms it.
+            base.base_tick = tick;
         }
         out
     }
@@ -2589,7 +2871,7 @@ impl NetServer {
         if Self::remove_connection(
             &self.connection_by_addr,
             &self.connections,
-            &self.delta_compressor,
+            &self.pending_confirms,
             &self.client_layers,
             connection_id,
             conn.addr,
@@ -2683,6 +2965,20 @@ impl NetServer {
             .collect()
     }
 
+    /// Bug №742: the applied-lag gauge, per connection, ordered by client id.
+    ///
+    /// `tick - reported_applied[layer]` — how far behind the server's clock
+    /// each client's last-mounted state actually is, in ticks, summed over
+    /// the wire both ways and the client's apply pipeline. This is №30's
+    /// confirmation chain turned into an instrument: before it, the only
+    /// latency numbers were the heartbeat RTT samples (one per second, no
+    /// per-layer picture). A `None` row means the client has not reported
+    /// yet — silence is not zero lag.
+    pub fn apply_lag_stats(&self) -> Vec<(u32, Option<[u64; LAYER_COUNT]>)> {
+        let now = self.current_tick.lock().value();
+        applied_lag_rows(now, &self.connections)
+    }
+
     pub fn interest_manager(&self) -> Arc<InterestManager> {
         self.interest_manager.clone()
     }
@@ -2718,7 +3014,9 @@ mod intro_timeout_tests {
     fn a_userless_connected_client_is_reaped_after_the_wait() {
         let connections = Arc::new(RwLock::new(HashMap::new()));
         let by_addr = Arc::new(RwLock::new(HashMap::new()));
-        let delta = Arc::new(DeltaCompressor::default());
+        // Bug №30 (B): the sweep reaps pending rings, not compressor state.
+        let pending: Arc<Mutex<HashMap<u32, ClientLayerTrack>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let layers = Arc::new(RwLock::new(HashMap::new()));
         let pending_challenges = Arc::new(RwLock::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(64);
@@ -2753,7 +3051,7 @@ mod intro_timeout_tests {
         NetServer::sweep_timeouts(
             &connections,
             &by_addr,
-            &delta,
+            &pending,
             &layers,
             &tx,
             &dropped,
@@ -2866,7 +3164,7 @@ mod resync_request_tests {
     #[test]
     fn an_incoming_request_arms_the_asked_layer() {
         let conn = conn();
-        let payload = bincode::serialize(&ResyncRequestPacket { layer: 2 }).unwrap();
+        let payload = rfs_core::packet::encode(&ResyncRequestPacket { layer: 2 }).unwrap();
         assert!(apply_resync_request(&conn, &payload));
         assert!(conn.take_resync_request(2), "layer 2 must be armed");
         assert!(!conn.take_resync_request(0), "no other layer may be armed");
@@ -2875,7 +3173,7 @@ mod resync_request_tests {
     #[test]
     fn a_request_for_a_layer_outside_the_range_is_refused() {
         let conn = conn();
-        let payload = bincode::serialize(&ResyncRequestPacket {
+        let payload = rfs_core::packet::encode(&ResyncRequestPacket {
             layer: LAYER_COUNT as u8,
         })
         .unwrap();
@@ -2895,6 +3193,225 @@ mod resync_request_tests {
         for layer in 0..LAYER_COUNT {
             assert!(!conn.take_resync_request(layer));
         }
+    }
+}
+
+#[cfg(test)]
+mod layer_confirm_tests {
+    //! Bug №30 (B): the applied-report path — session gate, merge semantics,
+    //! install from the pending ring, the self-shield rule and ring hygiene.
+
+    use super::*;
+
+    fn conn() -> Connection {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        Connection::new(1, addr, ConnectionConfig::default())
+    }
+
+    fn report(applied: [u32; 4], session: u128) -> Vec<u8> {
+        rfs_core::packet::encode(&LayerSyncPacket { applied, session }).unwrap()
+    }
+
+    fn ring(entry_ticks: &[u64]) -> VecDeque<LayerBase> {
+        entry_ticks
+            .iter()
+            .map(|&t| LayerBase {
+                entities: Vec::new(),
+                projectiles: Vec::new(),
+                base_tick: t,
+            })
+            .collect()
+    }
+
+    fn pending_map() -> Arc<Mutex<HashMap<u32, ClientLayerTrack>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn layers_map() -> Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    #[test]
+    fn a_report_gates_on_the_session_echo() {
+        let conn = conn();
+        let session = conn.session();
+        assert!(session != 0, "test prep: the fixture has a session");
+        // Bug №30 (B): the report becomes the server's confirmed diff base,
+        // so it gates exactly like Input — session echo or nothing.
+        let typed = PacketType::LayerSync as u8;
+        let good = report([5, 5, 5, 5], session);
+        assert!(
+            NetServer::session_gate(&conn, typed, &good),
+            "a live session echo passes the gate"
+        );
+        let forged = report([5, 5, 5, 5], session.wrapping_add(1));
+        assert!(
+            !NetServer::session_gate(&conn, typed, &forged),
+            "a wrong session echo must not reach the install"
+        );
+        assert!(
+            !NetServer::session_gate(&conn, typed, &[0xff, 0xff, 0xff]),
+            "an unroutable payload is not an identity either"
+        );
+    }
+
+    #[test]
+    fn a_valid_report_merges_max_per_layer() {
+        let conn = conn();
+        let pending = pending_map();
+        let layers = layers_map();
+        let session = conn.session();
+        assert!(apply_layer_sync_report(
+            &conn, &pending, &layers, 1, &report([7, 3, 0, 0], session)
+        ));
+        assert_eq!(conn.reported_applied(0), 7);
+        assert_eq!(conn.reported_applied(1), 3);
+        // A duplicate or a reordered stale report is ignored, never rewound.
+        assert!(apply_layer_sync_report(
+            &conn, &pending, &layers, 1, &report([2, 0, 9, 0], session)
+        ));
+        assert_eq!(conn.reported_applied(0), 7, "merge is max");
+        assert_eq!(conn.reported_applied(1), 3, "merge is max");
+        assert_eq!(conn.reported_applied(2), 9);
+    }
+
+    #[test]
+    fn a_malformed_report_merges_nothing() {
+        let conn = conn();
+        assert!(!apply_layer_sync_report(
+            &conn,
+            &pending_map(),
+            &layers_map(),
+            1,
+            &[0xff, 0xff]
+        ));
+        for layer in 0..LAYER_COUNT {
+            assert_eq!(conn.reported_applied(layer), 0);
+        }
+    }
+
+    #[test]
+    fn an_exact_report_installs_the_confirmed_base_and_drains_the_ring() {
+        let conn = conn();
+        let pending = pending_map();
+        pending.lock().entry(1).or_default().pending[2] = ring(&[8, 10, 12]);
+        let layers = layers_map();
+        let mut row: [LayerBase; LAYER_COUNT] = Default::default();
+        row[2].base_tick = 6;
+        layers.write().insert(1, row);
+
+        // applied = 10: the middle entry is proof the client holds it.
+        assert!(apply_layer_sync_report(
+            &conn,
+            &pending,
+            &layers,
+            1,
+            &report([0, 0, 10, 0], conn.session())
+        ));
+
+        let now: [LayerBase; LAYER_COUNT] = layers.read().get(&1).cloned().unwrap();
+        assert_eq!(
+            now[2].base_tick, 10,
+            "the entry the client applied becomes the confirmed base"
+        );
+        let left: Vec<u64> = pending.lock().get(&1).unwrap().pending[2]
+            .iter()
+            .map(|e| e.base_tick)
+            .collect();
+        assert_eq!(
+            left,
+            vec![12],
+            "consumed and superseded entries are drained"
+        );
+    }
+
+    #[test]
+    fn a_report_without_an_exact_match_moves_nothing() {
+        let conn = conn();
+        let pending = pending_map();
+        pending.lock().entry(1).or_default().pending[0] = ring(&[10, 12]);
+        let layers = layers_map();
+        let mut row: [LayerBase; LAYER_COUNT] = Default::default();
+        row[0].base_tick = 4;
+        layers.write().insert(1, row);
+
+        // applied = 11: between entries — nothing installs, but the entry
+        // the client has already moved past is consumed.
+        assert!(apply_layer_sync_report(
+            &conn,
+            &pending,
+            &layers,
+            1,
+            &report([11, 0, 0, 0], conn.session())
+        ));
+        let now: [LayerBase; LAYER_COUNT] = layers.read().get(&1).cloned().unwrap();
+        assert_eq!(now[0].base_tick, 4, "no guess, no install");
+        let left: Vec<u64> = pending.lock().get(&1).unwrap().pending[0]
+            .iter()
+            .map(|e| e.base_tick)
+            .collect();
+        assert_eq!(left, vec![12], "entries below the applied tick are drained");
+    }
+
+    #[test]
+    fn the_self_shield_arms_one_span_at_a_time() {
+        // Due: a stale unconfirmed send and a cold shield.
+        assert!(layer_confirm_self_resync_due(1, LAYER_CONFIRM_RESYNC_TICKS[1], u64::MAX));
+        // Cooldown hot: wait for the span.
+        assert!(!layer_confirm_self_resync_due(
+            1,
+            LAYER_CONFIRM_RESYNC_TICKS[1],
+            LAYER_CONFIRM_RESYNC_TICKS[1] - 1
+        ));
+        // Nothing pending: the chain is dry; the scheduled cadence owns it.
+        assert!(!layer_confirm_self_resync_due(1, 0, u64::MAX));
+    }
+
+    #[test]
+    fn the_ring_caps_at_the_confirms_limit() {
+        let mut track = ClientLayerTrack::default();
+        let ring = &mut track.pending[3];
+        for t in 1..=6u64 {
+            ring.push_back(LayerBase {
+                entities: Vec::new(),
+                projectiles: Vec::new(),
+                base_tick: t,
+            });
+            if ring.len() > MAX_PENDING_CONFIRMS {
+                ring.pop_front();
+            }
+        }
+        let ticks: Vec<u64> = ring.iter().map(|e| e.base_tick).collect();
+        assert_eq!(ticks, vec![3, 4, 5, 6], "the oldest give way to the newest");
+    }
+
+    #[test]
+    fn the_lag_rows_measure_only_clients_that_reported() {
+        // Bug №742: two connections — №1 has reported [6,7,8,0] at tick 40
+        // (its fresh state sits 34/33/32 ticks behind; the 0 is a real
+        // applied-tick-0 datapoint, 40 behind), №2 silent.
+        let connections: Arc<RwLock<HashMap<u32, Arc<Connection>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let first = Arc::new(conn());
+        first.report_applied([6, 7, 8, 0]);
+        connections.write().insert(1, first);
+        connections.write().insert(2, Arc::new(conn()));
+        // A client that never reported on an empty map — the second read.
+        connections.write().insert(3, Arc::new(conn()));
+
+        let rows = applied_lag_rows(40, &connections);
+        assert_eq!(rows.len(), 3, "one row per live connection");
+        assert_eq!(rows[0].0, 1, "rows are ordered by client id, not map order");
+        assert_eq!(rows[0].1, Some([34, 33, 32, 40]));
+        assert_eq!(
+            rows[1].1, None,
+            "no report means no measurement, never zero lag"
+        );
+        assert_eq!(rows[2].0, 3);
+
+        let empty: Arc<RwLock<HashMap<u32, Arc<Connection>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        assert!(applied_lag_rows(40, &empty).is_empty());
     }
 }
 

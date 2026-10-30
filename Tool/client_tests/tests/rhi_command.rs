@@ -549,3 +549,299 @@ fn ray_tracing_commands_report_why_they_are_unavailable() {
         "BuildAccelerationStructure should explain that BLAS/TLAS building is absent"
     );
 }
+
+// Bug №205: `begin_render_pass` accepted `clear_depth`/`clear_stencil` and
+// dropped both, so a depth attachment whose load op is `Clear` was left
+// uninitialized for the whole frame. The fix follows the spec's positional
+// rule — `clear_values[i] describes attachment `i`` — so the encoder must
+// place the `DepthStencil` value at the depth attachment's index taken from
+// the render pass description.
+//
+// Every test below asserts on the *finished buffer*, because the buffer is
+// what a backend replays: a value that only lived in the encoder's own `Vec`
+// would be invisible to the translator (that was bug №203 in another shape).
+
+/// A render pass with `depth_index` color attachments followed by one
+/// depth/stencil attachment, and a single subpass that uses all of them.
+fn render_pass_with_depth_at(depth_index: u32) -> RenderPass {
+    let attachments = (0..depth_index)
+        .map(|_| AttachmentDescription {
+            format: Format::RGBA8_UNORM,
+            samples: SampleCount::X1,
+            load_op: LoadOp::Clear,
+            store_op: StoreOp::Store,
+            stencil_load_op: LoadOp::DontCare,
+            stencil_store_op: StoreOp::DontCare,
+            initial_layout: TextureLayout::Undefined,
+            final_layout: TextureLayout::ColorAttachmentOptimal,
+        })
+        .chain([AttachmentDescription {
+            format: Format::D32_SFLOAT,
+            samples: SampleCount::X1,
+            load_op: LoadOp::Clear,
+            store_op: StoreOp::Store,
+            stencil_load_op: LoadOp::DontCare,
+            stencil_store_op: StoreOp::DontCare,
+            initial_layout: TextureLayout::Undefined,
+            final_layout: TextureLayout::DepthStencilAttachmentOptimal,
+        }])
+        .collect();
+    let color_attachments = (0..depth_index)
+        .map(|i| AttachmentReference {
+            attachment: i,
+            layout: TextureLayout::ColorAttachmentOptimal,
+        })
+        .collect();
+    RenderPass::new(RenderPassDesc {
+        attachments,
+        subpasses: vec![SubpassDescription {
+            flags: SubpassFlags::NONE,
+            pipeline_bind_point: PipelineBindPoint::Graphics,
+            input_attachments: vec![],
+            color_attachments,
+            resolve_attachments: vec![],
+            depth_stencil_attachment: Some(AttachmentReference {
+                attachment: depth_index,
+                layout: TextureLayout::DepthStencilAttachmentOptimal,
+            }),
+            preserve_attachments: vec![],
+        }],
+        ..Default::default()
+    })
+}
+
+fn framebuffer_640_480() -> Framebuffer {
+    Framebuffer::new(FramebufferDesc {
+        width: 640,
+        height: 480,
+        ..Default::default()
+    })
+}
+
+/// Extracts the `RenderPassBeginInfo` recorded by an encoder that recorded a
+/// single render pass and nothing else, and returns the finished buffer.
+fn finished_begin_render_pass(encoder: CommandEncoder) -> RenderPassBeginInfo {
+    let finished = encoder.finish().expect("finish");
+    assert_eq!(
+        finished.commands().len(),
+        1,
+        "the test records exactly one command"
+    );
+    match &finished.commands()[0] {
+        Command::BeginRenderPass(info) => info.clone(),
+        other => panic!("expected BeginRenderPass, got {:?}", other),
+    }
+}
+
+/// The base case: a color-only caller list plus `clear_depth`/`clear_stencil`
+/// parameters. The recorded list must have grown to cover the depth
+/// attachment's index and must carry the depth value there — on the D3D11 side
+/// colors are zipped by index, so the color entry must stay at slot 0.
+#[test]
+fn the_depth_clear_is_placed_at_the_depth_attachments_index() {
+    let pool = make_pool(0);
+    let mut enc = CommandEncoder::new(make_buffer(pool));
+    enc.begin().expect("begin");
+
+    let rp = render_pass_with_depth_at(1);
+    enc.begin_render_pass(
+        &rp,
+        &framebuffer_640_480(),
+        Rect2D::default(),
+        &[ClearValue::color(0.1, 0.2, 0.3, 1.0)],
+        0.42,
+        7,
+    );
+
+    let info = finished_begin_render_pass(enc);
+    assert_eq!(
+        info.clear_values.len(),
+        2,
+        "the list must cover both attachments"
+    );
+    assert_eq!(
+        info.clear_values[0],
+        ClearValue::color(0.1, 0.2, 0.3, 1.0),
+        "the color entry must stay in its own slot"
+    );
+    assert_eq!(
+        info.clear_values[1],
+        ClearValue::DepthStencil {
+            depth: 0.42,
+            stencil: 7
+        },
+        "the depth/stencil entry must describe the depth attachment"
+    );
+    assert_eq!(
+        info
+            .clear_values
+            .iter()
+            .filter(|v| matches!(v, ClearValue::DepthStencil { .. }))
+            .count(),
+        1,
+        "exactly one depth/stencil clear, no duplicates"
+    );
+}
+
+/// Growth case: the depth attachment sits at index 2 but the caller listed
+/// only one color. The gap must be filled with zero colors (harmless for a
+/// color attachment the pass never clears) and the depth value must land at
+/// index 2 — appended-at-the-end would put it behind the fillers, offsetting
+/// nothing for the D3D11 zip and breaking the Vulkan pairing.
+#[test]
+fn the_gap_up_to_a_late_depth_index_is_filled_with_zero_colors() {
+    let pool = make_pool(0);
+    let mut enc = CommandEncoder::new(make_buffer(pool));
+    enc.begin().expect("begin");
+
+    let rp = render_pass_with_depth_at(2);
+    enc.begin_render_pass(
+        &rp,
+        &framebuffer_640_480(),
+        Rect2D::default(),
+        &[ClearValue::color(0.1, 0.2, 0.3, 1.0)],
+        0.42,
+        7,
+    );
+
+    let info = finished_begin_render_pass(enc);
+    assert_eq!(info.clear_values.len(), 3);
+    assert_eq!(
+        info.clear_values[0],
+        ClearValue::color(0.1, 0.2, 0.3, 1.0),
+        "the caller's color entry must stay at slot 0"
+    );
+    assert_eq!(
+        info.clear_values[1],
+        ClearValue::color(0.0, 0.0, 0.0, 0.0),
+        "the filler must not displace the depth entry"
+    );
+    assert_eq!(
+        info.clear_values[2],
+        ClearValue::DepthStencil {
+            depth: 0.42,
+            stencil: 7
+        }
+    );
+}
+
+/// A caller that already put a `DepthStencil` entry into the list was being
+/// explicit; the list must pass through unchanged, and the two parameters must
+/// not overwrite the explicit value nor add a duplicate.
+#[test]
+fn an_explicit_depth_stencil_entry_is_honoured_without_duplicates() {
+    let pool = make_pool(0);
+    let mut enc = CommandEncoder::new(make_buffer(pool));
+    enc.begin().expect("begin");
+
+    let rp = render_pass_with_depth_at(1);
+    enc.begin_render_pass(
+        &rp,
+        &framebuffer_640_480(),
+        Rect2D::default(),
+        &[
+            ClearValue::color(0.1, 0.2, 0.3, 1.0),
+            ClearValue::DepthStencil {
+                depth: 0.9,
+                stencil: 3,
+            },
+        ],
+        0.42,
+        7,
+    );
+
+    let info = finished_begin_render_pass(enc);
+    assert_eq!(info.clear_values.len(), 2, "no duplicates may be appended");
+    assert_eq!(
+        info.clear_values[1],
+        ClearValue::DepthStencil {
+            depth: 0.9,
+            stencil: 3
+        },
+        "the explicit value must win over the parameters"
+    );
+}
+
+/// A color `ClearValue` at a depth attachment's index is invalid per the spec
+/// the fix follows. Replacing it in place is the required behavior; appending
+/// the depth value at the end would leave the invalid color in the slot.
+#[test]
+fn a_color_in_the_depth_slot_is_replaced_in_place() {
+    let pool = make_pool(0);
+    let mut enc = CommandEncoder::new(make_buffer(pool));
+    enc.begin().expect("begin");
+
+    let rp = render_pass_with_depth_at(1);
+    enc.begin_render_pass(
+        &rp,
+        &framebuffer_640_480(),
+        Rect2D::default(),
+        &[
+            ClearValue::color(0.1, 0.2, 0.3, 1.0),
+            ClearValue::color(1.0, 0.0, 0.0, 1.0),
+        ],
+        0.55,
+        9,
+    );
+
+    let info = finished_begin_render_pass(enc);
+    assert_eq!(info.clear_values.len(), 2, "no entry may be appended");
+    assert_eq!(
+        info.clear_values[1],
+        ClearValue::DepthStencil {
+            depth: 0.55,
+            stencil: 9
+        },
+        "the invalid color at the depth slot must be replaced"
+    );
+}
+
+/// A pass without a depth/stencil attachment has nothing to clear: the
+/// parameters must be unused and the list must pass through unmodified.
+#[test]
+fn a_pass_without_a_depth_attachment_ignores_the_depth_parameters() {
+    let pool = make_pool(0);
+    let mut enc = CommandEncoder::new(make_buffer(pool));
+    enc.begin().expect("begin");
+
+    let rp = RenderPass::new(RenderPassDesc {
+        attachments: vec![AttachmentDescription {
+            format: Format::RGBA8_UNORM,
+            samples: SampleCount::X1,
+            load_op: LoadOp::Clear,
+            store_op: StoreOp::Store,
+            stencil_load_op: LoadOp::DontCare,
+            stencil_store_op: StoreOp::DontCare,
+            initial_layout: TextureLayout::Undefined,
+            final_layout: TextureLayout::ColorAttachmentOptimal,
+        }],
+        subpasses: vec![SubpassDescription {
+            flags: SubpassFlags::NONE,
+            pipeline_bind_point: PipelineBindPoint::Graphics,
+            input_attachments: vec![],
+            color_attachments: vec![AttachmentReference {
+                attachment: 0,
+                layout: TextureLayout::ColorAttachmentOptimal,
+            }],
+            resolve_attachments: vec![],
+            depth_stencil_attachment: None,
+            preserve_attachments: vec![],
+        }],
+        ..Default::default()
+    });
+    enc.begin_render_pass(
+        &rp,
+        &framebuffer_640_480(),
+        Rect2D::default(),
+        &[ClearValue::color(0.1, 0.2, 0.3, 1.0)],
+        0.42,
+        7,
+    );
+
+    let info = finished_begin_render_pass(enc);
+    assert_eq!(
+        info.clear_values,
+        vec![ClearValue::color(0.1, 0.2, 0.3, 1.0)],
+        "a depth-less pass must not grow a depth entry"
+    );
+}

@@ -6,7 +6,13 @@ edition = "2021"
 [dependencies]
 rfs_core = { path = "../core" }
 serde = { workspace = true, features = ["derive"] }
+# Bug №732: payloads encode with postcard; bincode stays DEPENDING ONLY FOR
+# ITS ERROR TYPE — the carrier every wire `Result<_, bincode::Error>` and
+# `Serialization(#[from] bincode::Error)` declares; postcard errors box into
+# it through `rfs_core::packet::encoding_error`. No bincode codec call is
+# left in this crate.
 bincode = { workspace = true }
+postcard = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 parking_lot = { workspace = true }

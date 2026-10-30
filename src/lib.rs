@@ -15,9 +15,8 @@
 //!
 //! ## Architecture
 //! The rendering system uses a RenderGraph approach with multiple render passes:
-//! - GBuffer Pass (Deferred Rendering)
+//! - Forward Pass (Forward+: light from the clustered light buffer, cascaded shadows)
 //! - Shadow Pass (Cascaded Shadow Maps)
-//! - Lighting Pass (PBR Lighting)
 //! - Transparent Pass (Water, Smoke, Fire)
 //! - Water Pass (Reflections, Refractions)
 //! - Post-Process Pass (Bloom, HDR, FXAA, Motion Blur, DoF)
@@ -32,7 +31,7 @@ pub mod render;
 // Re-export common types from render for convenience
 pub use render::{
     Camera, CameraController, Entity, Light, LightProbe, Material, MaterialLibrary, Mesh,
-    MeshLibrary, OrthographicCamera, ParticleEffect, ParticleEmitter, ParticleSystem,
+    MeshLibrary, OrthographicCamera, ParticleEmitter, ParticleSystem,
     PerspectiveCamera, PostProcessConfig, RenderContext, RenderGraph, RenderStats, Renderer,
     RendererConfig, Scene, ShadowConfig, Transform, WaterConfig, WaterRenderer, HUD,
     MAX_LOD_LEVELS,

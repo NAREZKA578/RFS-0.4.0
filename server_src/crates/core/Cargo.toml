@@ -6,6 +6,10 @@ edition = "2021"
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
+# Bug №732: the payload wire encoder. bincode stays declared for its Error
+# type only — the error carrier every Result up and down the wire declares,
+# and postcard's richer error boxes into it per `encoding_error`.
+postcard = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 glam = { workspace = true }
 bitflags = { workspace = true }

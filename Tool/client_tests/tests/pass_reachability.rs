@@ -477,22 +477,10 @@ fn every_declared_pass_is_instantiated_somewhere() {
     // name the pass, and listing a wired one (`GeometryPass`) made the staleness
     // assertion fire. A check that only ever passed proves nothing.
     let known_unwired: &[(&str, &str)] = &[
-        // `GBufferPass` used to be here: "MRT pipeline never written". It is
-        // not any more — the pass has a real MRT pipeline, real targets taken
-        // from the graph, and a pixel test that reads all four of them back
-        // (`Tool/client_tests/tests/gbuffer_pixels.rs`). The allowlist entry
-        // failed on its own staleness check, which is what it is for.
-        //
-        // `LightingPass` left for the same reason: it has a real pipeline, a
-        // real framebuffer and a pixel test that reads the lit image back
-        // (`Tool/client_tests/tests/lighting_pixels.rs`).
-        //
-        // What is still missing for the lighting pass is SSAO and SSR, and
-        // those are separate pipelines, not the pass.
-        //
-        // What is still missing for the deferred chain is the *product*
-        // wiring: it is not assembled by anything yet, so no application runs
-        // the GBuffer. That is a different debt, and it is not this list's.
+        // `GBufferPass` and `LightingPass` were removed together with the
+        // deferred chain (№741): the same picture has been proven on the
+        // forward path (`forward_pixels.rs`, `forward_clusters.rs`), so the
+        // second path was deleted rather than maintained.
         // `ShadowPass` used to be here: "depth pipeline never written". It is
         // not any more — the pass has a real depth-only pipeline, a real
         // shadow map with the scene's depth in it, per-item uniform blocks,
@@ -551,10 +539,9 @@ fn every_declared_pass_is_instantiated_somewhere() {
             continue;
         };
         // The type name is read out of the file, not derived from its name.
-        // `gbuffer.rs` declares `GBufferPass` and `ui.rs` declares `UIPass`;
-        // camelising the filename gives `Gbuffer` and `Ui`, which match neither the
-        // type nor the `known_unwired` list, and a check that misidentifies its own
-        // subject is worse than none.
+        // `ui.rs` declares `UIPass`; camelising the filename gives `Ui`, which
+        // matches neither the type nor the `known_unwired` list, and a check
+        // that misidentifies its own subject is worse than none.
         let Some(type_name) = declared_pass_type(&text) else {
             continue;
         };

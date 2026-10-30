@@ -231,12 +231,23 @@ impl GeometryPass {
     /// mesh whose GPU buffers were never created. The reasons are collected
     /// rather than printed per entity: a scene with a thousand entities would
     /// flood the log, and a list nobody reads is the same as no list.
+    ///
+    /// The scene's own frustum cull (`Scene::cull`, №723) gates what is even
+    /// considered: an entity the active camera cannot see lands neither in
+    /// items nor in skipped — it is not a failure, it is simply not in the
+    /// picture. A scene with no active camera is not culled at all, so scenes
+    /// that draw through handed-in uniforms behave exactly as before.
     pub fn items_for_scene(scene: &Scene) -> SceneItems {
         let mut items = Vec::new();
         let mut skipped = Vec::new();
 
+        let not_culled: std::collections::HashSet<usize> = scene.cull().into_iter().collect();
+
         for entity in scene.entities() {
             if !entity.is_active() || !entity.is_visible() {
+                continue;
+            }
+            if !not_culled.contains(&entity.id()) {
                 continue;
             }
             // An entity with no mesh is not a drawable entity — a light or a

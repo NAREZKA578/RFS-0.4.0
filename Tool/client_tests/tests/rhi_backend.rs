@@ -4,6 +4,7 @@
 // create_backend dispatch.
 
 use rhi::backend::{create_backend, Backend};
+use rhi::backend::common::ReleaseKind;
 use rhi::backend::d3d11::D3D11Backend;
 use rhi::backend::d3d12::D3D12Backend;
 use rhi::backend::opengl::OpenGLBackend;
@@ -89,7 +90,7 @@ fn d3d12_device_buffer_round_trip() {
     // A device-only buffer in the DEFAULT heap: the upload goes through the
     // UPLOAD-heap staging buffer, a COPY_DEST barrier and CopyBufferRegion;
     // the download goes back through a READBACK staging buffer. The bytes
-    // must survive the trip unchanged (BUGS №706).
+    // must survive the trip unchanged (BUGS №729).
     let device = d3d12_test_device();
     let desc = BufferDesc {
         size: 1024,
@@ -140,7 +141,7 @@ fn d3d12_device_mapped_buffer_view() {
 fn d3d12_device_texture_round_trip() {
     // A 2D texture in the DEFAULT heap: upload with the 256-byte-pitch
     // staging footprint, download the same mip back; the bytes must
-    // survive the trip unchanged (BUGS №706).
+    // survive the trip unchanged (BUGS №729).
     let device = d3d12_test_device();
     let desc = TextureDesc {
         width: 64,
@@ -162,6 +163,129 @@ fn d3d12_device_texture_round_trip() {
     let back = device.download_texture(&texture, 0, 0).unwrap();
     assert_eq!(back.len(), data.len());
     assert_eq!(back, data);
+}
+
+// Bug №731: the D3D12 backend inherits the no-op defaults of `release`,
+// `release_many` and `release_texture`, so an explicitly released texture
+// sat in the handle table until device teardown — the D3D12 edition of the
+// leak bug №289 fixed for Vulkan. The public contract: a release must
+// remove the tracked entry, a repeated release must stay a no-op, and
+// handles the backend never tracked must be ignored rather than panic.
+#[test]
+fn d3d12_released_texture_leaves_the_teardown_list() {
+    let device = d3d12_test_device();
+    let before = device.tracked_object_count();
+
+    let desc = TextureDesc {
+        width: 8,
+        height: 8,
+        depth: 1,
+        mip_levels: 1,
+        array_layers: 1,
+        format: Format::RGBA8_UNORM,
+        usage: TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST,
+        sample_count: SampleCount::X1,
+        dimensions: TextureDimensions::D2,
+        sharing_mode: SharingMode::Exclusive,
+        queue_family_indices: Vec::new(),
+    };
+    let texture = device.create_texture_from_desc(&desc).unwrap();
+    assert!(texture.has_gpu_backing());
+
+    assert_eq!(
+        device.tracked_object_count(),
+        before + 1,
+        "the created texture must be tracked"
+    );
+
+    device.release_texture(&texture);
+    assert_eq!(
+        device.tracked_object_count(),
+        before,
+        "the released texture must leave the handle table"
+    );
+
+    // A double release, a handle the backend never tracked (zero is the
+    // invalid sentinel) and a kind the backend does not own are all plain
+    // no-ops — most of all they must not panic.
+    device.release_texture(&texture);
+    assert_eq!(
+        device.tracked_object_count(),
+        before,
+        "a repeated release must stay harmless"
+    );
+    let backend = device.backend_resource().unwrap();
+    backend.release(ReleaseKind::Buffer, 0);
+    backend.release(ReleaseKind::Sampler, 7);
+    assert_eq!(device.tracked_object_count(), before);
+}
+
+// Bug №737: the upload path wrote only subresource 0 — mip 0 of layer 0 —
+// with hand-computed geometry, so every texture beyond a single mip kept
+// the whole mip chain as uninitialized committed memory; download of
+// mip 1+ returned whatever the allocation happened to hold. The contract
+// mirrors the Vulkan backend: the upload fills the mip chain of layer 0
+// from tightly packed, 4-byte-aligned rows, each mip at its own offset,
+// and wider layer counts stay an honest rejection.
+#[test]
+fn d3d12_device_texture_mip_chain_round_trip() {
+    let device = d3d12_test_device();
+    let desc = TextureDesc {
+        width: 64,
+        height: 64,
+        depth: 1,
+        mip_levels: 3,
+        array_layers: 1,
+        format: Format::RGBA8_UNORM,
+        usage: TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST,
+        sample_count: SampleCount::X1,
+        dimensions: TextureDimensions::D2,
+        sharing_mode: SharingMode::Exclusive,
+        queue_family_indices: Vec::new(),
+    };
+    let texture = device.create_texture_from_desc(&desc).unwrap();
+    assert!(texture.has_gpu_backing());
+
+    // Every mip carries its own pattern, so a stale subresource cannot pass
+    // for the expected content by accident.
+    let region = |mip: u32, base: u8, seed: u64| -> Vec<u8> {
+        let side = 64u32 >> mip;
+        (0..side * side * 4)
+            .map(|i| ((i as u64 * seed + base as u64 * 9617) % 251) as u8)
+            .collect()
+    };
+    let mip0 = region(0, 1, 31);
+    let mip1 = region(1, 2, 127);
+    let mip2 = region(2, 3, 89);
+    assert_eq!(mip0.len(), 64 * 64 * 4);
+    assert_eq!(mip1.len(), 32 * 32 * 4);
+    assert_eq!(mip2.len(), 16 * 16 * 4);
+    let mut data = mip0.clone();
+    data.extend_from_slice(&mip1);
+    data.extend_from_slice(&mip2);
+
+    device.upload_texture(&texture, &data).unwrap();
+    assert_eq!(device.download_texture(&texture, 0, 0).unwrap(), mip0);
+    assert_eq!(
+        device.download_texture(&texture, 1, 0).unwrap(),
+        mip1,
+        "mip 1 must carry its own uploaded bytes, not uninitialized memory"
+    );
+    assert_eq!(device.download_texture(&texture, 2, 0).unwrap(), mip2);
+
+    // The layer contract is the same honest rejection the Vulkan backend
+    // makes today: uploads cover one layer, wider arrays are refused rather
+    // than silently writing layer 0 only.
+    let layered_desc = TextureDesc {
+        array_layers: 2,
+        ..desc.clone()
+    };
+    let layered = device.create_texture_from_desc(&layered_desc).unwrap();
+    let result = device.upload_texture(&layered, &mip0);
+    assert!(
+        matches!(result, Err(RhiError::NotSupported(_))),
+        "a two-layer upload must be a stated refusal, saw {result:?}"
+    );
 }
 
 #[test]

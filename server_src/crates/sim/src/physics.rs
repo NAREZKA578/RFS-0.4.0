@@ -1,6 +1,25 @@
 use rfs_core::math::{Bounds, Quatf, Transform, Vec3f};
 use serde::{Deserialize, Serialize};
 
+/// Bug №725: the waterline area the hydrostatics integrate buoyancy over.
+///
+/// This used to be a literal `1000.0` inside `calculate_hydrostatics`, while
+/// the mass, the waterline height and the rest all lived in
+/// `ShipPhysicsConfig` — so a second ship class (the destroyer exists and is
+/// registered) configured everything but got the frigate's waterline. The
+/// number is config now; `1000.0` stays as the default so every class file
+/// already on disk keeps loading unchanged.
+///
+/// `DEFAULT_HULL_AREA` (not a `#[serde(default)]` on the field alone) because
+/// the derive's default for `f32` is `0.0`, which is the one value a hull area
+/// cannot be — that would read as "no buoyancy at all".
+const DEFAULT_HULL_AREA: f32 = 1000.0;
+
+/// The `#[serde(default = ...)]` engine the field below names.
+fn default_hull_area() -> f32 {
+    DEFAULT_HULL_AREA
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShipPhysicsConfig {
     pub mass: f32,
@@ -16,6 +35,10 @@ pub struct ShipPhysicsConfig {
     pub max_propeller_rpm: f32,
     pub wave_response_amplitude: f32,
     pub wave_response_frequency: f32,
+    /// Bug №725: the ship's waterline area, in m². A class declares its own;
+    /// an older class file without the field loads the historical `1000.0`.
+    #[serde(default = "default_hull_area")]
+    pub hull_area: f32,
 }
 
 impl Default for ShipPhysicsConfig {
@@ -34,6 +57,7 @@ impl Default for ShipPhysicsConfig {
             max_propeller_rpm: 200.0,
             wave_response_amplitude: 0.5,
             wave_response_frequency: 0.5,
+            hull_area: DEFAULT_HULL_AREA,
         }
     }
 }
@@ -95,7 +119,12 @@ impl ShipPhysics {
 
     fn calculate_hydrostatics(&mut self) {
         let submerged_depth = (self.config.waterline_height - self.state.position.y).max(0.0);
-        let hull_area = 1000.0;
+        // Bug №725: the area is the class's declared one, no longer a shared
+        // literal. `max(0.0)` also reads a negative or NaN declaration as "no
+        // waterline area" — a broken config must collapse to an unmoving hull,
+        // not to a sign-flipped or exploding buoyancy term (the NaN rules of
+        // №197/№198 apply here the same way).
+        let hull_area = self.config.hull_area.max(0.0);
         self.state.submerged_volume = submerged_depth * hull_area;
 
         let buoyancy_force = self.state.submerged_volume * 1025.0 * 9.81;
@@ -596,5 +625,71 @@ mod tests {
         let (roll, pitch) = roll_and_pitch(q);
         assert!((pitch - 0.4).abs() < 1e-3, "pitch recovered as {pitch}");
         assert!(roll.abs() < 1e-3, "a pure pitch reported roll {roll}");
+    }
+
+    /// Bug №725: a class file predating the field must load through the
+    /// explicit default — the historical hardcoded `1000.0` — and not through
+    /// f32's derived `0.0`, which is "no buoyancy at all".
+    #[test]
+    fn a_class_file_without_hull_area_loads_the_hardcoded_default() {
+        let mut value = serde_json::to_value(ShipPhysicsConfig::default())
+            .expect("the default config serializes");
+        let obj = value.as_object_mut().expect("the config serializes as an object");
+        let removed = obj.remove("hull_area");
+        assert_eq!(
+            removed,
+            Some(serde_json::json!(1000.0)),
+            "the default itself must stay the historical value"
+        );
+        // Vec3f does not have a Default-derived wire form at issue here; the
+        // full object minus the one key is exactly an old class file's entry.
+        let config: ShipPhysicsConfig =
+            serde_json::from_value(value).expect("a class file without the field loads");
+        assert_eq!(config.hull_area, 1000.0);
+    }
+
+    /// Bug №725: a declared area is taken, so a second class can differ from
+    /// the first without touching physics.rs.
+    #[test]
+    fn a_declared_hull_area_is_taken_over_the_default() {
+        let mut value = serde_json::to_value(ShipPhysicsConfig::default())
+            .expect("the default config serializes");
+        value
+            .as_object_mut()
+            .expect("an object")
+            .insert("hull_area".to_string(), serde_json::json!(2300.0));
+        let config: ShipPhysicsConfig =
+            serde_json::from_value(value).expect("the override loads");
+        assert_eq!(config.hull_area, 2300.0);
+    }
+
+    /// Bug №725: the hydrostatics integrate over the class's declared area,
+    /// not over the old hardcoded `1000.0` — this test is the one that would
+    /// go red if the literal moved back into `calculate_hydrostatics`.
+    #[test]
+    fn hydrostatics_uses_the_declared_hull_area() {
+        let config =
+            ShipPhysicsConfig { hull_area: 2000.0, ..ShipPhysicsConfig::default() };
+        let mut physics = ShipPhysics::new(config);
+        // The default state floats at y=0, the default waterline is 5 m:
+        // 5 m of draft over a 2000 m² waterline area.
+        physics.update(1.0 / 30.0, 0.0, 0.0);
+        assert_eq!(
+            physics.get_submerged_volume(),
+            10000.0,
+            "5 m draft over a 2000 m² waterline"
+        );
+
+        for broken in [0.0, -300.0, f32::NAN] {
+            let config =
+                ShipPhysicsConfig { hull_area: broken, ..ShipPhysicsConfig::default() };
+            let mut physics = ShipPhysics::new(config);
+            physics.update(1.0 / 30.0, 0.0, 0.0);
+            assert_eq!(
+                physics.get_submerged_volume(),
+                0.0,
+                "a {broken} declaration must read as no waterline area"
+            );
+        }
     }
 }

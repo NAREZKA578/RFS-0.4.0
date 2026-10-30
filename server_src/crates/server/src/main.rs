@@ -69,16 +69,6 @@ async fn main() -> Result<()> {
     // produced the same one-ship match as no flag at all. Both are reported now.
     let ship_count = resolve_ship_count(&args)?;
 
-    let config = ServerConfig::default();
-    let net = Arc::new(NetServer::new(config).await?);
-    let mut events = net.get_event_receiver().expect("server event receiver");
-    let interest = net.interest_manager();
-
-    // The world is loaded before anything is placed in it, so every ship spawn
-    // can be checked against it and nothing runs in an empty universe by
-    // accident.
-    let world = load_world(&args, ship_count)?;
-
     // Owner decision (2026-10-19): the config file is created with defaults
     // on the first run and read on every start; `--config` moves it off the
     // working directory's default name. A broken file is a hard stop, not a
@@ -96,22 +86,38 @@ async fn main() -> Result<()> {
         (match_config.vote_kick.majority * 100.0) as u32,
         match_config.vote_kick.window_ticks
     );
-    // Bug №700: the token lands in the network layer before anyone connects.
-    // A blank config is legal — the unsigned dialect — but the operator must
-    // SEE that it is legal, not discover it during an attack.
-    match match_config.auth_token.as_deref().map(str::trim) {
-        Some(token) if !token.is_empty() => {
-            net.set_auth_token(Some(token.to_string()));
-            info!("auth: every datagram is now keyed with the configured secret");
-        }
-        _ => {
-            warn!(
-                "auth: the server runs WITHOUT a shared secret — datagrams are \
-                 accepted on framing alone. Set `auth_token` in the config file \
-                 to require the HMAC key."
-            );
-        }
+    // Bug №700, the reading half, moved up with the config: whether the
+    // receiver is born keyed is decided here. Bug №216: nothing is applied
+    // after the fact — the secret travels in `ServerConfig`, so the very
+    // first datagram the live receiver processes is already judged by it.
+    // `validate()` has already refused a blank secret without the config's
+    // explicit `allow_unsigned = true`; what remains is the log line saying
+    // which dialect was actually born.
+    let wire_token = match_config
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from);
+    if wire_token.is_none() {
+        warn!(
+            "auth: the server runs WITHOUT a shared secret — datagrams are \
+             accepted on framing alone (the config file set `allow_unsigned`). \
+             Set `auth_token` to require the HMAC key."
+        );
     }
+    let net = Arc::new(NetServer::new(ServerConfig {
+        auth_token: wire_token,
+        ..ServerConfig::default()
+    }).await?);
+    let mut events = net.get_event_receiver().expect("server event receiver");
+    let interest = net.interest_manager();
+
+    // The world is loaded before anything is placed in it, so every ship spawn
+    // can be checked against it and nothing runs in an empty universe by
+    // accident. It is loaded after the config: there is no point paying for
+    // map validation if the config the operator chose cannot start at all.
+    let world = load_world(&args, ship_count)?;
 
     struct ShipEntry {
         id: EntityId,

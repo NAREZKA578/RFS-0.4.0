@@ -237,3 +237,101 @@ fn entity_builder_transform_and_renderable() {
     let renderable = entity.renderable().unwrap();
     assert_eq!(renderable.lod_level, 2);
 }
+
+// №723: `Scene::cull` had no caller — the passes built draw items from every
+// entity and the frustum math ran for nobody. These tests pin the contract
+// now that the scene's cull gates `GeometryPass::items_for_scene` and
+// `TransparentPass::items_for_scene`.
+//
+// All device-free on purpose: a mesh's bounding box is computed from its
+// vertices on the CPU at construction, and an entity without GPU buffers
+// lands in `items_for_scene`'s `skipped` list — which is exactly the marker
+// the tests read. A culled entity never reaches the buffer check, so it
+// appears in neither list, and the lists themselves become the instrument.
+
+fn mesh_entity(name: &str, position: Vec3) -> Entity {
+    use rfs_client::render::meshes::Mesh;
+    use rfs_client::render::scene::components::MeshComponent;
+
+    let mut entity = Entity::new(name);
+    entity.add_component(Transform::with_position(position));
+    entity.add_component(MeshComponent::new(Arc::new(Mesh::cube(name, 1.0))));
+    entity
+}
+
+fn cull_scene(camera: bool) -> Scene {
+    let mut scene = Scene::new("cull");
+    scene.add_entity(mesh_entity("near", Vec3::new(0.0, 0.0, 5.0)));
+    scene.add_entity(mesh_entity("far", Vec3::new(0.0, 0.0, -5.0)));
+    if camera {
+        use rfs_client::render::camera::PerspectiveCamera;
+        use rfs_client::render::scene::components::CameraComponent;
+
+        let mut camera_entity = Entity::new("camera");
+        camera_entity.add_component(CameraComponent::new(Arc::new(
+            PerspectiveCamera::look_at(
+                Vec3::ZERO,
+                Vec3::new(0.0, 0.0, 10.0),
+                Vec3::Y,
+                90.0_f32.to_radians(),
+                1.0,
+                0.1,
+                100.0,
+            ),
+        )));
+        scene.add_entity(camera_entity);
+        scene.set_active_camera(3);
+    }
+    scene
+}
+
+#[test]
+fn cull_without_a_camera_culls_nothing() {
+    // No active camera: the view-projection fallback is the identity matrix,
+    // whose frustum is the unit NDC box — culling against it would keep only
+    // entities within one unit of the origin and silently empty the scene.
+    // The contract is the opposite: nothing is culled.
+    let scene = cull_scene(false);
+    let mut culled = scene.cull();
+    culled.sort_unstable();
+    assert_eq!(culled, vec![1, 2], "both mesh entities must survive");
+}
+
+#[test]
+fn cull_with_a_camera_drops_what_is_outside_the_frustum() {
+    // Camera at the origin looking down +Z: the entity at +5 is in front and
+    // inside, the entity at -5 is behind the camera — only the frustum can
+    // tell them apart, and it must. The camera entity itself has no mesh and
+    // no bounding box, so the cull keeps it too (nothing to test) — it is not
+    // drawable either way, and items_for_scene filters it out.
+    let scene = cull_scene(true);
+    let culled = scene.cull();
+    assert!(culled.contains(&1), "the entity in front of the camera survives");
+    assert!(
+        !culled.contains(&2),
+        "the entity behind the camera is culled"
+    );
+}
+
+#[test]
+fn items_for_scene_only_sees_what_the_cull_kept() {
+    use rfs_client::render::passes::geometry::GeometryPass;
+
+    // With the camera: the near entity survives the cull and reaches the
+    // buffer check (its mesh has no GPU buffers, so it shows up in `skipped`
+    // with that reason); the far entity is culled, and a culled entity is not
+    // a failure — it lands in neither list.
+    let scene = cull_scene(true);
+    let built = GeometryPass::items_for_scene(&scene);
+    assert!(built.items.is_empty(), "no mesh has GPU buffers here");
+    assert_eq!(built.skipped.len(), 1, "only the near entity is reported");
+    assert_eq!(built.skipped[0].0, "near");
+    assert_eq!(built.skipped[0].1, "the mesh has no GPU buffers");
+
+    // Without the camera nothing is culled, so both entities are reported.
+    let scene = cull_scene(false);
+    let built = GeometryPass::items_for_scene(&scene);
+    assert_eq!(built.skipped.len(), 2, "no camera, no culling");
+    let names: Vec<&str> = built.skipped.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(names.contains(&"near") && names.contains(&"far"));
+}

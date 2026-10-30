@@ -807,7 +807,7 @@ by it yet — that is what the clustering is for.
       sorting that it already computes. The scene side exists:
       `Entity::is_transparent()` and `Entity::blend_mode()`.
 - [ ] `WaterPass`: the shader exists, the pipeline does not.
-- [ ] Then, and only then, delete the deferred chain. What goes with it:
+- [x] Then, and only then, delete the deferred chain. What goes with it:
       `src/render/passes/gbuffer.rs`, `pub mod gbuffer` and the re-export in
       `passes/mod.rs`, the four `gbuffer_*` resources in `graph.rs`, the
       `GBufferPass` entry in the `pass_reachability` allowlist, the mentions
@@ -817,6 +817,15 @@ by it yet — that is what the clustering is for.
       is part of the work, not a detail. The check that the removal is correct
       is a pixel test: the same scene, the same picture, one path instead of
       two.
+      (Сделано №741, 2026-10-29: цепочка удалена целиком — gbuffer/lighting/resolve
+      пассы, реэкспорты, четыре gbuffer_* и ресурс lighting из каталога графа,
+      examples/deferred.rs, шейдеры gbuffer/lighting; перечисленные в списке
+      `transparent.rs`/`water.rs` зависимости на "gbuffer" к этому времени уже
+      были переведены на общую глубину (№703) и там не находились. resolve.{wgsl,spv}
+      удалены не были: их подгружает композит частиц — пара переименована в
+      composite.*. NC: pass_reachability краснел в промежуточном состоянии,
+      назвав оба удалённых пасса. Доказательство «один путь вместо двух»:
+      forward_pixels/forward_clusters остались зелёными. BUGS №741.)
 
 ### Process, worth fixing before more code
 
@@ -853,7 +862,7 @@ by it yet — that is what the clustering is for.
       `Cargo.toml` is not merely unimplemented, it is unimplementable. The fix
       changes the public surface of the RHI: either move the presentation
       types into a neutral layer, or take presentation out of the trait.
-- [ ] §682: the graph's screen-sized resources (the GBuffer's four targets,
+- [x] §682: the graph's screen-sized resources (the GBuffer's four targets,
       the lit image, the depth) are created once in `RenderGraph::initialize`
       and never recreated, and `gbuffer`, `lighting` and `resolve` do not
       override `resize` at all. After a window resize the chain draws into
@@ -863,6 +872,9 @@ by it yet — that is what the clustering is for.
       occupy the same share of the frame, not a corner. The forward and
       transparent passes do not have this defect — they read the size from the
       target's own descriptor — so it goes away with the deferred chain.
+      (Закрыто удалением цепочки №741, 2026-10-29: носители дефекта — gbuffer_*,
+      lit-образ и пассы gbuffer/lighting/resolve — удалены; forward/transparent/water
+      дефекта не имели.)
 
 ### Examples and checks
 
@@ -885,11 +897,12 @@ by it yet — that is what the clustering is for.
 
 ### Decision still open
 
-- [ ] §316 says the deferred chain is to be deleted. The work above keeps it
+- [x] §316 says the deferred chain is to be deleted. The work above keeps it
       alive until Forward+ is proven, and the deletion is the last step. If
       the owner prefers to keep the deferred chain instead, steps 1 to 3 are
       the same work — the shadow map and the forward shader are not
       deferred-specific — but step 4 disappears.
+      (Сделано №741, 2026-10-29: Forward+ доказан пикселями, цепочка удалена.)
 
 ## Render: the D3D12 backend plan, compiled 2026-10-22 (GLM4)
 

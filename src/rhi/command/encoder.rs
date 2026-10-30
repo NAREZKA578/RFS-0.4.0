@@ -88,20 +88,63 @@ impl CommandEncoder {
     }
 
     /// Begin a render pass.
+    ///
+    /// Bug №205: the depth and stencil clear values used to be accepted and
+    /// dropped, which left every depth attachment with a `Clear` load op
+    /// uninitialized for the whole frame — a "forgotten" clear that looks
+    /// intentional.
+    ///
+    /// The fix follows the spec's positional rule instead of adding a
+    /// parallel depth field to the command: `clear_values[i] describes
+    /// attachment `i`. The render pass itself names the depth/stencil
+    /// attachment (the first subpass's `depth_stencil_attachment.attachment`),
+    /// so the encoder can place the value where the spec demands it.
+    ///
+    /// - If the pass has no depth/stencil attachment, the two parameters are
+    ///   unused (there is nothing to clear).
+    /// - If `clear_values` already carries a `DepthStencil` entry, the caller
+    ///   was explicit and the list is honoured as given.
+    /// - Otherwise the entry is placed at the attachment's index: either by
+    ///   replacing whatever (invalid for a depth attachment) value occupied
+    ///   that slot, or by growing the list up to that index.
     pub fn begin_render_pass(
         &mut self,
         render_pass: &RenderPass,
         framebuffer: &Framebuffer,
         render_area: Rect2D,
         clear_values: &[ClearValue],
-        _clear_depth: f32,
-        _clear_stencil: u32,
+        clear_depth: f32,
+        clear_stencil: u32,
     ) {
+        let mut values = clear_values.to_vec();
+        let depth_index = render_pass
+            .desc()
+            .subpasses
+            .first()
+            .and_then(|subpass| subpass.depth_stencil_attachment.as_ref())
+            .map(|reference| reference.attachment as usize);
+        if let Some(index) = depth_index {
+            let caller_explicit = values
+                .iter()
+                .any(|value| matches!(value, ClearValue::DepthStencil { .. }));
+            if !caller_explicit {
+                let value = ClearValue::DepthStencil {
+                    depth: clear_depth,
+                    stencil: clear_stencil,
+                };
+                if index >= values.len() {
+                    values.resize(index, ClearValue::color(0.0, 0.0, 0.0, 0.0));
+                    values.push(value);
+                } else {
+                    values[index] = value;
+                }
+            }
+        }
         self.record(Command::BeginRenderPass(RenderPassBeginInfo {
             render_pass: render_pass.clone(),
             framebuffer: framebuffer.clone(),
             render_area,
-            clear_values: clear_values.to_vec(),
+            clear_values: values,
         }));
     }
 

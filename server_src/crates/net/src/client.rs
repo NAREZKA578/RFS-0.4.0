@@ -27,8 +27,40 @@ use uuid::Uuid;
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Give up waiting for ConnectAccept after this long.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Wire cap for a single bincode message (DoS: Vec len prefix could OOM).
-const WIRE_LIMIT: u64 = 1024 * 1024;
+/// Bug №30 (B): the applied-layer report rides the input cadence but no more
+/// often than this. The report's freshness bounds how long a lost delta's
+/// changes keep flowing cumulatively (from the confirmed base) before the
+/// server re-anchors the layer.
+///
+/// Bug №742 (замер и уменьшение): the floor is 50 ms — it was 100 ms until
+/// this ход measured the report's traffic and recovery roles side by side.
+/// The payload is a handful of bytes, the throttle still fires only on
+/// forward progress, and halving the floor halves the worst-case window
+/// during which the server keeps re-anchoring off stale confirmations —
+/// **≤20 tiny datagrams/sec** remains noise next to the input stream it
+/// rides.
+const LAYER_REPORT_INTERVAL: Duration = Duration::from_millis(50);
+// Bug №30 (B): the wire report is four layers wide (LayerSyncPacket.applied).
+// Core cannot see this crate's LAYER_COUNT, so the width contract is pinned
+// here where the report is built; if the replication layer count ever
+// changes, this fails the build instead of the wire drifting from it.
+const _: () = assert!(LAYER_COUNT == 4, "LayerSyncPacket.applied is four layers wide");
+
+/// Bug №30 (B): the send loop's per-tick fan-out, named so each match arm
+/// reads as dataflow rather than a four-line type annotation (clippy's
+/// type-complexity check vetoes the annotation verbatim).
+type ScheduledFanout = (
+    Option<(PacketHeader, InputPacket)>,
+    Option<OutgoingPacket>,
+    Vec<OutgoingPacket>,
+    Option<(PacketHeader, LayerSyncPacket)>,
+);
+/// Wire cap for a single postcard message (bug №732 rewords it; DoS: a
+/// corrupted message framing could still OOM, so the cap keeps guarding the
+/// length of the bytes we hand to a deserializer).
+/// №239 addendum: an alias of the one statement in `connection`, same as the
+/// server side — two framings, one number.
+pub(crate) const WIRE_LIMIT: u64 = crate::connection::WIRE_LIMIT;
 
 /// Move the client's world clock forward, never backward. Bug №269.
 ///
@@ -84,26 +116,34 @@ const CLIENT_EVENT_QUEUE: usize = 4096;
 /// `CLIENT_EVENT_QUEUE` because state updates legitimately queue in bursts.
 const CLIENT_OUTBOX_QUEUE_LIMIT: usize = 8192;
 
+/// Bug №732: the size gate keeps its job but loses its shape — postcard has
+/// no Options dial, so the cap is an explicit check against the slice, then
+/// one decode. The bincode deserialize cap (№239-family) guarded a corrupted
+/// length prefix from an OOM allocation; the same guard belongs on the
+/// length of the bytes we are about to hand to a deserializer, whatever that
+/// deserializer frames.
+fn deserialize_capped<T: serde::de::DeserializeOwned>(
+    payload: &[u8],
+    cap: u64,
+) -> Result<T, bincode::Error> {
+    if payload.len() as u64 > cap {
+        return Err(bincode::Error::new(bincode::ErrorKind::Custom(
+            format!("payload of {} bytes exceeds the {cap}-byte parse cap", payload.len()),
+        )));
+    }
+    postcard::from_bytes(payload).map_err(encoding_error)
+}
+
 fn deserialize_limited<T: serde::de::DeserializeOwned>(
     payload: &[u8],
 ) -> Result<T, bincode::Error> {
-    use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_limit(WIRE_LIMIT)
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .deserialize(payload)
+    deserialize_capped(payload, WIRE_LIMIT)
 }
 
 fn deserialize_full_state<T: serde::de::DeserializeOwned>(
     payload: &[u8],
 ) -> Result<T, bincode::Error> {
-    use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_limit(FULL_STATE_LIMIT)
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .deserialize(payload)
+    deserialize_capped(payload, FULL_STATE_LIMIT)
 }
 
 /// Outcome of an event delivery attempt.
@@ -628,7 +668,7 @@ impl NetClient {
         // outbox fallback still gets it out.
         if self.connection.lock().take().is_some() {
             let packet = DisconnectPacket { reason };
-            match bincode::serialize(&packet) {
+            match rfs_core::packet::encode(&packet) {
                 Ok(payload) => {
                     let Ok(len) = u16::try_from(payload.len()) else {
                         warn!("disconnect: payload too large to frame");
@@ -643,47 +683,46 @@ impl NetClient {
                         0,
                     );
                     header.payload_size = len;
-                    match bincode::serialize(&header) {
-                        Ok(head) => {
-                            // Bug №700: the farewell carries the same auth
-                            // block as every datagram, so the server unwraps
-                            // it the same way it unwraps the rest.
-                            let total = crate::auth::AUTH_WIRE_LEN + HEADER_SIZE + payload.len();
-                            if total > MAX_PACKET_SIZE {
-                                warn!("disconnect: {total} exceeds the MTU, not sending");
-                            } else {
-                                let mut packet_bytes = head.to_vec();
-                                packet_bytes.extend_from_slice(&payload);
-                                let seq = {
-                                    let mut seq = self.wire_seq.lock();
-                                    *seq = seq.wrapping_add(1);
-                                    if *seq == 0 {
-                                        *seq = 1;
-                                    }
-                                    *seq
-                                };
-                                let mut buffer = Vec::with_capacity(total);
-                                crate::auth::seal(
-                                    self.auth_key.as_deref(),
-                                    crate::auth::Direction::ClientToServer,
-                                    seq,
-                                    &packet_bytes,
-                                    &mut buffer,
-                                );
-                                match self.socket.try_send(&buffer) {
-                                    Ok(n) => {
-                                        self.bandwidth_tracker.record_sent(n);
-                                    }
-                                    Err(e) => {
-                                        // Buffer full or socket closing: fall
-                                        // back to the ordered outbox.
-                                        warn!("disconnect: try_send failed ({e}), queueing");
-                                        self.enqueue(header, payload);
-                                    }
-                                }
+                    // Bug №732: the header stays a hand-rolled 24 bytes
+                    // (`PacketHeader::to_wire`); only the payload switched
+                    // to postcard.
+                    let head = header.to_wire();
+                    // Bug №700: the farewell carries the same auth
+                    // block as every datagram, so the server unwraps
+                    // it the same way it unwraps the rest.
+                    let total = crate::auth::AUTH_WIRE_LEN + HEADER_SIZE + payload.len();
+                    if total > MAX_PACKET_SIZE {
+                        warn!("disconnect: {total} exceeds the MTU, not sending");
+                    } else {
+                        let mut packet_bytes = head; // to_wire already owns exact bytes
+                        packet_bytes.extend_from_slice(&payload);
+                        let seq = {
+                            let mut seq = self.wire_seq.lock();
+                            *seq = seq.wrapping_add(1);
+                            if *seq == 0 {
+                                *seq = 1;
+                            }
+                            *seq
+                        };
+                        let mut buffer = Vec::with_capacity(total);
+                        crate::auth::seal(
+                            self.auth_key.as_deref(),
+                            crate::auth::Direction::ClientToServer,
+                            seq,
+                            &packet_bytes,
+                            &mut buffer,
+                        );
+                        match self.socket.try_send(&buffer) {
+                            Ok(n) => {
+                                self.bandwidth_tracker.record_sent(n);
+                            }
+                            Err(e) => {
+                                // Buffer full or socket closing: fall
+                                // back to the ordered outbox.
+                                warn!("disconnect: try_send failed ({e}), queueing");
+                                self.enqueue(header, payload);
                             }
                         }
-                        Err(e) => warn!("disconnect: header serialize failed: {e}"),
                     }
                 }
                 Err(e) => warn!("disconnect: serialize failed: {e}"),
@@ -743,7 +782,7 @@ impl NetClient {
     }
 
     /// Bug №172: serialise instead of spawning. `payload` must already be the
-    /// bincode body; the writer frames it with the header.
+    /// postcard body; the writer frames it with the header.
     fn enqueue(&self, mut header: PacketHeader, payload: Vec<u8>) {
         let Ok(len) = u16::try_from(payload.len()) else {
             warn!(
@@ -862,7 +901,7 @@ impl NetClient {
     ) -> anyhow::Result<()> {
         // Bug №81: a serialization failure must surface — not silently turn
         // into an empty payload the peer drops as invalid.
-        let payload = bincode::serialize(packet)?;
+        let payload = rfs_core::packet::encode(packet)?;
         // The header length field is a u16: refuse to truncate instead of
         // lying about the size on the wire.
         let payload_len = u16::try_from(payload.len())
@@ -905,7 +944,10 @@ impl NetClient {
             }
         }
 
-        let mut packet_bytes = bincode::serialize(&header)?;
+        // Bug №732: the header is the hand-rolled fixed codec
+        // (`PacketHeader::to_wire`), not a serializer's output — same 24
+        // bytes as before, no `?` needed, nothing here can fail.
+        let mut packet_bytes = header.to_wire();
         packet_bytes.extend_from_slice(&payload);
         let seq = {
             let mut seq = wire_seq.lock();
@@ -976,7 +1018,8 @@ impl NetClient {
             }
         }
 
-        let mut packet_bytes = bincode::serialize(&out.header)?;
+        // Bug №732: hand-rolled fixed header (`to_wire`), same 24 bytes.
+        let mut packet_bytes = out.header.to_wire();
         packet_bytes.extend_from_slice(&out.payload);
         let seq = {
             let mut seq = wire_seq.lock();
@@ -2118,6 +2161,9 @@ impl NetClient {
         // Bug №700: the seal and its counter are the send loop's, too.
         let auth_key = self.auth_key.clone();
         let wire_seq = self.wire_seq.clone();
+        // Bug №30 (B): the applied report reads the same per-layer applied
+        // clock the delta guard checks against — one fact, two consumers.
+        let last_applied_layer = self.last_applied_layer.clone();
         // Bug №31: a degenerate tick_rate would panic on 1000/0 or busy-loop the
         // send task (interval 0 ms). Clamp to the sane 1..=1000 ticks/sec.
         let tick_rate = self.config.tick_rate.clamp(1, 1000);
@@ -2125,6 +2171,14 @@ impl NetClient {
         let handle = tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(1000 / tick_rate as u64));
+
+            // Bug №30 (B): the applied-report throttle. The epoch-minus trick is
+            // the resync channel's: the first change goes out immediately
+            // instead of waiting out the floor from process start.
+            let mut last_reported = [0u32; LAYER_COUNT];
+            let mut last_report_at = Instant::now()
+                .checked_sub(LAYER_REPORT_INTERVAL)
+                .unwrap_or_else(Instant::now);
 
             while *running.lock() {
                 interval.tick().await;
@@ -2135,11 +2189,7 @@ impl NetClient {
                     *ct
                 };
 
-                let (pending, heartbeat, retransmits): (
-                    Option<(PacketHeader, InputPacket)>,
-                    Option<OutgoingPacket>,
-                    Vec<OutgoingPacket>,
-                ) = {
+                let (pending, heartbeat, retransmits, layer_sync): ScheduledFanout = {
                     let conn_guard = connection.lock();
                     match conn_guard.as_ref() {
                         Some(conn) if conn.state() == ConnectionState::Connected => {
@@ -2211,9 +2261,52 @@ impl NetClient {
                             // the input send; the ledger clamps per-pass count.
                             let retransmits = conn.collect_retransmits();
 
-                            (Some((header, input)), heartbeat, retransmits)
+                            // Bug №30 (B): the applied-layer report rides the
+                            // input cadence. Each tick we check whether any
+                            // layer's applied tick moved forward past the one
+                            // we last put on the wire (a four-entry compare at
+                            // tick rate is nothing) and floor the rate at
+                            // LAYER_REPORT_INTERVAL. The numbers are the same
+                            // `last_applied_layer` the mismatch guard checks
+                            // deltas against — so a report that arrives means
+                            // the server's confirmed base is what this client
+                            // ACTUALLY holds, not the state we last queued and
+                            // hoped it got.
+                            let applied_now = *last_applied_layer.lock();
+                            let layer_sync = if Self::layer_report_due(
+                                &last_reported,
+                                &applied_now,
+                                last_report_at.elapsed(),
+                            ) {
+                                // u32 on the wire over u64 bookkeeping: every
+                                // applied tick came from a u32 server tick
+                                // (delta.server_tick), so the cast is lossless.
+                                let applied = std::array::from_fn(|i| applied_now[i] as u32);
+                                let ls_header = PacketHeader::new(
+                                    PacketType::LayerSync,
+                                    ChannelType::UnreliableSequenced,
+                                    conn.next_sequence(),
+                                    ack,
+                                    ack_bitfield,
+                                    0,
+                                );
+                                Some((
+                                    ls_header,
+                                    LayerSyncPacket {
+                                        applied,
+                                        // Bug №216 contract: the session echo
+                                        // rides the report like on every other
+                                        // gated type.
+                                        session: conn.session(),
+                                    },
+                                ))
+                            } else {
+                                None
+                            };
+
+                            (Some((header, input)), heartbeat, retransmits, layer_sync)
                         }
-                        _ => (None, None, Vec::new()),
+                        _ => (None, None, Vec::new(), None),
                     }
                 };
 
@@ -2241,6 +2334,32 @@ impl NetClient {
                         &wire_seq,
                     )
                     .await;
+                }
+                if let Some((ls_header, report)) = layer_sync {
+                    // Bug №30 (B): a dropped or limiter-refused report costs one
+                    // report interval of freshness — the next applied delta
+                    // changes the same comparison again and the report goes
+                    // out again. The stamp lands on the attempt, the way the
+                    // resync channel's cooldown lands on the arm.
+                    match Self::send_packet_static(
+                        &socket,
+                        &bandwidth_tracker,
+                        &limiter,
+                        limit_enabled,
+                        &ls_header,
+                        &report,
+                        &auth_key,
+                        &wire_seq,
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!("layer sync report not admitted: {e}");
+                        }
+                    }
+                    last_reported = report.applied;
+                    last_report_at = Instant::now();
                 }
                 // Bug №215: retransmits go through the plain raw path — the
                 // ledger entry already exists, so no registration on this
@@ -2278,6 +2397,31 @@ impl NetClient {
             // Bug №216: the session echo rides every input.
             session,
         }
+    }
+
+    /// Bug №30 (B): whether an applied report is due on the wire.
+    ///
+    /// `last_reported` is what we last put out; `applied` is the current
+    /// per-layer applied state; `since_report` is the time since that send.
+    /// A report fires only when some layer's applied tick moved FORWARD past
+    /// what we last reported AND the floor has elapsed. Extracted so the
+    /// throttle (progress check + interval floor) is testable without a
+    /// socket.
+    ///
+    /// A regression is never news: the server's merge is `max`, so a rewound
+    /// value cannot move its confirmed base no matter how often we repeat it.
+    /// What heals a rewind is the resync machinery (the base-mismatch guard
+    /// arming №267 (A)), not this report.
+    fn layer_report_due(
+        last_reported: &[u32; LAYER_COUNT],
+        applied: &[u64; LAYER_COUNT],
+        since_report: Duration,
+    ) -> bool {
+        let progressed = applied
+            .iter()
+            .zip(last_reported.iter())
+            .any(|(a, r)| *a > u64::from(*r));
+        progressed && since_report >= LAYER_REPORT_INTERVAL
     }
 
     pub fn send_input(&self, mut input: InputPacket) {
@@ -2320,7 +2464,7 @@ impl NetClient {
         );
 
         // Bug №172: queue instead of spawning a task per input.
-        match bincode::serialize(&input) {
+        match rfs_core::packet::encode(&input) {
             Ok(payload) => self.enqueue(header, payload),
             Err(e) => warn!("send_input: serialize failed: {e}"),
         }
@@ -2352,7 +2496,7 @@ impl NetClient {
             );
 
             // Bug №172: queue instead of spawning a task per command.
-            match bincode::serialize(&packet) {
+            match rfs_core::packet::encode(&packet) {
                 Ok(payload) => {
                     // Bug №215: the command rides ReliableOrdered — mirror it
                     // into the ledger BEFORE the queue serializes the send, so
@@ -3007,7 +3151,8 @@ mod event_delivery_tests {
     }
 
     /// Hand-crafted UDP datagram in the exact wire format `deserialize_packet`
-    /// expects: bincode header (with payload_size), then the bincode body.
+    /// expects (bug №732): the hand-rolled 24-byte header (with payload_size),
+    /// then the postcard body.
     fn craft<T: Serializable>(
         packet_type: PacketType,
         channel: ChannelType,
@@ -3450,6 +3595,90 @@ mod auth_pair_tests {
             "an unsigned client and server must still talk: the block is framing now, not a switch"
         );
         client.disconnect(DisconnectReason::ClientQuit);
+    }
+}
+
+#[cfg(test)]
+mod layer_report_tests {
+    use super::*;
+
+    /// Bug №30 (B): an applied change after the floor fires the report.
+    #[test]
+    fn a_new_applied_tick_reports_once_the_floor_has_elapsed() {
+        let last_reported = [3u32, 7, 5, 9];
+        let applied = [4u64, 7, 5, 9];
+        assert!(NetClient::layer_report_due(
+            &last_reported,
+            &applied,
+            LAYER_REPORT_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn an_unchanged_state_never_reports() {
+        let last_reported = [3u32, 7, 5, 9];
+        let applied = [3u64, 7, 5, 9];
+        assert!(!NetClient::layer_report_due(
+            &last_reported,
+            &applied,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn a_change_within_the_floor_waits() {
+        let last_reported = [3u32, 7, 5, 9];
+        let applied = [8u64, 7, 5, 9];
+        assert!(!NetClient::layer_report_due(
+            &last_reported,
+            &applied,
+            LAYER_REPORT_INTERVAL - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn a_regression_is_not_reported() {
+        // applied never rewinds per the apply-path guards; the throttle must
+        // not treat a stale lower value as news — the server's merge is
+        // `max` anyway, and a rewind story belongs to the session machinery.
+        let last_reported = [9u32, 7, 5, 9];
+        let applied = [3u64, 7, 5, 9];
+        assert!(!NetClient::layer_report_due(
+            &last_reported,
+            &applied,
+            LAYER_REPORT_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn the_report_floor_is_fifty_milliseconds() {
+        // Bug №742: the floor was measured down from 100 ms to 50 — a 60 ms
+        // gap now rides inside its gate as long as a layer progressed. NC
+        // for this ход: with the old 100 ms constant re-injected, the first
+        // assert goes red.
+        let last_reported = [5u32, 4, 3, 2];
+        let progressed = [6u64, 4, 3, 2];
+        assert!(NetClient::layer_report_due(
+            &last_reported,
+            &progressed,
+            Duration::from_millis(60)
+        ));
+        assert!(
+            !NetClient::layer_report_due(
+                &last_reported,
+                &[5u64, 4, 3, 2],
+                Duration::from_millis(60)
+            ),
+            "progress, not the clock, still owns firing"
+        );
+        assert!(
+            !NetClient::layer_report_due(
+                &last_reported,
+                &progressed,
+                Duration::from_millis(30)
+            ),
+            "below the floor nothing goes out, progress or not"
+        );
     }
 }
 

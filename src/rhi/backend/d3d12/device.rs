@@ -1,8 +1,8 @@
 ﻿//! Direct3D 12 Device Resource
 //!
 //! Implementation of `BackendResource` over a real `ID3D12Device`, its direct
-//! command queue, one fence, and — since M2 (BUGS №706) — one direct command
-//! allocator plus graphics command list that copies buffers and textures
+//! command queue, one fence, and — since the M1 skeleton (Баг№705) — one direct
+//! command allocator plus graphics command list that copies buffers and textures
 //! sequentially. Buffers and textures are committed resources: host-visible
 //! buffers live in the UPLOAD heap and stay persistently mapped, device-only
 //! data copies through staging (UPLOAD heap for uploads, READBACK heap for
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::backend::common::BackendResource;
+use crate::backend::common::{BackendResource, ReleaseKind};
 use crate::error::{RhiError, RhiResult};
 use crate::resource::{Buffer, BufferDesc, GpuResource, Texture, TextureDesc};
 use crate::types::{GraphicsApi, TextureDimensions, TextureUsage};
@@ -572,7 +572,13 @@ impl BackendResource for D3D12Device {
                 D3D12_RESOURCE_STATE_COPY_DEST,
             );
             unsafe {
-                list.CopyBufferRegion(&staging, 0, &dst.0, 0, data.len() as u64)
+                // `CopyBufferRegion` is note-exceptional among the D3D12 copy
+                // calls: the DESTINATION comes first (dst, dstoffset, src,
+                // srcoffset, bytes), for both the SDK and the windows 0.61
+                // bindings. Reading it as src-first copies backwards: the
+                // upload zeroes the staging instead of filling the buffer
+                // (BUGS №729).
+                list.CopyBufferRegion(&dst.0, 0, &staging, 0, data.len() as u64)
             };
             self.transition(
                 list,
@@ -613,7 +619,10 @@ impl BackendResource for D3D12Device {
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             );
             unsafe {
-                list.CopyBufferRegion(&src.0, offset, &staging, 0, size)
+                // Destination-first order, see the upload comment above
+                // (BUGS №729): the READBACK staging is written from the
+                // device-local buffer.
+                list.CopyBufferRegion(&staging, 0, &src.0, offset, size)
             };
             self.transition(
                 list,
@@ -892,6 +901,95 @@ impl BackendResource for D3D12Device {
         Ok(out)
     }
 
+    /// Destroy a tracked buffer or texture now instead of at device teardown.
+    ///
+    /// Bug №731: the defaults are no-ops, which leaked every explicitly
+    /// released object until the device was dropped — the D3D12 edition of
+    /// the leak bug №289 fixed for Vulkan. The handle table is this
+    /// backend's single bookkeeping, so a release removes the entry, which
+    /// also drops the last carried COM reference and destroys the committed
+    /// resource.
+    ///
+    /// Untracked handles and kinds this backend does not own are no-ops,
+    /// which is what makes a repeated `release` harmless rather than a
+    /// double free (the same contract the Vulkan backend follows). Handles
+    /// stay private to this crate by design — see `Device::release_many` —
+    /// so the kind-matching half of the contract is covered by the in-crate
+    /// tests below this impl.
+    fn release(&self, kind: ReleaseKind, object: u64) {
+        self.release_many(&[(kind, object)]);
+    }
+
+    /// Bug №731: see [`BackendResource::release_many`]; the batch is one
+    /// removal pass, one `wait_idle` for the whole batch, and one destroy
+    /// pass — the same shape `Device::release_many` documents for the
+    /// per-batch wait.
+    fn release_many(&self, objects: &[(ReleaseKind, u64)]) {
+        if objects.is_empty() {
+            return;
+        }
+        // Collect first, destroy second: removing and destroying while
+        // holding the lock would serialise driver calls behind the mutex,
+        // and removing inline already makes a repeated handle in one batch
+        // a no-op rather than a double remove.
+        let mut dead: Vec<D3DObject> = Vec::new();
+        let Ok(mut handles) = self.handles.lock() else {
+            return;
+        };
+        for (kind, object) in objects {
+            let matches = match kind {
+                ReleaseKind::Buffer => {
+                    matches!(handles.get(object), Some(D3DObject::Buffer(_)))
+                }
+                ReleaseKind::Image => {
+                    matches!(handles.get(object), Some(D3DObject::Texture(_)))
+                }
+                // Framebuffers and views are not tracked here yet: dropping
+                // them is the honest no-op, and the Vulkan side of this
+                // surface shows what to add once they exist.
+                _ => false,
+            };
+            if matches {
+                if let Some(entry) = handles.remove(object) {
+                    dead.push(entry);
+                }
+            }
+        }
+        drop(handles);
+        if dead.is_empty() {
+            return;
+        }
+        // Nothing the GPU may still be reading is destroyed first: the
+        // Vulkan side of this surface waits for the device before it frees
+        // (bug №289), release traffic here is resize/teardown traffic, and
+        // the copy path keeps every resource in COMMON state anyway. One
+        // wait covers the whole batch, not one per object.
+        self.wait_idle().ok();
+        for entry in dead {
+            if let D3DObject::Buffer(entry) = &entry {
+                if entry.upload_heap && !entry.mapped.is_null() {
+                    // An upload-heap buffer is persistently mapped; the
+                    // mapping must not outlive the resource it points into.
+                    // Result ignored: nothing sensible can be done if the
+                    // driver reports a range issue, and the release stands.
+                    unsafe { entry.resource.0.Unmap(0, None) };
+                }
+            }
+            // Dropping the entry drops the last COM reference, which
+            // releases the committed resource itself.
+            drop(entry);
+        }
+    }
+
+    /// See [`BackendResource::release_texture`]; overrides the no-op default
+    /// that leaked the texture until device teardown (bug №731).
+    fn release_texture(&self, texture: &crate::resource::Texture) {
+        let Some(gpu) = texture.backend() else {
+            return;
+        };
+        self.release(ReleaseKind::Image, gpu.handle);
+    }
+
     fn tracked_object_count(&self) -> usize {
         self.handles.lock().unwrap().len()
     }
@@ -907,5 +1005,213 @@ impl BackendResource for D3D12Device {
             }
         }
         format!("buffers: {}, textures: {}", buffers, textures)
+    }
+}
+
+// At the end of the file on purpose: clippy's `items_after_test_module` fires when
+// anything follows a `mod tests`, and a warning here is a warning every future
+// contributor learns to ignore.
+
+#[cfg(test)]
+mod release_surface {
+    //! Bug №731: the raw `(kind, handle)` release surface.
+    //!
+    //! `backend()` is private to this crate by design — `Device::release_many`
+    //! takes resource references instead — so the kind-matching half of the
+    //! release contract cannot be reached from the client tests without
+    //! exposing handles. It is checked here, where the handle table itself
+    //! decides what a release is.
+
+    use crate::backend::common::ReleaseKind;
+    use crate::backend::d3d12::D3D12Backend;
+    use crate::backend::Backend;
+    use crate::config::RhiConfig;
+    use crate::core::device::{Device, DeviceDesc};
+    use crate::types::{BufferUsage, Format, TextureUsage};
+
+    fn d3d12_test_device() -> Device {
+        let b = D3D12Backend::new(&RhiConfig::default()).unwrap();
+        let devices = b.enumerate_physical_devices().unwrap();
+        b.create_device(&devices[0], &DeviceDesc::default()).unwrap()
+    }
+
+    /// A release must remove the entry whose kind matches the handle it was
+    /// given, stay a no-op for a kind mismatch, an unknown handle, and a
+    /// repeat, and clear the texture through the public red-texture path.
+    #[test]
+    fn release_removes_only_the_matching_kind() {
+        let device = d3d12_test_device();
+        let backend = device.backend_resource().unwrap();
+        let before = device.tracked_object_count();
+
+        // The host-visible buffer lands in the UPLOAD heap with a persistent
+        // mapping, so its release also exercises the unmap-before-drop path.
+        let buffer = device.create_buffer(256, BufferUsage::UNIFORM, true).unwrap();
+        let texture = device
+            .create_texture(8, 8, 1, Format::RGBA8_UNORM, TextureUsage::TRANSFER_SRC, 1)
+            .unwrap();
+        assert_eq!(
+            device.tracked_object_count(),
+            before + 2,
+            "the created buffer and texture must be tracked"
+        );
+
+        // A kind that does not own the handle must not release it: the
+        // handle vocabulary and the handle table must agree, or a stray call
+        // would destroy an object of the wrong kind.
+        backend.release(
+            ReleaseKind::Image,
+            buffer.backend().expect("the buffer has a GPU backing").handle,
+        );
+        assert_eq!(
+            device.tracked_object_count(),
+            before + 2,
+            "an Image release over a buffer handle must be a no-op"
+        );
+        backend.release(
+            ReleaseKind::Buffer,
+            texture.backend().expect("the texture has a GPU backing").handle,
+        );
+        assert_eq!(
+            device.tracked_object_count(),
+            before + 2,
+            "a Buffer release over a texture handle must be a no-op"
+        );
+
+        // Matching kinds release exactly one entry each, and a repeated
+        // release must not re-insert or panic.
+        backend.release(
+            ReleaseKind::Buffer,
+            buffer.backend().expect("the buffer has a GPU backing").handle,
+        );
+        assert_eq!(
+            device.tracked_object_count(),
+            before + 1,
+            "the released buffer must leave the handle table"
+        );
+        backend.release(
+            ReleaseKind::Buffer,
+            buffer.backend().expect("the buffer has a GPU backing").handle,
+        );
+        assert_eq!(
+            device.tracked_object_count(),
+            before + 1,
+            "a repeated release must stay harmless"
+        );
+
+        device.release_texture(&texture);
+        assert_eq!(
+            device.tracked_object_count(),
+            before,
+            "the released texture must leave the handle table"
+        );
+    }
+
+    /// The summary must keep reporting the truth after releases: the counting
+    /// side reads the same handle table the release side edits.
+    #[test]
+    fn release_texture_summary_reports_the_removal() {
+        let device = d3d12_test_device();
+        let texture = device
+            .create_texture(8, 8, 1, Format::RGBA8_UNORM, TextureUsage::TRANSFER_SRC, 1)
+            .unwrap();
+        assert_eq!(tracked_textures_of(&device), 1);
+        device.release_texture(&texture);
+        assert_eq!(tracked_textures_of(&device), 0);
+    }
+
+    /// Read the tracked-texture part of the summary without parsing the
+    /// string: the release side must edit the entry the summary counts, and
+    /// the public count is the closest observable to it.
+    fn tracked_textures_of(device: &Device) -> usize {
+        let summary = device.tracked_object_summary();
+        match summary.rsplit_once("textures: ") {
+            Some((_, tail)) => tail.parse::<usize>().unwrap_or(usize::MAX),
+            None => usize::MAX,
+        }
+    }
+}
+
+// At the end of the file on purpose: clippy's `items_after_test_module` fires when
+// anything follows a `mod tests`, and a warning here is a warning every future
+// contributor learns to ignore.
+
+#[cfg(test)]
+mod texture_desc_contract {
+    //! Bug №737: `texture_desc` must build depth resources from the typeless
+    //! base `convert.rs` promises. convert.rs carries the pair
+    //! `typeless_base`/`depth_srv_format` with its own unit test; the creator
+    //! ignoring the base would leave a typed depth resource whose vigilance
+    //! — DSV/SRV views of M3 — never lands on it.
+
+    use super::super::convert;
+    use super::D3D12Device;
+    use crate::resource::TextureDesc;
+    use crate::types::{Format, SampleCount, SharingMode, TextureDimensions, TextureUsage};
+
+    #[test]
+    fn a_depth_texture_resource_desc_is_typeless() {
+        for format in [
+            Format::D16_UNORM,
+            Format::D24_UNORM,
+            Format::D24_UNORM_S8_UINT,
+            Format::D32_SFLOAT,
+            Format::D32_SFLOAT_S8_UINT,
+        ] {
+            let desc = TextureDesc {
+                width: 8,
+                height: 8,
+                depth: 1,
+                mip_levels: 1,
+                array_layers: 1,
+                format,
+                usage: TextureUsage::DEPTH_STENCIL_ATTACHMENT,
+                sample_count: SampleCount::X1,
+                dimensions: TextureDimensions::D2,
+                sharing_mode: SharingMode::Exclusive,
+                queue_family_indices: Vec::new(),
+            };
+            let resource = D3D12Device::texture_desc(&desc)
+                .expect("the depth texture description must build")
+                .Format;
+            let want = convert::typeless_base(format)
+                .expect("every depth format of the table has a typeless base");
+            assert_eq!(
+                resource, want,
+                "{format:?} must be created as typeless {want:?}, not as {resource:?}"
+            );
+        }
+
+        // Non-depth formats keep their typed format: the typeless base
+        // exists only for the depth family.
+        for format in [
+            Format::RGBA8_UNORM,
+            Format::RGBA8_SRGB,
+            Format::BGRA8_UNORM,
+            Format::R32_FLOAT,
+        ] {
+            let desc = TextureDesc {
+                width: 8,
+                height: 8,
+                depth: 1,
+                mip_levels: 1,
+                array_layers: 1,
+                format,
+                usage: TextureUsage::TRANSFER_SRC,
+                sample_count: SampleCount::X1,
+                dimensions: TextureDimensions::D2,
+                sharing_mode: SharingMode::Exclusive,
+                queue_family_indices: Vec::new(),
+            };
+            let resource = D3D12Device::texture_desc(&desc)
+                .expect("the color texture description must build")
+                .Format;
+            let want = convert::dxgi_format(format)
+                .expect("every color format of the table has a DX12 format");
+            assert_eq!(
+                resource, want,
+                "{format:?} is not a depth format: it must keep {want:?}, not {resource:?}"
+            );
+        }
     }
 }

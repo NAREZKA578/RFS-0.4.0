@@ -31,16 +31,18 @@
 //! its own boundary is broken authoring data; quietly clamping it hides the
 //! mistake until someone wonders why the asteroid is the wrong shape.
 
+use std::collections::HashMap;
 use rfs_core::entity::EntityId;
 use rfs_core::math::{Bounds, Vec3f};
 use serde::{Deserialize, Serialize};
 
 /// Largest number of obstacles a single map may declare.
 ///
-/// Not a performance limit — the tick walks every obstacle per projectile. It is
-/// a sanity bound: a JSON file claiming two million rocks is a bug or an attack,
-/// and either way it should not be turned into a `Vec` allocation on the server's
-/// startup path.
+/// Bug №731 added a broadphase grid, so the tick no longer walks every
+/// obstacle per projectile and per hull; the bound stays for what it always
+/// was: a sanity bound. A JSON file claiming two million rocks is a bug or an
+/// attack, and either way it should not be turned into a `Vec` allocation on
+/// the server's startup path.
 pub const MAX_OBSTACLES: usize = 65_536;
 
 /// What a solid thing is, for replication and for log lines.
@@ -401,18 +403,60 @@ impl WorldMap {
         Ok(map)
     }
 
+    /// Builds the broadphase for this map. Test-side convenience: the live
+    /// system builds the grid together with the world in `set_world` and keeps
+    /// it on the `TickSystem`; a freshly written map rebuilds its own.
+    #[cfg(test)]
+    pub(crate) fn broadphase(&self) -> ObstacleGrid {
+        ObstacleGrid::build(self)
+    }
+
     /// The obstacle `segment` from `prev` to `curr` sweeps through, if any.
     ///
     /// Returns the *first* hit along the segment rather than an arbitrary one:
-    /// with two rocks on the same line, whichever the loop reaches first is not
-    /// the one a shell would meet first.
+    /// the obstacle with the smallest segment parameter, and on a tie the one
+    /// that comes first in the map's list — the same rule the full scan
+    /// applied.
+    ///
+    /// Bug №731: the full scan walked every obstacle of the map for every
+    /// projectile every tick. The broadphase grid narrows the walk to the
+    /// cells the segment passes through; the answer is unchanged, because the
+    /// cells a point lies in are a superset of the boxes a segment touches
+    /// (see [`ObstacleGrid::sweep_candidates`]).
+    ///
+    /// `broadphase` may be `None` — an absent grid is exactly the pre-№731
+    /// behaviour, kept as the fallback rather than a hard dependency, so a
+    /// caller that has no grid never pays for building one on the hot path.
     pub fn swept_obstacle(
         &self,
         prev: Vec3f,
         curr: Vec3f,
+        broadphase: Option<&ObstacleGrid>,
     ) -> Option<(EntityId, &'static ObstacleKind, Vec3f, f32)> {
+        match broadphase.and_then(|grid| grid.sweep_candidates(prev, curr)) {
+            Some(indices) => self.swept_among(
+                prev,
+                curr,
+                indices.iter().map(|&i| &self.obstacles[i as usize]),
+            ),
+            None => self.swept_among(prev, curr, self.obstacles.iter()),
+        }
+    }
+
+    /// The selection rule both the grid path and the full scan share: the
+    /// smallest parameter along the segment, ties going to the earlier list
+    /// entry (strict `<` keeps the first of equals).
+    fn swept_among<'a, I>(
+        &self,
+        prev: Vec3f,
+        curr: Vec3f,
+        obstacles: I,
+    ) -> Option<(EntityId, &'static ObstacleKind, Vec3f, f32)>
+    where
+        I: Iterator<Item = &'a MapObstacle>,
+    {
         let mut best: Option<(f32, EntityId, &'static ObstacleKind, f32)> = None;
-        for obstacle in &self.obstacles {
+        for obstacle in obstacles {
             if !crate::tick::segment_intersects_bounds(prev, curr, &obstacle.bounds) {
                 continue;
             }
@@ -442,6 +486,254 @@ impl WorldMap {
         }
         best.map(|(t, id, kind, depth)| (id, kind, prev + (curr - prev) * t, depth))
     }
+}
+
+/// The obstacle index the broadphase walks, one per map obstacle.
+///
+/// A uniform grid over the map: every obstacle is registered in every cell its
+/// axis-aligned box overlaps. A query walks only the cells it touches, so the
+/// per-tick cost follows what the query is near, not what the map holds (bug
+/// №731: 65 536 rocks × every projectile × every hull at 30 Hz was a linear
+/// tax on map size that two separate consumers paid per tick).
+///
+/// Fidelity contract, pinned by tests: the grid is a *filter*, never a
+/// decider. It hands back candidate indices in list order, and its sweep walk
+/// provably covers every cell any point of the segment lies in, so the
+/// caller's selection rule still sees every box the full scan would have
+/// seen — the candidates are a superset of the true hits, never a subset.
+/// public APIs take it as an opaque parameter, never constructed outside.
+pub struct ObstacleGrid {
+    /// Edge length of one cell in world units.
+    cell: f32,
+    /// Obstacle indices per occupied cell, ascending within a cell by
+    /// construction (obstacles are inserted in list order).
+    cells: HashMap<[i32; 3], Vec<u32>>,
+}
+
+impl ObstacleGrid {
+    /// Builds the grid for a validated map.
+    ///
+    /// The cell edge is sized by the largest obstacle (`extent / 4`, so even
+    /// the biggest rock spans at most a handful of cells per axis, which
+    /// bounds both the entries an obstacle costs and the cells any query
+    /// walks), floored by `diagonal / 512` so a map of needle rocks cannot
+    /// turn the grid into a point cloud, and floored by 1 so no cell edge is
+    /// ever degenerate.
+    pub(crate) fn build(map: &WorldMap) -> Self {
+        let mut max_extent = 0.0f32;
+        for obstacle in &map.obstacles {
+            let size = obstacle.bounds.size();
+            max_extent = max_extent.max(size.x.max(size.y).max(size.z));
+        }
+        let size = map.bounds.size();
+        let diagonal = (size.x * size.x + size.y * size.y + size.z * size.z).sqrt();
+
+        let cell = (max_extent / 4.0).max(diagonal / 512.0).max(1.0);
+        let mut cells: HashMap<[i32; 3], Vec<u32>> = HashMap::new();
+        for (index, obstacle) in map.obstacles.iter().enumerate() {
+            let min = [
+                cell_axis(obstacle.bounds.min.x, cell),
+                cell_axis(obstacle.bounds.min.y, cell),
+                cell_axis(obstacle.bounds.min.z, cell),
+            ];
+            let max = [
+                cell_axis(obstacle.bounds.max.x, cell),
+                cell_axis(obstacle.bounds.max.y, cell),
+                cell_axis(obstacle.bounds.max.z, cell),
+            ];
+            for x in min[0]..=max[0] {
+                for y in min[1]..=max[1] {
+                    for z in min[2]..=max[2] {
+                        cells.entry([x, y, z]).or_default().push(index as u32);
+                    }
+                }
+            }
+        }
+        Self { cell, cells }
+    }
+
+    /// Indices of obstacles whose boxes overlap the box the segment sweeps
+    /// (the segment's own axis-aligned hull), ascending, deduplicated.
+    ///
+    /// `None` means "this query is degenerate for the grid" — non-finite
+    /// input, or a walk that outgrew the seat-belt cap — and the caller falls
+    /// back to the full scan. On a validated map with finite positions the
+    /// walk costs at most the cells the segment's spans cover.
+    ///
+    /// Coverage argument, pinned by the parity test: every point `p` of the
+    /// segment lies in exactly one cell, `floor(p / cell)`; `floor` is
+    /// monotone, so any obstacle box that contains `p` spans that cell or a
+    /// neighbour the DDA step reaches between its own `floor(min)` and
+    /// `floor(max)` — the walk never loses a box the segment touches.
+    pub(crate) fn sweep_candidates(&self, prev: Vec3f, curr: Vec3f) -> Option<Vec<u32>> {
+        if !(prev.x.is_finite()
+            && prev.y.is_finite()
+            && prev.z.is_finite()
+            && curr.x.is_finite()
+            && curr.y.is_finite()
+            && curr.z.is_finite())
+        {
+            return None;
+        }
+
+        // Amanatides & Woo: walk the cells the line passes through, stepping
+        // whichever axis reaches its next cell boundary first. Cell-space
+        // arithmetic in f64: the walk must agree with itself over the whole
+        // segment, and cell boundaries are exactly where f32 drift would pay.
+        let cell = self.cell as f64;
+        let mut cell_at = [
+            (prev.x as f64 / cell).floor(),
+            (prev.y as f64 / cell).floor(),
+            (prev.z as f64 / cell).floor(),
+        ];
+        let dir = [
+            (curr.x - prev.x) as f64 / cell,
+            (curr.y - prev.y) as f64 / cell,
+            (curr.z - prev.z) as f64 / cell,
+        ];
+        let steps = [
+            if dir[0] > 0.0 {
+                1
+            } else if dir[0] < 0.0 {
+                -1
+            } else {
+                0
+            },
+            if dir[1] > 0.0 {
+                1
+            } else if dir[1] < 0.0 {
+                -1
+            } else {
+                0
+            },
+            if dir[2] > 0.0 {
+                1
+            } else if dir[2] < 0.0 {
+                -1
+            } else {
+                0
+            },
+        ];
+        // Fraction of the segment travelled when each axis first reaches its
+        // next cell boundary in `steps[axis]` direction, and the fraction a
+        // full cell edge costs once the walk is underway.
+        let mut t_next = [f64::INFINITY; 3];
+        let mut t_delta = [f64::INFINITY; 3];
+        for axis in 0..3 {
+            if steps[axis] == 0 {
+                continue;
+            }
+            let position = (if axis == 0 {
+                prev.x
+            } else if axis == 1 {
+                prev.y
+            } else {
+                prev.z
+            }) as f64 / cell;
+            let into_cell = position - position.floor(); // 0..1
+            // Exactly on a boundary (`into_cell == 0`) the negative direction
+            // steps immediately into the cell behind, which is correct: the
+            // start cell was registered below, and what the walk visits now
+            // is the other side of that boundary.
+            t_next[axis] = (if steps[axis] > 0 {
+                1.0 - into_cell
+            } else {
+                into_cell
+            }) / dir[axis].abs();
+            t_delta[axis] = 1.0 / dir[axis].abs();
+        }
+
+        let mut indices: Vec<u32> = Vec::new();
+        // The start cell first: obstacles the segment begins inside must be
+        // candidates before the walk moves anywhere. (NCGRID-731-TEMP proved
+        // the parity test reacts: without this block the zero-length segment
+        // inside a rock returned None while the full scan found it.)
+        if let Some(bucket) = self.cells.get(&[
+            cell_at[0] as i32,
+            cell_at[1] as i32,
+            cell_at[2] as i32,
+        ]) {
+            indices.extend_from_slice(bucket);
+        }
+        // Seat belt: on a validated map the per-axis spans bound the walk, so
+        // the cap only ever matters if f64 drift manufactures a pathological
+        // step. The honest ceiling is the sum of the axis spans (~513 each).
+        for _ in 0..2048 {
+            let axis = (0..3)
+                .min_by(|a, b| t_next[*a].total_cmp(&t_next[*b]))
+                .unwrap();
+            if t_next[axis] > 1.0 {
+                break;
+            }
+            cell_at[axis] += steps[axis] as f64;
+            t_next[axis] += t_delta[axis];
+            if let Some(bucket) = self.cells.get(&[
+                cell_at[0] as i32,
+                cell_at[1] as i32,
+                cell_at[2] as i32,
+            ]) {
+                indices.extend_from_slice(bucket);
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
+
+    /// Indices of obstacles whose boxes overlap `[min, max]`, ascending,
+    /// deduplicated. Same `None` contract as [`ObstacleGrid::sweep_candidates`]:
+    /// a query box that would walk an unreasonable number of cells (a hull
+    /// the size of the map, or non-finite corners) falls back to the full
+    /// scan, which is exactly what the tick did before №731.
+    pub(crate) fn box_candidates(&self, min: Vec3f, max: Vec3f) -> Option<Vec<u32>> {
+        const MAX_CELLS_PER_QUERY: i64 = 20_000;
+        let x0 = cell_axis(min.x, self.cell);
+        let y0 = cell_axis(min.y, self.cell);
+        let z0 = cell_axis(min.z, self.cell);
+        let x1 = cell_axis(max.x, self.cell);
+        let y1 = cell_axis(max.y, self.cell);
+        let z1 = cell_axis(max.z, self.cell);
+        let span_x = x1 as i64 - x0 as i64 + 1;
+        let span_y = y1 as i64 - y0 as i64 + 1;
+        let span_z = z1 as i64 - z0 as i64 + 1;
+        let walked = span_x
+            .checked_mul(span_y)
+            .and_then(|xy| xy.checked_mul(span_z));
+        if walked.unwrap_or(MAX_CELLS_PER_QUERY + 1) > MAX_CELLS_PER_QUERY {
+            return None;
+        }
+
+        let mut indices: Vec<u32> = Vec::new();
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                for z in z0..=z1 {
+                    if let Some(bucket) = self.cells.get(&[x, y, z]) {
+                        indices.extend_from_slice(bucket);
+                    }
+                }
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
+}
+
+// The grid does not live inside WorldMap — a map stays a plain value
+// (cloned, compared, serialized), and the grid is a derived index over it.
+// It is carried by its owner instead: the TickSystem holds its world as a
+// map+broadphase pair under one lock (WorldSlot), so no reader can ever
+// combine a grid built for one map with another map's obstacle list — grid
+// indices from one list read against another are nonsense at best and an
+// out-of-bounds read at worst. `set_world` builds the grid for the map it
+// installs, in the same write that installs it.
+
+/// The cell index of a world coordinate: `floor(coord / cell)`. The `as i32`
+/// cast is exact for every number a validated map or a live entity can carry
+/// (tens of kilometres against a cell of metres); a corrupt but finite value
+/// degrades to a wrong cell of the grid, never to a panic.
+fn cell_axis(coordinate: f32, cell: f32) -> i32 {
+    (coordinate / cell).floor() as i32
 }
 
 /// `swept_obstacle` has to hand back a `&'static ObstacleKind` without borrowing
@@ -701,15 +993,37 @@ mod tests {
         }
     }
 
+    /// Both sweep paths on every question a test asks: the grid path the
+    /// production tick takes, and the `None` fallback the pre-№731 tick took.
+    /// Their disagreement would mean the grid decided an answer, which the
+    /// contract forbids — this helper pins parity on every legacy assertion.
+    fn swept(
+        map: &WorldMap,
+        prev: Vec3f,
+        curr: Vec3f,
+    ) -> Option<(EntityId, &'static ObstacleKind, Vec3f, f32)> {
+        let grid = map.broadphase();
+        let by_grid = map.swept_obstacle(prev, curr, Some(&grid));
+        assert_eq!(
+            by_grid,
+            map.swept_obstacle(prev, curr, None),
+            "grid and full scan disagreed along {prev:?} → {curr:?}"
+        );
+        by_grid
+    }
+
     /// Two rocks on the same line: whichever the loop reaches first is not the
     /// one a shell meets first, and the difference is a shell passing through
     /// the far rock to report the near one.
     #[test]
     fn the_first_rock_a_shell_meets_is_the_one_reported() {
         let map = authored();
-        let (id, _, hit, _) = map
-            .swept_obstacle(Vec3f::new(-900.0, 0.0, 0.0), Vec3f::new(900.0, 0.0, 0.0))
-            .expect("a shell straight through both rocks hit neither");
+        let (id, _, hit, _) = swept(
+            &map,
+            Vec3f::new(-900.0, 0.0, 0.0),
+            Vec3f::new(900.0, 0.0, 0.0),
+        )
+        .expect("a shell straight through both rocks hit neither");
         assert_eq!(id, EntityId::new(100_002), "the far rock was reported");
         // The reported point must be the face of the near rock, not somewhere
         // past it: a hit position past the second rock would place the impact
@@ -720,17 +1034,163 @@ mod tests {
         );
     }
 
+    /// Grid and full scan parity for a single segment. Where a finite answer
+    /// is expected this is plain equality, but a degenerate or non-finite
+    /// segment can produce NaN in its own right, and NaN == NaN is the fact
+    /// there — so the comparison is bit-exact, which also pins "identical
+    /// expression, identical result" harder than PartialEq would.
+    #[allow(clippy::type_complexity)]
+    fn same_hit(
+        a: Option<(EntityId, &'static ObstacleKind, Vec3f, f32)>,
+        b: Option<(EntityId, &'static ObstacleKind, Vec3f, f32)>,
+    ) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(x), Some(y)) => {
+                let (p, q) = (x.2, y.2);
+                x.0 == y.0
+                    && x.1 == y.1
+                    && x.3.to_bits() == y.3.to_bits()
+                    && p.x.to_bits() == q.x.to_bits()
+                    && p.y.to_bits() == q.y.to_bits()
+                    && p.z.to_bits() == q.z.to_bits()
+            }
+            _ => false,
+        }
+    }
+
+    /// The point of №731: the grid is a filter, never a decider. Four hundred
+    /// manufactured segments — across the rocks, grazing them, missing by
+    /// inches, lying outside the map, degenerate to a point, and one with
+    /// non-finite ends — must produce the same answer from the grid path the
+    /// tick takes and the `None` path the pre-№731 tick took.
+    #[test]
+    fn the_broadphase_returns_what_the_full_scan_returns() {
+        let map = authored();
+        let grid = map.broadphase();
+        let mut rng = SmallRng::new(0x731_5EED);
+        // A degenerate zero-length segment, then the manufactured ones.
+        for (prev, curr) in [
+            (Vec3f::new(320.0, 0.0, 0.0), Vec3f::new(320.0, 0.0, 0.0)),
+            (Vec3f::new(f32::NAN, 0.0, 0.0), Vec3f::new(900.0, 0.0, 0.0)),
+            (
+                Vec3f::new(-900.0, 0.0, 0.0),
+                Vec3f::new(f32::INFINITY, 0.0, 0.0),
+            ),
+        ] {
+            let by_grid = map.swept_obstacle(prev, curr, Some(&grid));
+            let by_scan = map.swept_obstacle(prev, curr, None);
+            assert!(
+                same_hit(by_grid, by_scan),
+                "grid and full scan disagreed on a special segment {prev:?} → {curr:?}: \
+                 grid={by_grid:?}, scan={by_scan:?}"
+            );
+        }
+        for case in 0..400 {
+            let prev = Vec3f::new(
+                rng.range(-1100.0, 1100.0),
+                rng.range(-1100.0, 1100.0),
+                rng.range(-1100.0, 1100.0),
+            );
+            let span = rng.range(-1600.0, 1600.0);
+            let curr = Vec3f::new(
+                prev.x + span,
+                prev.y + rng.range(-1600.0, 1600.0),
+                prev.z + rng.range(-1600.0, 1600.0),
+            );
+            let by_grid = map.swept_obstacle(prev, curr, Some(&grid));
+            let by_scan = map.swept_obstacle(prev, curr, None);
+            assert!(
+                same_hit(by_grid, by_scan),
+                "grid and full scan disagreed on segment {case} from {prev:?} to {curr:?}: \
+                 grid={by_grid:?}, scan={by_scan:?}"
+            );
+        }
+    }
+
+    /// The other half of №731: the walk must follow what is NEAR the query,
+    /// not what the map holds. Two thousand scattered rocks, a segment down
+    /// the map's middle — the candidates it collects are the rocks a line of
+    /// fire could plausibly touch, with the 1995 distant ones out of it, and
+    /// the answer it leads to is still whatever the full scan says.
+    #[test]
+    fn a_straight_segment_walks_a_handful_of_candidates_not_the_whole_map() {
+        let mut rng = SmallRng::new(0x731_BA5E);
+        // Four rocks strung along the x axis at y=z=0, in reach of a line of
+        // fire; nineteen hundred and ninety six rocks scattered far off that
+        // line, out of reach of anything it can graze.
+        let mut obstacles = Vec::new();
+        for (n, x) in [-400.0, -50.0, 300.0, 700.0].iter().enumerate() {
+            let x = *x;
+            obstacles.push(MapObstacle {
+                id: 900_001 + n as u64,
+                bounds: Bounds::new(
+                    Vec3f::new(x, -6.0, -6.0),
+                    Vec3f::new(x + 12.0, 6.0, 6.0),
+                ),
+                kind: ObstacleKind::Structure,
+            });
+        }
+        for i in 0..1996u64 {
+            let x = rng.range(-900.0, 900.0);
+            // Off the firing line: the nearest scatter is 30 units off it,
+            // and the segment tests cells around y=z=0 only.
+            let y = 30.0 * rng.range(1.2, 33.0) * if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 };
+            let z = 30.0 * rng.range(1.2, 33.0) * if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 };
+            obstacles.push(MapObstacle {
+                id: 10_000 + i,
+                bounds: Bounds::new(
+                    Vec3f::new(x, y - 6.0, z - 6.0),
+                    Vec3f::new(x + 12.0, y + 6.0, z + 6.0),
+                ),
+                kind: ObstacleKind::Structure,
+            });
+        }
+        let map = WorldMap {
+            name: "sublinear".to_string(),
+            bounds: Bounds::new(
+                Vec3f::new(-1000.0, -1000.0, -1000.0),
+                Vec3f::new(1000.0, 1000.0, 1000.0),
+            ),
+            obstacles,
+        };
+        let grid = map.broadphase();
+
+        let prev = Vec3f::new(-990.0, 0.0, 0.0);
+        let curr = Vec3f::new(990.0, 0.0, 0.0);
+        let candidates = grid
+            .sweep_candidates(prev, curr)
+            .expect("a finite segment must always be answerable");
+        assert!(
+            candidates.len() <= map.obstacles.len() / 20,
+            "a line of fire across {} rocks collected {} candidates",
+            map.obstacles.len(),
+            candidates.len()
+        );
+        assert_eq!(
+            map.swept_obstacle(prev, curr, Some(&grid)),
+            map.swept_obstacle(prev, curr, None),
+            "the broadphase's few candidates changed the answer"
+        );
+    }
+
     /// A segment that misses by a hair must miss. Without this, a shell would
     /// stop on a rock it flew past, and the ship behind it would take the hit.
     #[test]
     fn a_segment_that_clears_the_rock_does_not_hit_it() {
         let map = authored();
-        assert!(map
-            .swept_obstacle(Vec3f::new(-900.0, 60.0, 0.0), Vec3f::new(900.0, 60.0, 0.0))
-            .is_none());
-        assert!(map
-            .swept_obstacle(Vec3f::new(0.0, -900.0, 0.0), Vec3f::new(0.0, 900.0, 0.0))
-            .is_none());
+        assert!(swept(
+            &map,
+            Vec3f::new(-900.0, 60.0, 0.0),
+            Vec3f::new(900.0, 60.0, 0.0)
+        )
+        .is_none());
+        assert!(swept(
+            &map,
+            Vec3f::new(0.0, -900.0, 0.0),
+            Vec3f::new(0.0, 900.0, 0.0)
+        )
+        .is_none());
     }
 
     #[test]
@@ -758,9 +1218,12 @@ mod tests {
     #[test]
     fn penetration_is_measured_where_the_shell_arrived() {
         let map = authored();
-        let (_, _, _, depth) = map
-            .swept_obstacle(Vec3f::new(-900.0, 0.0, 0.0), Vec3f::new(900.0, 0.0, 0.0))
-            .expect("a shell through the rock hit nothing");
+        let (_, _, _, depth) = swept(
+            &map,
+            Vec3f::new(-900.0, 0.0, 0.0),
+            Vec3f::new(900.0, 0.0, 0.0),
+        )
+        .expect("a shell through the rock hit nothing");
         assert!(
             depth > 0.0 && depth <= 1.0,
             "a shell that stopped on the rock reported depth {depth}"

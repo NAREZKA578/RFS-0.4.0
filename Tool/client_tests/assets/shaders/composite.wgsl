@@ -1,8 +1,9 @@
 // Copies one texture into another, fullscreen.
 //
-// The last link of the deferred chain: the GBuffer is filled, the lighting
-// pass resolves it into a lit image, and something has to put that image on
-// the screen. Without this pass the chain produced a texture nobody read.
+// Used to be the last link of the deferred chain; that chain is gone
+// (№741). The copy itself is not: the particle composite puts the particle
+// image over the scene's image with it, and anything else that moves a
+// finished texture onto another target can do the same.
 //
 // Deliberately vertex-less: the three vertices come from
 // `@builtin(vertex_index)`, so there is no vertex buffer to own.

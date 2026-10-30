@@ -1530,7 +1530,13 @@ impl BackendResource for D3D11Device {
         let rasterizer = desc
             .rasterizer_state
             .as_ref()
-            .map(|state| self.create_rasterizer_state(state))
+            .map(|state| {
+                // The scissor follows the pipeline's viewport state: declaring
+                // scissors turns the test on, not declaring it leaves the
+                // rasterizer un-scissored (an empty D3D11 default rect would
+                // reject everything — BUGS №730).
+                self.create_rasterizer_state(state, !desc.viewport_state.scissors.is_empty())
+            })
             .transpose()?;
         let blend_state = desc
             .color_blend_state
@@ -1896,9 +1902,17 @@ impl D3D11Device {
         Ok((vs, ps, vs_code))
     }
 
+    /// The D3D11 rasterizer state for an RHI rasterizer description.
+    ///
+    /// `enable_scissor` mirrors "scissors are declared in the pipeline's
+    /// viewport state". It must follow the declared scissors exactly:
+    /// D3D11's *default* scissor rect is empty, so `ScissorEnable: true`
+    /// without a bound rect silently rejects every pixel — the draw ran,
+    /// the clear showed, nothing painted (BUGS №730).
     fn create_rasterizer_state(
         &self,
         desc: &RasterizerState,
+        enable_scissor: bool,
     ) -> RhiResult<DxCom<ID3D11RasterizerState>> {
         let fill = convert::d3d_fill_mode(desc.polygon_mode).ok_or_else(|| {
             RhiError::PipelineCreationError(
@@ -1934,7 +1948,7 @@ impl D3D11Device {
                 0.0
             },
             DepthClipEnable: (!desc.depth_clamp_enable).into(),
-            ScissorEnable: true.into(),
+            ScissorEnable: enable_scissor.into(),
             MultisampleEnable: false.into(),
             AntialiasedLineEnable: false.into(),
         };

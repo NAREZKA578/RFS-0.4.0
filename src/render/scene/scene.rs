@@ -7,7 +7,7 @@ use super::components::{
 };
 use super::entity::Entity;
 use crate::render::core::RenderContext;
-use crate::render::scene::culling::{Aabb, FrustumCuller};
+use crate::render::scene::culling::{Aabb, Frustum};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -22,8 +22,6 @@ pub struct Scene {
     next_entity_id: usize,
     /// Active camera
     active_camera: Option<usize>, // entity_id of active camera
-    /// Frustum culler
-    _frustum_culler: FrustumCuller,
     /// Scene bounding box
     bounding_box: Option<Aabb>,
     /// Scene name
@@ -38,7 +36,6 @@ impl Scene {
             entity_map: HashMap::new(),
             next_entity_id: 1,
             active_camera: None,
-            _frustum_culler: FrustumCuller::new(),
             bounding_box: None,
             name: name.to_string(),
         }
@@ -214,32 +211,56 @@ impl Scene {
         }
     }
 
-    /// Perform frustum culling
-    pub fn cull(&self, _context: &RenderContext) -> Vec<usize> {
-        let view_proj = self.camera_view_projection_matrix();
-        // Hoisted out of the hot loop: one extraction per frame, not per entity.
-        let frustum = crate::render::scene::culling::Frustum::from_matrix(view_proj);
-        let mut visible_entities = Vec::new();
+    /// Perform frustum culling: the entity IDs the active camera can see.
+    ///
+    /// This is the scene's own gate, and it had no caller until №723 — the
+    /// passes built draw items from every entity and the frustum math ran for
+    /// nobody. Its rules, each one load-bearing:
+    ///
+    /// - an inactive or invisible entity is never returned: it cannot be
+    ///   drawn either way, with or without a frustum;
+    /// - an entity with a bounding box must meet the frustum. An entity with a
+    ///   mesh always has one — the mesh's local box transformed by the model
+    ///   matrix (`Entity::bounding_box`) — so every drawable entity is tested;
+    /// - an entity without a bounding box — a light, a camera — is returned:
+    ///   there is no extent to test, and a guessed rejection would silently
+    ///   drop the scene's lights;
+    /// - **no active camera → nothing is culled.** The view-projection falls
+    ///   back to the identity matrix, whose frustum is the unit NDC box;
+    ///   culling against it would keep only entities within one unit of the
+    ///   origin and silently empty the rest of the scene. Scenes that draw
+    ///   through uniforms handed to the passes (no `CameraComponent`) keep
+    ///   their previous behavior exactly.
+    ///
+    /// The consumers are `GeometryPass::items_for_scene` and
+    /// `TransparentPass::items_for_scene`: the scene decides what is drawable,
+    /// the passes draw it. An entity the cull dropped is not an error and not
+    /// a `skipped` entry — it is simply not in the picture.
+    pub fn cull(&self) -> Vec<usize> {
+        let visible: Vec<usize> = self
+            .entities
+            .iter()
+            .filter(|e| e.is_active() && e.is_visible())
+            .map(|e| e.id())
+            .collect();
 
-        for (entity_id, &index) in &self.entity_map {
-            let entity = &self.entities[index];
-
-            if !entity.is_active() || !entity.is_visible() {
-                continue;
-            }
-
-            // Check if entity is in frustum
-            if let Some(aabb) = entity.bounding_box() {
-                if frustum.is_visible(&aabb) {
-                    visible_entities.push(*entity_id);
-                }
-            } else {
-                // If no bounding box, assume visible
-                visible_entities.push(*entity_id);
-            }
+        // No camera, no frustum: the identity fallback above would cull the
+        // world outside the unit box, so cull nothing instead.
+        if self.active_camera.is_none() {
+            return visible;
         }
 
-        visible_entities
+        let frustum = Frustum::from_matrix(self.camera_view_projection_matrix());
+        visible
+            .into_iter()
+            .filter(|&entity_id| {
+                let entity = &self.entities[self.entity_map[&entity_id]];
+                match entity.bounding_box() {
+                    Some(aabb) => frustum.is_visible(&aabb),
+                    None => true,
+                }
+            })
+            .collect()
     }
 
     /// Get all lights in the scene

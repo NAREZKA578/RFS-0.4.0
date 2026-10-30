@@ -163,14 +163,21 @@ pub fn entity_layer(entity_type: EntityType) -> u8 {
     }
 }
 
-/// What a client was last sent for one layer: the layer content plus the tick
-/// it went out. The next delta for that layer diffs against this content only,
-// so layers never interfere with each other.
+/// The base a layer diff is built against: the layer content plus the tick it
+/// belongs to. Layers never interfere with each other: the next delta for a
+/// layer diffs against this content only.
+///
+/// Bug №30 (B): when a `LayerBase` sits in the server's `client_layers` map,
+/// the content is what that client has CONFIRMED applied for the layer and
+/// `base_tick` is the tick it belongs to — and the pair moves only on the
+/// client's LayerSync report, never on queueing a send. (The pending-confirm
+/// ring owns its own `LayerBase`s, each keyed by the tick one queued delta
+/// targeted; a confirmed install moves its entry out of the ring.)
 #[derive(Debug, Clone, Default)]
 pub struct LayerBase {
     pub entities: Vec<EntitySnapshot>,
     pub projectiles: Vec<ProjectileSnapshot>,
-    pub last_sent_tick: u64,
+    pub base_tick: u64,
 }
 
 impl LayerBase {
@@ -346,7 +353,15 @@ pub struct ProjectileUpdate {
 }
 
 pub struct DeltaCompressor {
-    last_snapshots: RwLock<HashMap<(u32, u8), Tick>>,
+    // Bug №30 (B): stateless by design. The diff base is whatever the caller
+    // declares in `base_snapshot`, and under the applied-report scheme that
+    // is the client's confirmed base content — a fact the client itself
+    // asserted, not an assumption this struct maintained. The old
+    // per-(client, layer) tick ring that used to live here advanced on
+    // every built send and could declare a base the client had never
+    // applied (the №22/№78 story); a base passed in the caller's snapshot
+    // cannot lie, because the pass fills it from the confirmed base — which
+    // moves only on the client's report.
 }
 
 impl Default for DeltaCompressor {
@@ -357,28 +372,28 @@ impl Default for DeltaCompressor {
 
 impl DeltaCompressor {
     pub fn new() -> Self {
-        Self {
-            last_snapshots: RwLock::new(HashMap::new()),
-        }
+        Self {}
     }
 
     pub fn create_delta(
         &self,
-        client_id: u32,
+        _client_id: u32,
         layer: u8,
         base_snapshot: &Snapshot,
         target_snapshot: &Snapshot,
     ) -> DeltaSnapshot {
-        let mut last = self.last_snapshots.write();
-        let key = (client_id, layer);
-        let base_tick = last.get(&key).copied().unwrap_or(base_snapshot.tick);
+        // Bug №30 (B): the base tick is exactly the tick of the snapshot the
+        // caller diffed from. The caller fills that from the confirmed base,
+        // which is the tick whose content the client holds — so the delta's
+        // declared `base_tick` matches the client's guard by construction
+        // (that match is what the old ring-based advance could break).
+        let base_tick = base_snapshot.tick;
 
-        // Bug №22/№78: the old code advanced the ring on this early return
-        // even though nothing is sent (and the client applies nothing). That
-        // raced the ring ahead of the server's LayerBase.last_sent_tick, which
-        // only moves on real sends — the next non-empty delta declared a base
-        // tick the client had never applied and was dropped, freezing the
-        // layer forever. Keep the ring in lockstep: no send, no advance.
+        // Bug №22/№78: do not diff backwards. The belt-and-braces form of the
+        // same rule: the caller under the confirmed-base scheme (bug №30)
+        // passes a base the client holds, so an equal-or-older target is
+        // either world-restart weirdness or a caller bug — return an empty
+        // step rather than fabricate numbers below the base.
         if target_snapshot.tick <= base_tick {
             return DeltaSnapshot {
                 layer,
@@ -501,9 +516,12 @@ impl DeltaCompressor {
             && projectile_updated.is_empty()
             && projectile_destroyed.is_empty();
 
-        // Bug №22/№78: an empty delta is never sent, so the client base does
-        // not advance. Advancing the ring here used to desync it from the
-        // server's LayerBase and freeze replication for every client.
+        // Bug №22/№78: an empty delta is never sent, so nothing waits for
+        // confirmation and nothing may pretend otherwise. Advancing the old
+        // ring here used to desync it from the base the client actually
+        // applied and froze replication for every client; under the
+        // confirmed-base scheme (bug №30) the pass simply queues no pending
+        // confirm, so the client's base stays exactly where it is.
         if is_empty {
             return DeltaSnapshot {
                 layer,
@@ -519,7 +537,11 @@ impl DeltaCompressor {
             };
         }
 
-        *last.entry(key).or_insert(target_snapshot.tick) = target_snapshot.tick;
+        // Bug №30 (B): the ring's last act — with the confirmed-base scheme the
+        // compressor keeps no per-client state, so nothing advances here. The
+        // delta declares `base_tick = base_snapshot.tick`; the pass queues a
+        // pending confirm for exactly that target, and the base moves only
+        // when the client reports it applied.
 
         DeltaSnapshot {
             layer,
@@ -538,13 +560,14 @@ impl DeltaCompressor {
     /// An empty delta that is deliberately not sent, leaving the client's base
     /// where it is.
     ///
-    /// Bug №271: the caller sends nothing and the ring is not advanced, so the
-    /// next tick diffs the same base again and the withheld content goes out in
-    /// full. `base_tick` is the client's real base — using the target tick here
-    /// (as the early return in `create_delta` does) would declare a base the
-    /// client never applied, which is the same class of error this exists to
-    /// avoid. It is never observed on the wire: the send path drops empty
-    /// deltas, so the value exists only to be unambiguous if that changes.
+    /// Bug №271: the caller sends nothing and queues no pending confirm, so
+    /// the next tick diffs the same confirmed base again and the withheld
+    /// content goes out in full. `base_tick` is the client's confirmed base —
+    /// using the target tick here (as the early return in `create_delta`
+    /// does) would declare a base the client never applied, which is the
+    /// same class of error this exists to avoid. It is never observed on the
+    /// wire: the send path drops empty deltas, so the value exists only to
+    /// be unambiguous if that changes.
     fn withheld_delta(layer: u8, base_tick: Tick, target: &Snapshot) -> DeltaSnapshot {
         DeltaSnapshot {
             layer,
@@ -558,26 +581,6 @@ impl DeltaCompressor {
             projectile_updated: Vec::new(),
             projectile_destroyed: Vec::new(),
         }
-    }
-
-    /// Move a client's per-layer base tick forward without building a delta.
-    ///
-    /// The caller is about to send a delta that was serialized for a different
-    /// client (identical layer content, identical base tick, identical target
-    /// tick — that is exactly what the payload cache key guarantees), so the
-    /// diff itself is not needed, but this client's base tick still has to move
-    /// to the tick that was just sent.
-    ///
-    /// Skipping this is what the payload cache used to do, and it silently broke
-    /// replication: the ring stayed behind while the server's own
-    /// `LayerBase.last_sent_tick` moved on, so the next real diff declared a
-    /// base tick the client had already applied and the client rejected it as a
-    /// base mismatch — for the ship layer, whose content is identical for every
-    /// client, that is almost every client, every tick.
-    pub fn advance_base(&self, client_id: u32, layer: u8, target_tick: u64) {
-        self.last_snapshots
-            .write()
-            .insert((client_id, layer), Tick(target_tick));
     }
 
     fn compute_entity_update(
@@ -662,12 +665,6 @@ impl DeltaCompressor {
         }
 
         update
-    }
-
-    pub fn remove_client(&self, client_id: u32) {
-        self.last_snapshots
-            .write()
-            .retain(|(id, _), _| *id != client_id);
     }
 }
 

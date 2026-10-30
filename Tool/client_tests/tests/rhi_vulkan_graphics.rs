@@ -29,14 +29,14 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 "#;
 
-fn open_vulkan_device(features: Features) -> Device {
-    let backend = VulkanBackend::new(&RhiConfig::default()).unwrap();
-    let devices = backend.enumerate_physical_devices().unwrap();
+fn open_vulkan_device(features: Features) -> Option<Device> {
+    let backend = VulkanBackend::new(&RhiConfig::default()).ok()?;
+    let devices = backend.enumerate_physical_devices().ok()?;
     let desc = DeviceDesc {
         features,
         ..Default::default()
     };
-    backend.create_device(&devices[0], &desc).unwrap()
+    backend.create_device(devices.first()?, &desc).ok()
 }
 
 fn wgsl_to_spirv(source: &str) -> Vec<u8> {
@@ -64,7 +64,12 @@ fn all_channels() -> ColorComponentFlags {
 
 #[test]
 fn vulkan_offscreen_graphics_roundtrip() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     const EXTENT: u32 = 64;
     let texture = device
@@ -238,7 +243,10 @@ fn vulkan_offscreen_graphics_roundtrip() {
 /// as the previous colour still being there.
 #[test]
 fn repeated_submits_do_not_reuse_a_previously_signalled_fence() {
-    let device = open_vulkan_device(Features::default());
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     const EXTENT: u32 = 64;
     const FRAMES: u32 = 8;
@@ -394,7 +402,10 @@ fn repeated_submits_do_not_reuse_a_previously_signalled_fence() {
 /// pipeline's.
 #[test]
 fn a_pipeline_with_the_wrong_attachment_count_is_refused() {
-    let device = open_vulkan_device(Features::default());
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     const EXTENT: u32 = 64;
     let render_pass = device

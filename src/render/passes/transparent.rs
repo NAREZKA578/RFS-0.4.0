@@ -606,10 +606,21 @@ impl TransparentPass {
     /// The bridge between the scene graph and the GPU, the same one the
     /// geometry pass has, narrowed to the objects that are not opaque: a light
     /// and a camera are not drawn, and neither is an opaque box.
+    ///
+    /// The scene's own frustum cull (`Scene::cull`, №723) gates what is even
+    /// considered, the same way it gates the geometry pass: an entity the
+    /// active camera cannot see is not drawn and not reported. A scene with no
+    /// active camera is not culled at all.
     pub fn items_for_scene(scene: &Scene) -> Vec<TransparentItem> {
         let mut items = Vec::new();
+
+        let not_culled: std::collections::HashSet<usize> = scene.cull().into_iter().collect();
+
         for entity in scene.entities() {
             if !entity.is_transparent() || !entity.is_visible() {
+                continue;
+            }
+            if !not_culled.contains(&entity.id()) {
                 continue;
             }
             let Some(mesh_component) = entity.mesh() else {

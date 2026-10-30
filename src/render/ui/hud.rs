@@ -2,10 +2,13 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
+use crate::rhi::ui::UiCommand;
 use crate::render::meshes::Mesh;
 use crate::render::textures::Texture;
 use glam::{Vec2, Vec4};
 use std::sync::Arc;
+
+use super::model::{rgba, UiBatch};
 
 /// HUD element alignment
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -240,69 +243,281 @@ impl HUD {
         self.damage_indicators.retain(|i| !i.expired());
     }
 
-    pub fn render(&self) {
-        // Render all HUD elements
-        for element in &self.elements {
-            if element.visible {
-                self.render_element(element);
-            }
+    /// Compiles the HUD into `UiCommand`s for the frame, replacing the stub
+    /// `render` this once replaced.
+    ///
+    /// ** Bug №724.** `render` and its seven `render_*` helpers were empty
+    /// bodies with zero callers: every part of the HUD the data model can
+    /// express now lands in the command stream instead, so the pass draws
+    /// exactly what `to_commands` compiled and nothing is drawn from a
+    /// parallel path.
+    ///
+    /// Draw order: elements (stable `z_index` ascending), then the crosshair,
+    /// then the info panels. Panels are drawn only when they carry data (a
+    /// non-empty name), so a default `HUD` — no elements, default infos,
+    /// no compass — compiles nothing at all, and an empty screen is an
+    /// assertable fact rather than a coincidence of layout.
+    ///
+    /// v1 scope, on the record:
+    ///  - an element with a texture is an `Image`; one without (its `mesh` is
+    ///    ignored, mesh HUDs need their own pipeline) is a flat `Rectangle`;
+    ///  - an info panel is one background rectangle and fixed-pitch rows —
+    ///    a label, and where there is a quantity a `ProgressBar` — so every
+    ///    compiled coordinate is recomputable in a test;
+    ///  - the compass is an outline and an "N" label; its markers are v2;
+    ///  - a damage indicator is a line from its position along its direction,
+    ///    faded by intensity; zero-length indicators draw nothing.
+    pub fn to_commands(&self, batch: &mut UiBatch) {
+        let screen = self.screen_size;
+
+        let mut order: Vec<&HUDElement> = self.elements.iter().filter(|e| e.visible).collect();
+        order.sort_by_key(|e| e.z_index);
+        for element in &order {
+            push_element(batch, element, screen);
         }
 
-        // Render crosshair
         if let Some(crosshair) = &self.crosshair {
             if crosshair.visible {
-                self.render_element(crosshair);
+                push_element(batch, crosshair, screen);
             }
         }
 
-        // Render ship info
-        self.render_ship_info();
-
-        // Render weapon info
-        self.render_weapon_info();
-
-        // Render player info
-        self.render_player_info();
-
-        // Render objectives
-        self.render_objectives();
-
-        // Render compass
-        if let Some(compass) = &self.compass {
-            self.render_compass(compass);
+        if !self.ship_info.name.is_empty() {
+            let rows = [
+                Row::Label(self.ship_info.name.clone()),
+                Row::Bar(
+                    "HP".to_string(),
+                    ratio(self.ship_info.hp, self.ship_info.max_hp),
+                ),
+                Row::Bar(
+                    "SPD".to_string(),
+                    ratio(self.ship_info.speed, self.ship_info.max_speed),
+                ),
+                Row::Bar(
+                    "FUEL".to_string(),
+                    ratio(self.ship_info.fuel, self.ship_info.max_fuel),
+                ),
+                Row::Label(format!(
+                    "CREW {}/{}",
+                    self.ship_info.crew_count, self.ship_info.max_crew
+                )),
+            ];
+            let y = screen.y - PANEL_MARGIN - rows.len() as f32 * ROW_PITCH;
+            push_panel(batch, PANEL_MARGIN, y, &rows);
         }
 
-        // Render damage indicators
-        self.render_damage_indicators();
-    }
+        if !self.weapon_info.name.is_empty() {
+            let rows = [
+                Row::Label(self.weapon_info.name.clone()),
+                Row::Label(format!(
+                    "AMMO {}/{}",
+                    self.weapon_info.ammo, self.weapon_info.max_ammo
+                )),
+                Row::Bar(
+                    "COOL".to_string(),
+                    ratio(self.weapon_info.cooldown, self.weapon_info.max_cooldown),
+                ),
+            ];
+            let y = screen.y - PANEL_MARGIN - rows.len() as f32 * ROW_PITCH;
+            push_panel(batch, screen.x - PANEL_MARGIN - PANEL_WIDTH, y, &rows);
+        }
 
-    fn render_element(&self, _element: &HUDElement) {
-        // Render a single HUD element
-        // This would use the UI render pass
-    }
+        if !self.player_info.name.is_empty() {
+            let rows = [
+                Row::Label(self.player_info.name.clone()),
+                Row::Bar(
+                    "HP".to_string(),
+                    ratio(self.player_info.health, self.player_info.max_health),
+                ),
+                Row::Label(format!("ROLE {}", self.player_info.role)),
+            ];
+            push_panel(batch, PANEL_MARGIN, PANEL_MARGIN, &rows);
+        }
 
-    fn render_ship_info(&self) {
-        // Render ship information (HP, speed, fuel, etc.)
-    }
+        for (index, objective) in self.objectives.iter().enumerate() {
+            if !objective.visible {
+                continue;
+            }
+            // An objective set at (0, 0) stacks under the previous one in the
+            // top-right corner; an explicit position wins.
+            let at = if objective.position == Vec2::ZERO {
+                Vec2::new(
+                    screen.x - PANEL_MARGIN - PANEL_WIDTH + PANEL_PAD,
+                    PANEL_MARGIN + index as f32 * ROW_PITCH,
+                )
+            } else {
+                objective.position
+            };
+            batch.commands.push(UiCommand::Text {
+                content: objective.title.clone(),
+                x: at.x,
+                y: at.y,
+                size: TEXT_SIZE,
+                color: if objective.completed {
+                    OBJECTIVE_DONE
+                } else {
+                    OBJECTIVE_OPEN
+                },
+                font: None,
+            });
+        }
 
-    fn render_weapon_info(&self) {
-        // Render weapon information (ammo, cooldown, etc.)
-    }
+        if let Some(compass) = &self.compass {
+            if compass.visible {
+                // The compass carries no anchor of its own, so it uses the
+                // bottom-centre one: `position` is an offset from there, and
+                // the default (0, -100) docks it just above the bottom edge.
+                let x = screen.x * 0.5 + compass.position.x;
+                let y = screen.y + compass.position.y;
+                batch.commands.push(UiCommand::RectangleOutline {
+                    x,
+                    y,
+                    width: compass.size.x,
+                    height: compass.size.y,
+                    color: COMPASS_COLOR,
+                    thickness: 2.0,
+                    corner_radius: 0.0,
+                });
+                batch.commands.push(UiCommand::Text {
+                    content: "N".to_string(),
+                    x: x + compass.size.x * 0.5 - TEXT_SIZE * 0.5,
+                    y: y + compass.size.y * 0.5 - TEXT_SIZE * 0.5,
+                    size: TEXT_SIZE,
+                    color: COMPASS_COLOR,
+                    font: None,
+                });
+            }
+        }
 
-    fn render_player_info(&self) {
-        // Render player information (health, role, etc.)
+        for indicator in &self.damage_indicators {
+            if indicator.direction.length_squared() > 0.0 {
+                let color = [
+                    indicator.color.x,
+                    indicator.color.y,
+                    indicator.color.z,
+                    indicator.color.w * indicator.intensity.clamp(0.0, 1.0),
+                ];
+                batch.commands.push(UiCommand::Line {
+                    x1: indicator.position.x,
+                    y1: indicator.position.y,
+                    x2: indicator.position.x + indicator.direction.x * DAMAGE_REACH,
+                    y2: indicator.position.y + indicator.direction.y * DAMAGE_REACH,
+                    color,
+                    thickness: 3.0,
+                });
+            }
+        }
     }
+}
 
-    fn render_objectives(&self) {
-        // Render objectives
+/// Where the drawn panels sit and how far apart their rows are.
+///
+/// Every one of these is load-bearing: `ui_pass_model.rs` asserts the compiled
+/// geometry exactly, so the constants are named here once and cited there —
+/// they are not to drift independently.
+const PANEL_WIDTH: f32 = 240.0;
+const PANEL_MARGIN: f32 = 16.0;
+const PANEL_PAD: f32 = 8.0;
+const ROW_PITCH: f32 = 18.0;
+const TEXT_SIZE: f32 = 14.0;
+const BAR_HEIGHT: f32 = 10.0;
+/// Bar left edge, relative to its panel: 240 - 96 - 8 = 136 wide.
+const BAR_INSET: f32 = 96.0;
+const BAR_WIDTH: f32 = PANEL_WIDTH - BAR_INSET - PANEL_PAD;
+/// A damage indicator's line reaches this far along its direction.
+const DAMAGE_REACH: f32 = 40.0;
+const PANEL_BACKGROUND: [f32; 4] = [0.05, 0.05, 0.08, 0.85];
+const LABEL_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+const OBJECTIVE_DONE: [f32; 4] = [0.35, 0.9, 0.35, 1.0];
+const OBJECTIVE_OPEN: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+const COMPASS_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// One row of an info panel: a label on the left, and — where the row reports
+/// a quantity — a bar anchored at `BAR_INSET`.
+enum Row {
+    Label(String),
+    /// Label text and the already-clamped, NaN-free fill fraction for the bar.
+    Bar(String, f32),
+}
+
+/// `value / max` clamped into 0..1, with the degenerate denominator handled:
+/// `f32` division by zero is NaN, and a NaN `progress` survives the
+/// renderer's own `.clamp(0.0, 1.0)` and reaches the GPU as NaN geometry.
+fn ratio(value: f32, max: f32) -> f32 {
+    if max > 0.0 {
+        (value / max).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
+}
 
-    fn render_compass(&self, _compass: &HUDCompass) {
-        // Render compass
+/// Emits one visible HUD element: texture-backed elements go out as full-rect
+/// `Image` commands, the rest as flat quads (a `mesh` field with no texture is
+/// v2 and co-equally ignored by the old stub).
+fn push_element(batch: &mut UiBatch, element: &HUDElement, screen: Vec2) {
+    let at = element.calculate_position(screen);
+    if let Some(texture) = &element.texture {
+        let id = batch.push_texture(texture);
+        batch.commands.push(UiCommand::Image {
+            texture_id: id,
+            x: at.x,
+            y: at.y,
+            width: element.size.x,
+            height: element.size.y,
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            color: rgba(element.color),
+        });
+    } else {
+        batch.commands.push(UiCommand::Rectangle {
+            x: at.x,
+            y: at.y,
+            width: element.size.x,
+            height: element.size.y,
+            color: rgba(element.color),
+            corner_radius: 0.0,
+        });
     }
+}
 
-    fn render_damage_indicators(&self) {
-        // Render damage indicators
+/// Emits one info panel: the background rectangle, then its rows left-padded
+/// by `PANEL_PAD`, one every `ROW_PITCH`; bars sit at `BAR_INSET`, centred in
+/// the row.
+fn push_panel(batch: &mut UiBatch, x: f32, y: f32, rows: &[Row]) {
+    batch.commands.push(UiCommand::Rectangle {
+        x,
+        y,
+        width: PANEL_WIDTH,
+        height: rows.len() as f32 * ROW_PITCH,
+        color: PANEL_BACKGROUND,
+        corner_radius: 0.0,
+    });
+    for (index, row) in rows.iter().enumerate() {
+        let y = y + index as f32 * ROW_PITCH;
+        let (text, bar) = match row {
+            Row::Label(text) => (text, None),
+            Row::Bar(text, progress) => (text, Some(*progress)),
+        };
+        batch.commands.push(UiCommand::Text {
+            content: text.clone(),
+            x: x + PANEL_PAD,
+            y: y + (ROW_PITCH - TEXT_SIZE) * 0.5,
+            size: TEXT_SIZE,
+            color: LABEL_COLOR,
+            font: None,
+        });
+        if let Some(progress) = bar {
+            batch.commands.push(UiCommand::ProgressBar {
+                x: x + BAR_INSET,
+                y: y + (ROW_PITCH - BAR_HEIGHT) * 0.5,
+                width: BAR_WIDTH,
+                height: BAR_HEIGHT,
+                progress,
+                background_color: [0.2, 0.2, 0.25, 1.0],
+                fill_color: [0.3, 0.8, 0.3, 1.0],
+                corner_radius: 0.0,
+            });
+        }
     }
 }
 

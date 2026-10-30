@@ -2,9 +2,31 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
+use crate::rhi::ui::UiCommand;
 use crate::render::textures::Texture;
 use glam::{Vec2, Vec4};
 use std::sync::Arc;
+
+use super::model::{rgba, UiBatch};
+
+/// Menu layout. Asserted exactly in `ui_pass_model.rs`, so it is named once
+/// here and cited there.
+const TITLE_SIZE: f32 = 24.0;
+const ITEM_TEXT_SIZE: f32 = 16.0;
+/// Vertical distance between stacked item tops.
+const ITEM_PITCH: f32 = 48.0;
+/// Height of the title zone, where stacked items start below.
+const HEADER_HEIGHT: f32 = 64.0;
+const MENU_PAD: f32 = 24.0;
+/// Text inset inside an item's own rectangle.
+const BOX_PAD: f32 = 8.0;
+const CHECKBOX_BOX: f32 = 20.0;
+/// Inside inset of a checkbox's filled square: 20 - 4 - 4 = 12 side.
+const CHECKBOX_FILL_INSET: f32 = 4.0;
+const OUTLINE_THICKNESS: f32 = 2.0;
+const TITLE_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+const ITEM_TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+const TRACK_COLOR: [f32; 4] = [0.15, 0.15, 0.15, 1.0];
 
 /// Menu type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -264,63 +286,186 @@ impl Menu {
         }
     }
 
-    pub fn render(&self) {
-        // Render menu background
-        self.render_background();
+    /// Compiles the menu into `UiCommand`s, replacing the stub `render` and
+    /// its nine `render_*` helpers this once replaced (Bug №724).
+    ///
+    /// Layout: the background fills `position..position+size`; the title text
+    /// sits at the top-left padding; items are either at their explicit
+    /// `position` or stacked one `ITEM_PITCH` apart below the header. Selected
+    /// highlighting uses the menu's `selected_index` when the item is enabled;
+    /// otherwise the item's own colour rule applies.
+    ///
+    /// v1 scope, on the record: a dropdown renders like a button (no expanded
+    /// option list) and carries only its name — per-option lists are v2.
+    pub fn to_commands(&self, batch: &mut UiBatch) {
+        if !self.visible {
+            return;
+        }
+        let (x, y, w, h) = (
+            self.position.x,
+            self.position.y,
+            self.size.x,
+            self.size.y,
+        );
 
-        // Render menu title
-        self.render_title();
+        if let Some(texture) = &self.background_texture {
+            let id = batch.push_texture(texture);
+            batch.commands.push(UiCommand::Image {
+                texture_id: id,
+                x,
+                y,
+                width: w,
+                height: h,
+                uv_min: [0.0, 0.0],
+                uv_max: [1.0, 1.0],
+                color: rgba(self.background_color),
+            });
+        } else {
+            batch.commands.push(UiCommand::Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+                color: rgba(self.background_color),
+                corner_radius: 0.0,
+            });
+        }
 
-        // Render menu items
+        if !self.title.is_empty() {
+            batch.commands.push(UiCommand::Text {
+                content: self.title.clone(),
+                x: x + MENU_PAD,
+                y: y + MENU_PAD,
+                size: TITLE_SIZE,
+                color: TITLE_COLOR,
+                font: None,
+            });
+        }
+
         for (index, item) in self.items.iter().enumerate() {
-            let is_selected = index == self.selected_index;
-            self.render_item(item, is_selected);
+            let at = if item.position == Vec2::ZERO {
+                Vec2::new(
+                    x + MENU_PAD,
+                    y + HEADER_HEIGHT + index as f32 * ITEM_PITCH,
+                )
+            } else {
+                item.position
+            };
+            let color = if index == self.selected_index && item.enabled {
+                rgba(item.selected_color)
+            } else {
+                rgba(item.color())
+            };
+            match item.item_type {
+                MenuItemType::Button | MenuItemType::Dropdown => {
+                    batch.commands.push(rect(at, item.size, color));
+                    push_item_text(batch, item, at);
+                }
+                MenuItemType::Label => push_item_text(batch, item, at),
+                MenuItemType::Slider => {
+                    batch.commands.push(UiCommand::ProgressBar {
+                        x: at.x,
+                        y: at.y,
+                        width: item.size.x,
+                        height: item.size.y,
+                        progress: range_ratio(item.value, item.min_value, item.max_value),
+                        background_color: TRACK_COLOR,
+                        fill_color: color,
+                        corner_radius: 0.0,
+                    });
+                    push_item_text(batch, item, at);
+                }
+                MenuItemType::Checkbox => {
+                    // The square is vertically centred in the item row, the
+                    // label sits right of it.
+                    let box_y = at.y + (item.size.y - CHECKBOX_BOX) * 0.5;
+                    batch.commands.push(UiCommand::RectangleOutline {
+                        x: at.x,
+                        y: box_y,
+                        width: CHECKBOX_BOX,
+                        height: CHECKBOX_BOX,
+                        color,
+                        thickness: OUTLINE_THICKNESS,
+                        corner_radius: 0.0,
+                    });
+                    if item.checked {
+                        batch.commands.push(UiCommand::Rectangle {
+                            x: at.x + CHECKBOX_FILL_INSET,
+                            y: box_y + CHECKBOX_FILL_INSET,
+                            width: CHECKBOX_BOX - CHECKBOX_FILL_INSET * 2.0,
+                            height: CHECKBOX_BOX - CHECKBOX_FILL_INSET * 2.0,
+                            color,
+                            corner_radius: 0.0,
+                        });
+                    }
+                    let text_at = Vec2::new(at.x + CHECKBOX_BOX, at.y);
+                    push_item_text(batch, item, text_at);
+                }
+                MenuItemType::TextInput => {
+                    batch.commands.push(UiCommand::RectangleOutline {
+                        x: at.x,
+                        y: at.y,
+                        width: item.size.x,
+                        height: item.size.y,
+                        color,
+                        thickness: OUTLINE_THICKNESS,
+                        corner_radius: 0.0,
+                    });
+                    push_item_text(batch, item, at);
+                }
+            }
         }
     }
 
-    fn render_background(&self) {
-        // Render menu background
-    }
-
-    fn render_title(&self) {
-        // Render menu title
-    }
-
-    fn render_item(&self, item: &MenuItem, is_selected: bool) {
-        // Render menu item
-        match item.item_type {
-            MenuItemType::Button => self.render_button(item, is_selected),
-            MenuItemType::Label => self.render_label(item),
-            MenuItemType::Slider => self.render_slider(item, is_selected),
-            MenuItemType::Dropdown => self.render_dropdown(item, is_selected),
-            MenuItemType::Checkbox => self.render_checkbox(item, is_selected),
-            MenuItemType::TextInput => self.render_text_input(item, is_selected),
+    /// The text an item displays. A text input shows what has been typed; when
+    /// that is empty it falls back to the item's own text, which for inputs
+    /// doubles as the prompt.
+    fn item_content(item: &MenuItem) -> String {
+        if item.input_text.is_empty() {
+            item.text.clone()
+        } else {
+            item.input_text.clone()
         }
     }
+}
 
-    fn render_button(&self, _item: &MenuItem, _is_selected: bool) {
-        // Render button
+/// `(value - min) / (max - min)` clamped into 0..1, degenerate range handled:
+/// without the guard a zero-height range divides by zero and hands the GPU NaN.
+fn range_ratio(value: f32, min: f32, max: f32) -> f32 {
+    if max > min {
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
+}
 
-    fn render_label(&self, _item: &MenuItem) {
-        // Render label
+/// A flat quad at an item's position and size. The renderer skips any
+/// rectangle with a positive `corner_radius`, so v1 compiles square ones.
+fn rect(at: Vec2, size: Vec2, color: [f32; 4]) -> UiCommand {
+    UiCommand::Rectangle {
+        x: at.x,
+        y: at.y,
+        width: size.x,
+        height: size.y,
+        color,
+        corner_radius: 0.0,
     }
+}
 
-    fn render_slider(&self, _item: &MenuItem, _is_selected: bool) {
-        // Render slider
+/// An item's label, centred vertically inside its own row height.
+fn push_item_text(batch: &mut UiBatch, item: &MenuItem, at: Vec2) {
+    let content = Menu::item_content(item);
+    if content.is_empty() {
+        return;
     }
-
-    fn render_dropdown(&self, _item: &MenuItem, _is_selected: bool) {
-        // Render dropdown
-    }
-
-    fn render_checkbox(&self, _item: &MenuItem, _is_selected: bool) {
-        // Render checkbox
-    }
-
-    fn render_text_input(&self, _item: &MenuItem, _is_selected: bool) {
-        // Render text input
-    }
+    batch.commands.push(UiCommand::Text {
+        content,
+        x: at.x + BOX_PAD,
+        y: at.y + (item.size.y - ITEM_TEXT_SIZE) * 0.5,
+        size: ITEM_TEXT_SIZE,
+        color: ITEM_TEXT_COLOR,
+        font: None,
+    });
 }
 
 impl Default for Menu {

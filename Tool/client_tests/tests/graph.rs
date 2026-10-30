@@ -92,11 +92,6 @@ fn the_graph_sizes_its_targets_from_the_presentation_extent() {
     // Every screen-sized resource the graph declares.
     for name in [
         "depth",
-        "gbuffer_position",
-        "gbuffer_normal",
-        "gbuffer_albedo",
-        "gbuffer_material",
-        "lighting",
         "postprocess_bloom",
         "final",
         "swapchain",

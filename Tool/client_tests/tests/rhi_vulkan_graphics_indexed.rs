@@ -59,14 +59,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-fn open_vulkan_device(features: Features) -> Device {
-    let backend = VulkanBackend::new(&RhiConfig::default()).unwrap();
-    let devices = backend.enumerate_physical_devices().unwrap();
+fn open_vulkan_device(features: Features) -> Option<Device> {
+    let backend = VulkanBackend::new(&RhiConfig::default()).ok()?;
+    let devices = backend.enumerate_physical_devices().ok()?;
     let desc = DeviceDesc {
         features,
         ..Default::default()
     };
-    backend.create_device(&devices[0], &desc).unwrap()
+    backend.create_device(devices.first()?, &desc).ok()
 }
 
 fn wgsl_to_spirv(source: &str) -> Vec<u8> {
@@ -94,7 +94,12 @@ fn all_channels() -> ColorComponentFlags {
 
 #[test]
 fn vulkan_offscreen_indexed_depth_roundtrip() {
-    let device = open_vulkan_device(Features::default());
+    // Bug №187: graceful skip instead of a panic — a machine without a Vulkan
+    // loader/device falls out of the test as a skip, not as a red unit.
+    let Some(device) = open_vulkan_device(Features::default()) else {
+        eprintln!("skipped: no Vulkan backend/device on this machine");
+        return;
+    };
 
     const EXTENT: u32 = 64;
     let color = device

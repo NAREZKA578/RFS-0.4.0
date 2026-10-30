@@ -29,9 +29,12 @@ use crate::render::graph::resource::GraphResource;
 use crate::render::graph::types::ResourceUsage;
 use crate::render::passes::base::BaseRenderPass;
 use crate::render::scene::Scene;
+use crate::render::ui::{UiBatch, UiGates, UiModel};
 use crate::rhi::command::encoder::CommandEncoder;
 use crate::rhi::ui::{UiCommand, UiRenderStats, UiRenderer, UiRendererConfig};
+use glam::Vec2;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Compiled from `assets/shaders/ui_geom.wgsl`. The RHI takes SPIR-V as bytes
 /// rather than reading a path, so it does not need to know where assets live.
@@ -49,6 +52,16 @@ const UI_GEOM_SPV: &[u8] =
 /// beats refusing to start.
 const UI_TEX_SPV: &[u8] =
     include_bytes!("../../../Tool/client_tests/assets/shaders/ui_tex.spv");
+
+/// The full-colour image pipeline. Optional in exactly the same sense as
+/// `UI_TEX_SPV`: until it is loaded, images draw through the glyph pipeline,
+/// which samples only the red channel as coverage — a UI_TEX-shaped shader, not
+/// an RGB picture — so a full-colour image whose red channel is zero is
+/// invisible through it (`UiRenderer::load_image_shader` states the why).
+/// Models carry images now, so this is loaded with everything else; a load
+/// failure is reported once and never stops the frame.
+const UI_IMAGE_SPV: &[u8] =
+    include_bytes!("../../../Tool/client_tests/assets/shaders/ui.spv");
 
 /// UI configuration.
 #[derive(Debug, Clone)]
@@ -90,6 +103,15 @@ pub struct UIPass {
         /// log at 60 Hz.
         reported_init: bool,
         reported_resize: bool,
+    /// The UI's data model, compiled into commands every frame. Shared, not
+    /// owned: the game side publishes HUD/menu/minimap state from its own
+    /// thread, and the pass snapshots it at its own cadence. `None` is a valid
+    /// state — the pass then draws only its debug marker, exactly as it did
+    /// before a model existed.
+    model: Option<Arc<Mutex<UiModel>>>,
+    /// Reported once per change rather than every frame, which would drown the
+    /// log at 60 Hz.
+    reported_image_shader: bool,
     /// Frames that actually recorded a draw. Drives the heartbeat log.
     frames: u64,
 }
@@ -112,12 +134,33 @@ impl UIPass {
         built_for: None,
         reported_init: false,
             reported_resize: false,
+            model: None,
+            reported_image_shader: false,
             frames: 0,
         }
     }
 
     pub fn config(&self) -> &UIConfig {
         &self.config
+    }
+
+    /// Attaches the model this pass compiles every frame.
+    ///
+    /// The `Arc<Mutex>` is the publication contract: whoever owns the game
+    /// state mutates it behind the same handle, and the pass locks it only for
+    /// the instant it takes to compile a frame's commands — never across a GPU
+    /// call — so a slow `record_into_view` cannot block the publisher mid-write.
+    /// Call before the first `execute`; attaching mid-frame also works, since
+    /// every `execute` compiles afresh.
+    pub fn with_model(mut self, model: Arc<Mutex<UiModel>>) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Replaces (or removes) the model. Same contract as [`Self::with_model`];
+    /// `None` puts the pass back on marker-only drawing.
+    pub fn set_model(&mut self, model: Option<Arc<Mutex<UiModel>>>) {
+        self.model = model;
     }
 
     /// Per-frame counters. The caller needs this because `UiRenderer` reports
@@ -173,6 +216,19 @@ impl UIPass {
                 // font should still draw its panels.
                 if let Err(e) = ui.install_bitmap_font("bitmap8") {
                     eprintln!("[ui] font install failed, text will be skipped: {e}");
+                }
+                // The image pipeline rides along with the font: both are the
+                // textured descriptor land the glyph pipeline already rented,
+                // both fail non-fatally, and the model now compiles images. The
+                // old state — a renderer that reports every `UiCommand::Image`
+                // as drawn and then rasterises it through the coverage-sampled
+                // glyph stage — is invisible from the command list, so the
+                // failure mention is the only signal.
+                if let Err(e) = ui.load_image_shader(UI_IMAGE_SPV) {
+                    if !self.reported_image_shader {
+                        eprintln!("[ui] image pipeline failed to load, images will be skipped: {e}");
+                        self.reported_image_shader = true;
+                    }
                 }
                 if !self.reported_init {
                     eprintln!(
@@ -271,6 +327,45 @@ impl RenderPass for UIPass {
         else {
             return PassOutcome::skipped("no typed view for the acquired image");
         };
+
+        // The model's frame, ahead of the marker: the marker is a diagnostic,
+        // so it draws over whatever the model published. The lock is held only
+        // for the snapshot and the compile below, and dropped before
+        // `record_into_view` does any GPU work — a mutex held across a device
+        // call is how a game-side panic turns into a hung publisher.
+        if let Some(model) = self.model.as_ref() {
+            let mut batch = UiBatch::default();
+            {
+                let mut guard = match model.lock() {
+                    Ok(guard) => guard,
+                    // The game thread panicked mid-write. The data survived
+                    // whatever it survived, and a poisoned-lock UI that stops
+                    // compiling frames would turn one bad frame into all of
+                    // them — compile from it.
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                // The HUD's alignment math needs the physical extent, and the
+                // pass is the only one who knows it. Published on change only,
+                // so an owner's own `set_screen_size` between frames survives.
+                if guard.hud.screen_size() != Vec2::new(width as f32, height as f32) {
+                    guard.set_screen_size(width, height);
+                }
+                guard.compile_into(
+                    &mut batch,
+                    UiGates {
+                        hud: self.config.enable_hud,
+                        menu: self.config.enable_menu,
+                        minimap: self.config.enable_minimap,
+                    },
+                );
+            }
+            for (id, texture) in &batch.textures {
+                ui.add_texture(*id, texture.clone());
+            }
+            if let Err(e) = ui.submit_commands(batch.commands) {
+                eprintln!("[ui] submit_commands failed: {e}");
+            }
+        }
 
         // What is actually drawn this frame. Kept minimal on purpose — see
         // `UIConfig::debug_marker`.
