@@ -129,10 +129,6 @@ fn load_from_json(
     let positions = read_vec3(root, &buffers, attributes, "POSITION")?;
     let count = positions.len();
 
-    let normals = match attributes.get("NORMAL") {
-        Some(_) => Some(read_vec3(root, &buffers, attributes, "NORMAL")?),
-        None => None,
-    };
     let uvs = match attributes.get("TEXCOORD_0") {
         Some(_) => Some(read_vec2(root, &buffers, attributes, "TEXCOORD_0")?),
         None => None,
@@ -143,6 +139,16 @@ fn load_from_json(
         // A primitive without indices is a point/line/list; for triangles the
         // spec requires them, so refuse rather than inventing an order.
         None => (0..count as u32).collect(),
+    };
+
+    // Indices come first because generated normals need the triangles; the
+    // file's own normals, when present, take priority and are never touched.
+    let normals = match attributes.get("NORMAL") {
+        Some(_) => Some(read_vec3(root, &buffers, attributes, "NORMAL")?),
+        // No normals in the primitive: invent smooth ones from the geometry
+        // instead of shipping the vertex default (0,0,1), which lights every
+        // face identically and flattens the whole model.
+        None => Some(generated_smooth_normals(&positions, &indices)),
     };
 
     let mut vertices = Vec::with_capacity(positions.len());
@@ -170,6 +176,48 @@ fn load_from_json(
         .with_vertices(vertices)
         .with_indices(indices)
         .build())
+}
+
+/// Compute smooth area-weighted normals for a POSITION-only primitive.
+///
+/// Every triangle contributes its face normal — the cross product of two
+/// edges, whose length already scales with the triangle's area — to all
+/// three of its corners. Positions shared by several triangles accumulate
+/// the sum of all faces touching them, so a logically smooth surface shades
+/// as one surface rather than as a patchwork of hard faces. File normals,
+/// when the asset carries them, never reach this function.
+///
+/// Out-of-range indices cannot happen in a spec-compliant file, but the
+/// loader reads indices without validating them against the vertex count,
+/// so this simply skips anything out of bounds instead of panicking on a
+/// malformed asset. A corner with no meaningful face normal left after all
+/// its triangles cancel out falls back to world up, keeping the vertex out
+/// of NaN territory.
+fn generated_smooth_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
+    let mut normals = vec![Vec3::ZERO; positions.len()];
+    for triangle in indices.chunks_exact(3) {
+        let (Some(&a), Some(&b), Some(&c)) = (
+            positions.get(triangle[0] as usize),
+            positions.get(triangle[1] as usize),
+            positions.get(triangle[2] as usize),
+        ) else {
+            continue;
+        };
+        let face = (b - a).cross(c - a);
+        for corner in triangle {
+            if let Some(slot) = normals.get_mut(*corner as usize) {
+                *slot += face;
+            }
+        }
+    }
+    for normal in &mut normals {
+        *normal = if normal.length_squared() > 1e-18 {
+            normal.normalize()
+        } else {
+            Vec3::Y
+        };
+    }
+    normals
 }
 
 /// Read every buffer declared by the document into memory.

@@ -29,7 +29,8 @@ use crate::types::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use windows::core::Interface;
+use windows::core::{HRESULT, Interface};
+use windows::Win32::Foundation::S_FALSE;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_DEPTH_STENCIL, D3D11_BIND_INDEX_BUFFER,
@@ -45,6 +46,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_DSV_DIMENSION_TEXTURE2D, D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS,
     D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS, D3D11_INPUT_ELEMENT_DESC,
     D3D11_INPUT_PER_INSTANCE_DATA, D3D11_INPUT_PER_VERTEX_DATA,     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_MAP_WRITE, D3D11_MAP_WRITE_DISCARD,
+    D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
     D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RTV_DIMENSION_TEXTURE2D,
     D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC,
     D3D11_SIGNATURE_PARAMETER_DESC, D3D11_TEX2D_DSV,
@@ -52,9 +54,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_TEXTURE3D_DESC, D3D11_UNORDERED_ACCESS_VIEW_DESC, D3D11_UAV_DIMENSION_BUFFER,
     D3D11_UAV_DIMENSION_TEXTURE2D, D3D11_USAGE, D3D11_USAGE_DYNAMIC, D3D11_USAGE_DEFAULT,
     D3D11_USAGE_STAGING, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS,
-    ID3D11BlendState, ID3D11Buffer, ID3D11ComputeShader,
+    ID3D11Asynchronous, ID3D11BlendState, ID3D11Buffer, ID3D11ComputeShader,
     ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
-    ID3D11InputLayout, ID3D11Multithread, ID3D11PixelShader, ID3D11RasterizerState,
+    ID3D11InputLayout, ID3D11Multithread, ID3D11PixelShader, ID3D11Query,
+    ID3D11RasterizerState,
     ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState, ID3D11ShaderResourceView,
     ID3D11Texture2D, ID3D11Texture3D, ID3D11UnorderedAccessView, ID3D11VertexShader,
 };
@@ -106,8 +109,6 @@ pub(crate) struct TextureEntry {
     /// separate tracked entry would be unreachable bookkeeping, and every
     /// lookup that went through it reported a lost kind instead.
     pub roles: ViewEntry,
-    /// Staging copy for `download_texture`, made at first download.
-    pub download_staging: Option<DxCom<ID3D11Resource>>,
 }
 
 /// All view roles one RHI texture view can serve, created from the source
@@ -261,7 +262,7 @@ impl D3D11Device {
         let mut hw = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS {
             ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x: false.into(),
         };
-        let uav_support = unsafe {
+        let queried = unsafe {
             device
                 .0
                 .CheckFeatureSupport(
@@ -269,8 +270,14 @@ impl D3D11Device {
                     &mut hw as *mut _ as *mut core::ffi::c_void,
                     std::mem::size_of::<D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS>() as u32,
                 )
-                .is_ok()
         };
+        // Bug №739: the query succeeding is not the support — it only says
+        // the query was understood. The answer is the flag itself: a device
+        // without the compute-shader path (the one UAV stages ride on)
+        // carried `is_ok()` truth here and the flag stayed unread. A refused
+        // query leaves the flag at its pre-filled FALSE, which reads as the
+        // honest "no" for an unknown capability.
+        let uav_support = queried.is_ok() && Self::uav_support_from_options(&hw);
         Self {
             device,
             context,
@@ -282,6 +289,18 @@ impl D3D11Device {
             caps: StageCaps { constant_buffers: cbs, samplers, srvs: 128, uavs },
             uav_support,
         }
+    }
+
+    /// The actual D3D10.x hardware-option decision (bug №739).
+    ///
+    /// The flag is the device's own word about the compute-shader path raw
+    /// and structured-buffer UAV stages ride on. The query succeeding says
+    /// nothing about that path; only the flag does. Kept a pure function so
+    /// both flag values are unit-testable without a device of either shape.
+    fn uav_support_from_options(
+        hw: &D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS,
+    ) -> bool {
+        hw.ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x.as_bool()
     }
 
     pub(crate) fn next_handle(&self) -> u64 {
@@ -670,7 +689,6 @@ impl D3D11Device {
                 resource,
                 desc: desc.clone(),
                 roles,
-                download_staging: None,
             }),
         );
         Ok(handle)
@@ -981,33 +999,74 @@ impl BackendResource for D3D11Device {
     }
 
     fn upload_texture(&self, texture: &Texture, data: &[u8]) -> RhiResult<()> {
-        let gpu = texture.backend().ok_or_else(|| {
-            RhiError::BackendError("the texture has no GPU backing".into())
-        })?;
+        let gpu = texture
+            .backend()
+            .ok_or_else(|| RhiError::BackendError("the texture has no GPU backing".into()))?;
         self.with_object(gpu.handle, "texture", |object| {
             let D3DObject::Texture(entry) = object else {
                 return Err(RhiError::InternalError(
                     "a texture handle lost its kind".into(),
                 ));
             };
-            let pitch = convert::row_pitch(entry.desc.format, entry.desc.width) as usize;
-            let needed = (entry.desc.height as usize) * pitch;
+            let desc = entry.desc.clone();
+            // The upload contract is the one the Vulkan and D3D12 backends
+            // carry today (bug №738): the mip chain of layer 0 fills from one
+            // tightly packed buffer, and anything wider is refused rather
+            // than half-written. D3's volume layout and cube faces need a
+            // different copy path; multisampled textures never reach here at
+            // all because the D3D11 creator refuses them first.
+            if !matches!(
+                desc.dimensions,
+                TextureDimensions::D1 | TextureDimensions::D2
+            ) {
+                return Err(RhiError::NotSupported(
+                    "D3D11 texture uploads cover 1D and 2D textures; 3D volumes \
+                     and cube faces need a different copy path and are honest \
+                     rejections here"
+                        .into(),
+                ));
+            }
+            if desc.array_layers > 1 {
+                return Err(RhiError::NotSupported(
+                    "multi-layer texture upload is not supported yet".into(),
+                ));
+            }
+            // The input rows sit at the tight row size of each mip; every
+            // staging row walks the `RowPitch` the driver reports for that
+            // subresource. The buffer the caller hands in must cover the
+            // whole chain — earlier versions checked only mip 0.
+            let count = desc.mip_levels.max(1);
+            let mut mip_rows = Vec::with_capacity(count as usize);
+            let mut needed = 0usize;
+            for mip in 0..count {
+                let mip_w = (desc.width >> mip.min(31)).max(1);
+                let mip_h = (desc.height >> mip.min(31)).max(1);
+                let row_bytes =
+                    convert::row_pitch(desc.format, mip_w) as usize;
+                needed += mip_h as usize * row_bytes;
+                mip_rows.push((mip_h as usize, row_bytes));
+            }
             if data.len() < needed {
                 return Err(RhiError::BackendError(format!(
-                    "the {}-byte upload is too small: the texture needs {} bytes \
-                     (format {:?}, {}x{}@row-pitch {})",
+                    "the {}-byte upload is too small: the mip chain needs {} bytes \
+                     (format {:?}, {}x{}, {} mips)",
                     data.len(),
                     needed,
-                    entry.desc.format,
-                    entry.desc.width,
-                    entry.desc.height,
-                    pitch
+                    desc.format,
+                    desc.width,
+                    desc.height,
+                    desc.mip_levels
                 )));
             }
+            // The staging mirrors the target's full mip chain — a one-mip
+            // staging used to make `CopyResource` fail with mismatched
+            // subresource counts while the ignored result hid the refusal.
+            // Layer count stays 1: wider arrays were refused above, so this
+            // staging covers exactly what is about to be copied.
             let staging = D3D11_TEXTURE2D_DESC {
-                Width: entry.desc.width,
-                Height: entry.desc.height,
-                MipLevels: 1,
+                Width: desc.width,
+                Height: desc.height,
+                MipLevels: desc.mip_levels,
                 ArraySize: 1,
                 Format: convert::dxgi_format(entry.desc.format).ok_or_else(|| {
                     RhiError::BackendError(format!(
@@ -1030,26 +1089,45 @@ impl BackendResource for D3D11Device {
             let st_res: ID3D11Resource = st_res.cast().map_err(|e| {
                 RhiError::BackendError(format!("staging resource cast: {e}"))
             })?;
-            let mut mapped: D3D11_MAPPED_SUBRESOURCE = unsafe { std::mem::zeroed() };
-            unsafe {
-                self.context.0.Map(
-                    &st_res,
-                    0,
-                    D3D11_MAP_WRITE,
-                    0,
-                    Some(&mut mapped),
-                )
-            }
-            .map_err(|e| RhiError::BackendError(format!("staging Map: {e}")))?;
-            unsafe {
-                for row in 0..entry.desc.height as usize {
-                    let src = data.as_ptr().add(row * pitch);
-                    let dst = (mapped.pData as *mut u8).add(row * mapped.RowPitch as usize);
-                    std::ptr::copy_nonoverlapping(src, dst, pitch);
+            let mut cursor = 0usize;
+            for (mip, (rows, row_bytes)) in mip_rows.iter().enumerate() {
+                let mut mapped: D3D11_MAPPED_SUBRESOURCE = unsafe { std::mem::zeroed() };
+                unsafe {
+                    self.context.0.Map(
+                        &st_res,
+                        mip as u32,
+                        D3D11_MAP_WRITE,
+                        0,
+                        Some(&mut mapped),
+                    )
                 }
-                self.context.0.Unmap(&st_res, 0);
-                self.context.0.CopyResource(&entry.resource.0, &st_res);
+                .map_err(|e| {
+                    RhiError::BackendError(format!("staging Map for mip {mip}: {e}"))
+                })?;
+                // SAFETY: the mapped region is at least `rows * RowPitch`
+                // bytes tall with `RowPitch >= row_bytes`, and the source
+                // cursor stays inside `data` by the `needed` check above.
+                unsafe {
+                    let dst = mapped.pData as *mut u8;
+                    for row in 0..*rows {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(cursor + row * row_bytes),
+                            dst.add(row * mapped.RowPitch as usize),
+                            *row_bytes,
+                        );
+                    }
+                    self.context.0.Unmap(&st_res, mip as u32);
+                }
+                cursor += rows * row_bytes;
             }
+            // CopyResource is a void call whose failures surface only as
+            // debug-layer messages, so the honest guards are upstream: the
+            // staging mirrors the target's full mip chain (a one-mip staging
+            // used to make the copy silently copy nothing — bug №738) and
+            // every Map/creation error travels to the caller.
+            unsafe {
+                self.context.0.CopyResource(&entry.resource.0, &st_res)
+            };
             Ok(())
         })
     }
@@ -1595,8 +1673,62 @@ impl BackendResource for D3D11Device {
     }
 
     fn wait_idle(&self) -> RhiResult<()> {
-        unsafe { self.context.0.Flush() };
-        Ok(())
+        let context = &self.context.0;
+        unsafe { context.Flush() };
+
+        // The idle claim is only as good as its measurement. `Flush` only says
+        // the driver accepted the batch; the GPU can still be running it. An
+        // event query issued after the flush fires exactly when all queued
+        // work has drained (D3D11 completes event queries in submission
+        // order), so polling it turns "accepted" into "finished".
+        let desc = D3D11_QUERY_DESC {
+            Query: D3D11_QUERY_EVENT,
+            MiscFlags: 0,
+        };
+        let mut query: Option<ID3D11Query> = None;
+        unsafe { self.device.0.CreateQuery(&desc, Some(&mut query)) }.map_err(|e| {
+            RhiError::InternalError(format!("d3d11 wait_idle: create event query: {e}"))
+        })?;
+        let query = query.ok_or_else(|| {
+            RhiError::InternalError("d3d11 wait_idle: no event query returned".into())
+        })?;
+        let asynchronous: &ID3D11Asynchronous = &query;
+        unsafe { context.End(asynchronous) };
+
+        // The `windows` shim flattens `GetData`'s `HRESULT` onto a `Result`,
+        // which erases exactly the distinction this wait lives on: `S_OK`
+        // ("idle") and `S_FALSE` ("still working") are both successes. The
+        // raw vtable call keeps the `HRESULT`, so pending can never read as
+        // done (bug №740).
+        let mut polls: u32 = 0;
+        loop {
+            let hr: HRESULT = unsafe {
+                (Interface::vtable(context).GetData)(
+                    context.as_raw(),
+                    asynchronous.as_raw(),
+                    core::ptr::null_mut(),
+                    0,
+                    0,
+                )
+            };
+            match event_query_state(hr) {
+                EventQueryState::Ready => return Ok(()),
+                EventQueryState::Failed => {
+                    return Err(RhiError::InternalError(format!(
+                        "d3d11 wait_idle: event query failed: {hr:?}"
+                    )))
+                }
+                EventQueryState::Pending => {}
+            }
+            polls += 1;
+            if polls < 64 {
+                core::hint::spin_loop();
+            } else if polls < 1024 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     }
 
     fn release(&self, _kind: ReleaseKind, object: u64) {
@@ -2288,5 +2420,102 @@ impl D3D11Device {
         Ok(Some(DxCom(out.ok_or_else(|| {
             RhiError::PipelineCreationError("CreateInputLayout returned no layout".into())
         })?)))
+    }
+}
+
+/// The three outcomes `GetData` can report for an event query.
+///
+/// Keeping the raw `HRESULT` language in one classifier is the guard for the
+/// wait itself: `S_FALSE` ("the event has not fired yet") must never flatten
+/// into "idle" (the shim's `Result`-shaped `GetData` would do exactly that),
+/// and a device-level failure must surface as an error, not as a silent Ok.
+enum EventQueryState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+fn event_query_state(hr: HRESULT) -> EventQueryState {
+    if hr == S_FALSE {
+        EventQueryState::Pending
+    } else if hr.is_err() {
+        EventQueryState::Failed
+    } else {
+        EventQueryState::Ready
+    }
+}
+
+#[cfg(test)]
+mod uav_options_contract {
+    //! Bug №739: `uav_support` answered from the query's `is_ok()`, leaving
+    //! the actual `D3D10_X_HARDWARE_OPTIONS` flag unread — a device without
+    //! the compute-shader path would still get 8 (or 64) UAV stages and a
+    //! raw-view creation it cannot back. The pure decision is testable both
+    //! ways without owning a device of either shape.
+
+    use super::*;
+
+    #[test]
+    fn the_flag_itself_is_the_answer() {
+        let off = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS {
+            ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x: false.into(),
+        };
+        assert!(
+            !D3D11Device::uav_support_from_options(&off),
+            "a device without the flag must read as unsupported, not as \
+             'the query did not fail'"
+        );
+
+        let on = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS {
+            ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x: true.into(),
+        };
+        assert!(
+            D3D11Device::uav_support_from_options(&on),
+            "a device carrying the flag must read as supported"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wait_idle_event_contract {
+    //! Bug №740: `wait_idle` returned after a bare `Flush`, i.e. after the
+    //! driver *accepted* the batch — the GPU could still run it. The wait
+    //! now polls an event query through the raw `HRESULT`: `S_OK` is idle,
+    //! `S_FALSE` is pending, a device failure surfaces as an error. The
+    //! shim's `GetData` reports both `S_OK` and `S_FALSE` as `Ok(())`, which
+    //! is exactly why the raw vtable call exists; the classifier is what
+    //! makes "pending" impossible to read as "idle".
+
+    use super::*;
+
+    #[test]
+    fn pending_is_never_read_as_idle() {
+        assert!(
+            matches!(
+                event_query_state(windows::Win32::Foundation::S_FALSE),
+                EventQueryState::Pending
+            ),
+            "S_FALSE means the queue is still working; reading it as idle is \
+             the bare-Flush bug again"
+        );
+    }
+
+    #[test]
+    fn completion_reads_as_idle() {
+        // S_OK (0): the event query fired, so everything queued before it
+        // has finished — the one state allowed to read as "idle".
+        assert!(matches!(event_query_state(HRESULT(0)), EventQueryState::Ready));
+    }
+
+    #[test]
+    fn device_failure_is_an_error_not_idle() {
+        assert!(
+            matches!(
+                event_query_state(windows::Win32::Foundation::E_FAIL),
+                EventQueryState::Failed
+            ),
+            "a broken device must surface as an error, not as a claim that \
+             the GPU went idle"
+        );
     }
 }

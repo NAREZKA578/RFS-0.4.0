@@ -1,23 +1,24 @@
 //! HDR Effect
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
+//!
+//! Honest shell (Bug №204): the former placeholder "tone-mapped" by copying
+//! frames through the silent `copy_texture` encoder stub — twice when the
+//! input and output views were the same object, once otherwise. No exposure,
+//! gamma or ACES stage existed anywhere, and the output texture it prepared
+//! was read by nobody (the manager passes the caller's views, not the
+//! effect's own). The effect keeps its configuration and enable knob and
+//! refuses to apply while enabled.
 
 use super::HDRConfig;
 use crate::render::core::RenderContext;
-use crate::rhi::{
-    CommandEncoder, Device, Format, Pipeline, RhiError, RhiResult, Texture, TextureView,
-};
+use crate::rhi::{CommandEncoder, Device, Format, RhiError, RhiResult, TextureView};
 use std::sync::Arc;
 
 /// HDR effect
 pub struct HDREffect {
     config: HDRConfig,
     enabled: bool,
-    /// Output texture
-    output_texture: Option<Texture>,
-    output_view: Option<TextureView>,
-    /// Pipeline
-    pipeline: Option<Pipeline>,
 }
 
 impl HDREffect {
@@ -25,9 +26,6 @@ impl HDREffect {
         Self {
             config,
             enabled: true,
-            output_texture: None,
-            output_view: None,
-            pipeline: None,
         }
     }
 
@@ -47,50 +45,46 @@ impl HDREffect {
         self.enabled = enabled;
     }
 
+    /// Prepare the effect's target — **refused** (Bug №204).
+    ///
+    /// The former output target was never in the manager's frame path — the
+    /// manager passes the caller's views — and its only writer was the fake
+    /// pass-through copy. Preparing a target nothing reads is not done.
     pub fn initialize(
         &mut self,
-        device: &Arc<Device>,
-        context: &RenderContext,
+        _device: &Arc<Device>,
+        _context: &RenderContext,
         _input_format: Format,
     ) -> RhiResult<()> {
-        // Bug №651: the size comes from the presentation extent, not from
-        // `context.resolution` — see `RenderContext::drawable_extent`.
-        let (width, height) = context.drawable_size();
-        let output = device
-            .create_texture(
-                width,
-                height,
-                1,
-                Format::RGBA32_SFLOAT,
-                crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
-                1,
-            )
-            .map_err(|e| RhiError::BackendError(format!("the HDR output texture: {e}")))?;
-        self.output_view = Some(output.create_view(Default::default()));
-        self.output_texture = Some(output);
-        Ok(())
+        Err(RhiError::NotSupported(
+            "HDR is not built: the effect has no pipeline stage (Bug №204); \
+             refusing to prepare a target nothing would read"
+                .into(),
+        ))
     }
 
+    /// Apply the effect — **refused** while enabled (Bug №204).
+    ///
+    /// A disabled effect is an honest no-op. An enabled one refuses: there is
+    /// no pipeline to run, and the former pass-through copies hid exactly that.
     pub fn apply(
         &mut self,
-        encoder: &mut CommandEncoder,
+        _encoder: &mut CommandEncoder,
         _context: &RenderContext,
-        input: &TextureView,
-        output: &TextureView,
-    ) {
+        _input: &TextureView,
+        _output: &TextureView,
+    ) -> RhiResult<()> {
         if !self.enabled {
-            return;
+            return Ok(());
         }
-        if std::ptr::eq(input, output) {
-            if let Some(ref temp) = self.output_view {
-                encoder.copy_texture(input, temp);
-                encoder.copy_texture(temp, output);
-            }
-        } else {
-            encoder.copy_texture(input, output);
-        }
+        Err(RhiError::NotSupported(
+            "HDR is not built: the effect has no pipeline stage (Bug №204); \
+             a frame cannot be tone-mapped, and none was faked either"
+                .into(),
+        ))
     }
 
+    /// Resize the effect.
     pub fn resize(
         &mut self,
         device: &Arc<Device>,
@@ -98,12 +92,6 @@ impl HDREffect {
         input_format: Format,
     ) -> RhiResult<()> {
         self.initialize(device, context, input_format)
-    }
-
-    pub fn cleanup(&mut self) {
-        self.output_texture = None;
-        self.output_view = None;
-        self.pipeline = None;
     }
 }
 

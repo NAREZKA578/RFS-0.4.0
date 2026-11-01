@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 use rfs_core::entity::EntityId;
-use rfs_core::math::{Transform, Vec3f};
+use rfs_core::math::{Quatf, Transform, Vec3f};
 use rfs_core::packet::ProjectileType;
 use rfs_core::time::{Tick, FIXED_DT};
 use rfs_ship::ship::{Ship, ShipState};
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::ballistics::{BallisticsCalculator, BallisticsConfig, RICOCHET_ELASTICITY};
+use crate::physics::{ShipPhysics, ShipPhysicsConfig, ShipPhysicsState, yaw_heading};
 
 /// How much of the kinetic energy of a ram becomes hull damage.
 ///
@@ -141,6 +142,15 @@ pub struct TickSystem {
     /// map, and grid indices read against another map's obstacle list are an
     /// out-of-bounds read waiting to happen.
     world: RwLock<Option<WorldSlot>>,
+    /// Bug №743: the hydrostatic integrator per ship. This is the hull's sole
+    /// motion authority now (`Ship::update` keeps compartments/stations/
+    /// sinking only): the integrator lives as long as its ship so propeller
+    /// rpm and hydro bookkeeping persist tick to tick, and each tick it is
+    /// handed the ship record's pose (`set_pose`) — the ship state stays the
+    /// single source of truth, the integrator never runs two steps ahead or
+    /// behind. Lock order everywhere: `ships` first, this second; the
+    /// add/remove pair below never holds both.
+    ship_physics: RwLock<HashMap<EntityId, ShipPhysics>>,
 }
 
 /// One installed world: the map, plus the broadphase grid built over it
@@ -271,6 +281,50 @@ pub struct Projectile {
 /// damping would fire forever.
 pub const SHIP_BOUNDS_MARGIN: f32 = 1.0;
 
+/// Bug №743: the pose one ship hands its integrator for this tick — the
+/// hull's truth as the ship record holds it, plus the helm the crew set.
+/// Plain data so the protocol between the two parallel phases needs neither
+/// guards nor locks.
+#[derive(Clone, Copy)]
+struct HullSeed {
+    position: Vec3f,
+    rotation: Quatf,
+    velocity: Vec3f,
+    angular_velocity: Vec3f,
+    throttle: f32,
+    rudder: f32,
+}
+
+impl HullSeed {
+    fn from_state(state: &ShipState) -> Self {
+        Self {
+            position: state.transform.position,
+            rotation: state.transform.rotation,
+            velocity: state.velocity,
+            angular_velocity: state.angular_velocity,
+            throttle: state.throttle,
+            // ShipState.rudder_angle is the helm FACTOR (−1..1), exactly what
+            // `ShipPhysics::update` expects as `rudder_input` — the radians
+            // conversion happens against the integrator's own max_rudder_angle.
+            rudder: state.rudder_angle,
+        }
+    }
+}
+
+/// Bug №743: copy the integrator's recomputed hull onto the ship record, as
+/// one merged write. `heading` and `speed` stop being independent quantities:
+/// heading is the forward direction of the ACTUAL rotation (heel and trim are
+/// real now), speed is the length of the ACTUAL velocity — the arcade model
+/// kept pocket copies of both and could disagree with what it was moving.
+fn install_hull_motion(state: &mut ShipState, motion: ShipPhysicsState) {
+    state.transform.position = motion.position;
+    state.transform.rotation = motion.rotation;
+    state.velocity = motion.velocity;
+    state.angular_velocity = motion.angular_velocity;
+    state.heading = yaw_heading(motion.rotation);
+    state.speed = motion.velocity.length();
+}
+
 /// What a projectile ran into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollisionTarget {
@@ -318,6 +372,7 @@ impl TickSystem {
             dropped_projectiles: std::sync::atomic::AtomicU64::new(0),
             obstacle_hits: std::sync::atomic::AtomicU64::new(0),
             world: RwLock::new(None),
+            ship_physics: RwLock::new(HashMap::new()),
         }
     }
 
@@ -710,23 +765,56 @@ impl TickSystem {
     ) {
         let ships = self.ships.read();
 
-        // Bug №153: the pre-tick state is captured so flooding/occupancy
-        // transitions are detected edge-triggered — the old code never emitted
+        // Phase 1 (the ships read guard only). Bug №153: the pre-tick state is
+        // captured so flooding/occupancy transitions are detected
+        // edge-triggered — the old code never emitted
         // CompartmentFlooded/StationOccupied/StationVacated at all.
-        let updates: Vec<_> = ships
+        //
+        // Bug №743: `Ship::update` no longer moves the hull — the arcade mover
+        // handed over to `ShipPhysics` (see ship.rs): what runs here is
+        // compartments/stations/sinking. What leaves this phase is the pose
+        // the integrator pushes its forces against.
+        let updates: Vec<(EntityId, ShipState, ShipState, HullSeed)> = ships
             .par_iter()
             .map(|(id, ship)| {
                 let prev = ship.get_state();
                 let mut ship_state = prev.clone();
                 ship.update(FIXED_DT, &mut ship_state);
-                (*id, prev, ship_state)
+                let seed = HullSeed::from_state(&ship_state);
+                (*id, prev, ship_state, seed)
             })
             .collect();
 
         drop(ships);
 
+        // Phase 2 (the physics write guard only). The parking_lot guard is not
+        // Send, so it must not live across a rayon closure — the phases shake
+        // hands through the collected Vecs instead, one guard at a time. A
+        // missing map entry (a ship raced in through a path that keeps the old
+        // code's contract) simply produces no motion; the record keeps its own
+        // pose verbatim.
+        let seeds: HashMap<EntityId, HullSeed> = updates
+            .iter()
+            .map(|(id, _, _, seed)| (*id, *seed))
+            .collect();
+        let mut physics = self.ship_physics.write();
+        let motions: Vec<(EntityId, ShipPhysicsState)> = physics
+            .par_iter_mut()
+            .filter_map(|(id, p)| {
+                let seed = *seeds.get(id)?;
+                p.set_pose(
+                    seed.position, seed.rotation, seed.velocity, seed.angular_velocity,
+                );
+                p.update(FIXED_DT, seed.throttle, seed.rudder);
+                Some((*id, p.get_state()))
+            })
+            .collect();
+        drop(physics);
+        let motions: HashMap<EntityId, ShipPhysicsState> = motions.into_iter().collect();
+
+        // Phase 3 (the ships write guard only): the serial merge verbatim.
         let mut ships = self.ships.write();
-        for (id, prev, state) in updates {
+        for (id, prev, mut state, _seed) in updates {
             // Bug №57: a ship that finished sinking leaves the simulation —
             // the old code kept it around forever with an empty sink-timer
             // body.
@@ -739,6 +827,12 @@ impl TickSystem {
                 continue;
             }
             if let Some(ship) = ships.get(&id) {
+                // Bug №743: the integrator's pose is the hull's truth; the
+                // ship record takes it as one merged write so no mid-tick
+                // reader can see the two halves disagree.
+                if let Some(motion) = motions.get(&id) {
+                    install_hull_motion(&mut state, motion.clone());
+                }
                 // Bug №701: the loss of a hull is fixed when `is_sinking` flips
                 // — by `check_sinking` in the update below, or earlier in the
                 // same tick by `apply_health_damage` (№191's guard). Edge
@@ -1392,11 +1486,17 @@ impl TickSystem {
     }
 
     pub fn add_ship(&self, ship: Ship) {
+        // Bug №743: the integrator is born with its ship, configured from the
+        // ship class the loader built it from.
+        let physics =
+            ShipPhysics::new(ShipPhysicsConfig::from_ship_config(ship.config()));
+        self.ship_physics.write().insert(ship.entity_id(), physics);
         self.ships.write().insert(ship.entity_id(), Arc::new(ship));
     }
 
     pub fn remove_ship(&self, entity_id: EntityId) {
         self.ships.write().remove(&entity_id);
+        self.ship_physics.write().remove(&entity_id);
     }
 
     pub fn get_ship(&self, entity_id: EntityId) -> Option<Arc<Ship>> {
@@ -2351,6 +2451,133 @@ mod tests {
         assert_eq!(
             with_world.velocity, without_world.velocity,
             "the world changed the speed of a ship that was inside it"
+        );
+    }
+
+    /// Bug №743: the physics config a tick actually sails a ship with is the
+    /// class bridge (`from_ship_config`), applied at `add_ship` — the same
+    /// constructor every real spawn takes. Sailed through the tick loop, the
+    /// hull's pose stays the authority: an idle ship at the fleet spawn holds
+    /// it (weight balances buoyancy there by construction), instead of
+    /// rocketing up or sinking away like the pre-cutover unpowered physics
+    /// would have.
+    fn idle_ship_at_spawn() -> (TickSystem, ShipState) {
+        let mut sim = TickSystem::new();
+        let ship = rfs_ship::ship::Ship::new(
+            rfs_ship::ship::ShipConfig::default(),
+            EntityId::new(1),
+            std::sync::Arc::new(rfs_damage::DamageSystem::new()),
+        );
+        let spawn = ship.get_state();
+        sim.add_ship(ship);
+        for _ in 0..90 {
+            sim.tick();
+        }
+        (sim, spawn)
+    }
+
+    #[test]
+    fn an_idle_ship_holds_its_spawn_pose() {
+        let (sim, spawn) = idle_ship_at_spawn();
+        let after = sim
+            .get_ship(EntityId::new(1))
+            .expect("ship registered")
+            .get_state();
+
+        let drift = after.transform.position - spawn.transform.position;
+        assert!(
+            drift.length() < 2.0,
+            "an idle ship must hold its spawn pose, drifted to {:?}",
+            after.transform.position
+        );
+        assert!(
+            after.velocity.length() < 5.0,
+            "an idle ship must not sail itself, velocity {:?}",
+            after.velocity
+        );
+    }
+
+    /// Bug №743: the helm reaches the integrator and the integrator's pose
+    /// reaches back. The write-back (`install_hull_motion`) is what makes the
+    /// motion visible on the ship record; a throttle with no plumbing must
+    /// leave the hull at its spawn, and this is the test that goes red when
+    /// either half of that path is lost.
+    #[test]
+    fn a_throttled_ship_builds_way_forward() {
+        let mut sim = TickSystem::new();
+        let ship = rfs_ship::ship::Ship::new(
+            rfs_ship::ship::ShipConfig::default(),
+            EntityId::new(1),
+            std::sync::Arc::new(rfs_damage::DamageSystem::new()),
+        );
+        ship.set_throttle(1.0);
+        sim.add_ship(ship);
+        for _ in 0..90 {
+            sim.tick();
+        }
+        let after = sim
+            .get_ship(EntityId::new(1))
+            .expect("ship registered")
+            .get_state();
+
+        // The default pose faces FORWARD = +Z, so the way made is +Z. The
+        // magnitudes are not calibrated yet, so the test is qualitative: it
+        // must hold its line (no sideways wander) and move well beyond a
+        // drift.
+        assert!(
+            after.transform.position.z > 2.0,
+            "full throttle for 90 ticks made no way: z = {}",
+            after.transform.position.z
+        );
+        assert!(
+            after.transform.position.x.abs() < 5.0,
+            "a straight run must not wander sideways: x = {}",
+            after.transform.position.x
+        );
+        assert!(
+            after.speed > 0.5,
+            "the derived speed must reflect the run: {}",
+            after.speed
+        );
+    }
+
+    /// Bug №743: steering is a real rotation about +Y now, projected back into
+    /// `heading` by `yaw_heading`. The rudder needs flow to bite (speed above
+    /// 1 m/s), so the run starts throttled; and the two helm positions must
+    /// turn OPPOSITE ways — a sign error that always turned the same way
+    /// would otherwise pass.
+    #[test]
+    fn the_rudder_turns_the_heading() {
+        let run = |rudder: f32| {
+            let mut sim = TickSystem::new();
+            let ship = rfs_ship::ship::Ship::new(
+                rfs_ship::ship::ShipConfig::default(),
+                EntityId::new(1),
+                std::sync::Arc::new(rfs_damage::DamageSystem::new()),
+            );
+            ship.set_throttle(1.0);
+            ship.set_rudder(rudder);
+            sim.add_ship(ship);
+            for _ in 0..90 {
+                sim.tick();
+            }
+            sim.get_ship(EntityId::new(1))
+                .expect("ship registered")
+                .get_state()
+        };
+        let hard_to_port = run(1.0);
+        let hard_to_starboard = run(-1.0);
+
+        assert!(
+            hard_to_port.heading.abs() > 0.05,
+            "90 ticks under full rudder must turn the heading, got {}",
+            hard_to_port.heading
+        );
+        assert!(
+            hard_to_starboard.heading * hard_to_port.heading < 0.0,
+            "the two helm positions must turn opposite ways: {} and {}",
+            hard_to_starboard.heading,
+            hard_to_port.heading
         );
     }
 

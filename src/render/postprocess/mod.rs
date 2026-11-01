@@ -1,6 +1,17 @@
 //! Post-Processing Module
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
+//!
+//! Honest contract (Bug №204). The effects below are shells, and they say so:
+//! each keeps its real configuration and enable knob, and every stage that
+//! used to *pretend* to run now returns `RhiError::NotSupported` instead of
+//! imitating work through the encoder's silent stubs. A disabled effect is an
+//! honest no-op; an enabled one refuses. Nothing in this module renders.
+//!
+//! That is the layer's boundary, not a bug to patch here: the missing pieces
+//! are fullscreen-quad passes, pipelines and effect shaders. Building those
+//! waits on the owner's shader decision (HLSL vs a single WGSL source fanout
+//! via naga/DXC), then is done as its own move — not smuggled into a cleanup.
 
 pub mod bloom;
 pub mod dof;

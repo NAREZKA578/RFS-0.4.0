@@ -94,14 +94,6 @@ fn item(name: &str, mesh: &Mesh) -> GeometryItem {
     }
 }
 
-/// The colour the cube is lit to: the ambient term and the light.
-///
-/// The cube is white and the light is white, so the lit colour saturates:
-/// every channel is 1.0.
-fn lit_cube() -> Vec3 {
-    Vec3::ONE
-}
-
 #[test]
 fn the_transparent_object_is_behind_the_opaque_one() {
     let device = open_device();
@@ -335,7 +327,6 @@ fn the_transparent_object_is_behind_the_opaque_one() {
         .expect("the target could not be read back");
     let centre = (EXTENT / 2) as usize;
     let pixel = &bytes[(centre * EXTENT as usize + centre) * 4..][..4];
-    let red = pixel[0] as f32 / 255.0;
     let green = pixel[1] as f32 / 255.0;
 
     // The cube is white and the light is white, so the cube's colour is

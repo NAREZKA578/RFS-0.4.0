@@ -2170,6 +2170,51 @@ impl NetServer {
             events: Vec::new(),
         });
 
+        // RTT697-TEMP: probes, откатить после разбора.
+        static FLUSH_OK_697: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FLUSH_ERR_697: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FLUSH_ROUNDS_697: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // RTT697-TEMP: разрез отправленных дельт — мелкая vs фрагментная,
+        // resync-флаг, по слоям. Откатить после разбора.
+        static DS_SMALL_697: AtomicU64 = AtomicU64::new(0);
+        static DS_FRAG_697: AtomicU64 = AtomicU64::new(0);
+        static DS_FRAG_RESYNC_697: AtomicU64 = AtomicU64::new(0);
+        static DS_BY_LAYER_697: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        static DS_FRAG_BY_LAYER_697: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        static DS_BYTES_FRAG_697: AtomicU64 = AtomicU64::new(0);
+        static DS_BYTES_SMALL_697: AtomicU64 = AtomicU64::new(0);
+        static DS_LASTLOG_697: AtomicU64 = AtomicU64::new(0);
+        fn ds_log_697() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = DS_LASTLOG_697.load(Ordering::Relaxed);
+            if now >= last + 5000
+                && DS_LASTLOG_697
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let l = |t: &[AtomicU64; 4]| -> String {
+                    t.iter()
+                        .map(|c| c.load(Ordering::Relaxed).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                eprintln!(
+                    "RTT697-TEMP server_ds t={} small={} smallbytes={} frag={} fragbytes={} frag_resync={} by_layer=[{}] frag_by_layer=[{}]",
+                    now,
+                    DS_SMALL_697.load(Ordering::Relaxed),
+                    DS_BYTES_SMALL_697.load(Ordering::Relaxed),
+                    DS_FRAG_697.load(Ordering::Relaxed),
+                    DS_BYTES_FRAG_697.load(Ordering::Relaxed),
+                    DS_FRAG_RESYNC_697.load(Ordering::Relaxed),
+                    l(&DS_BY_LAYER_697),
+                    l(&DS_FRAG_BY_LAYER_697)
+                );
+            }
+        }
+
         // Bug #267: at 50+ clients the per-client filter+diff+serialize inside
         // the tick budget is the wall (applied rate collapsed to 0.86 Hz at 200
         // bots; the payload cache alone only reached 3.76 Hz). Two levers land
@@ -2412,7 +2457,27 @@ impl NetServer {
                         },
                     );
                     if let Some(bytes) = cached {
-                        for packet in conn.send_state_delta_bytes(bytes) {
+                        // RTT697-TEMP: probe, откатить после разбора.
+                        let blob = bytes.len();
+                        let dpackets = conn.send_state_delta_bytes(bytes);
+                        if dpackets
+                            .first()
+                            .is_some_and(|p| p.header.packet_type == PacketType::Fragment as u8)
+                        {
+                            DS_FRAG_697.fetch_add(1, Ordering::Relaxed);
+                            if resync {
+                                DS_FRAG_RESYNC_697.fetch_add(1, Ordering::Relaxed);
+                            }
+                            DS_BYTES_FRAG_697.fetch_add(blob as u64, Ordering::Relaxed);
+                            DS_FRAG_BY_LAYER_697[layer_u8 as usize]
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            DS_SMALL_697.fetch_add(1, Ordering::Relaxed);
+                            DS_BYTES_SMALL_697.fetch_add(blob as u64, Ordering::Relaxed);
+                        }
+                        DS_BY_LAYER_697[layer_u8 as usize].fetch_add(1, Ordering::Relaxed);
+                        ds_log_697();
+                        for packet in dpackets {
                             out.push((conn.clone(), packet));
                         }
                         // Bug №30 (B): the cached payload was serialized for
@@ -2479,7 +2544,27 @@ impl NetServer {
                                 bytes.clone(),
                             ),
                         );
-                        for packet in conn.send_state_delta_bytes(bytes) {
+                        // RTT697-TEMP: probe, откатить после разбора.
+                        let blob = bytes.len();
+                        let dpackets = conn.send_state_delta_bytes(bytes);
+                        if dpackets
+                            .first()
+                            .is_some_and(|p| p.header.packet_type == PacketType::Fragment as u8)
+                        {
+                            DS_FRAG_697.fetch_add(1, Ordering::Relaxed);
+                            if resync {
+                                DS_FRAG_RESYNC_697.fetch_add(1, Ordering::Relaxed);
+                            }
+                            DS_BYTES_FRAG_697.fetch_add(blob as u64, Ordering::Relaxed);
+                            DS_FRAG_BY_LAYER_697[layer_u8 as usize]
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            DS_SMALL_697.fetch_add(1, Ordering::Relaxed);
+                            DS_BYTES_SMALL_697.fetch_add(blob as u64, Ordering::Relaxed);
+                        }
+                        DS_BY_LAYER_697[layer_u8 as usize].fetch_add(1, Ordering::Relaxed);
+                        ds_log_697();
+                        for packet in dpackets {
                             out.push((conn.clone(), packet));
                         }
                         // Bug №274: count deltas actually put on the wire, per
@@ -2531,9 +2616,31 @@ impl NetServer {
         );
         for batch in pending_batches {
             for (conn, packet) in batch {
-                let _ =
-                    Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled, auth).await;
+                // RTT697-TEMP: probe, откатить после разбора.
+                match Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled, auth).await
+                {
+                    Ok(_) => FLUSH_OK_697.fetch_add(1, Ordering::Relaxed),
+                    Err(_) => FLUSH_ERR_697.fetch_add(1, Ordering::Relaxed),
+                };
             }
+        }
+        // RTT697-TEMP: probe, откатить после разбора. Раз в ~5 с (150 раундов
+        // по 33 мс) — фактические отправки против построенных пакетов.
+        let round_no = FLUSH_ROUNDS_697.fetch_add(1, Ordering::Relaxed);
+        if round_no % 150 == 149 {
+            eprintln!(
+                "RTT697-TEMP server_flush t={} rounds={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                round_no + 1
+            );
+            eprintln!(
+                "RTT697-TEMP server_flush_counts ok={} err={}",
+                FLUSH_OK_697.load(Ordering::Relaxed),
+                FLUSH_ERR_697.load(Ordering::Relaxed)
+            );
         }
     }
 

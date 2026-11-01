@@ -9,9 +9,11 @@ use rhi::backend::d3d11::D3D11Backend;
 use rhi::backend::d3d12::D3D12Backend;
 use rhi::backend::opengl::OpenGLBackend;
 use rhi::backend::vulkan::VulkanBackend;
+use rhi::command::commands::Command;
 use rhi::config::RhiConfig;
 use rhi::core::device::{DeviceDesc, PhysicalDevice, PhysicalDeviceType};
 use rhi::resource::{BufferDesc, TextureDesc};
+use rhi::sync::barrier::{BufferCopy, BufferTextureCopy};
 use rhi::types::GraphicsApi;
 use rhi::types::{BufferUsage, Format, MemoryPropertyFlags, SampleCount, SharingMode};
 use rhi::types::{Features, Limits, TextureDimensions, TextureUsage};
@@ -135,6 +137,149 @@ fn d3d12_device_mapped_buffer_view() {
     let view = device.buffer_data(&buffer).expect("the upload buffer maps");
     assert_eq!(view.len(), 256);
     assert_eq!(view, payload.as_slice());
+}
+
+// Bug №706: `submit_recorded` on the D3D12 device inherited a
+// NotSupported default — the recorded command surface did not exist. The M2
+// contract: a recorded `CopyBuffer` replays on a real graphics command list
+// (reset → record → close → `ExecuteCommandLists` → fence wait), and the
+// destination bytes are readable back unchanged.
+#[test]
+fn d3d12_submit_recorded_copy_round_trip() {
+    let device = d3d12_test_device();
+
+    // The source is an upload-heap buffer the host wrote through the managed
+    // path; the copy itself must travel through the recorded list.
+    let src = device
+        .create_buffer(512, BufferUsage::TRANSFER_SRC, true)
+        .unwrap();
+    let payload: Vec<u32> = (0..128).map(|i| 0x500_000 + i as u32).collect();
+    device.upload_buffer::<u32>(&src, &payload).unwrap();
+
+    let dst_desc = BufferDesc {
+        size: 512,
+        usage: BufferUsage::TRANSFER_DST,
+        memory_flags: MemoryPropertyFlags::DEVICE_LOCAL,
+        sharing_mode: SharingMode::Exclusive,
+        queue_family_indices: Vec::new(),
+    };
+    let dst = device.create_buffer_from_desc(&dst_desc).unwrap();
+
+    let commands = vec![Command::CopyBuffer {
+        src: src.clone(),
+        dst: dst.clone(),
+        regions: vec![BufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: 512,
+        }],
+    }];
+    device.submit_recorded(&commands).unwrap();
+
+    // The device-local destination only reads through a staging download.
+    let out = device.download_buffer(&dst, 0, 512).unwrap();
+    let back: Vec<u32> = out
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if back != payload {
+        let first = back.iter().zip(payload.iter()).position(|(a, b)| a != b);
+        eprintln!(
+            "recorded copy mismatch: first at u32 index {:?}, saw {:?}, expected {:?}",
+            first,
+            back.iter().take(8).collect::<Vec<_>>(),
+            payload.iter().take(8).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(back, payload);
+    device.wait_idle().unwrap();
+}
+
+// The recorded texture upload (Bug №706): a `CopyBufferToTexture` whose tight
+// row happens to be a multiple of the 256-byte staging alignment replays
+// directly — width 256 RGBA8 makes the row 1024 bytes. Deeper usage stays
+// with the managed `upload_texture`, which stages the general case itself.
+#[test]
+fn d3d12_submit_recorded_texture_upload_round_trip() {
+    let device = d3d12_test_device();
+    let src = device
+        .create_buffer(1024, BufferUsage::TRANSFER_SRC, true)
+        .unwrap();
+    let payload: Vec<u8> = (0..1024).map(|i| (i * 7 % 251) as u8).collect();
+    device.upload_buffer::<u8>(&src, &payload).unwrap();
+
+    let desc = TextureDesc {
+        width: 256,
+        height: 1,
+        depth: 1,
+        mip_levels: 1,
+        array_layers: 1,
+        format: Format::RGBA8_UNORM,
+        usage: TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST,
+        sample_count: SampleCount::X1,
+        dimensions: TextureDimensions::D2,
+        sharing_mode: SharingMode::Exclusive,
+        queue_family_indices: Vec::new(),
+    };
+    let texture = device.create_texture_from_desc(&desc).unwrap();
+    assert!(texture.has_gpu_backing());
+
+    let commands = vec![Command::CopyBufferToTexture {
+        src: src.clone(),
+        dst: texture.clone(),
+        regions: vec![BufferTextureCopy {
+            buffer_offset: 0,
+            size: 1024,
+        }],
+    }];
+    device.submit_recorded(&commands).unwrap();
+
+    let back = device.download_texture(&texture, 0, 0).unwrap();
+    assert_eq!(back.len(), 1024);
+    assert_eq!(back, payload);
+}
+
+// The recorded texture upload refuses what the D3D12 copy contract cannot
+// take silently: a tight row narrower than the 256-byte staging alignment
+// (width 32 RGBA8 is 128 bytes) must be refused as NotSupported rather than
+// arriving as misaligned-at-the-source bytes (Bug №706).
+#[test]
+fn d3d12_submit_recorded_refuses_unaligned_texture_rows() {
+    let device = d3d12_test_device();
+    let src = device
+        .create_buffer(128, BufferUsage::TRANSFER_SRC, true)
+        .unwrap();
+    let payload: Vec<u8> = (0..128).map(|i| i as u8).collect();
+    device.upload_buffer::<u8>(&src, &payload).unwrap();
+
+    let desc = TextureDesc {
+        width: 32,
+        height: 1,
+        depth: 1,
+        mip_levels: 1,
+        array_layers: 1,
+        format: Format::RGBA8_UNORM,
+        usage: TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST,
+        sample_count: SampleCount::X1,
+        dimensions: TextureDimensions::D2,
+        sharing_mode: SharingMode::Exclusive,
+        queue_family_indices: Vec::new(),
+    };
+    let texture = device.create_texture_from_desc(&desc).unwrap();
+
+    let commands = vec![Command::CopyBufferToTexture {
+        src: src.clone(),
+        dst: texture.clone(),
+        regions: vec![BufferTextureCopy {
+            buffer_offset: 0,
+            size: 128,
+        }],
+    }];
+    let result = device.submit_recorded(&commands);
+    assert!(
+        matches!(result, Err(RhiError::NotSupported(_))),
+        "an unaligned recorded row must be refused, got {result:?}"
+    );
 }
 
 #[test]

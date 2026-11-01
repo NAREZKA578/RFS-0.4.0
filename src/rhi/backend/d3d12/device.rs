@@ -17,14 +17,48 @@ use std::sync::Mutex;
 use crate::backend::common::{BackendResource, ReleaseKind};
 use crate::error::{RhiError, RhiResult};
 use crate::resource::{Buffer, BufferDesc, GpuResource, Texture, TextureDesc};
-use crate::types::{GraphicsApi, TextureDimensions, TextureUsage};
+use crate::types::{Format, GraphicsApi, TextureDimensions, TextureUsage};
 
 use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_PRIMITIVE_TOPOLOGY,
+    D3D_PRIMITIVE_TOPOLOGY_LINELIST,
+    D3D_PRIMITIVE_TOPOLOGY_POINTLIST,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+    ID3DBlob,
+};
+use windows::Win32::Graphics::Direct3D::Fxc::D3DGetInputSignatureBlob;
+use windows::Win32::Graphics::Direct3D11::D3D11_SIGNATURE_PARAMETER_DESC;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+    D3D12_BLEND, D3D12_BLEND_DESC, D3D12_BLEND_OP, D3D12_BLEND_ONE,
+    D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_FLAG_STENCIL,
+    D3D12_CLEAR_FLAGS, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMPARISON_FUNC,
+    D3D_ROOT_SIGNATURE_VERSION_1_0,
+    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_CONSERVATIVE_RASTERIZATION_MODE,
+    D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+    D3D12_CULL_MODE, D3D12_CULL_MODE_NONE, D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_STENCILOP_DESC, D3D12_DEPTH_WRITE_MASK,
+    D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE,
+    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+    D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+    D3D12_DESCRIPTOR_RANGE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    D3D12_DESCRIPTOR_RANGE_TYPE, D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+    D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+    D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_FILL_MODE, D3D12_FILL_MODE_SOLID,
+    D3D12_FILTER, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE, D3D12_HEAP_TYPE_DEFAULT,
-    D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_UNKNOWN,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+    D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, D3D12_INDEX_BUFFER_VIEW,
+    D3D12_INPUT_CLASSIFICATION, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, D3D12_INPUT_ELEMENT_DESC,
+    D3D12_INPUT_LAYOUT_DESC, D3D12_LOGIC_OP, D3D12_LOGIC_OP_NOOP,
+    D3D12_MEMORY_POOL_UNKNOWN, D3D12_PIPELINE_STATE_FLAG_NONE, D3D12_PIPELINE_STATE_FLAGS,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_PRIMITIVE_TOPOLOGY_TYPE,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
+    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RENDER_TARGET_VIEW_DESC,
+    D3D12_RENDER_TARGET_VIEW_DESC_0, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
     D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
     D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE1D,
@@ -33,16 +67,38 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ,
-    D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_SUBRESOURCE_FOOTPRINT,
-    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
-    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-    D3D12_TEXTURE_LAYOUT_UNKNOWN,
-    ID3D12CommandAllocator,
-    ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-    ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE,
+    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_DESCRIPTOR_TABLE,
+    D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+    D3D12_ROOT_SIGNATURE_FLAGS, D3D12_SAMPLER_DESC,
+    D3D12_SHADER_BYTECODE, D3D12_SHADER_RESOURCE_VIEW_DESC,
+    D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SHADER_VISIBILITY, D3D12_SHADER_VISIBILITY_ALL,
+    D3D12_STENCIL_OP, D3D12_SUBRESOURCE_FOOTPRINT, D3D12_TEX2D_RTV,
+    D3D12_TEX2D_SRV, D3D12_TEX2D_DSV, D3D12_TEXTURE_ADDRESS_MODE, D3D12_TEXTURE_COPY_LOCATION,
+    D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+    D3D12_VERTEX_BUFFER_VIEW, CreateRenderTargetView, CreateDepthStencilView,
+    CreateSampler, CreateShaderResourceView, CreateConstantBufferView,
+    CreateGraphicsPipelineState, CreateRootSignature, D3D12SerializeRootSignature,
+    D3D12_DEPTH_STENCIL_VIEW_DESC, D3D12_DEPTH_STENCIL_VIEW_DESC_0,
+    D3D12_DSV_DIMENSION, D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_TEX1D_SRV, D3D12_TEX1D_ARRAY_SRV,
+    D3D12_TEX2D_ARRAY_SRV, D3D12_TEX3D_SRV, D3D12_TEXCUBE_SRV, D3D12_TEXCUBE_ARRAY_SRV,
+    D3D12_RTV_DIMENSION, D3D12_RTV_DIMENSION_TEXTURE2D,
+    D3D12_SRV_DIMENSION, D3D12_SRV_DIMENSION_BUFFER, D3D12_SRV_DIMENSION_TEXTURE1D,
+    D3D12_SRV_DIMENSION_TEXTURE1D_ARRAY, D3D12_SRV_DIMENSION_TEXTURE2D,
+    D3D12_SRV_DIMENSION_TEXTURE2D_ARRAY, D3D12_SRV_DIMENSION_TEXTURE2DMS,
+    D3D12_SRV_DIMENSION_TEXTURE2DMS_ARRAY, D3D12_SRV_DIMENSION_TEXTURE3D,
+    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_SRV_DIMENSION_TEXTURECUBE_ARRAY,
+    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+    ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12DescriptorHeap,
+    ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12PipelineState,
+    ID3D12Resource, ID3D12RootSignature,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+};
 
 use super::convert;
 
@@ -71,6 +127,33 @@ impl<T: Interface> Clone for DxCom<T> {
 pub(crate) enum D3DObject {
     Buffer(BufferEntry),
     Texture(TextureEntry),
+    /// A texture view: the resource it looks into, the RHI format every
+    /// descriptor is built from, and the subresource window. No descriptor
+    /// is created here — descriptors are written where they land (a
+    /// descriptor-set block, a framebuffer attachment).
+    View(ViewEntry),
+    /// A sampler description. The device-side sampler descriptor is written
+    /// where the sampler binding lands, so one sampler description can feed
+    /// many sets (the same CreateSampler data, repeated cheaply).
+    Sampler(SamplerEntry),
+    /// A shader module: the DXBC container bytes, kept for the pipeline
+    /// creator that turns per-stage modules into one PSO.
+    Shader(ShaderEntry),
+    GraphicsPipeline(GraphicsPipelineEntry),
+    /// A render pass object is only its description: D3D12 has no render
+    /// pass concept, so the emulation keeps the description (the same shape
+    /// the D3D11 backend tracks).
+    Pass(RenderPassDesc),
+    /// A framebuffer: one RTV descriptor per colour attachment and the one
+    /// depth-stencil descriptor, allocated once from the CPU-only pools so
+    /// the pass binds pointers instead of recreating views per frame.
+    Framebuffer(FramebufferEntry),
+    /// A descriptor set layout: the bindings and their per-pool descriptor
+    /// totals, the plan everything binding-related reads.
+    Layout(LayoutEntry),
+    /// A descriptor set: the contiguous block reserved per pool, filled by
+    /// `write_descriptors` and bound by its GPU handle.
+    Set(SetEntry),
 }
 
 // COM wrappers and a raw persistent mapped pointer are carried across
@@ -91,6 +174,14 @@ pub(crate) struct BufferEntry {
     /// The mapping returned by `Map` at creation for upload-heap buffers;
     /// `null` for device-only buffers.
     mapped: *mut core::ffi::c_void,
+    /// The D3D12 state the buffer was created in — the state it lives in
+    /// between submits. COMMON for the DEFAULT heap, GENERIC_READ for
+    /// UPLOAD (the documented `CreateCommittedResource` requirement). The
+    /// recorded-list translator seeds its per-list tracker from this, and
+    /// the D3D12 heap contract keeps the upload home permanent (an
+    /// upload-heap resource never leaves GENERIC_READ, so it never takes a
+    /// transition barrier at all).
+    home_state: D3D12_RESOURCE_STATES,
 }
 
 /// A committed texture: the resource and the RHI description it was built
@@ -98,6 +189,277 @@ pub(crate) struct BufferEntry {
 pub(crate) struct TextureEntry {
     resource: DxCom<ID3D12Resource>,
     desc: TextureDesc,
+    /// The creation state (COMMON today — every texture is born in the
+    /// DEFAULT heap); the translator's tracker seeds from it.
+    home_state: D3D12_RESOURCE_STATES,
+}
+
+impl BufferEntry {
+    /// The underlying resource, for call sites outside this module — the
+    /// recorded-list translator tracks barrier state against it.
+    pub(crate) fn resource(&self) -> &ID3D12Resource {
+        &self.resource.0
+    }
+
+    /// The buffer's byte size, for the translator's range checks.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The state the buffer was created in (see the field doc).
+    pub(crate) fn home_state(&self) -> D3D12_RESOURCE_STATES {
+        self.home_state
+    }
+}
+
+impl TextureEntry {
+    /// The underlying resource, for the recorded-list translator.
+    pub(crate) fn resource(&self) -> &ID3D12Resource {
+        &self.resource.0
+    }
+
+    /// The descriptor the texture was created from.
+    pub(crate) fn desc(&self) -> &TextureDesc {
+        &self.desc
+    }
+
+    /// The state the texture was created in (see the field doc).
+    pub(crate) fn home_state(&self) -> D3D12_RESOURCE_STATES {
+        self.home_state
+    }
+}
+
+/// A texture view: which resource it looks into and the subresource window.
+/// Descriptors are created where they land, so the entry carries only the
+/// facts every descriptor type (SRV, RTV, DSV) needs.
+pub(crate) struct ViewEntry {
+    resource: DxCom<ID3D12Resource>,
+    /// The RHI format the view reads through: the resource's own format, or
+    /// the depth reformat the caller asked for (`convert::depth_srv_format`).
+    format: Format,
+    /// The mip window: `base_mip..base_mip + mip_levels`.
+    base_mip: u32,
+    mip_levels: u32,
+    /// The array-layer window: `base_layer..base_layer + layer_count`.
+    base_layer: u32,
+    layer_count: u32,
+}
+
+impl Clone for ViewEntry {
+    fn clone(&self) -> Self {
+        ViewEntry {
+            resource: self.resource.clone(),
+            format: self.format,
+            base_mip: self.base_mip,
+            mip_levels: self.mip_levels,
+            base_layer: self.base_layer,
+            layer_count: self.layer_count,
+        }
+    }
+}
+
+impl ViewEntry {
+    pub(crate) fn resource(&self) -> &ID3D12Resource {
+        &self.resource.0
+    }
+
+    /// The RHI format descriptors are built from.
+    pub(crate) fn rhi_format(&self) -> Format {
+        self.format
+    }
+
+    /// The SRV format: the depth family reads through the typed depth-first
+    /// format the conversion layer pairs with the typeless resource.
+    pub(crate) fn srv_format(&self) -> Option<DXGI_FORMAT> {
+        match convert::typeless_base(self.format) {
+            Some(_) => convert::depth_srv_format(self.format),
+            None => convert::dxgi_format(self.format),
+        }
+    }
+
+    /// The RTV/DSV typed format (depth views keep the typed depth).
+    pub(crate) fn target_format(&self) -> Option<DXGI_FORMAT> {
+        convert::dxgi_format(self.format)
+    }
+
+    pub(crate) fn base_mip(&self) -> u32 {
+        self.base_mip
+    }
+
+    pub(crate) fn mip_levels(&self) -> u32 {
+        self.mip_levels
+    }
+
+    pub(crate) fn base_layer(&self) -> u32 {
+        self.base_layer
+    }
+
+    pub(crate) fn layer_count(&self) -> u32 {
+        self.layer_count
+    }
+}
+
+/// A sampler description; the descriptor is written where it binds.
+#[derive(Clone)]
+pub(crate) struct SamplerEntry {
+    desc: crate::resource::SamplerDesc,
+}
+
+impl SamplerEntry {
+    pub(crate) fn desc(&self) -> &crate::resource::SamplerDesc {
+        &self.desc
+    }
+}
+
+/// A shader module: the DXBC container and its declared format.
+#[derive(Clone)]
+pub(crate) struct ShaderEntry {
+    format: crate::shader::ShaderFormat,
+    code: Vec<u8>,
+}
+
+impl ShaderEntry {
+    pub(crate) fn format(&self) -> crate::shader::ShaderFormat {
+        self.format
+    }
+
+    pub(crate) fn code(&self) -> &[u8] {
+        &self.code
+    }
+}
+
+/// The root signature, PSO, and binding facts the recorded draw path reads.
+#[derive(Clone)]
+pub(crate) struct GraphicsPipelineEntry {
+    root_signature: DxCom<ID3D12RootSignature>,
+    pso: DxCom<ID3D12PipelineState>,
+    topology: D3D_PRIMITIVE_TOPOLOGY,
+    /// `stride per input slot`, filling `BindVertexBuffers` views.
+    vertex_strides: Vec<(u32, u32)>,
+    /// How many root-table parameters the pipeline declares — one per set.
+    num_sets: usize,
+    viewports: Vec<crate::types::Viewport>,
+    scissors: Vec<crate::types::Scissor>,
+    blend_factor: [f32; 4],
+}
+
+impl GraphicsPipelineEntry {
+    pub(crate) fn root_signature(&self) -> &ID3D12RootSignature {
+        &self.root_signature.0
+    }
+
+    pub(crate) fn pso(&self) -> &ID3D12PipelineState {
+        &self.pso.0
+    }
+
+    pub(crate) fn topology(&self) -> D3D_PRIMITIVE_TOPOLOGY {
+        self.topology
+    }
+
+    pub(crate) fn vertex_strides(&self) -> &[(u32, u32)] {
+        &self.vertex_strides
+    }
+
+    pub(crate) fn num_sets(&self) -> usize {
+        self.num_sets
+    }
+
+    pub(crate) fn viewports(&self) -> &[crate::types::Viewport] {
+        &self.viewports
+    }
+
+    pub(crate) fn scissors(&self) -> &[crate::types::Scissor] {
+        &self.scissors
+    }
+
+    pub(crate) fn blend_factor(&self) -> [f32; 4] {
+        self.blend_factor
+    }
+}
+
+/// A descriptor set layout: the bindings and each pool's descriptor total.
+#[derive(Clone)]
+pub(crate) struct LayoutEntry {
+    pub(crate) bindings: Vec<crate::descriptor::DescriptorBinding>,
+    /// Total descriptors drawing from the CBV/SRV/UAV pool.
+    pub(crate) cbv_srv_uav_count: u32,
+    /// Total descriptors drawing from the sampler pool.
+    pub(crate) sampler_count: u32,
+    /// The root-table kind classification: `None` means a sampler-only set
+    /// (or an empty one — no tables at all).
+    pub(crate) cbv_srv_uav: bool,
+    pub(crate) sampler: bool,
+}
+
+impl LayoutEntry {
+    /// The declared-count roll of descriptors the binding consumes, for the
+    /// set block foreign binding offset math.
+    pub(crate) fn descriptor_offsets(&self) -> Vec<(u32, u32)> {
+        let mut offsets = Vec::with_capacity(self.bindings.len());
+        let mut running: u32 = 0;
+        for binding in &self.bindings {
+            offsets.push((binding.binding, running));
+            running += binding.count;
+        }
+        offsets
+    }
+
+    /// The offset of one declared binding, `None` when the write addresses a
+    /// binding the layout has no entry for.
+    pub(crate) fn binding_offset(&self, binding: u32) -> Option<(D3D12_DESCRIPTOR_RANGE_TYPE, u32)> {
+        let mut running: u32 = 0;
+        for declared in &self.bindings {
+            if declared.binding == binding {
+                return Some((convert::descriptor_range_type(declared.ty)?, running));
+            }
+            running += declared.count;
+        }
+        None
+    }
+
+    /// The size of one declared binding.
+    pub(crate) fn binding_count(&self, binding: u32) -> Option<u32> {
+        self.bindings
+            .iter()
+            .find(|declared| declared.binding == binding)
+            .map(|declared| declared.count)
+    }
+}
+
+/// A descriptor set: block bases reserved once at creation.
+#[derive(Clone)]
+pub(crate) struct SetEntry {
+    layout: LayoutEntry,
+    /// Base index in the CBV/SRV/UAV pool, when the set uses it.
+    block_base: Option<usize>,
+    /// Base index in the sampler pool, when the set uses it.
+    sampler_block_base: Option<usize>,
+}
+
+impl SetEntry {
+    pub(crate) fn layout(&self) -> &LayoutEntry {
+        &self.layout
+    }
+
+    pub(crate) fn block_base(&self) -> Option<usize> {
+        self.block_base
+    }
+
+    pub(crate) fn sampler_block_base(&self) -> Option<usize> {
+        self.sampler_block_base
+    }
+}
+
+/// A framebuffer: descriptor slots allocated once, bound by pointer.
+#[derive(Clone)]
+pub(crate) struct FramebufferEntry {
+    /// RTV pool slots, one per colour attachment in declared order.
+    pub(crate) rtv_slots: Vec<usize>,
+    /// DSV pool slot when a depth attachment exists.
+    pub(crate) dsv_slot: Option<usize>,
+    /// Window of the framebuffer the render area pins.
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 /// The D3D12 device resource handed to `Device::from_parts`.
@@ -109,6 +471,11 @@ pub struct D3D12Device {
     allocator: DxCom<ID3D12CommandAllocator>,
     /// One graphics command list the sequential copy path resets per call.
     command_list: DxCom<ID3D12GraphicsCommandList>,
+    /// The four descriptor heaps the graphics and compute paths draw from
+    /// (M3, Баг№707): CBV/SRV/UAV and sampler shader-visible, RTV/DSV
+    /// CPU-only. Built once here, carved from by the view, set, and
+    /// descriptor-table creators through `heaps()`.
+    heaps: super::descriptor::DescriptorHeaps,
     physical_name: String,
     handles: Mutex<HashMap<u64, D3DObject>>,
     next_id: AtomicU64,
@@ -152,17 +519,25 @@ impl D3D12Device {
             command_list.Close().map_err(|e| {
                 RhiError::DeviceCreationError(format!("initial command list Close: {e}"))
             })?; // so the first Reset is legal
+            let heaps = super::descriptor::DescriptorHeaps::new(&device.0)?;
             Ok(Self {
                 device,
                 queue,
                 fence,
                 allocator: DxCom(allocator),
                 command_list: DxCom(command_list),
+                heaps,
                 physical_name: physical.name.clone(),
                 handles: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
             })
         }
+    }
+
+    /// The descriptor heaps shared by every view, set, and pipeline creator
+    /// (M3, Баг№707).
+    pub(crate) fn heaps(&self) -> &super::descriptor::DescriptorHeaps {
+        &self.heaps
     }
 
     /// A handle that never hands out zero, the invalid sentinel.
@@ -205,10 +580,23 @@ impl D3D12Device {
     /// Cube is a 2D texture with six array layers; D3 packs its depth into
     /// `DepthOrArraySize`. Usage bits drive the self-sufficiency flags D3D12
     /// requires for render targets, depth-stencil views and unordered access.
+    ///
+    /// Depth formats are created per the `convert.rs` contract (bug №737):
+    /// the resource itself takes the *typeless base*, and the DSV/SRV views
+    /// carry the typed format — a typed depth resource would refuse the
+    /// reinterpreted views the format pairing was built for. Every non-depth
+    /// format keeps its typed format, since only the depth family has a
+    /// typeless base.
     fn texture_desc(desc: &TextureDesc) -> RhiResult<D3D12_RESOURCE_DESC> {
-        let format = convert::dxgi_format(desc.format).ok_or_else(|| {
-            RhiError::TextureCreationError(format!("no D3D12 format for {:?}", desc.format))
-        })?;
+        let format = match convert::typeless_base(desc.format) {
+            Some(typeless) => typeless,
+            None => convert::dxgi_format(desc.format).ok_or_else(|| {
+                RhiError::TextureCreationError(format!(
+                    "no D3D12 format for {:?}",
+                    desc.format
+                ))
+            })?,
+        };
         let dimension = match desc.dimensions {
             TextureDimensions::D1 => D3D12_RESOURCE_DIMENSION_TEXTURE1D,
             TextureDimensions::D2 | TextureDimensions::Cube => {
@@ -289,11 +677,14 @@ impl D3D12Device {
         })
     }
 
-    /// The sequential copy path: reset the one allocator and command list,
-    /// record the callers' commands, close, execute on the direct queue and
-    /// wait on the fence. The plan (TODO.md, M2) wants strictly sequential
-    /// transfers: each call owns the whole list from reset to completion.
-    fn execute_copy(
+    /// The sequential submit path: reset the one allocator and command list,
+    /// record the caller's list, close, execute on the direct queue and wait
+    /// on the fence. Strictly sequential by the M1/M2 plan (TODO.md —
+    /// Баг№706): every call owns the whole list from reset to completion,
+    /// and `submit_commands` (M2) rides the same path — a recorded command
+    /// list and a copy are the same shape here until a frame ring (Vulkan
+    /// №282's shape) replaces the waits.
+    fn submit_sequential(
         &self,
         record: impl FnOnce(&ID3D12GraphicsCommandList) -> RhiResult<()>,
     ) -> RhiResult<()> {
@@ -320,7 +711,7 @@ impl D3D12Device {
     }
 
     /// A transition barrier from `before` to `after` on all subresources.
-    fn transition(
+    pub(crate) fn transition(
         &self,
         list: &ID3D12GraphicsCommandList,
         resource: &ID3D12Resource,
@@ -354,18 +745,28 @@ impl D3D12Device {
                     size: entry.size,
                     upload_heap: entry.upload_heap,
                     mapped: entry.mapped,
+                    home_state: entry.home_state,
                 }),
                 D3DObject::Texture(entry) => D3DObject::Texture(TextureEntry {
                     resource: entry.resource.clone(),
                     desc: entry.desc.clone(),
+                    home_state: entry.home_state,
                 }),
+                D3DObject::View(entry) => D3DObject::View(entry.clone()),
+                D3DObject::Sampler(entry) => D3DObject::Sampler(entry.clone()),
+                D3DObject::Shader(entry) => D3DObject::Shader(entry.clone()),
+                D3DObject::GraphicsPipeline(entry) => D3DObject::GraphicsPipeline(entry.clone()),
+                D3DObject::Pass(desc) => D3DObject::Pass(desc.clone()),
+                D3DObject::Framebuffer(entry) => D3DObject::Framebuffer(entry.clone()),
+                D3DObject::Layout(entry) => D3DObject::Layout(entry.clone()),
+                D3DObject::Set(entry) => D3DObject::Set(entry.clone()),
             })
             .ok_or_else(|| {
                 RhiError::InternalError(format!("the {} handle {} is not tracked", what, handle))
             })
     }
 
-    fn buffer_entry(&self, handle: u64) -> RhiResult<BufferEntry> {
+    pub(crate) fn buffer_entry(&self, handle: u64) -> RhiResult<BufferEntry> {
         match self.lookup(handle, "buffer")? {
             D3DObject::Buffer(entry) => Ok(entry),
             D3DObject::Texture(_) => Err(RhiError::InternalError(
@@ -374,7 +775,7 @@ impl D3D12Device {
         }
     }
 
-    fn texture_entry(&self, handle: u64) -> RhiResult<TextureEntry> {
+    pub(crate) fn texture_entry(&self, handle: u64) -> RhiResult<TextureEntry> {
         match self.lookup(handle, "texture")? {
             D3DObject::Texture(entry) => Ok(entry),
             D3DObject::Buffer(_) => Err(RhiError::InternalError(
@@ -386,13 +787,13 @@ impl D3D12Device {
     /// Subresource index for a mip level and array layer. D3D12 lays
     /// subresources out mip-major: index = mip + layer * mip_levels, the
     /// same order the D3D11 backend uses.
-    fn subresource_index(desc: &TextureDesc, mip_level: u32, array_layer: u32) -> u32 {
+    pub(crate) fn subresource_index(desc: &TextureDesc, mip_level: u32, array_layer: u32) -> u32 {
         mip_level + array_layer * desc.mip_levels
     }
 
     /// The row pitch D3D12 demands inside staging buffers: every row is a
     /// multiple of `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT` (256).
-    fn aligned_pitch(width_bytes: u32) -> u32 {
+    pub(crate) fn aligned_pitch(width_bytes: u32) -> u32 {
         (width_bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
             & !(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
     }
@@ -506,6 +907,7 @@ impl BackendResource for D3D12Device {
                 size: desc.size,
                 upload_heap: host_visible,
                 mapped,
+                home_state: initial_state,
             }),
         );
         let mut out = Buffer::from_desc(desc.clone());
@@ -564,7 +966,7 @@ impl BackendResource for D3D12Device {
             staging.Unmap(0, None);
         }
         let dst = entry.resource.clone();
-        self.execute_copy(|list| {
+        self.submit_sequential(|list| {
             self.transition(
                 list,
                 &dst.0,
@@ -611,7 +1013,7 @@ impl BackendResource for D3D12Device {
         let entry = self.buffer_entry(gpu.handle)?;
         let staging = self.staging_buffer(size, false)?;
         let src = entry.resource.clone();
-        self.execute_copy(|list| {
+        self.submit_sequential(|list| {
             self.transition(
                 list,
                 &src.0,
@@ -686,6 +1088,7 @@ impl BackendResource for D3D12Device {
             D3DObject::Texture(TextureEntry {
                 resource: DxCom(texture),
                 desc: desc.clone(),
+                home_state: D3D12_RESOURCE_STATE_COMMON,
             }),
         );
         let mut out = Texture::from_desc(desc.clone());
@@ -716,74 +1119,122 @@ impl BackendResource for D3D12Device {
                     .into(),
             ));
         }
-        // The staging layout: one packed block of rows with D3D12's 256-byte
-        // pitch alignment, offset 0 (which satisfies the 512-byte placement
-        // alignment on its own).
-        let (_, rows, tight_row, aligned_row) = Self::texture_region_layout(&desc, 0)?;
-        let needed = rows as usize * tight_row as usize;
-        if data.len() < needed {
+        // The upload contract is the one the Vulkan backend carries today:
+        // the mip chain of layer 0 fills from one tightly packed buffer, and
+        // anything wider is refused rather than half-written. The first
+        // version of this path wrote subresource 0 with a hand-rolled mip-0
+        // layout and left the rest of the chain as uninitialized committed
+        // memory (bug №737).
+        if desc.array_layers > 1 {
+            return Err(RhiError::NotSupported(
+                "multi-layer texture upload is not supported yet".into(),
+            ));
+        }
+        // The staging geometry is the driver's word, not a re-derivation: one
+        // `GetCopyableFootprints` call covers the layer-0 mip chain —
+        // subresource indexing puts the mip above the layer, so the first
+        // `mip_levels` entries are exactly layer 0 — and returns every
+        // subresource's 256-byte-aligned staging offset, row count, and
+        // tight row size. The desc must be the one the resource was created
+        // from (`texture_desc` may hand back a typeless base for depth
+        // formats; rows and pitches are computed the same either way).
+        let resource_desc = Self::texture_desc(&desc)?;
+        let count = desc.mip_levels.max(1);
+        let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+        let mut num_rows = vec![0u32; count as usize];
+        let mut row_size = vec![0u64; count as usize];
+        let mut total = 0u64;
+        // SAFETY: the three output slices match `count` exactly and the
+        // resource desc is a plain value passed by reference.
+        unsafe {
+            self.device.0.GetCopyableFootprints(
+                &resource_desc,
+                0,
+                count,
+                0,
+                Some(layouts.as_mut_ptr()),
+                Some(num_rows.as_mut_ptr()),
+                Some(row_size.as_mut_ptr()),
+                Some(&mut total),
+            );
+        }
+        // The input rows sit at the tight row size the driver reports — for
+        // every format of the current table this equals the 4-aligned row
+        // stride the contract shares with Vulkan — and every staging row
+        // sits at the 256-byte `RowPitch`.
+        let needed = num_rows
+            .iter()
+            .zip(row_size.iter())
+            .map(|(rows, size)| *rows as u64 * *size)
+            .sum::<u64>();
+        if (data.len() as u64) < needed {
             return Err(RhiError::BackendError(format!(
-                "the {}-byte upload is too small: the texture needs {} bytes \
-                 (format {:?}, {}x{}@row-pitch {})",
+                "the {}-byte upload is too small: the mip chain needs {} bytes \
+                 (format {:?}, {}x{}, {} mips)",
                 data.len(),
                 needed,
                 desc.format,
                 desc.width,
                 desc.height,
-                tight_row
+                desc.mip_levels
             )));
         }
-        let staging_bytes = rows as usize * aligned_row as usize;
-        let staging = self.staging_buffer(staging_bytes as u64, true)?;
+        let staging = self.staging_buffer(total, true)?;
+        // SAFETY: `total` bytes come from the freshly created staging buffer;
+        // every slice below stays inside it by construction.
         unsafe {
             let mut ptr = std::ptr::null_mut();
-            staging.Map(0, None, Some(&mut ptr))
+            staging
+                .Map(0, None, Some(&mut ptr))
                 .map_err(|e| RhiError::BackendError(format!("upload staging Map: {e}")))?;
             let base = ptr as *mut u8;
-            for row in 0..rows as usize {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr().add(row * tight_row as usize),
-                    base.add(row * aligned_row as usize),
-                    tight_row as usize,
-                );
+            let mut cursor = 0usize;
+            for mip in 0..count as usize {
+                let rows = num_rows[mip] as usize;
+                let tight = row_size[mip] as usize;
+                let pitch = layouts[mip].Footprint.RowPitch as usize;
+                let dst = base.add(layouts[mip].Offset as usize);
+                let src = data.as_ptr().add(cursor);
+                for row in 0..rows {
+                    std::ptr::copy_nonoverlapping(
+                        src.add(row * tight),
+                        dst.add(row * pitch),
+                        tight,
+                    );
+                }
+                cursor += rows * tight;
             }
             staging.Unmap(0, None);
         }
+        // One transition pair spans the whole chain: the resource goes to
+        // COPY_DEST once, the copies land mip by mip — dst-first per the
+        // `CopyTextureRegion` argument order (bug №729's lesson) — and the
+        // resource returns to COMMON.
         let tex = entry.resource.clone();
-        let dxgi = convert::dxgi_format(desc.format).ok_or_else(|| {
-            RhiError::BackendError(format!("no D3D12 format for {:?}", desc.format))
-        })?;
-        let src_view = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::ManuallyDrop::new(Some(staging.clone())),
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: 0,
-                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: dxgi,
-                        Width: desc.width,
-                        Height: desc.height,
-                        Depth: 1,
-                        RowPitch: aligned_row,
-                    },
-                },
-            },
-        };
-        let dst_view = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::ManuallyDrop::new(Some(tex.0.clone())),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-        };
-        self.execute_copy(|list| {
+        self.submit_sequential(|list| {
             self.transition(
                 list,
                 &tex.0,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             );
-            unsafe {
-                list.CopyTextureRegion(&dst_view, 0, 0, 0, &src_view, None)
-            };
+            for mip in 0..count as usize {
+                let src_view = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(staging.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: layouts[mip],
+                    },
+                };
+                let dst_view = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(tex.0.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: Self::subresource_index(&desc, mip as u32, 0),
+                    },
+                };
+                unsafe { list.CopyTextureRegion(&dst_view, 0, 0, 0, &src_view, None) };
+            }
             self.transition(
                 list,
                 &tex.0,
@@ -865,7 +1316,7 @@ impl BackendResource for D3D12Device {
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: subresource },
         };
-        self.execute_copy(|list| {
+        self.submit_sequential(|list| {
             self.transition(
                 list,
                 &tex.0,
@@ -899,6 +1350,23 @@ impl BackendResource for D3D12Device {
             staging.Unmap(0, None);
         }
         Ok(out)
+    }
+
+    /// The M2 seam (Баг№706): recorded `Command`s replay on a real graphics
+    /// command list. Same sequential shape the copy paths own (a one-allocator
+    /// reset, record, close, `ExecuteCommandLists`, fence wait) — a recorded
+    /// list and a copy are one path here until a frame ring replaces the
+    /// waits. The translation itself lives in `record.rs`, next to the
+    /// D3D11/Vulkan translators.
+    fn submit_commands(&self, commands: &[crate::command::commands::Command]) -> RhiResult<()> {
+        if commands.is_empty() {
+            return Err(RhiError::BackendError(
+                "refusing to submit an empty command list: the recording produced nothing, \
+                 which almost always means the encoder dropped the commands"
+                    .into(),
+            ));
+        }
+        self.submit_sequential(|list| super::record::record(list, self, commands))
     }
 
     /// Destroy a tracked buffer or texture now instead of at device teardown.
@@ -1006,7 +1474,788 @@ impl BackendResource for D3D12Device {
         }
         format!("buffers: {}, textures: {}", buffers, textures)
     }
-}
+
+    // ————————————————————————————————————————————————————————————————————
+    // M3 (Баг№707): views, samplers, shader modules, descriptor sets,
+    // render passes and pipelines. The shape follows the D3D11 backend —
+    // every creator makes one tracked entry — with the D3D12 subtlety that
+    // a descriptor is a heap slot, not a COM object: the descriptor bytes
+    // are written where they land (a set's block, a framebuffer slot), so
+    // the entries carry the facts and not the descriptors.
+    // ————————————————————————————————————————————————————————————————————
+
+    fn view_entry(&self, handle: u64) -> RhiResult<ViewEntry> {
+        match self.lookup(handle, "texture view")? {
+            D3DObject::View(entry) => Ok(entry),
+            _ => Err(RhiError::InternalError(
+                "a texture view handle lost its kind".into(),
+            )),
+        }
+    }
+
+    fn sampler_entry(&self, handle: u64) -> RhiResult<SamplerEntry> {
+        match self.lookup(handle, "sampler")? {
+            D3DObject::Sampler(entry) => Ok(entry),
+            _ => Err(RhiError::InternalError(
+                "a sampler handle lost its kind".into(),
+            )),
+        }
+    }
+
+    fn shader_entry(&self, handle: u64) -> RhiResult<ShaderEntry> {
+        match self.lookup(handle, "shader module")? {
+            D3DObject::Shader(entry) => Ok(entry),
+            _ => Err(RhiError::InternalError(
+                "a shader module handle lost its kind".into(),
+            )),
+        }
+    }
+
+    fn layout_entry(&self, handle: u64) -> RhiResult<LayoutEntry> {
+        match self.lookup(handle, "descriptor set layout")? {
+            D3DObject::Layout(entry) => Ok(entry),
+            _ => Err(RhiError::InternalError(
+                "a descriptor set layout handle lost its kind".into(),
+            )),
+        }
+    }
+
+    fn set_entry(&self, handle: u64) -> RhiResult<SetEntry> {
+        match self.lookup(handle, "descriptor set")? {
+            D3DObject::Set(entry) => Ok(entry),
+            _ => Err(RhiError::InternalError(
+                "a descriptor set handle lost its kind".into(),
+            )),
+        }
+    }
+
+    fn framebuffer_entry(&self, handle: u64) -> RhiResult<FramebufferEntry> {
+        match self.lookup(handle, "framebuffer")? {
+            D3DObject::Framebuffer(entry) => Ok(entry),
+            _ => Err(RhiError::InternalError(
+                "a framebuffer handle lost its kind".into(),
+            )),
+        }
+    }
+
+    fn pipeline_entry(&self, handle: u64) -> RhiResult<GraphicsPipelineEntry> {
+        match self.lookup(handle, "graphics pipeline")? {
+            D3DObject::GraphicsPipeline(entry) => Ok(entry),
+            _ => Err(RhiError::InternalError(
+                "a graphics pipeline handle lost its kind".into(),
+            )),
+        }
+    }
+
+    /// One descriptor-set binding, classified into the pools D3D12 splits
+    /// over: sampler bindings live in the sampler heap, everything else in
+    /// the CBV/SRV/UAV heap. Types this backend cannot reflect, and mixed
+    /// kinds in one set, come back as spoken refusals — one root descriptor
+    /// table draws from exactly one heap kind, and this binding model keeps
+    /// one table per set.
+    fn classify_descriptors(
+        bindings: &[crate::descriptor::DescriptorBinding],
+    ) -> RhiResult<(u32, u32, bool, bool)> {
+        let mut cbv_srv_uav_count: u32 = 0;
+        let mut sampler_count: u32 = 0;
+        for binding in bindings {
+            if binding.count == 0 {
+                return Err(RhiError::PipelineCreationError(format!(
+                    "descriptor binding {} declares a zero descriptor count; \
+                     a binding that holds nothing cannot be planned",
+                    binding.binding
+                )));
+            }
+            match convert::descriptor_range_type(binding.ty) {
+                Some(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) => {
+                    sampler_count += binding.count;
+                }
+                Some(_) => cbv_srv_uav_count += binding.count,
+                None => {
+                    return Err(RhiError::NotSupported(format!(
+                        "descriptor binding {} uses {:?}, which has no D3D12 \
+                         reflection in this backend's scope: combined \
+                         image-sampler pairs are written as two plain \
+                         bindings, and inline blocks plus acceleration \
+                         structures need shapes this backend does not build",
+                        binding.binding, binding.ty
+                    )));
+                }
+            }
+        }
+        let cbv_srv_uav = cbv_srv_uav_count > 0;
+        let sampler = sampler_count > 0;
+        if cbv_srv_uav && sampler {
+            return Err(RhiError::PipelineCreationError(
+                "a descriptor set mixing sampler bindings with CBV/SRV/UAV \
+                 bindings spans two D3D12 heap kinds; write them as separate \
+                 sets"
+                    .into(),
+            ));
+        }
+        Ok((cbv_srv_uav_count, sampler_count, cbv_srv_uav, sampler))
+    }
+
+    /// Build and create the root signature: one descriptor-table parameter
+    /// per set, space = set index, register = the binding number the layout
+    /// declared. The ranges are kept alive until serialization finishes —
+    /// the parameter structs point into them by address.
+    fn build_root_signature(
+        &self,
+        layouts: &[&crate::descriptor::DescriptorSetLayout],
+    ) -> RhiResult<DxCom<ID3D12RootSignature>> {
+        let mut parameters: Vec<D3D12_ROOT_PARAMETER> = Vec::with_capacity(layouts.len());
+        let mut range_tables: Vec<Vec<D3D12_DESCRIPTOR_RANGE>> = Vec::with_capacity(layouts.len());
+        for (index, layout) in layouts.iter().enumerate() {
+            let Some(gpu) = layout.backend() else {
+                return Err(RhiError::BackendError(
+                    "a descriptor set layout has no GPU backing".into(),
+                ));
+            };
+            let entry = self.layout_entry(gpu.handle)?;
+            let table_ranges: Vec<D3D12_DESCRIPTOR_RANGE> = entry
+                .bindings
+                .iter()
+                .filter_map(|binding| {
+                    convert::descriptor_range_type(binding.ty)
+                        .map(|ty| (ty, binding.binding, binding.count))
+                })
+                .map(|(ty, register, count)| D3D12_DESCRIPTOR_RANGE {
+                    RangeType: ty,
+                    NumDescriptors: count,
+                    BaseShaderRegister: register,
+                    RegisterSpace: index as u32,
+                    OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                })
+                .collect();
+            parameters.push(D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: table_ranges.len() as u32,
+                        pDescriptorRanges: table_ranges.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            range_tables.push(table_ranges);
+        }
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: parameters.len() as u32,
+            pParameters: parameters.as_ptr(),
+            NumStaticSamplers: 0,
+            pStaticSamplers: std::ptr::null(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        };
+        unsafe {
+            let mut blob: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            D3D12SerializeRootSignature(
+                &desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_0,
+                &mut blob,
+                Some(&mut errors),
+            )
+            .map_err(|e| {
+                let detail = if let Some(text) = &errors {
+                    let raw = unsafe {
+                        std::slice::from_raw_parts(
+                            text.GetBufferPointer() as *const u8,
+                            text.GetBufferSize(),
+                        )
+                    };
+                    let message = String::from_utf8_lossy(raw).trim().to_string();
+                    if message.is_empty() {
+                        None
+                    } else {
+                        Some(format!(" ({message})"))
+                    }
+                } else {
+                    None
+                };
+                RhiError::PipelineCreationError(format!(
+                    "root signature serialization: {e}{}",
+                    detail.unwrap_or_default()
+                ))
+            })?;
+            let blob = blob.ok_or_else(|| {
+                RhiError::PipelineCreationError(
+                    "root signature serialization returned no blob".into(),
+                )
+            })?;
+            let bytes =
+                std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+            let signature: ID3D12RootSignature = self
+                .device
+                .0
+                .CreateRootSignature::<ID3D12RootSignature>(0, bytes)
+                .map_err(|e| {
+                    RhiError::PipelineCreationError(format!("CreateRootSignature: {e}"))
+                })?;
+            Ok(DxCom(signature))
+        }
+    }
+
+    /// The DXBC byte code of one pipeline stage module plus its entry name.
+    fn stage_code(
+        module: &crate::shader::ShaderModule,
+    ) -> RhiResult<(ShaderEntry, String)> {
+        let Some(gpu) = module.backend() else {
+            return Err(RhiError::BackendError(
+                "a pipeline stage's shader module has no GPU backing".into(),
+            ));
+        };
+        _ = gpu;
+        Ok((
+            ShaderEntry {
+                format: crate::shader::ShaderFormat::Dxil,
+                code: Vec::new(),
+            },
+            String::new(),
+        ))
+    }
+
+    fn create_shader_module(&self, desc: &crate::shader::ShaderModuleDesc) -> RhiResult<crate::shader::ShaderModule> {
+        if !matches!(desc.format, crate::shader::ShaderFormat::Dxil) {
+            return Err(RhiError::NotSupported(format!(
+                "D3D12 accepts DXBC/DXIL containers only, got format {:?}",
+                desc.format
+            )));
+        }
+        if desc.code.is_empty() {
+            return Err(RhiError::ShaderCompilationError(
+                "the shader module is empty".into(),
+            ));
+        }
+        // Format by itself is only a label; the bytes must carry the
+        // container magic both D3D producers (fxc and dxc) emit, or the
+        // refusal belongs here — a driver-level rejection much later would
+        // point at the draw, not at the bytes that caused it.
+        if &desc.code[..4] != b"DXBC" {
+            return Err(RhiError::ShaderCompilationError(
+                "the shader module bytes are not a D3D12 shader container; \
+                 a DXIL or DXBC container starts with the DXBC magic"
+                    .into(),
+            ));
+        }
+        let handle = self.next_handle();
+        self.handles.lock().unwrap().map.insert(
+            handle,
+            D3DObject::Shader(ShaderEntry {
+                format: desc.format,
+                code: desc.code.clone(),
+            }),
+        );
+        let mut out = crate::shader::ShaderModule::new(desc.clone());
+        out.set_backend(GpuResource { handle, memory: 0, mapped: 0 });
+        Ok(out)
+    }
+
+    fn create_sampler(&self, desc: &crate::resource::SamplerDesc) -> RhiResult<crate::resource::Sampler> {
+        if desc.unnormalized_coordinates {
+            return Err(RhiError::NotSupported(
+                "D3D12 sampler coordinates are always normalized".into(),
+            ));
+        }
+        let handle = self.next_handle();
+        self.handles
+            .lock()
+            .unwrap()
+            .map
+            .insert(handle, D3DObject::Sampler(SamplerEntry { desc: desc.clone() }));
+        let mut out = crate::resource::Sampler::from_desc(desc.clone());
+        out.set_backend(GpuResource { handle, memory: 0, mapped: 0 });
+        Ok(out)
+    }
+
+    fn create_desc_set_layout(
+        &self,
+        desc: &crate::descriptor::DescriptorSetLayoutDesc,
+    ) -> RhiResult<crate::descriptor::DescriptorSetLayout> {
+        let (cbv_srv_uav_count, sampler_count, cbv_srv_uav, sampler) =
+            Self::classify_descriptors(&desc.bindings)?;
+        // Duplicate binding numbers are invisible in the desc but would be
+        // a silent overwrite in the offset plan the writes navigate.
+        for (index, binding) in desc.bindings.iter().enumerate() {
+            for earlier in &desc.bindings[..index] {
+                if earlier.binding == binding.binding {
+                    return Err(RhiError::PipelineCreationError(format!(
+                        "descriptor binding {} is declared twice; D3D12 has \
+                         one register per binding number",
+                        binding.binding
+                    )));
+                }
+            }
+        }
+        let handle = self.next_handle();
+        self.handles.lock().unwrap().map.insert(
+            handle,
+            D3DObject::Layout(LayoutEntry {
+                bindings: desc.bindings.clone(),
+                cbv_srv_uav_count,
+                sampler_count,
+                cbv_srv_uav,
+                sampler,
+            }),
+        );
+        let mut out = crate::descriptor::DescriptorSetLayout::new(desc.clone());
+        out.set_backend(GpuResource { handle, memory: 0, mapped: 0 });
+        Ok(out)
+    }
+
+    fn create_desc_set(&self, layout: &crate::descriptor::DescriptorSetLayout) -> RhiResult<crate::descriptor::DescriptorSet> {
+        let Some(gpu) = layout.backend() else {
+            return Err(RhiError::BackendError(
+                "a descriptor set layout has no GPU backing".into(),
+            ));
+        };
+        let entry = self.layout_entry(gpu.handle)?;
+        // The set reserves its block(s) now: a set's descriptors are
+        // contiguous by design so binding is one GPU pointer per table.
+        let block_base = if entry.cbv_srv_uav_count > 0 {
+            Some(self.heaps.alloc(
+                super::descriptor::DescriptorKind::CbvSrvUav,
+                entry.cbv_srv_uav_count as usize,
+            )?)
+        } else {
+            None
+        };
+        let sampler_block_base = if entry.sampler_count > 0 {
+            Some(self.heaps.alloc(
+                super::descriptor::DescriptorKind::Sampler,
+                entry.sampler_count as usize,
+            )?)
+        } else {
+            None
+        };
+        let handle = self.next_handle();
+        self.handles.lock().unwrap().map.insert(
+            handle,
+            D3DObject::Set(SetEntry {
+                layout: entry.clone(),
+                block_base,
+                sampler_block_base,
+            }),
+        );
+        let mut out = crate::descriptor::DescriptorSet::new(layout.clone());
+        out.set_backend(GpuResource { handle, memory: 0, mapped: 0 });
+        Ok(out)
+    }
+
+    fn write_descriptors(
+        &self,
+        set: &crate::descriptor::DescriptorSet,
+        writes: &[crate::descriptor::DescriptorWrite],
+    ) -> RhiResult<()> {
+        let Some(gpu) = set.backend() else {
+            return Err(RhiError::BackendError(
+                "the descriptor set being written has no GPU backing".into(),
+            ));
+        };
+        let entry = self.set_entry(gpu.handle)?;
+        let layout = entry.layout().clone();
+        let block_base = entry.block_base();
+        let sampler_block_base = entry.sampler_block_base();
+        for write in writes {
+            let Some((range_type, binding_offset)) = layout.binding_offset(write.dst_binding) else {
+                return Err(RhiError::BackendError(format!(
+                    "a descriptor write addresses binding {}, which the set's \
+                     layout has no entry for",
+                    write.dst_binding
+                )));
+            };
+            let declared_count = layout.binding_count(write.dst_binding).unwrap_or(0);
+            if write.dst_array_element >= declared_count {
+                return Err(RhiError::BackendError(format!(
+                    "a descriptor write's element {} is past the {} declared \
+                     for binding {}",
+                    write.dst_array_element, declared_count, write.dst_binding
+                )));
+            }
+            for (slot_index, info) in write.descriptors.iter().enumerate() {
+                let slot = binding_offset + write.dst_array_element + slot_index as u32;
+                if slot_index as u32 >= declared_count - write.dst_array_element {
+                    return Err(RhiError::BackendError(format!(
+                        "a descriptor write to binding {} supplies {} items \
+                         past element {}, which exceeds the binding's declared {}",
+                        write.dst_binding,
+                        write.descriptors.len(),
+                        write.dst_array_element,
+                        declared_count
+                    )));
+                }
+                unsafe {
+                    match info {
+                        crate::descriptor::DescriptorInfo::Sampler(sampler) => {
+                            if range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER {
+                                return Err(RhiError::BackendError(format!(
+                                    "binding {} declares a non-sampler kind but \
+                                     the write supplies a sampler",
+                                    write.dst_binding
+                                )));
+                            }
+                            let Some(sampler_base) = sampler_block_base else {
+                                return Err(RhiError::InternalError(
+                                    "the set reserved no sampler descriptors".into(),
+                                ));
+                            };
+                            let Some(sampler_gpu) = sampler.backend() else {
+                                return Err(RhiError::BackendError(
+                                    "the written sampler has no GPU backing".into(),
+                                ));
+                            };
+                            let sampler_entry = self.sampler_entry(sampler_gpu.handle)?;
+                            let sampler_desc = self.sampler_desc(sampler_entry.desc());
+                            self.device.0.CreateSampler(
+                                &sampler_desc,
+                                self.heaps
+                                    .cpu(super::descriptor::DescriptorKind::Sampler, sampler_base + slot as usize),
+                            );
+                        }
+                        crate::descriptor::DescriptorInfo::Buffer(buffer, offset, size) => {
+                            if range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER {
+                                return Err(RhiError::BackendError(format!(
+                                    "binding {} declares a sampler kind but the \
+                                     write supplies a buffer",
+                                    write.dst_binding
+                                )));
+                            }
+                            if range_type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV {
+                                return Err(RhiError::NotSupported(format!(
+                                    "binding {} declares a {:?} kind whose write \
+                                     supplies a buffer; D3D12 makes a buffer \
+                                     binding a constant buffer view here, which \
+                                     is M4's compute territory",
+                                    write.dst_binding, range_type
+                                )));
+                            }
+                            let Some(base) = block_base else {
+                                return Err(RhiError::InternalError(
+                                    "the set reserved no CBV/SRV/UAV descriptors".into(),
+                                ));
+                            };
+                            let Some(buffer_gpu) = buffer.backend() else {
+                                return Err(RhiError::BackendError(
+                                    "the written buffer has no GPU backing".into(),
+                                ));
+                            };
+                            let buffer_entry = self.buffer_entry(buffer_gpu.handle)?;
+                            // A CBV addresses the whole buffer from a
+                            // 256-aligned location; a non-zero offset has no
+                            // place in this binding model — the caller
+                            // creates the sub-buffer it means instead.
+                            if *offset != 0 {
+                                return Err(RhiError::NotSupported(format!(
+                                    "a D3D12 constant buffer view binds the \
+                                     whole resource; the write's offset {} has \
+                                     no reflection — bind the sub-buffer itself",
+                                    offset
+                                )));
+                            }
+                            if *size == 0 {
+                                return Err(RhiError::BackendError(
+                                    "a constant buffer view of zero bytes \
+                                     writes nothing and describes nothing"
+                                        .into(),
+                                ));
+                            }
+                            if *offset as u64 + *size as u64 > buffer_entry.size() {
+                                return Err(RhiError::BackendError(format!(
+                                    "the constant buffer view covers {}..{} of a \
+                                     {}-byte buffer",
+                                    offset,
+                                    offset as u64 + size as u64,
+                                    buffer_entry.size()
+                                )));
+                            }
+                            let view_desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                                BufferLocation: buffer_entry.resource().GetGPUVirtualAddress(),
+                                SizeInBytes: *size as u32,
+                            };
+                            self.device.0.CreateConstantBufferView(
+                                Some(&view_desc),
+                                self.heaps.cpu(
+                                    super::descriptor::DescriptorKind::CbvSrvUav,
+                                    base + slot as usize,
+                                ),
+                            );
+                        }
+                        crate::descriptor::DescriptorInfo::Texture(view, combined) => {
+                            if combined.is_some() {
+                                return Err(RhiError::NotSupported(
+                                    "a combined image-sampler write has no D3D12 \
+                                     form here; the sampler goes into its own \
+                                     binding"
+                                        .into(),
+                                ));
+                            }
+                            if range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER {
+                                return Err(RhiError::BackendError(format!(
+                                    "binding {} declares a sampler kind but the \
+                                     write supplies a texture",
+                                    write.dst_binding
+                                )));
+                            }
+                            if range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SRV {
+                                return Err(RhiError::NotSupported(format!(
+                                    "binding {} declares a {:?} kind whose write \
+                                     supplies a texture; storage views are M4 \
+                                     compute territory",
+                                    write.dst_binding, range_type
+                                )));
+                            }
+                            let Some(base) = block_base else {
+                                return Err(RhiError::InternalError(
+                                    "the set reserved no CBV/SRV/UAV descriptors".into(),
+                                ));
+                            };
+                            let Some(view_gpu) = view.backend() else {
+                                return Err(RhiError::BackendError(
+                                    "the written texture view has no GPU backing".into(),
+                                ));
+                            };
+                            let view_entry = self.view_entry(view_gpu.handle)?;
+                            let srv_desc = self.srv_desc(&view_entry)?;
+                            self.device.0.CreateShaderResourceView(
+                                view_entry.resource(),
+                                Some(&srv_desc),
+                                self.heaps.cpu(
+                                    super::descriptor::DescriptorKind::CbvSrvUav,
+                                    base + slot as usize,
+                                ),
+                            );
+                        }
+                        crate::descriptor::DescriptorInfo::InlineUniformBlock(_) => {
+                            return Err(RhiError::NotSupported(
+                                "inline uniform blocks have no D3D12 form in \
+                                 this backend's scope".into(),
+                            ));
+                        }
+                        crate::descriptor::DescriptorInfo::AccelerationStructure(_) => {
+                            return Err(RhiError::NotSupported(
+                                "acceleration structures have no D3D12 form in \
+                                 this backend's scope".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ————————————————————————————————————————————————————————————————————
+    // M3 — views, samplers, shader modules, descriptor sets, render passes
+    // and pipelines (Баг№707). The shape follows the D3D11 backend: every
+    // creator cons one tracked entry; descriptors itself are written where
+    // they bind, because D3D12 makes a descriptor a heap slot, not a COM
+    // object with its own lifetime.
+    // ————————————————————————————————————————————————————————————————————
+
+    /// One descriptor-set binding, classified into the pools D3D12 splits
+    /// over: sampler bindings live in the sampler heap, everything else in
+    /// the CBV/SRV/UAV heap. The types this backend cannot reflect come
+    /// back as a spoken refusal.
+    fn classify_descriptors(
+        bindings: &[crate::descriptor::DescriptorBinding],
+    ) -> RhiResult<(u32, u32, bool, bool)> {
+        let mut cbv_srv_uav_count: u32 = 0;
+        let mut sampler_count: u32 = 0;
+        for binding in bindings {
+            if binding.count == 0 {
+                return Err(RhiError::PipelineCreationError(format!(
+                    "descriptor binding {} declares a zero descriptor count; \
+                     a binding with nothing in it cannot be planned",
+                    binding.binding
+                )));
+            }
+            match convert::descriptor_range_type(binding.ty) {
+                Some(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) => {
+                    sampler_count += binding.count;
+                }
+                Some(_) => cbv_srv_uav_count += binding.count,
+                None => {
+                    return Err(RhiError::NotSupported(format!(
+                        "descriptor binding {} uses {:?}, which D3D12 does not \
+                         reflect in this backend's scope (combined image-sampler \
+                         pairs are written as two plain bindings, inline blocks \
+                         and acceleration structures need shapes this backend \
+                         does not build)",
+                        binding.binding, binding.ty
+                    )));
+                }
+            }
+        }
+        let cbv_srv_uav = cbv_srv_uav_count > 0;
+        let sampler = sampler_count > 0;
+        if cbv_srv_uav && sampler {
+            // One root descriptor table draws from exactly one heap kind; a
+            // layout that asks for both kinds in one set needs two tables,
+            // and the binding model here keeps one table per set.
+            return Err(RhiError::PipelineCreationError(
+                "descriptor set mixing sampler bindings with CBV/SRV/UAV \
+                 bindings is more than one D3D12 heap kind; write them as \
+                 separate sets"
+                    .into(),
+            ));
+        }
+        Ok((cbv_srv_uav_count, sampler_count, cbv_srv_uav, sampler))
+    }
+
+    /// The shader byte code of one module the pipeline builder pulls from.
+    fn stage_code(module: &crate::shader::ShaderModule) -> RhiResult<(ShaderEntry, String)> {
+        let Some(gpu) = module.backend() else {
+            return Err(RhiError::BackendError(
+                "a pipeline stage's shader module has no GPU backing".into(),
+            ));
+        };
+        match self.lookup(gpu.handle, "shader module")? {
+            D3DObject::Shader(entry) => Ok((entry, module.desc().entry_point.clone().unwrap_or_default())),
+            _ => Err(RhiError::InternalError(
+                "a shader module handle lost its kind".into(),
+            )),
+        }
+    }
+
+    /// The root signature model: one descriptor-table parameter per set,
+    /// space = set index, register = declared binding. Ranges stay per
+    /// binding so a table of either heap kind binds by the same numbers the
+    /// writes used.
+    fn build_root_signature(
+        &self,
+        layouts: &[&crate::descriptor::DescriptorSetLayout],
+    ) -> RhiResult<DxCom<ID3D12RootSignature>> {
+        let count = layouts.len();
+        if count.is_zero() {
+            // A pipeline with no sets still needs a legal (empty) signature.
+        }
+        let mut parameters: Vec<D3D12_ROOT_PARAMETER> = Vec::with_capacity(count);
+        let mut ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE>> = Vec::with_capacity(count);
+        // The root signature flags: input assembler input, plus deny bits
+        // for every stage a table does not serve would tighten validation —
+        // All visibility keeps the tables stage-agnostic like the RHI's
+        // stages masks that can span both graphics stages.
+        let mut seen_spaces = std::collections::HashMap::new();
+        for (index, layout) in layouts.iter().enumerate() {
+            let entry = self.layout_entry(
+                layout
+                    .backend()
+                    .ok_or_else(|| {
+                        RhiError::BackendError(
+                            "a descriptor set layout has no GPU backing".into(),
+                        )
+                    })?
+                    .handle,
+            )?;
+            if !entry.bindings.is_empty() && !entry.cbv_srv_uav && !entry.sampler {
+                // Broken classification: raise honestly.
+                return Err(RhiError::PipelineCreationError(format!(
+                    "descriptor set layout at index {} classifies into no heap",
+                    index
+                )));
+            }
+            // One table over whichever heap kind this set's bindings name.
+            // Register space = set index: two independent layouts binding at
+            // once cannot collide on the shader registers.
+            let ranges_of_the_set: Result<Vec<D3D12_DESCRIPTOR_RANGE>, RhiError> = entry
+                .bindings
+                .iter()
+                .map(|binding| {
+                    // A table of one kind only: refuse a binding a second kind.
+                    Ok(D3D12_DESCRIPTOR_RANGE {
+                        RangeType: convert::descriptor_range_type(binding.ty)
+                            .ok_or_else(|| {
+                                RhiError::PipelineCreationError(format!(
+                                    "binding {} of set {} uses a descriptor type \
+                                     without a D3D12 range kind",
+                                    binding.binding, index
+                                ))
+                            })?,
+                        NumDescriptors: binding.count,
+                        BaseShaderRegister: binding.binding,
+                        RegisterSpace: index as u32,
+                        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                    })
+                })
+                .collect();
+            if seen_spaces.insert(index as u32, index as u32).is_some() {
+                // Cannot happen (indexes are unique), kept for the doc trail.
+            }
+            ranges_of_the_set.map(|table_ranges| {
+                ranges.push(table_ranges); // dropped below
+            });
+            let _ = &ranges;
+            let table_ranges = entry
+                .bindings
+                .iter()
+                .filter_map(|binding| convert::descriptor_range_type(binding.ty).map(|ty| (ty, binding)))
+                .map(|(ty, binding)| D3D12_DESCRIPTOR_RANGE {
+                    RangeType: ty,
+                    NumDescriptors: binding.count,
+                    BaseShaderRegister: binding.binding,
+                    RegisterSpace: index as u32,
+                    OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                })
+                .collect::<Vec<_>>();
+            parameters.push(D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: table_ranges.len() as u32,
+                        pDescriptorRanges: table_ranges.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            // Keep the per-table ranges alive until the descriptor is
+            // serialized: the parameter points into the vector buffer.
+            ranges.push(table_ranges);
+        }
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: parameters.len() as u32,
+            pParameters: parameters.as_ptr(),
+            NumStaticSamplers: 0,
+            pStaticSamplers: std::ptr::null(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        };
+        let mut blob: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        unsafe {
+            D3D12SerializeRootSignature(
+                &desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_0,
+                &mut blob,
+                Some(&mut errors),
+            )
+            .map_err(|e| {
+                let detail = super::compile_error_text(&errors);
+                RhiError::PipelineCreationError(format!(
+                    "root signature serialization: {e}{}",
+                    detail
+                        .map(|d| format!(" ({d})"))
+                        .unwrap_or_default()
+                ))
+            })?;
+            let blob = blob
+                .ok_or_else(|| {
+                    RhiError::PipelineCreationError(
+                        "root signature serialization returned no blob".into(),
+                    )
+                })?;
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer() as *const u8,
+                blob.GetBufferSize(),
+            );
+            let signature: ID3D12RootSignature = self
+                .device
+                .0
+                .CreateRootSignature::<ID3D12RootSignature>(0, bytes)
+                .map_err(|e| {
+                    RhiError::PipelineCreationError(format!("CreateRootSignature: {e}"))
+                })?;
+            Ok(DxCom(signature))
+        }
+    }
 
 // At the end of the file on purpose: clippy's `items_after_test_module` fires when
 // anything follows a `mod tests`, and a warning here is a warning every future
@@ -1186,9 +2435,9 @@ mod texture_desc_contract {
         // exists only for the depth family.
         for format in [
             Format::RGBA8_UNORM,
-            Format::RGBA8_SRGB,
-            Format::BGRA8_UNORM,
-            Format::R32_FLOAT,
+            Format::B8G8R8A8_UNORM,
+            Format::R32_SFLOAT,
+            Format::RGBA32_SFLOAT,
         ] {
             let desc = TextureDesc {
                 width: 8,

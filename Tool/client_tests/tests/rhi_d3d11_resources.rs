@@ -256,6 +256,134 @@ fn d3d11_exact_width_forced_row_pitch_is_arbitrary() {
     assert_eq!(read_back, data, "row padding must be compacted away, not handed to the caller");
 }
 
+// Bug №738: the upload built its staging with `MipLevels: 1, ArraySize: 1`
+// and handed it to an ignored-result `CopyResource`, so every texture beyond
+// a single mip both failed the copy (mismatched subresource counts) AND hid
+// the failure — the upload reported success while nothing landed. The mips
+// kept their uninitialized content and even mip 0 stayed a ghost. The
+// contract mirrors the D3D12 backend: the upload fills the mip chain of
+// layer 0 from tightly packed rows, layer counts beyond one are refused
+// rather than half-written, and troubleshooting facts (upload geometry,
+// Map results) travel to the caller instead of being assumed.
+#[test]
+fn d3d11_device_texture_mip_chain_round_trip() {
+    let device = open_d3d11_device();
+    let texture = device
+        .create_texture(
+            64,
+            64,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC,
+            3,
+        )
+        .expect("the multi-mip texture must be created");
+
+    // Every mip carries its own pattern, so a stale or lost subresource
+    // cannot pass for the expected content by accident.
+    let region = |mip: u32, base: u8, seed: u64| -> Vec<u8> {
+        let side = 64u32 >> mip;
+        (0..side * side * 4)
+            .map(|i| ((i as u64 * seed + base as u64 * 9617) % 251) as u8)
+            .collect()
+    };
+    let mip0 = region(0, 1, 31);
+    let mip1 = region(1, 2, 127);
+    let mip2 = region(2, 3, 89);
+    assert_eq!(mip0.len(), 64 * 64 * 4);
+    assert_eq!(mip1.len(), 32 * 32 * 4);
+    assert_eq!(mip2.len(), 16 * 16 * 4);
+    let mut data = mip0.clone();
+    data.extend_from_slice(&mip1);
+    data.extend_from_slice(&mip2);
+
+    device
+        .upload_texture(&texture, &data)
+        .expect("the mip-chain upload must succeed; a silently inert copy here \
+                 would leave the readbacks asserting against memory nobody wrote");
+    assert_eq!(device.download_texture(&texture, 0, 0).unwrap(), mip0);
+    assert_eq!(
+        device.download_texture(&texture, 1, 0).unwrap(),
+        mip1,
+        "mip 1 must carry its own uploaded bytes, not uninitialized memory"
+    );
+    assert_eq!(device.download_texture(&texture, 2, 0).unwrap(), mip2);
+
+    // The layer contract is the same honest refusal the Vulkan and D3D12
+    // backends make today: uploads cover one layer, wider arrays are refused
+    // rather than silently writing layer 0 only.
+    let layered = device
+        .create_texture_from_desc(&TextureDesc {
+            width: 16,
+            height: 16,
+            depth: 1,
+            mip_levels: 1,
+            array_layers: 2,
+            format: Format::RGBA8_UNORM,
+            usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC,
+            sample_count: SampleCount::X1,
+            dimensions: TextureDimensions::D2,
+            sharing_mode: SharingMode::Exclusive,
+            queue_family_indices: Vec::new(),
+        })
+        .expect("the layered texture must be created");
+    let result = device.upload_texture(&layered, &mip0);
+    assert!(
+        matches!(result, Err(rhi::RhiError::NotSupported(_))),
+        "a two-layer upload must be a stated refusal, saw {result:?}"
+    );
+}
+
+/// Bug №740: `wait_idle` once was a bare `Flush` — the driver accepted the
+/// batch and the call reported "idle" while the GPU could still be running
+/// it. The honest wait is a device-level contract: submit real bytes on the
+/// real context, wait, then read the whole subresource set back. The
+/// readback is the proof the returned "idle" refers to finished work, not
+/// to a batch the driver merely accepted.
+#[test]
+fn d3d11_device_wait_idle_drains_submitted_work() {
+    let device = open_d3d11_device();
+    let texture = device
+        .create_texture(
+            32,
+            32,
+            1,
+            Format::RGBA8_UNORM,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC,
+            2,
+        )
+        .expect("the texture must be created");
+
+    // Per-mip patterns, so a lost or stale subresource cannot pass for the
+    // expected content by accident.
+    let mip = |level: u32, base: u8| -> Vec<u8> {
+        let side = 32u32 >> level;
+        (0..side * side * 4)
+            .map(|i| (i as u8).wrapping_add(base))
+            .collect()
+    };
+    let mip0 = mip(0, 7);
+    let mip1 = mip(1, 19);
+    assert_eq!(mip0.len(), 32 * 32 * 4);
+    assert_eq!(mip1.len(), 16 * 16 * 4);
+    let mut data = mip0.clone();
+    data.extend_from_slice(&mip1);
+
+    device
+        .upload_texture(&texture, &data)
+        .expect("the upload must succeed before the wait");
+    device
+        .wait_idle()
+        .expect("a healthy D3D11 device must answer the idle wait");
+    // Once the idle claim is out, the whole submitted set is observable.
+    assert_eq!(device.download_texture(&texture, 0, 0).unwrap(), mip0);
+    assert_eq!(
+        device.download_texture(&texture, 1, 0).unwrap(),
+        mip1,
+        "after the idle claim every submitted subresource must be there"
+    );
+}
+
 #[test]
 fn d3d11_the_invalid_texture_description_is_an_error_and_not_a_stand_in() {
     let device = open_d3d11_device();

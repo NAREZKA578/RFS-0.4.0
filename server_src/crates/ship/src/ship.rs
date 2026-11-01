@@ -2,7 +2,7 @@ use crate::compartment::{Compartment, CompartmentState, WaterTransfer};
 use crate::station::{DefaultBehavior, FireResult, Station, StationState};
 use parking_lot::RwLock;
 use rfs_core::entity::{CompartmentTemplate, EntityId, ShipClass, StationTemplate, StationType};
-use rfs_core::math::{Bounds as CoreBounds, Quatf, Transform, Vec3f};
+use rfs_core::math::{Bounds as CoreBounds, Transform, Vec3f};
 use rfs_damage::damage::{CompartmentHit, DamageSystem, DamageTarget, StationHit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -416,45 +416,16 @@ impl Ship {
     }
 
     pub fn update(&self, dt: f32, state: &mut ShipState) {
-        self.update_physics(dt, state);
+        // Bug №743: the hull's motion moved out of here. `update_physics` was
+        // an arcade stand-in (fixed thrust/drag plus a yaw-only turn), and as
+        // long as both it and the hydrostatic integrator `ShipPhysics` wrote
+        // the same hull each tick, two writers on one position is a desync,
+        // not a feature. The sim tick now owns the motion (single authority,
+        // №743 cutover) and this update keeps exactly what it always proved
+        // it does: compartments, stations, the sinking clock.
         self.update_compartments(dt, state);
         self.update_stations(dt, state);
         self.check_sinking(dt, state);
-    }
-
-    fn update_physics(&self, dt: f32, state: &mut ShipState) {
-        let throttle = state.throttle.clamp(-1.0, 1.0);
-        // turn_rate comes from JSON unvalidated; a negative value must not
-        // turn the clamp into a panic (min > max).
-        let turn_limit = self.config.turn_rate.abs();
-        let rudder = state.rudder_angle.clamp(-turn_limit, turn_limit);
-
-        let forward = state.transform.rotation.mul_vec3(Vec3f::FORWARD);
-
-        // Bug №57: unvalidated JSON mass (0 / negative / NaN) used to divide
-        // into inf/NaN. Clamp to a floor so dynamics always stay finite.
-        let mass = self.config.mass.max(0.0001);
-
-        let thrust_force = throttle * self.config.acceleration * mass;
-        let drag_force = -state.velocity.length() * state.velocity * 0.1;
-
-        let acceleration = (forward * thrust_force + drag_force) / mass;
-        state.velocity += acceleration * dt;
-        state.transform.position += state.velocity * dt;
-
-        state.speed = state.velocity.length();
-
-        // turn_rate sign must not invert steering; damping must be
-        // dt-dependent (pow), not per-tick constant.
-        let turn_torque = rudder * turn_limit * state.speed;
-        state.angular_velocity.y += turn_torque * dt;
-        let damping = 0.98f32.powf(dt * 60.0);
-        state.angular_velocity *= damping;
-
-        let yaw_change = state.angular_velocity.y * dt;
-        state.heading += yaw_change;
-        // from_euler(yaw, pitch, roll): heading spins around Y, so it goes first.
-        state.transform.rotation = Quatf::from_euler(state.heading, 0.0, 0.0);
     }
 
     fn update_compartments(&self, dt: f32, state: &mut ShipState) {

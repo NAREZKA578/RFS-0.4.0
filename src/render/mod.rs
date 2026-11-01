@@ -39,6 +39,7 @@
 pub mod camera;
 pub mod core;
 pub mod diagnostics;
+pub mod game_loop;
 pub mod graph;
 pub mod lighting;
 pub mod materials;

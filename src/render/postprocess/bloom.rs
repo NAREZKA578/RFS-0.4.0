@@ -2,51 +2,35 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
-//! Bloom effect extracts bright areas and blurs them to create a glow effect.
+//! Honest shell (Bug №204). What used to be here is a subsystem that only
+//! *looked* assembled: real target textures created by `initialize`, literal
+//! `None` pipelines, placeholder bright-pass/blur/composite functions whose
+//! entire body was comments plus calls into the silent encoder stubs
+//! (`bind_texture`, `copy_texture`), and a pass-through copy pretending the
+//! blur chain ran. Nothing was ever rendered, and the targets nothing read
+//! were allocations without a consumer.
+//!
+//! The shell now states its own contract instead of imitating work: config,
+//! builder and the enable knob are real; every stage that would have rendered
+//! or prepared targets refuses, so the unbuilt subsystem cannot be mistaken
+//! for a working one. Building the real bloom (pipelines, fullscreen quads,
+//! its own shaders) is a separate move that waits on the owner's shader
+//! decision — see the postprocess module docs.
 
 use super::BloomConfig;
 use crate::render::core::RenderContext;
-use crate::rhi::{
-    CommandEncoder, Device, Format, Pipeline, RhiError, RhiResult, Texture, TextureView,
-};
+use crate::rhi::{CommandEncoder, Device, Format, RhiError, RhiResult, TextureView};
 use std::sync::Arc;
 
 /// Bloom effect
 pub struct BloomEffect {
     config: BloomConfig,
     enabled: bool,
-    /// Bright pass pipeline
-    bright_pass_pipeline: Option<Pipeline>,
-    /// Blur pipelines (horizontal and vertical)
-    blur_pipelines: [Option<Pipeline>; 2],
-    /// Composite pipeline
-    composite_pipeline: Option<Pipeline>,
-    /// Bright pass texture
-    bright_pass_texture: Option<Texture>,
-    bright_pass_view: Option<TextureView>,
-    /// Blur textures (ping-pong buffers)
-    blur_textures: [Option<Texture>; 2],
-    blur_views: [Option<TextureView>; 2],
-    /// Output texture
-    output_texture: Option<Texture>,
-    output_view: Option<TextureView>,
 }
 
 impl BloomEffect {
     pub fn new(config: BloomConfig) -> Self {
-        Self {
-            config,
-            enabled: true,
-            bright_pass_pipeline: None,
-            blur_pipelines: [None, None],
-            composite_pipeline: None,
-            bright_pass_texture: None,
-            bright_pass_view: None,
-            blur_textures: [None, None],
-            blur_views: [None, None],
-            output_texture: None,
-            output_view: None,
-        }
+        Self { config, enabled: true }
     }
 
     pub fn config(&self) -> &BloomConfig {
@@ -65,220 +49,55 @@ impl BloomEffect {
         self.enabled = enabled;
     }
 
-    /// Initialize the effect.
+    /// Prepare the effect's targets — **refused** (Bug №204).
     ///
-    /// Returns the backend's refusal (bug №642): the old code dropped it and
-    /// installed handle-less stand-ins that looked like working targets.
+    /// The former targets (bright pass, two blur ping-pong buffers, output)
+    /// were read by no consumer: their only writers were the placeholder
+    /// passes and the pass-through copy, both removed as part of the same
+    /// honest-form move. Preparing targets nothing reads or writes is not
+    /// done until the pipelines exist.
     pub fn initialize(
         &mut self,
-        device: &Arc<Device>,
-        context: &RenderContext,
+        _device: &Arc<Device>,
+        _context: &RenderContext,
         _input_format: Format,
     ) -> RhiResult<()> {
-        // Bug №651: the size comes from the presentation extent, not from
-        // `context.resolution` — see `RenderContext::drawable_extent`.
-        let (width, height) = context.drawable_size();
-        let usage = crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED;
-
-        // Create bright pass texture
-        let bright_pass = device
-            .create_texture(width, height, 1, Format::RGBA32_SFLOAT, usage, 1)
-            .map_err(|e| RhiError::BackendError(format!("the bloom bright-pass texture: {e}")))?;
-        self.bright_pass_texture = Some(bright_pass.clone());
-        self.bright_pass_view = Some(bright_pass.create_view(Default::default()));
-
-        // Create blur textures (ping-pong buffers)
-        for i in 0..2 {
-            let blur = device
-                .create_texture(width, height, 1, Format::RGBA32_SFLOAT, usage, 1)
-                .map_err(|e| RhiError::BackendError(format!("the bloom blur texture: {e}")))?;
-            self.blur_views[i] = Some(blur.create_view(Default::default()));
-            self.blur_textures[i] = Some(blur);
-        }
-
-        // Create output texture
-        let output = device
-            .create_texture(width, height, 1, Format::RGBA32_SFLOAT, usage, 1)
-            .map_err(|e| RhiError::BackendError(format!("the bloom output texture: {e}")))?;
-        self.output_view = Some(output.create_view(Default::default()));
-        self.output_texture = Some(output);
-
-        // Create pipelines
-        // These would be created with appropriate shaders
-        // For now, we'll leave them as None
-        Ok(())
+        Err(RhiError::NotSupported(
+            "bloom is not built: the effect has no pipeline stage (Bug №204); \
+             refusing to prepare targets nothing would read or write"
+                .into(),
+        ))
     }
 
-    /// Apply the bloom effect
+    /// Apply the bloom effect — **refused** while enabled (Bug №204).
+    ///
+    /// A disabled effect is an honest no-op. An enabled one refuses: there is
+    /// no pipeline to run, and the former pass-through copy hid exactly that.
     pub fn apply(
         &mut self,
-        encoder: &mut CommandEncoder,
-        context: &RenderContext,
-        input: &TextureView,
-        output: &TextureView,
-    ) {
+        _encoder: &mut CommandEncoder,
+        _context: &RenderContext,
+        _input: &TextureView,
+        _output: &TextureView,
+    ) -> RhiResult<()> {
         if !self.enabled {
-            return;
+            return Ok(());
         }
-
-        // Bug №651: the effect's targets have to be the size of the frame they
-        // work on — the logical window size covers a corner at any scale
-        // factor other than 100%.
-        let (width, height) = context.drawable_size();
-
-        // Step 1: Bright pass
-        self.bright_pass(encoder, input, width, height);
-
-        // Step 2: seed blur chain from the bright-pass output (not from a
-        // stale blur target), then blur.
-        self.seed_blur_from_bright(encoder);
-        for _ in 0..self.config.blur_passes {
-            self.blur_pass(encoder, width, height);
-        }
-
-        // Step 3: Composite (placeholder still forwards the image).
-        self.composite_pass(encoder, input, width, height);
-        if !std::ptr::eq(input, output) {
-            encoder.copy_texture(input, output);
-        }
+        Err(RhiError::NotSupported(
+            "bloom is not built: the effect has no pipeline stage (Bug №204); \
+             a frame cannot be bloom-processed, and none was faked either"
+                .into(),
+        ))
     }
 
-    /// Seed blur chain from the bright-pass output so the first blur reads
-    /// thresholded pixels (not a stale blur target).
-    fn seed_blur_from_bright(&mut self, encoder: &mut CommandEncoder) {
-        if let (Some(src), Some(dst)) = (&self.bright_pass_view, &self.blur_views[0]) {
-            if !std::ptr::eq(src, dst) {
-                encoder.copy_texture(src, dst);
-            }
-        }
-    }
-
-    /// Bright pass: extract bright pixels
-    fn bright_pass(
-        &mut self,
-        encoder: &mut CommandEncoder,
-        input_texture: &TextureView,
-        _width: u32,
-        _height: u32,
-    ) {
-        // Bind bright pass pipeline
-        if let Some(pipeline) = &self.bright_pass_pipeline {
-            encoder.bind_pipeline(pipeline);
-        }
-
-        // Bind input texture
-        encoder.bind_texture(input_texture, 0);
-
-        // Set threshold uniform
-        // This would set the threshold value in the shader
-
-        // Render to bright pass texture
-        // This would use a full-screen quad
-
-        // For now, this is a placeholder
-    }
-
-    /// Blur pass: apply Gaussian blur
-    fn blur_pass(&mut self, encoder: &mut CommandEncoder, width: u32, height: u32) {
-        // Blur horizontally
-        self.blur(encoder, 0, true, width, height);
-
-        // Blur vertically
-        self.blur(encoder, 1, false, width, height);
-    }
-
-    /// Blur in one direction
-    fn blur(
-        &mut self,
-        encoder: &mut CommandEncoder,
-        pass: usize,
-        horizontal: bool,
-        _width: u32,
-        _height: u32,
-    ) {
-        let input_index = pass % 2;
-        let output_index = (pass + 1) % 2;
-
-        if let (Some(input_view), Some(_output_texture), Some(_output_view)) = (
-            &self.blur_views[input_index],
-            &self.blur_textures[output_index],
-            &self.blur_views[output_index],
-        ) {
-            // Bind blur pipeline
-            let pipeline_index = if horizontal { 0 } else { 1 };
-            if let Some(pipeline) = &self.blur_pipelines[pipeline_index] {
-                encoder.bind_pipeline(pipeline);
-            }
-
-            // Bind input texture
-            encoder.bind_texture(input_view, 0);
-
-            // Set blur parameters
-            // This would set the blur radius and direction in the shader
-
-            // Render to output texture
-            // This would use a full-screen quad
-
-            // For now, this is a placeholder
-        }
-    }
-
-    /// Composite: combine original and bloomed image
-    fn composite_pass(
-        &mut self,
-        encoder: &mut CommandEncoder,
-        input_texture: &TextureView,
-        _width: u32,
-        _height: u32,
-    ) {
-        // Prefer the blurred result; fall back to bright-pass only when blur
-        // targets are missing.
-        let bloom_view = self.blur_views[1]
-            .as_ref()
-            .or(self.blur_views[0].as_ref())
-            .or(self.bright_pass_view.as_ref());
-        if let (Some(bloomed), Some(_output_view)) = (bloom_view, &self.output_view) {
-            // Bind composite pipeline
-            if let Some(pipeline) = &self.composite_pipeline {
-                encoder.bind_pipeline(pipeline);
-            }
-
-            // Bind textures
-            encoder.bind_texture(input_texture, 0); // Original
-            encoder.bind_texture(bloomed, 1); // Blurred bloom
-
-            // Set intensity uniform
-            // This would set the bloom intensity in the shader
-
-            // Render to output texture
-            // This would use a full-screen quad
-
-            // For now, this is a placeholder
-        }
-    }
-
-    /// Resize the effect
+    /// Resize the effect.
     pub fn resize(
         &mut self,
         device: &Arc<Device>,
         context: &RenderContext,
         input_format: Format,
     ) -> RhiResult<()> {
-        // Recreate all textures with new dimensions
         self.initialize(device, context, input_format)
-    }
-
-    /// Clean up resources
-    pub fn cleanup(&mut self) {
-        self.bright_pass_pipeline = None;
-        self.blur_pipelines = [None, None];
-        self.composite_pipeline = None;
-        self.bright_pass_texture = None;
-        self.bright_pass_view = None;
-        self.blur_textures = [None, None];
-        self.blur_views = [None, None];
-        self.output_texture = None;
-        self.output_view = None;
     }
 }
 

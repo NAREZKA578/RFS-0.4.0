@@ -23,6 +23,41 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+// RTT697-TEMP: probes, откатить после разбора. Полный разрез rx/tx по байту
+// типа пакета — называет «other»-поток и растущие ретрансмиты в лоб.
+static PKT_RX_BY_TYPE_697: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+static PKT_TX_BY_TYPE_697: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+static PKT_RX_LASTLOG_697: AtomicU64 = AtomicU64::new(0);
+fn pkt_rx_log_line_697() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = PKT_RX_LASTLOG_697.load(Ordering::Relaxed);
+    if now >= last + 5000
+        && PKT_RX_LASTLOG_697
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let dump = |table: &[AtomicU64; 256]| -> String {
+            let mut s = String::new();
+            for (i, c) in table.iter().enumerate() {
+                let v = c.load(Ordering::Relaxed);
+                if v > 0 {
+                    s.push_str(&format!("0x{i:02x}={v} "));
+                }
+            }
+            s
+        };
+        eprintln!(
+            "RTT697-TEMP bytype t={} rx[{}] tx[{}]",
+            now,
+            dump(&PKT_RX_BY_TYPE_697),
+            dump(&PKT_TX_BY_TYPE_697)
+        );
+    }
+}
+
 /// Connect retransmit cadence (bug №74).
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Give up waiting for ConnectAccept after this long.
@@ -947,6 +982,8 @@ impl NetClient {
         // Bug №732: the header is the hand-rolled fixed codec
         // (`PacketHeader::to_wire`), not a serializer's output — same 24
         // bytes as before, no `?` needed, nothing here can fail.
+        // RTT697-TEMP: probe, откатить после разбора.
+        PKT_TX_BY_TYPE_697[header.packet_type as usize].fetch_add(1, Ordering::Relaxed);
         let mut packet_bytes = header.to_wire();
         packet_bytes.extend_from_slice(&payload);
         let seq = {
@@ -1019,6 +1056,8 @@ impl NetClient {
         }
 
         // Bug №732: hand-rolled fixed header (`to_wire`), same 24 bytes.
+        // RTT697-TEMP: probe, откатить после разбора.
+        PKT_TX_BY_TYPE_697[out.header.packet_type as usize].fetch_add(1, Ordering::Relaxed);
         let mut packet_bytes = out.header.to_wire();
         packet_bytes.extend_from_slice(&out.payload);
         let seq = {
@@ -1271,6 +1310,10 @@ impl NetClient {
         }
 
         let (header, payload) = deserialize_packet(data)?;
+
+        // RTT697-TEMP: probe, откатить после разбора.
+        PKT_RX_BY_TYPE_697[header.packet_type as usize].fetch_add(1, Ordering::Relaxed);
+        pkt_rx_log_line_697();
 
         // Bug №77: keep the peer connection's view of the server sequence so
         // outbound headers (Input, Heartbeat) carry a real ack and the server

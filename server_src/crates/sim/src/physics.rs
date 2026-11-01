@@ -62,6 +62,66 @@ impl Default for ShipPhysicsConfig {
     }
 }
 
+impl ShipPhysicsConfig {
+    /// Bug №743: derive the physics config from the ship class the loader
+    /// declared. Four numbers travel in the class JSON today — mass, center
+    /// of mass, center of buoyancy, waterline height — and they land here
+    /// unchanged; the engine/wave/inertia numbers still come from the
+    /// `Default` above until a class file grows its own section.
+    ///
+    /// The hull area is DERIVED, not defaulted: a hull rests level when the
+    /// displaced water weighs as much as the hull, `m = draft·area·ρ`, and at
+    /// the fleet pose (y = 0) the submerged depth IS the waterline height —
+    /// so `area := m/(ρ·waterline)` makes the pose an equilibrium instead of
+    /// a launch cannon. When a class file starts declaring `hull_area`
+    /// explicitly (№725 prepared the field), that number wins here by
+    /// overwriting the field after this constructor returns.
+    pub fn from_ship_config(config: &rfs_ship::ship::ShipConfig) -> Self {
+        let mut physics = Self::default();
+        let mass = if config.mass.is_finite() && config.mass > 0.0 {
+            config.mass
+        } else {
+            // Same policy as integrate's ballast: broken numbers read as
+            // something small and harmless, never as a cannon or a NaN.
+            physics.mass
+        };
+        physics.mass = mass;
+
+        let waterline = if config.waterline_height.is_finite() && config.waterline_height > 0.01 {
+            config.waterline_height
+        } else {
+            physics.waterline_height
+        };
+        physics.waterline_height = waterline;
+
+        if config.center_of_mass.is_finite() {
+            physics.center_of_mass = config.center_of_mass;
+        }
+        if config.center_of_buoyancy.is_finite() {
+            physics.center_of_buoyancy = config.center_of_buoyancy;
+        }
+        // Sea water density — the same 1025 kg/m³ calculate_hydrostatics
+        // integrates buoyancy with. A second literal of that number would be
+        // a drift; read it the way the balance reads it.
+        physics.hull_area = mass / (1025.0 * waterline);
+        physics
+    }
+}
+
+/// Bug №743: the ship `heading` field, derived from the hull's actual
+/// rotation. The arcade mover kept a separate yaw number and rebuilt the
+/// quaternion from it every tick; the hydrostatic integrator owns the
+/// quaternion (heel and trim are real rotations now), so heading is a
+/// PROJECTION of it — the compass direction of the hull's forward axis.
+/// `FORWARD` is (0, 0, 1) and the fleet yaw is a turn about +Y, so a
+/// `from_euler(h, 0, 0)` hull points forward = (sin h, 0, cos h); the inverse
+/// projection is `atan2(forward.x, forward.z)`. With heel and trim present
+/// this stays the compass projection of the real forward axis.
+pub fn yaw_heading(rotation: Quatf) -> f32 {
+    let forward = rotation.mul_vec3(Vec3f::FORWARD);
+    forward.x.atan2(forward.z)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShipPhysicsState {
     pub position: Vec3f,
@@ -108,6 +168,15 @@ impl ShipPhysics {
         self.state.rudder_angle = (rudder_input * self.config.max_rudder_angle)
             .clamp(-self.config.max_rudder_angle, self.config.max_rudder_angle);
 
+        // Bug №743: the weight term. Everything in this file is defined
+        // against it — buoyancy MEASURES against m*g (hydrostatics name the
+        // balance the two reach), yet the weight itself was never applied.
+        // Integrated with buoyancy alone, the first tick would have fired the
+        // hull UP out of the water at ~10 g. The same finite guard as
+        // integrate uses holds here so a broken class config reads as ballast,
+        // not as a sign flip.
+        self.forces.y -= 9.81 * Self::effective_mass(&self.config);
+
         self.calculate_hydrostatics();
         self.calculate_propulsion(dt);
         self.calculate_rudder_forces(dt);
@@ -115,6 +184,36 @@ impl ShipPhysics {
         self.calculate_wave_forces(dt);
 
         self.integrate(dt);
+    }
+
+    /// Bug №743: the mass actually integrated against. One definition for
+    /// the gravity term and the integration division — broken numbers (zero,
+    /// negative, NaN/non-finite) read as a 1 kg ballast everywhere rather
+    /// than dividing into inf/NaN.
+    fn effective_mass(config: &ShipPhysicsConfig) -> f32 {
+        if config.mass.is_finite() && config.mass > 1e-6 {
+            config.mass
+        } else {
+            1.0
+        }
+    }
+
+    /// Bug №743: hand the hull's pose over without wiping the parts the
+    /// physics owns across ticks (propeller rpm continuity, hydro bookkeeping).
+    /// Called at the top of every tick's hydro pass with the ship record's
+    /// transform and momenta, so the ship state stays the single source of
+    /// truth and the integrator never runs two steps ahead or behind it.
+    pub fn set_pose(
+        &mut self,
+        position: Vec3f,
+        rotation: Quatf,
+        velocity: Vec3f,
+        angular_velocity: Vec3f,
+    ) {
+        self.state.position = position;
+        self.state.rotation = rotation;
+        self.state.velocity = velocity;
+        self.state.angular_velocity = angular_velocity;
     }
 
     fn calculate_hydrostatics(&mut self) {
@@ -217,12 +316,11 @@ impl ShipPhysics {
 
     fn integrate(&mut self, dt: f32) {
         // Guards: mass/inertia from config must be positive finite, otherwise
-        // /mass -> inf -> NaN spreads over state and network.
-        let mass = if self.config.mass.is_finite() && self.config.mass > 1e-6 {
-            self.config.mass
-        } else {
-            1.0
-        };
+        // /mass -> inf -> NaN spreads over state and network. Bug №743: the
+        // mass guard lives in `effective_mass` — the gravity term above must
+        // integrated against the SAME ballast, or the two definitions could
+        // disagree and resurrect one of the two bugs individually.
+        let mass = Self::effective_mass(&self.config);
         let inertia = [
             if self.config.inertia_tensor[0].is_finite() && self.config.inertia_tensor[0] > 1e-6 {
                 self.config.inertia_tensor[0]
@@ -691,5 +789,126 @@ mod tests {
                 "a {broken} declaration must read as no waterline area"
             );
         }
+    }
+
+    /// Bug №743: the bridge from a ship class to its physics config — the
+    /// four JSON numbers travel, the engine/wave numbers stay default, and
+    /// the hull area is the EQUILIBRIUM area `m/(ρ·waterline)`, so the fleet
+    /// pose is where the hull rests, not where it launches from.
+    #[test]
+    fn a_ship_class_maps_into_the_physics_config() {
+        let mut class = rfs_ship::ship::ShipConfig::default();
+        class.mass = 800_000.0;
+        class.waterline_height = 6.0;
+        class.center_of_mass = rfs_core::math::Vec3f::new(0.0, -3.0, 0.0);
+        class.center_of_buoyancy = rfs_core::math::Vec3f::new(0.0, -6.0, 0.0);
+
+        let physics = ShipPhysicsConfig::from_ship_config(&class);
+        assert_eq!(physics.mass, 800_000.0, "the class mass travels");
+        assert_eq!(physics.waterline_height, 6.0, "the class waterline travels");
+        assert_eq!(
+            physics.center_of_mass.y, -3.0,
+            "the class center of mass travels"
+        );
+        assert_eq!(physics.center_of_buoyancy.y, -6.0);
+        assert_eq!(
+            physics.drag_coefficient,
+            ShipPhysicsConfig::default().drag_coefficient,
+            "no class section for engine numbers yet: defaults carry"
+        );
+        // m = draft·area·ρ exactly → the declared waterline depth is the
+        // equilibrium draft.
+        let expected_area = 800_000.0 / (1025.0 * 6.0);
+        assert!(
+            (physics.hull_area - expected_area).abs() < 1e-2,
+            "the equilibrium area m/(ρ·waterline), got {} expected {expected_area}",
+            physics.hull_area
+        );
+    }
+
+    /// Bug №743: broke numbers in the class JSON never turn into a physics
+    /// config that divides by zero or floats a sign — they read as the
+    /// default ballast, the same policy the integrator's guards hold.
+    #[test]
+    fn a_broken_ship_class_reads_as_the_default_ballast() {
+        let mut class = rfs_ship::ship::ShipConfig::default();
+        class.mass = f32::NAN;
+        class.waterline_height = -2.0;
+        class.center_of_mass = rfs_core::math::Vec3f::new(0.0, f32::NAN, 0.0);
+
+        let physics = ShipPhysicsConfig::from_ship_config(&class);
+        assert_eq!(
+            physics.mass,
+            ShipPhysicsConfig::default().mass,
+            "NaN mass reads as the default, never as a sign flip"
+        );
+        assert_eq!(
+            physics.waterline_height,
+            ShipPhysicsConfig::default().waterline_height,
+            "a negative waterline reads as the default"
+        );
+        assert_eq!(
+            physics.center_of_mass,
+            ShipPhysicsConfig::default().center_of_mass,
+            "a NaN center of mass reads as the default"
+        );
+        assert!(physics.hull_area.is_finite() && physics.hull_area > 0.0);
+    }
+
+    /// Bug №743: heading is the compass projection of the real rotation —
+    /// round-trips the arcade's own `from_euler(heading, 0, 0)` convention
+    /// so the fleet's numbering of bearings does not shift under the cutover.
+    #[test]
+    fn yaw_heading_round_trips_the_fleet_convention() {
+        // Angle comparison on the circle: the flat difference is wrong exactly
+        // at the ±PI seam, where float rounding of `from_euler(PI, ..)` can
+        // tilt the nose a hair past the seam and the projection reports
+        // -PI+eps. That is the same bearing, not a different one.
+        let wrap = |angle: f32| {
+            angle - 2.0 * core::f32::consts::PI * (angle / (2.0 * core::f32::consts::PI)).round()
+        };
+        for heading in [0.0, 0.25, -0.25, core::f32::consts::FRAC_PI_2, core::f32::consts::PI] {
+            let rotation = Quatf::from_euler(heading, 0.0, 0.0);
+            let back = yaw_heading(rotation);
+            assert!(
+                wrap(back - heading).abs() < 1e-4,
+                "heading {heading} recovered as {back}"
+            );
+        }
+        // A heeled/trimmed hull still faces the way its nose points.
+        let heeled = Quatf::from_euler(core::f32::consts::FRAC_PI_2, 0.0, 0.0)
+            .mul_vec3(rfs_core::math::Vec3f::FORWARD);
+        assert!(
+            (heeled.x - 1.0).abs() < 1e-4,
+            "a half-right turn points the nose at +X, got {heeled:?}"
+        );
+    }
+
+    /// Bug №743: the weight term against buoyancy. An idle hull integrated
+    /// from the fleet pose must come to rest around it — without gravity the
+    /// buoyancy alone had a hull rocketing UP at ~10 g on the first tick.
+    /// The config goes through the class bridge (`from_ship_config`), the
+    /// same path every real ship takes at spawn: that is the path whose
+    /// equilibrium IS the fleet pose. The naked default config keeps the
+    /// historical №725 numbers and is NOT balanced deliberately.
+    #[test]
+    fn an_idle_hull_rests_at_the_fleet_pose_not_in_the_sky() {
+        let config = ShipPhysicsConfig::from_ship_config(&rfs_ship::ship::ShipConfig::default());
+        let mut physics = ShipPhysics::new(config);
+        let dt = 1.0 / 30.0;
+        for _ in 0..120 {
+            physics.update(dt, 0.0, 0.0);
+        }
+        let state = physics.get_state();
+        assert!(
+            state.position.y.abs() < 2.0,
+            "an idle, non-flooded hull must rest near y=0, drifted to {}",
+            state.position.y
+        );
+        assert!(
+            state.velocity.y.abs() < 5.0,
+            "the heave motion must be bounded, velocity.y = {}",
+            state.velocity.y
+        );
     }
 }

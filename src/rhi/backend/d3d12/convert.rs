@@ -25,12 +25,13 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMPARISON_FUNC_LESS_EQUAL, D3D12_COMPARISON_FUNC_NEVER,
     D3D12_COMPARISON_FUNC_NOT_EQUAL, D3D12_CULL_MODE, D3D12_CULL_MODE_BACK,
     D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_FILL_MODE, D3D12_FILL_MODE_SOLID,
-    D3D12_FILL_MODE_WIREFRAME, D3D12_FILTER, D3D12_STENCIL_OP, D3D12_STENCIL_OP_DECR,
-    D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INCR, D3D12_STENCIL_OP_INCR_SAT,
-    D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE,
-    D3D12_STENCIL_OP_ZERO, D3D12_TEXTURE_ADDRESS_MODE, D3D12_TEXTURE_ADDRESS_MODE_BORDER,
-    D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
-    D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+    D3D12_FILL_MODE_WIREFRAME, D3D12_FILTER, D3D12_RESOURCE_STATES, D3D12_STENCIL_OP,
+    D3D12_STENCIL_OP_DECR, D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INCR,
+    D3D12_STENCIL_OP_INCR_SAT, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_KEEP,
+    D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_ZERO, D3D12_TEXTURE_ADDRESS_MODE,
+    D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+    D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+    D3D12_TEXTURE_ADDRESS_MODE_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -167,6 +168,98 @@ pub fn row_pitch(format: Format, width: u32) -> u32 {
         Some(block) => width.div_ceil(block.width) * block.bytes,
         None => width * crate::pipeline::format_size(format),
     }
+}
+
+/// The layout of a texture in the barrier command, as a D3D12 state.
+///
+/// D3D12's states are the RHI layouts' cousins: `Undefined` and `General`
+/// both read as the home `COMMON` state (a resource "in COMMON" is what the
+/// transfer paths leave behind, and it implicitly widens on first use),
+/// `PresentSrc` maps to the swapchain's own present state, and the rest
+/// name the state the documented consumer expects.
+pub fn texture_state(layout: crate::resource::TextureLayout) -> D3D12_RESOURCE_STATES {
+    use crate::resource::TextureLayout;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_READ,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PRESENT,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+    };
+    match layout {
+        // Shader reads ride the COMMON home too: `COMMON` promotes implicitly
+        // into the shader-resource states, so a sampled texture does not owe
+        // a explicit barrier; `Preinitialized` is the same home by contract.
+        TextureLayout::Undefined
+        | TextureLayout::General
+        | TextureLayout::Preinitialized
+        | TextureLayout::ShaderReadOnlyOptimal => D3D12_RESOURCE_STATE_COMMON,
+        TextureLayout::ColorAttachmentOptimal => D3D12_RESOURCE_STATE_RENDER_TARGET,
+        TextureLayout::TransferSrcOptimal => D3D12_RESOURCE_STATE_COPY_SOURCE,
+        TextureLayout::TransferDstOptimal => D3D12_RESOURCE_STATE_COPY_DEST,
+        TextureLayout::DepthStencilAttachmentOptimal | TextureLayout::DepthAttachmentOptimal | TextureLayout::StencilAttachmentOptimal => {
+            D3D12_RESOURCE_STATE_DEPTH_WRITE
+        }
+        TextureLayout::DepthStencilReadOnlyOptimal
+        | TextureLayout::DepthReadOnlyOptimal
+        | TextureLayout::StencilReadOnlyOptimal => D3D12_RESOURCE_STATE_DEPTH_READ,
+        TextureLayout::PresentSrc => D3D12_RESOURCE_STATE_PRESENT,
+    }
+}
+
+/// How a buffer barrier's access flags read as a D3D12 state.
+///
+/// The barrier's access pair is a declaration about how the resource was and
+/// will be used; the D3D12 state that "use" names is derived, with several
+/// access kinds sharing one state (`SHADER_READ` is both a pixel and a
+/// non-pixel read, `COLOR_ATTACHMENT_*` both fold into `RENDER_TARGET`,
+/// host traffic needs no GPU state at all and reads as `COMMON`).
+pub fn buffer_state(access: crate::types::AccessFlags) -> D3D12_RESOURCE_STATES {
+    use crate::types::AccessFlags;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_INDEX_BUFFER,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+    };
+    let mut state = D3D12_RESOURCE_STATE_COMMON;
+    if access.contains(AccessFlags::INDIRECT_COMMAND_READ) {
+        state |= D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    }
+    if access.contains(AccessFlags::INDEX_READ) {
+        state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
+    }
+    if access.contains(AccessFlags::VERTEX_ATTRIBUTE_READ) {
+        state |= D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    }
+    if access.contains(AccessFlags::UNIFORM_READ) {
+        state |= D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    }
+    if access.contains(AccessFlags::SHADER_READ) {
+        state |= D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    }
+    if access.contains(AccessFlags::SHADER_WRITE) {
+        state |= D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    if access.intersects(AccessFlags::COLOR_ATTACHMENT_READ | AccessFlags::COLOR_ATTACHMENT_WRITE) {
+        state |= D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    if access.contains(AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ) {
+        state |= D3D12_RESOURCE_STATE_DEPTH_READ;
+    }
+    if access.contains(AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE) {
+        state |= D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    }
+    if access.contains(AccessFlags::TRANSFER_READ) {
+        state |= D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    if access.contains(AccessFlags::TRANSFER_WRITE) {
+        state |= D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    // HOST_READ/HOST_WRITE need no GPU state: the host traffic happens on the
+    // mapped pointer, and a COMMON buffer stays the home.
+    state
 }
 
 /// The blend factor, as D3D12 names it.
@@ -340,6 +433,41 @@ pub fn d3d_color_write(mask: ColorComponentFlags) -> D3D12_COLOR_WRITE_ENABLE {
     D3D12_COLOR_WRITE_ENABLE(bits)
 }
 
+/// The heap pair a descriptor type draws from: D3D12 splits descriptors
+/// across the CBV/SRV/UAV heap and the sampler heap, and each descriptor
+/// type names one of them (plus the range type the root table declares).
+/// The combined sampler and inline-uniform forms have no D3D12 translation
+/// in this backend's scope and come back honestly absent.
+pub fn descriptor_range_type(ty: crate::descriptor::DescriptorType) -> Option<D3D12_DESCRIPTOR_RANGE_TYPE> {
+    use crate::descriptor::DescriptorType;
+    match ty {
+        DescriptorType::Sampler => Some(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER),
+        // Constant buffer views, whatever indirection names them.
+        DescriptorType::UniformBuffer | DescriptorType::DynamicUniformBuffer => {
+            Some(D3D12_DESCRIPTOR_RANGE_TYPE_CBV)
+        }
+        // Read-only shader views: textures read as data or texels.
+        DescriptorType::SampledTexture
+        | DescriptorType::UniformTexelBuffer
+        | DescriptorType::InputAttachment => Some(D3D12_DESCRIPTOR_RANGE_TYPE_SRV),
+        // Read-write shader views — storage buffers, textures, texel
+        // buffers. UAVs live on the same heap as SRV/CBV but carry the UAV
+        // range type (M4's dispatch territory, classified now so the layout
+        // plan is one map).
+        DescriptorType::StorageBuffer
+        | DescriptorType::DynamicStorageBuffer
+        | DescriptorType::StorageTexture
+        | DescriptorType::StorageTexelBuffer => Some(D3D12_DESCRIPTOR_RANGE_TYPE_UAV),
+        // D3D12 describes combined image-sampler bindings as two separate
+        // bindings; folding them into one RHI descriptor has no reflection
+        // here. Inline blocks and acceleration structures need shapes this
+        // backend does not build.
+        DescriptorType::CombinedTextureSampler
+        | DescriptorType::InlineUniformBlock
+        | DescriptorType::AccelerationStructure => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +594,77 @@ mod tests {
         assert_eq!(d3d_fill_mode(PolygonMode::Fill).unwrap().0, 3);
         assert!(d3d_cull_mode(CullMode::FrontAndBack).is_none());
         assert_eq!(d3d_cull_mode(CullMode::Back).unwrap().0, 3);
+    }
+
+    #[test]
+    fn texture_layouts_map_to_the_documented_states() {
+        use crate::resource::TextureLayout;
+        // The raw numbers the SDK header pins: COMMON 0, RENDER_TARGET 4,
+        // DEPTH_WRITE 0x10, DEPTH_READ 0x20, COPY_DEST 0x400, COPY_SOURCE
+        // 0x800, PRESENT 0. Shader reads ride the COMMON home: D3D12
+        // promotes COMMON implicitly into the shader-resource states, so
+        // the read-only layout costs no barrier at all.
+        for layout in [
+            TextureLayout::Undefined,
+            TextureLayout::General,
+            TextureLayout::Preinitialized,
+            TextureLayout::ShaderReadOnlyOptimal,
+        ] {
+            assert_eq!(texture_state(layout).0, 0, "{layout:?}");
+        }
+        assert_eq!(texture_state(TextureLayout::ColorAttachmentOptimal).0, 4);
+        assert_eq!(texture_state(TextureLayout::TransferSrcOptimal).0, 0x800);
+        assert_eq!(texture_state(TextureLayout::TransferDstOptimal).0, 0x400);
+        for layout in [
+            TextureLayout::DepthStencilAttachmentOptimal,
+            TextureLayout::DepthAttachmentOptimal,
+            TextureLayout::StencilAttachmentOptimal,
+        ] {
+            assert_eq!(texture_state(layout).0, 0x10, "{layout:?}");
+        }
+        for layout in [
+            TextureLayout::DepthStencilReadOnlyOptimal,
+            TextureLayout::DepthReadOnlyOptimal,
+            TextureLayout::StencilReadOnlyOptimal,
+        ] {
+            assert_eq!(texture_state(layout).0, 0x20, "{layout:?}");
+        }
+        assert_eq!(texture_state(TextureLayout::PresentSrc).0, 0);
+    }
+
+    #[test]
+    fn access_flags_map_to_the_buffer_states() {
+        use crate::types::AccessFlags as A;
+        // Buffer states, raw numbers: VERTEX_AND_CONSTANT_BUFFER 1,
+        // INDEX_BUFFER 2, UNORDERED_ACCESS 8, DEPTH_READ 0x20, DEPTH_WRITE
+        // 0x10, INDIRECT_ARGUMENT 0x200, ALL_SHADER_RESOURCE 0xC0,
+        // COPY_SOURCE 0x800, COPY_DEST 0x400.
+        assert_eq!(buffer_state(A::NONE).0, 0);
+        assert_eq!(buffer_state(A::HOST_READ).0, 0);
+        assert_eq!(buffer_state(A::HOST_WRITE).0, 0);
+        assert_eq!(buffer_state(A::INDEX_READ).0, 2);
+        assert_eq!(buffer_state(A::VERTEX_ATTRIBUTE_READ).0, 1);
+        assert_eq!(buffer_state(A::UNIFORM_READ).0, 1);
+        assert_eq!(buffer_state(A::INDIRECT_COMMAND_READ).0, 0x200);
+        assert_eq!(buffer_state(A::SHADER_READ).0, 0xC0);
+        assert_eq!(buffer_state(A::SHADER_WRITE).0, 8);
+        assert_eq!(
+            buffer_state(A::COLOR_ATTACHMENT_READ | A::COLOR_ATTACHMENT_WRITE).0,
+            4
+        );
+        assert_eq!(buffer_state(A::DEPTH_STENCIL_ATTACHMENT_READ).0, 0x20);
+        assert_eq!(buffer_state(A::DEPTH_STENCIL_ATTACHMENT_WRITE).0, 0x10);
+        assert_eq!(buffer_state(A::TRANSFER_READ).0, 0x800);
+        assert_eq!(buffer_state(A::TRANSFER_WRITE).0, 0x400);
+        // Compound uses accumulate: a shader-visible read of a written
+        // staging area is the sum, not a guess between them.
+        assert_eq!(
+            buffer_state(A::SHADER_READ | A::SHADER_WRITE).0,
+            0xC0 | 8
+        );
+        assert_eq!(
+            buffer_state(A::UNIFORM_READ | A::SHADER_READ | A::TRANSFER_WRITE).0,
+            1 | 0xC0 | 0x400
+        );
     }
 }

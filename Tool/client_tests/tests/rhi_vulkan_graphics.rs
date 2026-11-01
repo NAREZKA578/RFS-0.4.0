@@ -407,7 +407,6 @@ fn a_pipeline_with_the_wrong_attachment_count_is_refused() {
         return;
     };
 
-    const EXTENT: u32 = 64;
     let render_pass = device
         .create_gpu_render_pass(&RenderPassDesc {
             attachments: vec![AttachmentDescription {

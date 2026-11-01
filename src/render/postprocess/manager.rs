@@ -2,7 +2,14 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
-//! Manages all post-processing effects and their execution order.
+//! Honest shell (Bug №204). The manager used to look like a pipeline: it
+//! chained five effects, each of which "processed" the frame by copying it
+//! through the silent encoder stubs. Nothing rendered. The chain remains —
+//! the one piece worth keeping, because the execution order is a real design
+//! fact — but every stage now either runs for real or refuses, and the
+//! manager propagates those refusals instead of hiding them. Building the
+//! subsystem for real (pipelines, shaders, quads) is a separate move that
+//! waits on the owner's shader decision — see the postprocess module docs.
 
 use super::{
     BloomConfig, BloomEffect, DepthOfFieldConfig, DepthOfFieldEffect, FXAAEffect, HDRConfig,
@@ -10,7 +17,7 @@ use super::{
 };
 use crate::render::core::RenderContext;
 use crate::render::scene::Scene;
-use crate::rhi::{CommandEncoder, Device, Format, RhiResult, TextureView};
+use crate::rhi::{CommandEncoder, Device, Format, RhiError, RhiResult, TextureView};
 use std::sync::Arc;
 
 /// Post-processing manager
@@ -37,6 +44,8 @@ impl PostProcessManager {
         }
     }
 
+    /// Prepare the effects — refuses as soon as an unbuilt effect is reached
+    /// (Bug №204); the first refusal is propagated, not swallowed.
     pub fn initialize(
         &mut self,
         context: &RenderContext,
@@ -52,6 +61,16 @@ impl PostProcessManager {
         Ok(())
     }
 
+    /// Run the post-processing chain — **refused** while any enabled effect
+    /// is unbuilt (Bug №204).
+    ///
+    /// A disabled manager is an honest no-op. An enabled one runs the chain,
+    /// and every enabled effect in it refuses until pipelines exist; the
+    /// manager passes the refusal up instead of dropping the frame silently.
+    /// With every effect disabled the chain degenerates to delivering the
+    /// frame: when input and output are the same view that is a no-op, and a
+    /// real GPU copy between distinct views does not exist yet, so the
+    /// encoder's refusal travels through unchanged.
     pub fn apply(
         &mut self,
         encoder: &mut CommandEncoder,
@@ -60,9 +79,9 @@ impl PostProcessManager {
         input: &TextureView,
         depth: Option<&TextureView>,
         output: &TextureView,
-    ) {
+    ) -> RhiResult<()> {
         if !self.enabled {
-            return;
+            return Ok(());
         }
 
         let mut current = input;
@@ -70,37 +89,50 @@ impl PostProcessManager {
 
         // Apply HDR first
         if self.hdr.enabled() {
-            self.hdr.apply(encoder, context, current, temp);
+            self.hdr.apply(encoder, context, current, temp)?;
             std::mem::swap(&mut current, &mut temp);
         }
 
         // Apply bloom
         if self.bloom.enabled() {
-            self.bloom.apply(encoder, context, current, temp);
+            self.bloom.apply(encoder, context, current, temp)?;
             std::mem::swap(&mut current, &mut temp);
         }
 
         // Apply depth of field
         if self.depth_of_field.enabled() {
-            if let Some(depth) = depth {
-                self.depth_of_field
-                    .apply(encoder, context, current, depth, temp);
-                std::mem::swap(&mut current, &mut temp);
+            match depth {
+                Some(depth) => {
+                    self.depth_of_field
+                        .apply(encoder, context, current, depth, temp)?;
+                    std::mem::swap(&mut current, &mut temp);
+                }
+                // An enabled effect that silently skipped instead of running
+                // is the same lie a stub was; refuse.
+                None => {
+                    return Err(RhiError::NotSupported(
+                        "depth of field is enabled but no depth view was \
+                         given to PostprocessManager::apply (Bug №204)"
+                            .into(),
+                    ))
+                }
             }
         }
 
         // Apply motion blur
         if self.motion_blur.enabled() {
-            self.motion_blur.apply(encoder, context, current, temp);
+            self.motion_blur.apply(encoder, context, current, temp)?;
             std::mem::swap(&mut current, &mut temp);
         }
 
         // Apply FXAA last
         if self.fxaa.enabled() {
-            self.fxaa.apply(encoder, context, current, output);
+            self.fxaa.apply(encoder, context, current, output)?;
         } else if !std::ptr::eq(current, output) {
-            encoder.copy_texture(current, output);
+            encoder.copy_texture(current, output)?;
         }
+
+        Ok(())
     }
 
     /// Getters for individual effects

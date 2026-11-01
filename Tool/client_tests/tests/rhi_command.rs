@@ -14,7 +14,24 @@ use rhi::command::pass::render::{
     SubpassDependency, SubpassDescription, SubpassFlags,
 };
 use rhi::command::pool::{CommandPool, CommandPoolDesc, CommandPoolFlags};
-use rhi::{AccessFlags, ClearValue, Format, PipelineStage, Rect2D, SampleCount, ShaderStage, TextureLayout};
+use rhi::resource::texture::{Texture, TextureDesc, TextureView, TextureViewDesc, TextureViewType};
+use rhi::{
+    AccessFlags, ClearValue, Format, PipelineStage, Rect2D, RhiError, SampleCount, ShaderStage,
+    TextureLayout, TextureUsage,
+};
+
+fn view_of(texture: &Texture) -> TextureView {
+    texture.create_view(TextureViewDesc {
+        texture: texture.clone(),
+        format: None,
+        view_type: TextureViewType::D2,
+        aspects: TextureAspectFlags::COLOR,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        base_array_layer: 0,
+        array_layer_count: 1,
+    })
+}
 
 fn make_pool(qfi: u32) -> CommandPool {
     CommandPool::new(CommandPoolDesc {
@@ -843,5 +860,32 @@ fn a_pass_without_a_depth_attachment_ignores_the_depth_parameters() {
         info.clear_values,
         vec![ClearValue::color(0.1, 0.2, 0.3, 1.0)],
         "a depth-less pass must not grow a depth entry"
+    );
+}
+
+#[test]
+fn the_encoder_refuses_a_texture_copy_instead_of_faking_it() {
+    // Bug №204: copy_texture used to be a silent placeholder that postprocess
+    // call sites leaned on as if frames actually moved anywhere. A CPU-side
+    // encoder has no GPU copy to make; the call must say so, loudly.
+    let mut enc = CommandEncoder::new(make_buffer(make_pool(0)));
+    enc.begin().expect("begin");
+
+    let texture = Texture::new(TextureDesc {
+        width: 4,
+        height: 4,
+        format: Format::RGBA8_UNORM,
+        usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+        ..Default::default()
+    });
+    let source = view_of(&texture);
+    let destination = view_of(&texture);
+
+    let err = enc
+        .copy_texture(&source, &destination)
+        .expect_err("the refusal must be an error, not a silent success");
+    assert!(
+        matches!(err, RhiError::NotSupported(_)),
+        "the refusal must be NotSupported, got {err:?}"
     );
 }

@@ -7,7 +7,7 @@ use super::commands::Command;
 use crate::command::pass::render::{Framebuffer, RenderPass, RenderPassBeginInfo};
 use crate::descriptor::set::DescriptorSet;
 use crate::pipeline::GraphicsPipeline;
-use crate::error::RhiResult;
+use crate::error::{RhiError, RhiResult};
 use crate::resource::{Buffer, TextureView};
 use crate::types::*;
 
@@ -226,16 +226,11 @@ impl CommandEncoder {
         });
     }
 
-    /// Bind a uniform buffer to a binding slot.
-    pub fn bind_uniform_buffer(&mut self, _buffer: &Buffer, _binding: u32) {
-        // Uniform buffers are exposed through descriptor sets in the stub
-        // encoder; the binding is tracked by descriptor set layout instead.
-    }
-
-    /// Bind a texture view to a binding slot.
-    pub fn bind_texture(&mut self, _view: &TextureView, _binding: u32) {
-        // Texture bindings are exposed through descriptor sets.
-    }
+    // Bug №204: `bind_uniform_buffer` и `bind_texture` удалены как заглушки.
+    // Дизайн этого слоя давно легализует один путь связи ресурсов с шейдерами —
+    // дескрипторные наборы (`Command::BindDescriptorSets` несёт пайплайн),
+    // и их собственные комментарии именно это признавали; мёртвый API, который
+    // молча ничего не делал, был ложью поверх живого механизма.
 
     /// Draw instanced indexed geometry.
     pub fn draw_indexed_instanced(
@@ -255,9 +250,25 @@ impl CommandEncoder {
         });
     }
 
-    /// Copy a texture view into another.
-    pub fn copy_texture(&mut self, _source: &TextureView, _destination: &TextureView) {
-        // Placeholder for a GPU-side copy; a CPU stub has nothing to move.
+    /// Copy a texture view into another — **refused** (Bug №204).
+    ///
+    /// This was a silent placeholder: a call that looked like a GPU-side copy
+    /// while a CPU stub has nothing to move. Postprocess call sites leaned on
+    /// it to "deliver" frames that were never placed anywhere. A real
+    /// full-image copy needs its own `Command` variant and a fact about the
+    /// source image's layout — the backend's layout tracker is a submit-time
+    /// fact, not something the encoder sees — so until that exists the call is
+    /// refused loudly instead of succeeding silently.
+    pub fn copy_texture(
+        &mut self,
+        _source: &TextureView,
+        _destination: &TextureView,
+    ) -> RhiResult<()> {
+        Err(RhiError::NotSupported(
+            "copy_texture is refused: the encoder has no GPU-side texture copy; \
+             a real one needs its own Command variant and a source-layout fact"
+                .into(),
+        ))
     }
 
     /// Submitted commands in recording order.

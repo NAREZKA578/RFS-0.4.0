@@ -250,6 +250,93 @@ fn an_interleaved_buffer_is_read_with_its_stride() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A POSITION-only primitive — normals invented, because shipping the vertex
+/// default (0, 0, 1) would light every face identically.
+///
+/// The probe is two triangles joined along the edge (0,0,0)-(1,0,0):
+///
+/// * tri 1 lies in the XZ plane: its face normal is (0, -1, 0);
+/// * tri 2 lies in the XY plane: its face normal is (0, 0, 1).
+///
+/// The two shared corners must carry the normalized average of both faces;
+/// the two non-shared corners carry only their own face. A default normal
+/// (0, 0, 1) or a per-face-only mesh both look wrong here.
+#[test]
+fn a_position_only_primitive_receives_generated_smooth_normals() {
+    let mut buffer = Vec::new();
+    for position in [
+        [0.0f32, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+    ] {
+        for component in position {
+            buffer.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    for index in [0u16, 1, 2, 0, 1, 3] {
+        buffer.extend_from_slice(&index.to_le_bytes());
+    }
+
+    let json = format!(
+        r#"{{
+  "asset": {{ "version": "2.0" }},
+  "meshes": [{{
+    "name": "position-only",
+    "primitives": [{{
+      "attributes": {{ "POSITION": 0 }},
+      "indices": 1
+    }}]
+  }}],
+  "accessors": [
+    {{ "bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 4, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5123, "count": 6, "type": "SCALAR" }}
+  ],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": 0, "byteLength": 48 }},
+    {{ "buffer": 0, "byteOffset": 48, "byteLength": 12 }}
+  ],
+  "buffers": [{{
+    "byteLength": {total},
+    "uri": "data:application/octet-stream;base64,{encoded}"
+  }}]
+}}"#,
+        total = buffer.len(),
+        encoded = base64_encode(&buffer),
+    );
+
+    let path = temp_file("position-only.gltf", json.as_bytes());
+    let mesh = gltf::load(&path).expect("a POSITION-only primitive is a complete load");
+    assert_eq!(mesh.vertex_count, 4);
+    assert_eq!(mesh.index_count, 6, "two triangles are six indices");
+
+    let check = |vertex: usize, want: [f32; 3], why: &str| {
+        let got = mesh.vertices[vertex].normal.to_array();
+        for (component, expected) in got.iter().zip(want) {
+            assert!(
+                (component - expected).abs() < 1e-4,
+                "{why}: normal of vertex {vertex} is {got:?}, expected {want:?}"
+            );
+        }
+    };
+    // The two corners shared by both triangles carry the face average:
+    // normalize((0,-1,0) + (0,0,1)).
+    check(
+        0,
+        [0.0, -std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2],
+        "a corner joining an XZ-plane and an XY-plane face must average them",
+    );
+    check(
+        1,
+        [0.0, -std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2],
+        "the second shared corner must average the same two faces",
+    );
+    check(2, [0.0, -1.0, 0.0], "an XZ-plane-only corner keeps that face");
+    check(3, [0.0, 0.0, 1.0], "an XY-plane-only corner keeps that face");
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn a_gltf_without_buffers_is_an_error_not_a_cube() {
     let path = temp_file(
@@ -465,5 +552,24 @@ fn the_real_explosive_glb_loads_as_geometry() {
         mesh.index_count() % 3,
         0,
         "TRIANGLES: the index count must be a multiple of three"
+    );
+    // The file carries no NORMAL attribute, so the loader must have invented
+    // smooth normals; vertices left at the (0, 0, 1) default would light the
+    // whole model flat.
+    let mut non_default_normals = 0u32;
+    for vertex in mesh.vertices.iter() {
+        let n = vertex.normal.to_array();
+        if (n[0] - 0.0).abs() > 1e-6
+            || (n[1] - 0.0).abs() > 1e-6
+            || (n[2] - 1.0).abs() > 1e-6
+        {
+            non_default_normals += 1;
+        }
+    }
+    assert!(
+        non_default_normals > 0,
+        "the file has no NORMAL attribute, so generated normals must appear; \
+         {non_default_normals} of {} vertices carry one",
+        mesh.vertex_count()
     );
 }

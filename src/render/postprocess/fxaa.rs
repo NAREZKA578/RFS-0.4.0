@@ -3,31 +3,24 @@
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
 //! Fast Approximate Anti-Aliasing (FXAA) for post-process anti-aliasing.
+//!
+//! Honest shell (Bug №204): the former placeholder copied frames through the
+//! silent `copy_texture` encoder stub and called it anti-aliasing — nothing
+//! was ever filtered, and the target texture it created was read by no one.
+//! The effect keeps its enable knob and refuses to apply while enabled.
 
 use crate::render::core::RenderContext;
-use crate::rhi::{
-    CommandEncoder, Device, Format, Pipeline, RhiError, RhiResult, Texture, TextureView,
-};
+use crate::rhi::{CommandEncoder, Device, Format, RhiError, RhiResult, TextureView};
 use std::sync::Arc;
 
 /// FXAA effect
 pub struct FXAAEffect {
     enabled: bool,
-    /// Output texture
-    output_texture: Option<Texture>,
-    output_view: Option<TextureView>,
-    /// Pipeline
-    pipeline: Option<Pipeline>,
 }
 
 impl FXAAEffect {
     pub fn new() -> Self {
-        Self {
-            enabled: true,
-            output_texture: None,
-            output_view: None,
-            pipeline: None,
-        }
+        Self { enabled: true }
     }
 
     pub fn enabled(&self) -> bool {
@@ -38,46 +31,46 @@ impl FXAAEffect {
         self.enabled = enabled;
     }
 
+    /// Prepare the effect's target — **refused** (Bug №204).
+    ///
+    /// The former target was written only by the fake pass-through copy and
+    /// read by nobody. Refusing keeps the shell from spending device memory
+    /// on a texture that serves nothing.
     pub fn initialize(
         &mut self,
-        device: &Arc<Device>,
-        context: &RenderContext,
+        _device: &Arc<Device>,
+        _context: &RenderContext,
         _input_format: Format,
     ) -> RhiResult<()> {
-        // Bug №651: the size comes from the presentation extent, not from
-        // `context.resolution` — see `RenderContext::drawable_extent`.
-        let (width, height) = context.drawable_size();
-        let output = device
-            .create_texture(
-                width,
-                height,
-                1,
-                Format::RGBA8_UNORM,
-                crate::rhi::TextureUsage::COLOR_ATTACHMENT | crate::rhi::TextureUsage::SAMPLED,
-                1,
-            )
-            .map_err(|e| RhiError::BackendError(format!("the FXAA output texture: {e}")))?;
-        self.output_view = Some(output.create_view(Default::default()));
-        self.output_texture = Some(output);
-        Ok(())
+        Err(RhiError::NotSupported(
+            "FXAA is not built: the effect has no pipeline stage (Bug №204); \
+             refusing to prepare a target nothing would read"
+                .into(),
+        ))
     }
 
+    /// Apply the effect — **refused** while enabled (Bug №204).
+    ///
+    /// A disabled effect is an honest no-op. An enabled one refuses: there is
+    /// no pipeline to run, and the former pass-through copy hid exactly that.
     pub fn apply(
         &mut self,
-        encoder: &mut CommandEncoder,
+        _encoder: &mut CommandEncoder,
         _context: &RenderContext,
-        input: &TextureView,
-        output: &TextureView,
-    ) {
+        _input: &TextureView,
+        _output: &TextureView,
+    ) -> RhiResult<()> {
         if !self.enabled {
-            return;
+            return Ok(());
         }
-        // Placeholder pass-through until the real FXAA pipeline exists.
-        if !std::ptr::eq(input, output) {
-            encoder.copy_texture(input, output);
-        }
+        Err(RhiError::NotSupported(
+            "FXAA is not built: the effect has no pipeline stage (Bug №204); \
+             a frame cannot be anti-aliased, and none was faked either"
+                .into(),
+        ))
     }
 
+    /// Resize the effect.
     pub fn resize(
         &mut self,
         device: &Arc<Device>,
@@ -85,12 +78,6 @@ impl FXAAEffect {
         input_format: Format,
     ) -> RhiResult<()> {
         self.initialize(device, context, input_format)
-    }
-
-    pub fn cleanup(&mut self) {
-        self.output_texture = None;
-        self.output_view = None;
-        self.pipeline = None;
     }
 }
 

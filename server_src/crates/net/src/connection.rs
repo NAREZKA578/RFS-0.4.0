@@ -483,6 +483,15 @@ impl Connection {
                 *self.remote_ack_bitfield.lock() = ack_bitfield;
             }
         }
+        // Bug №697: the ack state must also reach OUR send ledgers — the
+        // client does not route datagrams through `handle_packet`, so this
+        // light-weight path is the only place it could happen. Before the
+        // feed, every reliable packet the client ever sent was retransmitted
+        // until the retry budget retired it (11 copies of each heartbeat),
+        // and each duplicate's ack then fed the RTT EWMA an ever-growing
+        // sample — the fabricated ~300 ms "round trip".
+        self.process_acks();
+        self.note_send_ack();
     }
 
     pub fn handle_packet(
@@ -1034,6 +1043,46 @@ impl Connection {
                 self.register_reliable_send(&outgoing.header, &outgoing.payload);
             }
             packets.push(outgoing);
+        }
+        // RTT697-TEMP: probe, откатить после разбора. Кто и сколько
+        // фрагментирует: тип, число сообщений, байты, выданные фрагменты.
+        {
+            mod frag_697 {
+                use std::sync::atomic::AtomicU64;
+                pub static MSG: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+                pub static BYTES: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+                pub static FRAGS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+                pub static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+            }
+            let tpe = packet_type as u8 as usize;
+            frag_697::MSG[tpe].fetch_add(1, Ordering::Relaxed);
+            frag_697::BYTES[tpe].fetch_add(data.len() as u64, Ordering::Relaxed);
+            frag_697::FRAGS[tpe].fetch_add(packets.len() as u64, Ordering::Relaxed);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = frag_697::LAST_LOG.load(Ordering::Relaxed);
+            if now >= last + 5000
+                && frag_697::LAST_LOG
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let mut s = String::new();
+                for i in 0..256usize {
+                    let m = frag_697::MSG[i].load(Ordering::Relaxed);
+                    if m > 0 {
+                        s.push_str(&format!(
+                            "0x{:02x} msgs={} bytes={} frags={:.1} ",
+                            i,
+                            m,
+                            frag_697::BYTES[i].load(Ordering::Relaxed),
+                            frag_697::FRAGS[i].load(Ordering::Relaxed) as f64 / m as f64
+                        ));
+                    }
+                }
+                eprintln!("RTT697-TEMP server_frag t={} [{}]", now, s);
+            }
         }
         packets
     }
@@ -1770,6 +1819,34 @@ mod sack_tests {
         assert!(
             !ledger.contains(seq),
             "an ack header must retire the ledger entry"
+        );
+        assert!(conn
+            .collect_retransmits_with(Duration::ZERO, 10, 16)
+            .is_empty());
+    }
+
+    #[test]
+    fn the_lightweight_record_remote_also_feeds_the_send_ledgers() {
+        // Bug №697: `record_remote` is the client's stand-in for
+        // `handle_packet`'s header bookkeeping, but it retired only the ack
+        // mark and never fed it to the send ledgers. The client then kept
+        // retransmitting every reliable packet until the retry budget gave
+        // up (11 copies of each heartbeat), and every duplicate's ack went
+        // into the RTT EWMA as an ever-growing sample — the fabricated
+        // ~300 ms "round trip" of the stress runs.
+        let conn = test_connection();
+        let sent = conn.send_command_ack(7, true, None);
+        let seq = sent[0].header.sequence;
+
+        // The client's inbound path in miniature: header bookkeeping WITHOUT
+        // dispatching the payload (how the receive loop treats snapshots and
+        // heartbeats it answers elsewhere). The peer's header acks `seq`.
+        conn.record_remote(991, seq, 0);
+
+        let ledger = conn.get_channel(ChannelType::ReliableOrdered).unwrap();
+        assert!(
+            !ledger.contains(seq),
+            "the light-weight bookkeeping must retire ledger entries too"
         );
         assert!(conn
             .collect_retransmits_with(Duration::ZERO, 10, 16)
