@@ -130,3 +130,160 @@ fn layer_sync_report_roundtrips_through_the_payload_codec() {
     let again = <LayerSyncPacket as Serializable>::serialize(&report).unwrap();
     assert_eq!(bytes, again, "serializing the same report twice must not drift");
 }
+
+// Bug №746: the transform rides the wire in its own compact form,
+// `WireTransform` — position f32×3, the rotation as smallest-three (index of
+// the largest component as one byte, the other three as i16 shares of it),
+// scale present only when it is not ONE (the probe measured ~99-100% records
+// at scale == ONE). These pins keep the byte budget and the precision
+// contract on the same side as the other wire pins; a move means a
+// PROTOCOL_VERSION bump with a note about who depends on it.
+use rfs_core::math::{Quatf, Transform, Vec3f};
+
+/// №746 residual bound, pinned with margin: the quantization step is
+/// 1/32767 of the largest component (~3e-5), the reconstruction adds a
+/// second-order share, and the server's replication-diff epsilon is 0.001 —
+/// so a server-visible rotation change always survives one encode/decode
+/// hop. 1.5e-4 keeps three-plus steps of headroom.
+const ROTATION_WIRE_EPS: f32 = 1.5e-4;
+
+fn assert_rotation_wire_close(got: Quatf, want: Quatf) {
+    let err = [
+        (got.x - want.x).abs(),
+        (got.y - want.y).abs(),
+        (got.z - want.z).abs(),
+        (got.w - want.w).abs(),
+    ]
+    .into_iter()
+    .fold(0.0f32, f32::max);
+    assert!(
+        err <= ROTATION_WIRE_EPS,
+        "the wire rotation drifted {err:.2e}, bound is {ROTATION_WIRE_EPS}"
+    );
+}
+
+#[test]
+fn the_no746_wire_transform_pins_the_one_scale_case_to_twenty_bytes() {
+    // The common case: scale == ONE stays implicit. 12 (position) + 1 (axis
+    // byte) + 6 (three i16 shares) + 1 (None tag) = 20 bytes; the core
+    // Transform would cost 40. The №746 layer-2 payloads averaged
+    // 1049-1427 B over the 1352 B threshold — this pin is the budget that
+    // carries them back under it.
+    let t = Transform::new(
+        Vec3f::new(12.5, -3.5, 1021.29),
+        Quatf::from_euler(0.3, -1.7, 2.9),
+        Vec3f::ONE,
+    );
+    let bytes = <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&t))
+        .unwrap();
+    assert_eq!(
+        bytes.len(),
+        20,
+        "the ONE-scale wire transform moved; №746 budgets it at 20 B (was 40)"
+    );
+}
+
+#[test]
+fn the_no746_wire_transform_carries_a_non_one_scale_losslessly() {
+    // A user ship-JSON station may set a scale (№746: station world
+    // transforms inherit `ss.local_transform.scale`) — the Option must be
+    // honest: Some rides, decodes exactly, and costs 1 + 12 on the wire
+    // (total 32; still under the old 40-byte core form).
+    let t = Transform::new(
+        Vec3f::new(0.0, 1.5, 40.0),
+        Quatf::from_euler(0.0, 0.0, 90.0_f32.to_radians()),
+        Vec3f::new(2.0, 3.0, 4.0),
+    );
+    let wire = <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&t))
+        .unwrap();
+    assert_eq!(
+        wire.len(),
+        32,
+        "the non-ONE-scale wire transform moved; №746 budgets it at 32 B"
+    );
+    let back = <WireTransform as Serializable>::deserialize(&wire)
+        .unwrap()
+        .into_transform();
+    assert_eq!(back.position, t.position, "position must round-trip exact");
+    assert_eq!(back.scale, t.scale, "a carried scale must come back exact");
+    assert_rotation_wire_close(back.rotation, t.rotation);
+}
+
+#[test]
+fn the_no746_wire_transform_rotation_round_trips_within_the_replication_epsilon() {
+    // A spread of rotations from across the real range: identity, yaw,
+    // pitch-roll mix, and a double-transformed rotor. The smallest-three
+    // reconstruction must stay far below the server's replication-diff
+    // epsilon (0.001) — otherwise an applied delta could hide a rotation
+    // change the server did report.
+    let cases = [
+        Quatf::IDENTITY,
+        Quatf::from_axis_angle(Vec3f::UP, 0.75),
+        Quatf::from_euler(0.9, -2.3, 1.1),
+        (Quatf::from_euler(0.4, 0.4, 0.4) * Quatf::from_euler(-1.3, 0.2, 0.8)),
+    ];
+    for q in cases {
+        let t = Transform::new(Vec3f::new(5.0, -6.0, 7.0), q, Vec3f::ONE);
+        let wire = <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&t))
+            .unwrap();
+        let back =
+            <WireTransform as Serializable>::deserialize(&wire).unwrap().into_transform();
+        assert_eq!(back.position, t.position, "position must round-trip exact");
+        assert_eq!(back.scale, t.scale, "scale must round-trip exact");
+        assert_rotation_wire_close(back.rotation, t.rotation);
+    }
+}
+
+#[test]
+fn the_no746_wire_transform_encodes_canonical_bytes_for_one_rotation() {
+    // q and −q are the same rotation; the wire form must not see the
+    // difference (the server's delta payload cache keys on serialized
+    // bytes), and the same value must serialize twice to the same bytes.
+    let q = Quatf::from_euler(1.1, -0.6, 2.2);
+    let t = Transform::new(Vec3f::new(1.0, 2.0, 3.0), q, Vec3f::ONE);
+    let flipped = Transform::new(Vec3f::new(1.0, 2.0, 3.0), Quatf::new(-q.x, -q.y, -q.z, -q.w), Vec3f::ONE);
+    let a = <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&t)).unwrap();
+    let b =
+        <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&flipped))
+            .unwrap();
+    let a_again =
+        <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&t)).unwrap();
+    assert_eq!(a, a_again, "encoding one value twice must not drift");
+    assert_eq!(a, b, "q and −q are one rotation: the canonical bytes must agree");
+}
+
+#[test]
+fn a_transform_only_delta_record_stays_far_below_the_fragmentation_threshold() {
+    // One updated record that only moves a transform. Every Option field on
+    // the wire form costs its tag byte; compacting the transform drops the
+    // per-record heft by ~20 B — the record itself must sit orders below the
+    // fragmentation threshold (MAX_PACKET_SIZE − HEADER_SIZE − AUTH_WIRE_LEN
+    // = 1400 − 24 − 24 = 1352), so a delta built of such records and a
+    // serialized variance of a few hundred bytes stay in one datagram.
+    let update = EntityStateUpdate {
+        entity_id: EntityId::new(5),
+        transform: Some(WireTransform::from_transform(&Transform::new(
+            Vec3f::new(320.0, 40.0, -128.5),
+            Quatf::from_euler(-0.7, 1.4, 0.02),
+            Vec3f::ONE,
+        ))),
+        velocity: None,
+        angular_velocity: None,
+        health: None,
+        flags: None,
+        ship_data: None,
+        station_data: None,
+        player_data: None,
+    };
+    let bytes = <EntityStateUpdate as Serializable>::serialize(&update).unwrap();
+    // id varint (1) + Some-transform (1 + 20) + seven None tags = 29.
+    assert_eq!(
+        bytes.len(),
+        29,
+        "the transform-only record moved; №746 budgets it at 29 B"
+    );
+    assert!(
+        bytes.len() <= MAX_PACKET_SIZE - HEADER_SIZE - AUTH_WIRE_LEN,
+        "a transform-only delta record must never fragment"
+    );
+}

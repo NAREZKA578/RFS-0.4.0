@@ -22,7 +22,6 @@ use rhi::{
     TextureViewDesc, TextureViewType,
 };
 use std::sync::Arc;
-use std::sync::Arc;
 
 fn assert_f32_eq(actual: f32, expected: f32) {
     assert!(

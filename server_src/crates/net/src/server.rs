@@ -2162,58 +2162,18 @@ impl NetServer {
         first_full_queue: &Arc<Mutex<FirstFullQueue>>,
         first_fulls_built: &Arc<AtomicU64>,
     ) {
-        let snapshot = snapshot_buffer.get_latest().unwrap_or_else(|| Snapshot {
-            tick: current_tick,
-            time: current_tick.value() as f64 * TICK_DURATION.as_secs_f64(),
-            entities: Vec::new(),
-            projectiles: Vec::new(),
-            events: Vec::new(),
+        // Bug №745: `get_latest` hands out the ring's shared allocation; the
+        // empty fallback (nothing written yet) is one extra allocation for
+        // the whole publish pass to read through `&Snapshot`.
+        let snapshot: Arc<Snapshot> = snapshot_buffer.get_latest().unwrap_or_else(|| {
+            Arc::new(Snapshot {
+                tick: current_tick,
+                time: current_tick.value() as f64 * TICK_DURATION.as_secs_f64(),
+                entities: Vec::new(),
+                projectiles: Vec::new(),
+                events: Vec::new(),
+            })
         });
-
-        // RTT697-TEMP: probes, откатить после разбора.
-        static FLUSH_OK_697: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        static FLUSH_ERR_697: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        static FLUSH_ROUNDS_697: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        // RTT697-TEMP: разрез отправленных дельт — мелкая vs фрагментная,
-        // resync-флаг, по слоям. Откатить после разбора.
-        static DS_SMALL_697: AtomicU64 = AtomicU64::new(0);
-        static DS_FRAG_697: AtomicU64 = AtomicU64::new(0);
-        static DS_FRAG_RESYNC_697: AtomicU64 = AtomicU64::new(0);
-        static DS_BY_LAYER_697: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-        static DS_FRAG_BY_LAYER_697: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-        static DS_BYTES_FRAG_697: AtomicU64 = AtomicU64::new(0);
-        static DS_BYTES_SMALL_697: AtomicU64 = AtomicU64::new(0);
-        static DS_LASTLOG_697: AtomicU64 = AtomicU64::new(0);
-        fn ds_log_697() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let last = DS_LASTLOG_697.load(Ordering::Relaxed);
-            if now >= last + 5000
-                && DS_LASTLOG_697
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let l = |t: &[AtomicU64; 4]| -> String {
-                    t.iter()
-                        .map(|c| c.load(Ordering::Relaxed).to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                };
-                eprintln!(
-                    "RTT697-TEMP server_ds t={} small={} smallbytes={} frag={} fragbytes={} frag_resync={} by_layer=[{}] frag_by_layer=[{}]",
-                    now,
-                    DS_SMALL_697.load(Ordering::Relaxed),
-                    DS_BYTES_SMALL_697.load(Ordering::Relaxed),
-                    DS_FRAG_697.load(Ordering::Relaxed),
-                    DS_BYTES_FRAG_697.load(Ordering::Relaxed),
-                    DS_FRAG_RESYNC_697.load(Ordering::Relaxed),
-                    l(&DS_BY_LAYER_697),
-                    l(&DS_FRAG_BY_LAYER_697)
-                );
-            }
-        }
 
         // Bug #267: at 50+ clients the per-client filter+diff+serialize inside
         // the tick budget is the wall (applied rate collapsed to 0.86 Hz at 200
@@ -2457,27 +2417,11 @@ impl NetServer {
                         },
                     );
                     if let Some(bytes) = cached {
-                        // RTT697-TEMP: probe, откатить после разбора.
-                        let blob = bytes.len();
-                        let dpackets = conn.send_state_delta_bytes(bytes);
-                        if dpackets
-                            .first()
-                            .is_some_and(|p| p.header.packet_type == PacketType::Fragment as u8)
-                        {
-                            DS_FRAG_697.fetch_add(1, Ordering::Relaxed);
-                            if resync {
-                                DS_FRAG_RESYNC_697.fetch_add(1, Ordering::Relaxed);
-                            }
-                            DS_BYTES_FRAG_697.fetch_add(blob as u64, Ordering::Relaxed);
-                            DS_FRAG_BY_LAYER_697[layer_u8 as usize]
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            DS_SMALL_697.fetch_add(1, Ordering::Relaxed);
-                            DS_BYTES_SMALL_697.fetch_add(blob as u64, Ordering::Relaxed);
+                        // NC-746-TEMP: probe the fragment share of cached sends too.
+                        if layer_u8 == 2 {
+                            nc746_probe::live_bytes(bytes.len(), true);
                         }
-                        DS_BY_LAYER_697[layer_u8 as usize].fetch_add(1, Ordering::Relaxed);
-                        ds_log_697();
-                        for packet in dpackets {
+                        for packet in conn.send_state_delta_bytes(bytes) {
                             out.push((conn.clone(), packet));
                         }
                         // Bug №30 (B): the cached payload was serialized for
@@ -2530,10 +2474,18 @@ impl NetServer {
                         // a lost delta left its base behind, and prunes the old layer.
                         let mut state_delta = delta.to_state_delta();
                         state_delta.is_resync = resync;
+                        // NC-746-TEMP: layer-2 composition probe.
+                        if layer_u8 == 2 {
+                            nc746_probe::live_fresh(&state_delta);
+                        }
                         let bytes = match conn.serialize_state_delta(state_delta) {
                             Some(b) => b,
                             None => continue,
                         };
+                        // NC-746-TEMP: payload accounting for the fresh branch.
+                        if layer_u8 == 2 {
+                            nc746_probe::live_bytes(bytes.len(), false);
+                        }
                         delta_cache.lock().insert(
                             key,
                             (
@@ -2544,27 +2496,7 @@ impl NetServer {
                                 bytes.clone(),
                             ),
                         );
-                        // RTT697-TEMP: probe, откатить после разбора.
-                        let blob = bytes.len();
-                        let dpackets = conn.send_state_delta_bytes(bytes);
-                        if dpackets
-                            .first()
-                            .is_some_and(|p| p.header.packet_type == PacketType::Fragment as u8)
-                        {
-                            DS_FRAG_697.fetch_add(1, Ordering::Relaxed);
-                            if resync {
-                                DS_FRAG_RESYNC_697.fetch_add(1, Ordering::Relaxed);
-                            }
-                            DS_BYTES_FRAG_697.fetch_add(blob as u64, Ordering::Relaxed);
-                            DS_FRAG_BY_LAYER_697[layer_u8 as usize]
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            DS_SMALL_697.fetch_add(1, Ordering::Relaxed);
-                            DS_BYTES_SMALL_697.fetch_add(blob as u64, Ordering::Relaxed);
-                        }
-                        DS_BY_LAYER_697[layer_u8 as usize].fetch_add(1, Ordering::Relaxed);
-                        ds_log_697();
-                        for packet in dpackets {
+                        for packet in conn.send_state_delta_bytes(bytes) {
                             out.push((conn.clone(), packet));
                         }
                         // Bug №274: count deltas actually put on the wire, per
@@ -2616,31 +2548,9 @@ impl NetServer {
         );
         for batch in pending_batches {
             for (conn, packet) in batch {
-                // RTT697-TEMP: probe, откатить после разбора.
-                match Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled, auth).await
-                {
-                    Ok(_) => FLUSH_OK_697.fetch_add(1, Ordering::Relaxed),
-                    Err(_) => FLUSH_ERR_697.fetch_add(1, Ordering::Relaxed),
-                };
+                let _ =
+                    Self::send_packet(socket, &conn, &packet, bandwidth, limit_enabled, auth).await;
             }
-        }
-        // RTT697-TEMP: probe, откатить после разбора. Раз в ~5 с (150 раундов
-        // по 33 мс) — фактические отправки против построенных пакетов.
-        let round_no = FLUSH_ROUNDS_697.fetch_add(1, Ordering::Relaxed);
-        if round_no % 150 == 149 {
-            eprintln!(
-                "RTT697-TEMP server_flush t={} rounds={}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0),
-                round_no + 1
-            );
-            eprintln!(
-                "RTT697-TEMP server_flush_counts ok={} err={}",
-                FLUSH_OK_697.load(Ordering::Relaxed),
-                FLUSH_ERR_697.load(Ordering::Relaxed)
-            );
         }
     }
 
@@ -3096,6 +3006,167 @@ impl NetServer {
 
     pub fn interest_stats(&self) -> crate::interest::InterestStats {
         self.interest_manager.stats()
+    }
+}
+
+// NC-746-TEMP: layer-2 wire composition probe. Added to measure what a
+// layer-2 delta actually carries (records per delta, which fields are
+// Some, postcard bytes per record and per player_data, share of payloads
+// above the fragmentation threshold). REVERT ENTIRELY after the run.
+pub mod nc746_probe {
+    use rfs_core::packet::{encode, StateDeltaPacket};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use tracing::info;
+
+    /// 1400 (MAX_PACKET_SIZE) - 24 (HEADER_SIZE) - 24 (AUTH_WIRE_LEN):
+    /// payloads above this are fragmented into two datagrams.
+    const FRAG_THRESHOLD: usize = 1352;
+
+    struct Probe {
+        deltas_fresh: AtomicU64,
+        deltas_cached: AtomicU64,
+        bytes_sum: AtomicU64,
+        bytes_over: AtomicU64,
+        recs: AtomicU64,
+        rec_bytes: AtomicU64,
+        rec_transform: AtomicU64,
+        rec_velocity: AtomicU64,
+        rec_angular: AtomicU64,
+        rec_health: AtomicU64,
+        rec_flags: AtomicU64,
+        rec_ship: AtomicU64,
+        rec_station: AtomicU64,
+        rec_pdata: AtomicU64,
+        rec_pdata_bytes: AtomicU64,
+        rec_name_bytes: AtomicU64,
+        resyncs: AtomicU64,
+    }
+
+    impl Probe {
+        const fn zeroed() -> Self {
+            Self {
+                deltas_fresh: AtomicU64::new(0),
+                deltas_cached: AtomicU64::new(0),
+                bytes_sum: AtomicU64::new(0),
+                bytes_over: AtomicU64::new(0),
+                recs: AtomicU64::new(0),
+                rec_bytes: AtomicU64::new(0),
+                rec_transform: AtomicU64::new(0),
+                rec_velocity: AtomicU64::new(0),
+                rec_angular: AtomicU64::new(0),
+                rec_health: AtomicU64::new(0),
+                rec_flags: AtomicU64::new(0),
+                rec_ship: AtomicU64::new(0),
+                rec_station: AtomicU64::new(0),
+                rec_pdata: AtomicU64::new(0),
+                rec_pdata_bytes: AtomicU64::new(0),
+                rec_name_bytes: AtomicU64::new(0),
+                resyncs: AtomicU64::new(0),
+            }
+        }
+    }
+
+    static PROBE: OnceLock<Probe> = OnceLock::new();
+
+    pub fn probe() -> &'static Probe {
+        PROBE.get_or_init(|| {
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let Some(p) = PROBE.get() else { continue };
+                    let fresh = p.deltas_fresh.swap(0, Ordering::Relaxed);
+                    let cached = p.deltas_cached.swap(0, Ordering::Relaxed);
+                    let bytes = p.bytes_sum.swap(0, Ordering::Relaxed);
+                    let over = p.bytes_over.swap(0, Ordering::Relaxed);
+                    let recs = p.recs.swap(0, Ordering::Relaxed);
+                    let rec_bytes = p.rec_bytes.swap(0, Ordering::Relaxed);
+                    let tr = p.rec_transform.swap(0, Ordering::Relaxed);
+                    let v = p.rec_velocity.swap(0, Ordering::Relaxed);
+                    let a = p.rec_angular.swap(0, Ordering::Relaxed);
+                    let h = p.rec_health.swap(0, Ordering::Relaxed);
+                    let f = p.rec_flags.swap(0, Ordering::Relaxed);
+                    let sh = p.rec_ship.swap(0, Ordering::Relaxed);
+                    let st = p.rec_station.swap(0, Ordering::Relaxed);
+                    let pd = p.rec_pdata.swap(0, Ordering::Relaxed);
+                    let pdb = p.rec_pdata_bytes.swap(0, Ordering::Relaxed);
+                    let nb = p.rec_name_bytes.swap(0, Ordering::Relaxed);
+                    let rs = p.resyncs.swap(0, Ordering::Relaxed);
+                    let total_d = fresh + cached;
+                    let avg_payload = if total_d > 0 { bytes as f64 / total_d as f64 } else { 0.0 };
+                    let over_pct = if total_d > 0 { 100.0 * over as f64 / total_d as f64 } else { 0.0 };
+                    let avg_rec = if recs > 0 { rec_bytes as f64 / recs as f64 } else { 0.0 };
+                    let pca = |n: u64| if recs > 0 { 100.0 * n as f64 / recs as f64 } else { 0.0 };
+                    let avg_pd = if pd > 0 { pdb as f64 / pd as f64 } else { 0.0 };
+                    let avg_name = if pd > 0 { nb as f64 / pd as f64 } else { 0.0 };
+                    info!(
+                        "NC746 window: l2 fresh={} cached={} avg_payload={:.0}B fragments={:.1}% recs={} avg_rec={:.1}B \
+                         tr%={:.0} vel%={:.0} ang%={:.0} h%={:.0} f%={:.0} ship%={:.0} st%={:.0} pdata%={:.0} \
+                         avg_pdb={:.0}B avg_name={:.1} resyncs={}",
+                        fresh, cached, avg_payload, over_pct, recs, avg_rec,
+                        pca(tr), pca(v), pca(a), pca(h), pca(f), pca(sh), pca(st), pca(pd),
+                        avg_pd, avg_name, rs
+                    );
+                }
+            });
+            Probe::zeroed()
+        })
+    }
+
+    /// Fresh (non-cached) delta: full composition. NC-746-TEMP.
+    pub fn live_fresh(d: &StateDeltaPacket) {
+        let p = probe();
+        p.deltas_fresh.fetch_add(1, Ordering::Relaxed);
+        if d.is_resync {
+            p.resyncs.fetch_add(1, Ordering::Relaxed);
+        }
+        for u in &d.updated {
+            p.recs.fetch_add(1, Ordering::Relaxed);
+            if let Ok(b) = encode(u) {
+                p.rec_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
+            }
+            if u.transform.is_some() {
+                p.rec_transform.fetch_add(1, Ordering::Relaxed);
+            }
+            if u.velocity.is_some() {
+                p.rec_velocity.fetch_add(1, Ordering::Relaxed);
+            }
+            if u.angular_velocity.is_some() {
+                p.rec_angular.fetch_add(1, Ordering::Relaxed);
+            }
+            if u.health.is_some() {
+                p.rec_health.fetch_add(1, Ordering::Relaxed);
+            }
+            if u.flags.is_some() {
+                p.rec_flags.fetch_add(1, Ordering::Relaxed);
+            }
+            if u.ship_data.is_some() {
+                p.rec_ship.fetch_add(1, Ordering::Relaxed);
+            }
+            if u.station_data.is_some() {
+                p.rec_station.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(pd) = &u.player_data {
+                p.rec_pdata.fetch_add(1, Ordering::Relaxed);
+                if let Ok(pb) = encode(pd) {
+                    p.rec_pdata_bytes.fetch_add(pb.len() as u64, Ordering::Relaxed);
+                }
+                p.rec_name_bytes.fetch_add(pd.name.len() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Payload-bytes accounting for both branches (fresh and cache-hit). NC-746-TEMP.
+    pub fn live_bytes(bytes_len: usize, cached: bool) {
+        let p = probe();
+        p.bytes_sum.fetch_add(bytes_len as u64, Ordering::Relaxed);
+        if bytes_len > FRAG_THRESHOLD {
+            p.bytes_over.fetch_add(1, Ordering::Relaxed);
+        }
+        if cached {
+            p.deltas_cached.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

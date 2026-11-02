@@ -1044,46 +1044,6 @@ impl Connection {
             }
             packets.push(outgoing);
         }
-        // RTT697-TEMP: probe, откатить после разбора. Кто и сколько
-        // фрагментирует: тип, число сообщений, байты, выданные фрагменты.
-        {
-            mod frag_697 {
-                use std::sync::atomic::AtomicU64;
-                pub static MSG: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
-                pub static BYTES: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
-                pub static FRAGS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
-                pub static LAST_LOG: AtomicU64 = AtomicU64::new(0);
-            }
-            let tpe = packet_type as u8 as usize;
-            frag_697::MSG[tpe].fetch_add(1, Ordering::Relaxed);
-            frag_697::BYTES[tpe].fetch_add(data.len() as u64, Ordering::Relaxed);
-            frag_697::FRAGS[tpe].fetch_add(packets.len() as u64, Ordering::Relaxed);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let last = frag_697::LAST_LOG.load(Ordering::Relaxed);
-            if now >= last + 5000
-                && frag_697::LAST_LOG
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let mut s = String::new();
-                for i in 0..256usize {
-                    let m = frag_697::MSG[i].load(Ordering::Relaxed);
-                    if m > 0 {
-                        s.push_str(&format!(
-                            "0x{:02x} msgs={} bytes={} frags={:.1} ",
-                            i,
-                            m,
-                            frag_697::BYTES[i].load(Ordering::Relaxed),
-                            frag_697::FRAGS[i].load(Ordering::Relaxed) as f64 / m as f64
-                        ));
-                    }
-                }
-                eprintln!("RTT697-TEMP server_frag t={} [{}]", now, s);
-            }
-        }
         packets
     }
 

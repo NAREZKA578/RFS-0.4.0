@@ -7,9 +7,15 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
-use crate::pipeline::graphics::{BlendFactor, BlendOp, CullMode, PolygonMode, StencilOp};
+use crate::pipeline::graphics::{BlendFactor, BlendOp, CullMode, LogicOp, PolygonMode,
+    PrimitiveTopology, StencilOp};
 use crate::resource::{AddressMode, BorderColor, CompareOp, FilterMode};
 use crate::types::{ColorComponentFlags, Format, IndexType};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_PRIMITIVE_TOPOLOGY, D3D_PRIMITIVE_TOPOLOGY_LINELIST, D3D_PRIMITIVE_TOPOLOGY_LINESTRIP,
+    D3D_PRIMITIVE_TOPOLOGY_POINTLIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_BLEND, D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_DEST_COLOR,
     D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_INV_DEST_COLOR,
@@ -24,8 +30,18 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMPARISON_FUNC_GREATER_EQUAL, D3D12_COMPARISON_FUNC_LESS,
     D3D12_COMPARISON_FUNC_LESS_EQUAL, D3D12_COMPARISON_FUNC_NEVER,
     D3D12_COMPARISON_FUNC_NOT_EQUAL, D3D12_CULL_MODE, D3D12_CULL_MODE_BACK,
-    D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_FILL_MODE, D3D12_FILL_MODE_SOLID,
-    D3D12_FILL_MODE_WIREFRAME, D3D12_FILTER, D3D12_RESOURCE_STATES, D3D12_STENCIL_OP,
+    D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_NONE, D3D12_DESCRIPTOR_RANGE_TYPE,
+    D3D12_DESCRIPTOR_RANGE_TYPE_CBV, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+    D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    D3D12_FILL_MODE, D3D12_FILL_MODE_SOLID,
+    D3D12_FILL_MODE_WIREFRAME, D3D12_FILTER, D3D12_LOGIC_OP, D3D12_LOGIC_OP_AND,
+    D3D12_LOGIC_OP_AND_INVERTED, D3D12_LOGIC_OP_AND_REVERSE, D3D12_LOGIC_OP_CLEAR,
+    D3D12_LOGIC_OP_COPY, D3D12_LOGIC_OP_COPY_INVERTED, D3D12_LOGIC_OP_EQUIV,
+    D3D12_LOGIC_OP_INVERT, D3D12_LOGIC_OP_NAND, D3D12_LOGIC_OP_NOOP, D3D12_LOGIC_OP_NOR,
+    D3D12_LOGIC_OP_OR, D3D12_LOGIC_OP_OR_INVERTED, D3D12_LOGIC_OP_OR_REVERSE,
+    D3D12_LOGIC_OP_SET, D3D12_LOGIC_OP_XOR, D3D12_PRIMITIVE_TOPOLOGY_TYPE,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RESOURCE_STATES, D3D12_STENCIL_OP,
     D3D12_STENCIL_OP_DECR, D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INCR,
     D3D12_STENCIL_OP_INCR_SAT, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_KEEP,
     D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_ZERO, D3D12_TEXTURE_ADDRESS_MODE,
@@ -465,6 +481,59 @@ pub fn descriptor_range_type(ty: crate::descriptor::DescriptorType) -> Option<D3
         DescriptorType::CombinedTextureSampler
         | DescriptorType::InlineUniformBlock
         | DescriptorType::AccelerationStructure => None,
+    }
+}
+
+/// The primitive topology, as D3D12 names it. `None` for the triangle fan,
+/// which D3D12's IA does not generate (list by list is the honest answer).
+pub fn d3d_topology(topology: PrimitiveTopology) -> Option<D3D_PRIMITIVE_TOPOLOGY> {
+    use PrimitiveTopology::*;
+    match topology {
+        PointList => Some(D3D_PRIMITIVE_TOPOLOGY_POINTLIST),
+        LineList => Some(D3D_PRIMITIVE_TOPOLOGY_LINELIST),
+        LineStrip => Some(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP),
+        TriangleList => Some(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST),
+        TriangleStrip => Some(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP),
+        TriangleFan => None,
+    }
+}
+
+/// The IA topology family the PSO declares, so the point/line/triangle
+/// family stays fixed even when the exact layout rides the draw command.
+pub fn d3d_topology_type(
+    topology: PrimitiveTopology,
+) -> Option<D3D12_PRIMITIVE_TOPOLOGY_TYPE> {
+    use PrimitiveTopology::*;
+    match topology {
+        PointList => Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT),
+        LineList | LineStrip => Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE),
+        TriangleList | TriangleStrip | TriangleFan => {
+            Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
+        }
+    }
+}
+
+/// The logic operation, as D3D12 names it. D3D12 applies logic ops to
+/// target 0 only; the shape has no per-target independent form.
+pub fn d3d_logic_op(op: LogicOp) -> D3D12_LOGIC_OP {
+    use LogicOp::*;
+    match op {
+        Clear => D3D12_LOGIC_OP_CLEAR,
+        And => D3D12_LOGIC_OP_AND,
+        AndReverse => D3D12_LOGIC_OP_AND_REVERSE,
+        Copy => D3D12_LOGIC_OP_COPY,
+        AndInverted => D3D12_LOGIC_OP_AND_INVERTED,
+        NoOp => D3D12_LOGIC_OP_NOOP,
+        Xor => D3D12_LOGIC_OP_XOR,
+        Or => D3D12_LOGIC_OP_OR,
+        Nor => D3D12_LOGIC_OP_NOR,
+        Equivalent => D3D12_LOGIC_OP_EQUIV,
+        Invert => D3D12_LOGIC_OP_INVERT,
+        OrReverse => D3D12_LOGIC_OP_OR_REVERSE,
+        CopyInverted => D3D12_LOGIC_OP_COPY_INVERTED,
+        OrInverted => D3D12_LOGIC_OP_OR_INVERTED,
+        Nand => D3D12_LOGIC_OP_NAND,
+        Set => D3D12_LOGIC_OP_SET,
     }
 }
 

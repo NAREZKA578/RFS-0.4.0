@@ -23,41 +23,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// RTT697-TEMP: probes, откатить после разбора. Полный разрез rx/tx по байту
-// типа пакета — называет «other»-поток и растущие ретрансмиты в лоб.
-static PKT_RX_BY_TYPE_697: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
-static PKT_TX_BY_TYPE_697: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
-static PKT_RX_LASTLOG_697: AtomicU64 = AtomicU64::new(0);
-fn pkt_rx_log_line_697() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let last = PKT_RX_LASTLOG_697.load(Ordering::Relaxed);
-    if now >= last + 5000
-        && PKT_RX_LASTLOG_697
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        let dump = |table: &[AtomicU64; 256]| -> String {
-            let mut s = String::new();
-            for (i, c) in table.iter().enumerate() {
-                let v = c.load(Ordering::Relaxed);
-                if v > 0 {
-                    s.push_str(&format!("0x{i:02x}={v} "));
-                }
-            }
-            s
-        };
-        eprintln!(
-            "RTT697-TEMP bytype t={} rx[{}] tx[{}]",
-            now,
-            dump(&PKT_RX_BY_TYPE_697),
-            dump(&PKT_TX_BY_TYPE_697)
-        );
-    }
-}
-
 /// Connect retransmit cadence (bug №74).
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Give up waiting for ConnectAccept after this long.
@@ -557,7 +522,11 @@ pub enum ClientEvent {
         reason: ConnectRejectReason,
     },
     StateUpdate {
-        snapshot: Snapshot,
+        // Bug №745: the coalescing slot shares the apply path's allocation
+        // (`Arc`) instead of receiving a whole-world deep copy per applied
+        // delta. Consumers read through the `Arc`; taking the snapshot out
+        // (take_latest_state) moves the Arc handle, not the world.
+        snapshot: Arc<Snapshot>,
     },
     EntityUpdate {
         entity_id: EntityId,
@@ -982,8 +951,6 @@ impl NetClient {
         // Bug №732: the header is the hand-rolled fixed codec
         // (`PacketHeader::to_wire`), not a serializer's output — same 24
         // bytes as before, no `?` needed, nothing here can fail.
-        // RTT697-TEMP: probe, откатить после разбора.
-        PKT_TX_BY_TYPE_697[header.packet_type as usize].fetch_add(1, Ordering::Relaxed);
         let mut packet_bytes = header.to_wire();
         packet_bytes.extend_from_slice(&payload);
         let seq = {
@@ -1056,8 +1023,6 @@ impl NetClient {
         }
 
         // Bug №732: hand-rolled fixed header (`to_wire`), same 24 bytes.
-        // RTT697-TEMP: probe, откатить после разбора.
-        PKT_TX_BY_TYPE_697[out.header.packet_type as usize].fetch_add(1, Ordering::Relaxed);
         let mut packet_bytes = out.header.to_wire();
         packet_bytes.extend_from_slice(&out.payload);
         let seq = {
@@ -1310,10 +1275,6 @@ impl NetClient {
         }
 
         let (header, payload) = deserialize_packet(data)?;
-
-        // RTT697-TEMP: probe, откатить после разбора.
-        PKT_RX_BY_TYPE_697[header.packet_type as usize].fetch_add(1, Ordering::Relaxed);
-        pkt_rx_log_line_697();
 
         // Bug №77: keep the peer connection's view of the server sequence so
         // outbound headers (Input, Heartbeat) carry a real ack and the server
@@ -1867,10 +1828,12 @@ impl NetClient {
             *server_time.lock() = state.server_time;
             *current_tick.lock() = Tick(incoming);
 
-            let snapshot = Snapshot::from(&state);
+            // Bug №745: one allocation — the full-state build is wrapped once
+            // and the ring, the interpolator and the coalescing slot all share it.
+            let snapshot = Arc::new(Snapshot::from(&state));
 
-            snapshot_buffer.write_snapshot(snapshot.clone());
-            snapshot_interpolator.lock().add_snapshot(snapshot.clone());
+            snapshot_buffer.write_arc(snapshot.clone());
+            snapshot_interpolator.lock().add_arc(snapshot.clone());
             *last_applied_layer.lock() = [state.server_tick as u64; LAYER_COUNT];
 
             // A full state is authoritative: prune ghosts the delta stream
@@ -2043,11 +2006,24 @@ impl NetClient {
             // resync delta is a complete layer definition, so bootstrap an
             // empty snapshot and apply it (other layers heal on their own
             // resyncs).
-            // Bug №637: the match result is already an owned copy (the buffer
-            // hands out its own clone); the extra `latest.clone()` of the old
-            // code was a second deep copy of every entity per applied delta.
-            let mut base = match snapshot_buffer.get_latest() {
-                Some(latest) => latest,
+            //
+            // Bug №745: the base is the ring's SHARED snapshot (`Arc`) — the
+            // interpolator and the coalescing slot may still read it, so it
+            // is not moved out of. `apply_delta_on` clones the base content
+            // once into the result, and the ONE merged allocation is then
+            // shared by all three storage sites (`Arc` in the ring, the
+            // interpolator and the slot). The old path paid three whole-world
+            // deep copies per applied delta (base clone + two storage clones)
+            // — the ~3k deltas/s consumption ceiling №697 measured.
+            let base_arc = snapshot_buffer.get_latest();
+            let target = match base_arc {
+                Some(base) => {
+                    // A resync replacement must not prune the SHARED base in
+                    // place (other readers hold it); `apply_delta_on` takes
+                    // the resync layer as a parameter and prunes inside the
+                    // being-built result instead.
+                    base.apply_delta_on(&delta, delta.is_resync.then_some(layer))
+                }
                 None => {
                     if !delta.is_resync {
                         return Ok(());
@@ -2060,131 +2036,111 @@ impl NetClient {
                         events: Vec::new(),
                     };
                     snapshot_buffer.write_snapshot(boot.clone());
-                    boot
+                    boot.apply_delta_on(&delta, delta.is_resync.then_some(layer))
                 }
             };
-            {
-                if delta.is_resync {
-                    // Full layer replace: drop everything this layer previously
-                    // held so entities destroyed while we were desynced do not
-                    // linger as ghosts.
-                    base.entities
-                        .retain(|e| entity_layer(e.entity_type) as usize != layer);
-                    if layer == LAYER_PROJECTILE as usize {
-                        base.projectiles.clear();
-                    }
-                }
-
-                // Bug №637: `apply_delta` consumes the base (its vectors move
-                // into the result), and the two storage sites each take an
-                // owned copy; the third use — the `StateUpdate` event below —
-                // moves the original into the slot. Three full copies exist by
-                // storage contract (buffer, interpolator, latest-state slot);
-                // the old code made five per applied delta.
-                let target = base.apply_delta(&delta);
-                snapshot_buffer.write_snapshot(target.clone());
-                snapshot_interpolator.lock().add_snapshot(target.clone());
-                last_applied_layer.lock()[layer] = delta.server_tick as u64;
-
-                // Bug №274: count the delta HERE — at the moment its base
-                // advances, which is the one place that cannot be undone and
-                // cannot coalesce. `latest_state` cannot serve as the counter:
-                // it is a single overwrite slot, so when several layers' deltas
-                // land in one server tick they overwrite each other and the
-                // consumer observes one update instead of four. Measured on the
-                // real harness, that made a perfectly healthy 1-bot client
-                // report 6.10 Hz while its layers had reached the server's own
-                // tick with zero stalls.
-                applied_delta_count.fetch_add(1, Ordering::Relaxed);
-                if let Some(counts) = applied_delta_count_by_layer.lock().get_mut(layer) {
-                    *counts += 1;
-                }
-
-                // Bug №36: emit events only for entities this delta actually
-                // carried, never re-emit the whole buffer.
-                let changed: HashSet<EntityId> = delta
-                    .created
-                    .iter()
-                    .map(|e| e.entity_id)
-                    .chain(delta.updated.iter().map(|u| u.entity_id))
-                    .collect();
-                let changed_projectiles: HashSet<EntityId> = delta
-                    .projectile_created
-                    .iter()
-                    .map(|p| p.entity_id)
-                    .chain(delta.projectile_updated.iter().map(|u| u.entity_id))
-                    .collect();
-
-                if delta.is_resync {
-                    let dead: Vec<EntityId> = {
-                        let states = entity_states.read();
-                        states
-                            .iter()
-                            .filter(|(id, ent)| {
-                                entity_layer(ent.entity_type) as usize == layer
-                                    && !target.entities.iter().any(|e| &e.entity_id == *id)
-                            })
-                            .map(|(id, _)| *id)
-                            .collect()
-                    };
-                    for id in dead {
-                        entity_states.write().remove(&id);
-                        event_sender.send_delta(ClientEvent::EntityRemoved { entity_id: id });
-                    }
-                }
-
-                {
-                    let mut states = entity_states.write();
-                    for id in &changed {
-                        if let Some(entity) = target.entities.iter().find(|e| e.entity_id == *id) {
-                            states.insert(*id, entity.clone());
-                            event_sender.send_delta(ClientEvent::EntityUpdate {
-                                entity_id: *id,
-                                snapshot: entity.clone(),
-                            });
-                        }
-                    }
-                }
-                for entity_id in &delta.destroyed {
-                    entity_states.write().remove(entity_id);
-                    event_sender.send_delta(ClientEvent::EntityRemoved {
-                        entity_id: *entity_id,
-                    });
-                }
-
-                {
-                    let mut states = projectile_states.write();
-                    if delta.is_resync && layer == LAYER_PROJECTILE as usize {
-                        let dead: Vec<EntityId> = states
-                            .keys()
-                            .copied()
-                            .filter(|id| !target.projectiles.iter().any(|p| &p.entity_id == id))
-                            .collect();
-                        for id in dead {
-                            states.remove(&id);
-                            event_sender
-                                .send_delta(ClientEvent::ProjectileRemoved { projectile_id: id });
-                        }
-                    }
-                    for id in &changed_projectiles {
-                        if let Some(proj) = target.projectiles.iter().find(|p| p.entity_id == *id) {
-                            states.insert(*id, proj.clone());
-                            event_sender.send_delta(ClientEvent::ProjectileUpdate {
-                                projectile_id: *id,
-                                snapshot: proj.clone(),
-                            });
-                        }
-                    }
-                }
-                for entity_id in &delta.projectile_destroyed {
-                    projectile_states.write().remove(entity_id);
-                    event_sender.send_delta(ClientEvent::ProjectileRemoved {
-                        projectile_id: *entity_id,
-                    });
-                }
-
-                *latest_state.lock() = Some(ClientEvent::StateUpdate { snapshot: target });
+            // Bug №274: count the delta HERE — at the moment its base
+            // advances, which is the one place that cannot be undone and
+            // cannot coalesce. `latest_state` cannot serve as the counter:
+            // it is a single overwrite slot, so when several layers' deltas
+            // land in one server tick they overwrite each other and the
+            // consumer observes one update instead of four. Measured on the
+            // real harness, that made a perfectly healthy 1-bot client
+            // report 6.10 Hz while its layers had reached the server's own
+            // tick with zero stalls.
+            let target_arc = Arc::new(target);
+            snapshot_buffer.write_arc(target_arc.clone());
+            snapshot_interpolator.lock().add_arc(target_arc.clone());
+            last_applied_layer.lock()[layer] = delta.server_tick as u64;
+            applied_delta_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(counts) = applied_delta_count_by_layer.lock().get_mut(layer) {
+                *counts += 1;
             }
+
+            // Bug №36: emit events only for entities this delta actually
+            // carried, never re-emit the whole buffer.
+            let changed: HashSet<EntityId> = delta
+                .created
+                .iter()
+                .map(|e| e.entity_id)
+                .chain(delta.updated.iter().map(|u| u.entity_id))
+                .collect();
+            let changed_projectiles: HashSet<EntityId> = delta
+                .projectile_created
+                .iter()
+                .map(|p| p.entity_id)
+                .chain(delta.projectile_updated.iter().map(|u| u.entity_id))
+                .collect();
+
+            if delta.is_resync {
+                let dead: Vec<EntityId> = {
+                    let states = entity_states.read();
+                    states
+                        .iter()
+                        .filter(|(id, ent)| {
+                            entity_layer(ent.entity_type) as usize == layer
+                                && !target_arc.entities.iter().any(|e| &e.entity_id == *id)
+                        })
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for id in dead {
+                    entity_states.write().remove(&id);
+                    event_sender.send_delta(ClientEvent::EntityRemoved { entity_id: id });
+                }
+            }
+
+            {
+                let mut states = entity_states.write();
+                for id in &changed {
+                    if let Some(entity) = target_arc.entities.iter().find(|e| e.entity_id == *id) {
+                        states.insert(*id, entity.clone());
+                        event_sender.send_delta(ClientEvent::EntityUpdate {
+                            entity_id: *id,
+                            snapshot: entity.clone(),
+                        });
+                    }
+                }
+            }
+            for entity_id in &delta.destroyed {
+                entity_states.write().remove(entity_id);
+                event_sender.send_delta(ClientEvent::EntityRemoved {
+                    entity_id: *entity_id,
+                });
+            }
+
+            {
+                let mut states = projectile_states.write();
+                if delta.is_resync && layer == LAYER_PROJECTILE as usize {
+                    let dead: Vec<EntityId> = states
+                        .keys()
+                        .copied()
+                        .filter(|id| !target_arc.projectiles.iter().any(|p| &p.entity_id == id))
+                        .collect();
+                    for id in dead {
+                        states.remove(&id);
+                        event_sender
+                            .send_delta(ClientEvent::ProjectileRemoved { projectile_id: id });
+                    }
+                }
+                for id in &changed_projectiles {
+                    if let Some(proj) = target_arc.projectiles.iter().find(|p| p.entity_id == *id) {
+                        states.insert(*id, proj.clone());
+                        event_sender.send_delta(ClientEvent::ProjectileUpdate {
+                            projectile_id: *id,
+                            snapshot: proj.clone(),
+                        });
+                    }
+                }
+            }
+            for entity_id in &delta.projectile_destroyed {
+                projectile_states.write().remove(entity_id);
+                event_sender.send_delta(ClientEvent::ProjectileRemoved {
+                    projectile_id: *entity_id,
+                });
+            }
+
+            *latest_state.lock() = Some(ClientEvent::StateUpdate { snapshot: target_arc });
         }
         Ok(())
     }
@@ -3215,7 +3171,7 @@ mod event_delivery_tests {
         EntityState {
             entity_id: EntityId(id),
             entity_type: EntityType::Ship,
-            transform: Transform::from_position(Vec3f::new(1.0, 0.0, 0.0)),
+            transform: Transform::from_position(Vec3f::new(1.0, 0.0, 0.0)).into(),
             velocity: Vec3f::ZERO,
             angular_velocity: Vec3f::ZERO,
             health: 100.0,

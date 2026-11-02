@@ -17,7 +17,7 @@ use rhi::command::pool::{CommandPool, CommandPoolDesc, CommandPoolFlags};
 use rhi::resource::texture::{Texture, TextureDesc, TextureView, TextureViewDesc, TextureViewType};
 use rhi::{
     AccessFlags, ClearValue, Format, PipelineStage, Rect2D, RhiError, SampleCount, ShaderStage,
-    TextureLayout, TextureUsage,
+    TextureAspectFlags, TextureLayout, TextureUsage,
 };
 
 fn view_of(texture: &Texture) -> TextureView {

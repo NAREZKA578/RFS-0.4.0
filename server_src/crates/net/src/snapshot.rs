@@ -7,6 +7,7 @@ use rfs_core::packet::*;
 use rfs_core::time::Tick;
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::warn;
 
 pub const MAX_SNAPSHOT_HISTORY: usize = 128;
@@ -195,7 +196,14 @@ pub struct SnapshotBuffer {
 }
 
 struct SnapshotBufferInner {
-    snapshots: Vec<Option<Snapshot>>,
+    // Bug №745: the ring stores shared allocations (`Arc<Snapshot>`), not
+    // owned snapshots. The client's apply path reads the newest entry as a
+    // merge base and re-stores the merged result here, in the interpolator
+    // and in the coalescing `StateUpdate` slot — the same allocation all
+    // three. The old owned-storage form forced a deep clone at every one of
+    // those hand-offs (№697 measured 3–4 full-world copies per applied
+    // delta and a consumption ceiling of ~3k deltas/s per process).
+    snapshots: Vec<Option<Arc<Snapshot>>>,
     current_index: usize,
     base_tick: Tick,
 }
@@ -219,6 +227,13 @@ impl SnapshotBuffer {
     }
 
     pub fn write_snapshot(&self, snapshot: Snapshot) {
+        self.write_arc(Arc::new(snapshot));
+    }
+
+    /// Bug №745: store an allocation the caller (the client apply path) has
+    /// already wrapped, so the ring can share it with the interpolator and
+    /// the coalescing slot instead of taking a deep copy of the whole world.
+    pub fn write_arc(&self, snapshot: Arc<Snapshot>) {
         let mut inner = self.inner.write();
 
         let tick = snapshot.tick;
@@ -258,7 +273,7 @@ impl SnapshotBuffer {
         inner.base_tick = Tick(0);
     }
 
-    pub fn get_snapshot(&self, tick: Tick) -> Option<Snapshot> {
+    pub fn get_snapshot(&self, tick: Tick) -> Option<Arc<Snapshot>> {
         let inner = self.inner.read();
 
         if tick < inner.base_tick {
@@ -274,11 +289,15 @@ impl SnapshotBuffer {
         inner.snapshots[idx].clone()
     }
 
-    pub fn get_latest(&self) -> Option<Snapshot> {
+    /// Bug №745: the newest snapshot is shared, not deep-copied. Two
+    /// consecutive reads hand out the exact same allocation (`Arc::ptr_eq`)
+    /// — the whole-world clone that used to sit at every read was one of the
+    /// three copies №697 traced to the apply path's consumption ceiling.
+    pub fn get_latest(&self) -> Option<Arc<Snapshot>> {
         let inner = self.inner.read();
         // Scan for the snapshot with the greatest tick — `current_index` points at `base_tick`,
         // not at the newest entry, so the old `snapshots[index]` was always stale/empty.
-        let mut best: Option<Snapshot> = None;
+        let mut best: Option<Arc<Snapshot>> = None;
         let mut best_tick = Tick(0);
         for slot in inner.snapshots.iter().flatten() {
             if best.is_none() || slot.tick > best_tick {
@@ -688,7 +707,10 @@ impl ProjectileUpdate {
 }
 
 pub struct SnapshotInterpolator {
-    snapshots: Vec<Snapshot>,
+    // Bug №745: samples are shared allocations, same one the ring and the
+    // coalescing slot hold. Deep-copying a whole world per sample was part
+    // of the №697 consumption ceiling.
+    snapshots: Vec<Arc<Snapshot>>,
     max_snapshots: usize,
 }
 
@@ -726,6 +748,37 @@ impl SnapshotInterpolator {
             );
             snapshot.projectiles.truncate(MAX_PROJECTILES_PER_SNAPSHOT);
         }
+        self.snapshots.push(Arc::new(snapshot));
+        if self.snapshots.len() > self.max_snapshots {
+            self.snapshots.remove(0);
+        }
+    }
+
+    /// Bug №745: store a snapshot the apply path has already wrapped — no
+    /// deep copy per sample. The Bug №20 truncation guard still applies, but
+    /// an `Arc` cannot be truncated in place, so the oversized case pays the
+    /// old deep-copy-then-truncate price rather than silently skipping the
+    /// guard. Normal traffic is never oversized, so the hot path stays free
+    /// of full-world copies.
+    pub fn add_arc(&mut self, snapshot: Arc<Snapshot>) {
+        if snapshot.entities.len() > MAX_ENTITIES_PER_SNAPSHOT
+            || snapshot.projectiles.len() > MAX_PROJECTILES_PER_SNAPSHOT
+        {
+            warn!(
+                "add_arc: truncating {} entities / {} projectiles to the caps",
+                snapshot.entities.len(),
+                snapshot.projectiles.len()
+            );
+            let mut owned = (*snapshot).clone();
+            owned
+                .entities
+                .truncate(MAX_ENTITIES_PER_SNAPSHOT);
+            owned
+                .projectiles
+                .truncate(MAX_PROJECTILES_PER_SNAPSHOT);
+            self.add_snapshot(owned);
+            return;
+        }
         self.snapshots.push(snapshot);
         if self.snapshots.len() > self.max_snapshots {
             self.snapshots.remove(0);
@@ -734,7 +787,7 @@ impl SnapshotInterpolator {
 
     pub fn interpolate(&self, target_time: f64) -> Option<Snapshot> {
         if self.snapshots.len() < 2 {
-            return self.snapshots.last().cloned();
+            return self.snapshots.last().map(|snap| (**snap).clone());
         }
 
         let mut before = None;
@@ -758,10 +811,10 @@ impl SnapshotInterpolator {
                 } else {
                     0.0
                 };
-                Some(self.interpolate_snapshots(b, a, alpha))
+                Some(self.interpolate_snapshots(&**b, &**a, alpha))
             }
-            (Some(b), None) => Some(b.clone()),
-            (None, Some(a)) => Some(a.clone()),
+            (Some(b), None) => Some((**b).clone()),
+            (None, Some(a)) => Some((**a).clone()),
             _ => None,
         }
     }
@@ -1034,7 +1087,7 @@ impl From<&EntityState> for EntitySnapshot {
         EntitySnapshot {
             entity_id: s.entity_id,
             entity_type: s.entity_type,
-            transform: s.transform,
+            transform: s.transform.into_transform(),
             velocity: s.velocity,
             angular_velocity: s.angular_velocity,
             health: s.health,
@@ -1156,16 +1209,44 @@ impl From<&StatePacket> for Snapshot {
 }
 
 impl Snapshot {
-    /// Bug №637: this used to take `&self` and deep-copy both vectors
-    /// (`iter().cloned().collect()`) into the result, on top of the caller
-    /// already owning a base copy — four full entity/projectile copies per
-    /// applied delta, each frame, layered. Taking `self` by value moves the
-    /// vectors for free; the caller's base is a private clone or a boot
-    /// snapshot, so nothing outside the call referenced it.
-    pub fn apply_delta(self, delta: &StateDeltaPacket) -> Snapshot {
+    /// Bug №745: the one merge implementation, two ownership forms.
+    ///
+    /// `merge_delta` takes the base content by value (moved, or cloned by the
+    /// caller for the shared-base case), applies the wire delta's
+    /// created/updated/destroyed records exactly as before (the index-based
+    /// merge of Bug №637, the upsert semantics of the layered deltas, the
+    /// retained-fields rule for partial updates), and stamps the result with
+    /// the delta's tick/time.
+    ///
+    /// `resync_layer` carries the merge-block's resync rule: a layer resync
+    /// replaces the whole layer's content, so entities of that layer are
+    /// dropped from the base before the records apply (destroyed entities
+    /// must not linger as ghosts), and a projectile-layer resync clears the
+    /// projectile list. The reference twin (`apply_delta_on`) needs this as
+    /// a parameter because it must not mutate the shared base the ring, the
+    /// interpolator and the consumer slot still hold; the by-value twin
+    /// (`apply_delta`) passes `None` to keep its own historical contract —
+    /// the client used to prune the layer on an owned base before calling.
+    fn merge_delta(
+        entities: Vec<EntitySnapshot>,
+        projectiles: Vec<ProjectileSnapshot>,
+        delta: &StateDeltaPacket,
+        resync_layer: Option<usize>,
+    ) -> Snapshot {
         // Layered deltas carry only their own layer, so `created` is an upsert:
         // the entity may already be present from an earlier full state or resync.
-        let mut entities = self.entities;
+        let mut entities = match resync_layer {
+            Some(layer) => entities
+                .into_iter()
+                .filter(|e| entity_layer(e.entity_type) as usize != layer)
+                .collect::<Vec<_>>(),
+            None => entities,
+        };
+        let mut projectiles = if resync_layer == Some(LAYER_PROJECTILE as usize) {
+            Vec::new()
+        } else {
+            projectiles
+        };
         // Bug №637: the four `find` scans looked the whole vector up per
         // created/updated record — O(records × entities) each frame. One index
         // pass up front makes it O(entities + records); updated/created lookups
@@ -1192,7 +1273,7 @@ impl Snapshot {
         }
         entities.retain(|e| !delta.destroyed.contains(&e.entity_id));
 
-        let mut projectiles = self.projectiles;
+        // Bug №637: same index rewrite for the projectile half.
         let mut pindex: HashMap<EntityId, usize> = projectiles
             .iter()
             .enumerate()
@@ -1223,6 +1304,46 @@ impl Snapshot {
             // №637 (`Vec::new()`), events travel via the event stream.
             events: Vec::new(),
         }
+    }
+
+    /// Bug №637: this used to take `&self` and deep-copy both vectors
+    /// (`iter().cloned().collect()`) into the result, on top of the caller
+    /// already owning a base copy — four full entity/projectile copies per
+    /// applied delta, each frame, layered. Taking `self` by value moves the
+    /// vectors for free; the caller's base is a private clone or a boot
+    /// snapshot, so nothing outside the call referenced it.
+    ///
+    /// Bug №745: kept as the ownership-move form for callers that own their
+    /// base outright (the hot client path moved to the shared-base
+    /// `apply_delta_on` twin — one whole-world clone per applied delta beats
+    /// three at the old hand-off sites, and the merge logic is shared).
+    pub fn apply_delta(self, delta: &StateDeltaPacket) -> Snapshot {
+        Self::merge_delta(self.entities, self.projectiles, delta, None)
+    }
+
+    /// Bug №745: merge against a base the caller does NOT own — the buffer's
+    /// newest snapshot is shared (`Arc`) with the ring, the interpolator and
+    /// the coalescing slot, so it cannot be moved out of. The base vectors
+    /// are cloned once into the result (one full-world allocation per
+    /// applied delta instead of the three hand-off copies the owned form
+    /// forced at call sites), and the exact same `merge_delta` keeps the
+    /// created/updated/destroyed semantics identical to the by-value twin.
+    ///
+    /// `resync_layer`: a resync replaces the whole layer's content (see
+    /// `merge_delta`), and the shared base stays untouched — the old code
+    /// pruned an owned base in the caller; that mutation must not reach the
+    /// snapshot other consumers still read.
+    pub fn apply_delta_on(
+        &self,
+        delta: &StateDeltaPacket,
+        resync_layer: Option<usize>,
+    ) -> Snapshot {
+        Self::merge_delta(
+            self.entities.clone(),
+            self.projectiles.clone(),
+            delta,
+            resync_layer,
+        )
     }
 
     pub fn to_state_packet(&self) -> StatePacket {
@@ -1348,7 +1469,7 @@ impl EntitySnapshot {
         EntityState {
             entity_id: self.entity_id,
             entity_type: self.entity_type,
-            transform: self.transform,
+            transform: WireTransform::from_transform(&self.transform),
             velocity: self.velocity,
             angular_velocity: self.angular_velocity,
             health: self.health,
@@ -1365,7 +1486,7 @@ impl EntitySnapshot {
 
     pub fn apply_state_update(&mut self, update: &EntityStateUpdate) {
         if let Some(t) = update.transform {
-            self.transform = t;
+            self.transform = t.into_transform();
         }
         if let Some(v) = update.velocity {
             self.velocity = v;
@@ -1395,7 +1516,7 @@ impl EntityUpdate {
     pub fn to_state_update(&self) -> EntityStateUpdate {
         EntityStateUpdate {
             entity_id: self.entity_id,
-            transform: self.transform,
+            transform: self.transform.map(|t| WireTransform::from_transform(&t)),
             velocity: self.velocity,
             angular_velocity: self.angular_velocity,
             health: self.health,
@@ -1564,7 +1685,7 @@ mod apply_delta_tests {
         EntityState {
             entity_id: EntityId::new(id),
             entity_type: EntityType::Ship,
-            transform: Transform::new(Vec3f::new(9.0, 0.0, 0.0), Quatf::IDENTITY, Vec3f::ONE),
+            transform: Transform::new(Vec3f::new(9.0, 0.0, 0.0), Quatf::IDENTITY, Vec3f::ONE).into(),
             velocity: Vec3f::new(5.0, 0.0, 0.0),
             angular_velocity: Vec3f::ZERO,
             health,
@@ -1851,7 +1972,81 @@ mod apply_delta_tests {
         .to_state_packet();
 
         let restored = EntitySnapshot::from(&packet.entities[0]);
-        assert_eq!(restored, source, "a wire field got dropped on the way out");
+
+        // Bug №746: the transform rides the quantized wire form — position
+        // and scale are exact, the rotation reconstructs within the codec
+        // residual (≤ 1.5e-4 per component; the step is 1/32767 ≈ 3e-5 plus
+        // reconstruction margin). Every other field must survive bitwise —
+        // that is what a dropped wire field is for: it shows up as here, not
+        // as a silent gap.
+        assert_eq!(restored.entity_id, source.entity_id, "entity_id dropped");
+        assert_eq!(restored.entity_type, source.entity_type, "entity_type dropped");
+        assert_eq!(restored.velocity, source.velocity, "velocity dropped");
+        assert_eq!(
+            restored.angular_velocity, source.angular_velocity,
+            "angular_velocity dropped"
+        );
+        assert_eq!(restored.health, source.health, "health dropped");
+        assert_eq!(restored.max_health, source.max_health, "max_health dropped");
+        assert_eq!(restored.flags, source.flags, "flags dropped");
+        assert_eq!(restored.ship_data, source.ship_data, "ship_data dropped");
+        assert_eq!(restored.station_data, source.station_data, "station_data dropped");
+        assert_eq!(restored.player_data, source.player_data, "player_data dropped");
+        assert_eq!(restored.transform.position, source.transform.position, "position dropped");
+        assert_eq!(restored.transform.scale, source.transform.scale, "scale dropped");
+        let r = restored.transform.rotation;
+        let s = source.transform.rotation;
+        for (a, b, what) in [(r.x, s.x, "x"), (r.y, s.y, "y"), (r.z, s.z, "z"), (r.w, s.w, "w")] {
+            assert!(
+                (a - b).abs() <= 1.5e-4,
+                "rotation.{what} drifted by {:.2e} through the quantized wire",
+                (a - b).abs()
+            );
+        }
+    }
+
+    /// Bug №746: the wire transform merges like any other Option field — the
+    /// record replaces the entity transform wholesale, so the quantized wire
+    /// form is all the consumer ever sees. Position and scale arrive exact,
+    /// the rotation within the codec residual (step 1/32767 ≈ 3e-5, bound
+    /// pinned here with margin).
+    #[test]
+    fn a_delta_merge_replaces_the_entity_transform_with_the_wire_value() {
+        let target = Transform::new(
+            Vec3f::new(412.5, -90.25, 1024.0),
+            Quatf::from_euler(2.1, -0.7, 0.5),
+            Vec3f::ONE,
+        );
+        let mut d = delta();
+        d.updated.push(EntityStateUpdate {
+            entity_id: EntityId::new(1),
+            transform: Some(WireTransform::from_transform(&target)),
+            velocity: None,
+            angular_velocity: None,
+            health: None,
+            flags: None,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        });
+
+        let merged = base_snapshot().apply_delta_on(&d, None);
+
+        let got = merged.entities[0].transform;
+        assert_eq!(got.position, target.position, "position is exact through the wire");
+        assert_eq!(got.scale, Vec3f::ONE, "the ONE-scale fast path decodes to exactly ONE");
+        let worst = [
+            (got.rotation.x - target.rotation.x).abs(),
+            (got.rotation.y - target.rotation.y).abs(),
+            (got.rotation.z - target.rotation.z).abs(),
+            (got.rotation.w - target.rotation.w).abs(),
+        ]
+        .into_iter()
+        .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 1.5e-4,
+            "rotation drifted {worst:.2e} through the quantized merge (bound 1.5e-4)"
+        );
     }
 
     /// Bug №672 (delta branch): `DeltaSnapshot::to_state_delta` feeds both
@@ -1946,6 +2141,318 @@ mod apply_delta_tests {
             merged.projectiles[0].velocity,
             Vec3f::new(10.0, 0.0, 0.0),
             "fields the update left None keep the stored value"
+        );
+    }
+}
+
+/// Bug №745, negative controls: the client's apply path hands out SHARED
+/// allocations instead of whole-world deep copies. №697 traced the ~3k
+/// deltas/s consumption ceiling to copies at every hand-off — the merge-base
+/// read (`get_latest`), the two storage re-stores (ring, interpolator) and
+/// the coalescing `StateUpdate` slot. These tests fail if any site starts
+/// deep-copying again or if the reference merge twin (`apply_delta_on`)
+/// drifts from the by-value merge.
+#[cfg(test)]
+mod snapshot_sharing_tests_745 {
+    //! RED discipline: T1 was forced red with a temporary deep clone inside
+    //! `get_latest` (a reverted probe edit); T2/T3 with a temporary
+    //! twin that ignored `destroyed` and `resync_layer`; T4 with a temporary
+    //! `add_arc` that skipped the truncation guard. Each probe failed exactly
+    //! its own test, then the revert restored green.
+
+    use super::*;
+    use rfs_core::entity::EntityId;
+    use rfs_core::math::Quatf;
+
+    fn entity(id: u64, health: f32) -> EntitySnapshot {
+        EntitySnapshot {
+            entity_id: EntityId::new(id),
+            entity_type: EntityType::Ship,
+            transform: Transform::new(Vec3f::new(1.0, 2.0, 3.0), Quatf::IDENTITY, Vec3f::ONE),
+            velocity: Vec3f::ZERO,
+            angular_velocity: Vec3f::ZERO,
+            health,
+            max_health: 100.0,
+            flags: EntityFlags::NONE,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        }
+    }
+
+    fn wire_entity(id: u64, health: f32) -> EntityState {
+        EntityState {
+            entity_id: EntityId::new(id),
+            entity_type: EntityType::Ship,
+            transform: Transform::new(Vec3f::new(9.0, 0.0, 0.0), Quatf::IDENTITY, Vec3f::ONE).into(),
+            velocity: Vec3f::new(5.0, 0.0, 0.0),
+            angular_velocity: Vec3f::ZERO,
+            health,
+            max_health: 100.0,
+            flags: EntityFlags::NONE,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        }
+    }
+
+    fn projectile(id: u64, lifetime: f32) -> ProjectileSnapshot {
+        ProjectileSnapshot {
+            entity_id: EntityId::new(id),
+            projectile_type: ProjectileType::Cannonball,
+            position: Vec3f::new(1.0, 1.0, 1.0),
+            velocity: Vec3f::new(10.0, 0.0, 0.0),
+            spawn_tick: 1,
+            lifetime,
+            owner: EntityId::new(1),
+            damage: 5.0,
+            penetration: 0.0,
+        }
+    }
+
+    fn wire_projectile(id: u64) -> ProjectileState {
+        ProjectileState {
+            entity_id: EntityId::new(id),
+            projectile_type: ProjectileType::Cannonball,
+            position: Vec3f::new(2.0, 2.0, 2.0),
+            velocity: Vec3f::new(3.0, 0.0, 0.0),
+            spawn_tick: 2,
+            lifetime: 7.0,
+            owner: EntityId::new(1),
+            damage: 9.0,
+            penetration: 0.0,
+        }
+    }
+
+    fn base_snapshot() -> Snapshot {
+        Snapshot {
+            tick: Tick(10),
+            time: 10.0 / 30.0,
+            entities: vec![entity(1, 100.0), entity(2, 90.0)],
+            projectiles: vec![projectile(500, 4.0)],
+            events: Vec::new(),
+        }
+    }
+
+    fn delta() -> StateDeltaPacket {
+        StateDeltaPacket {
+            layer: LAYER_SHIP,
+            base_tick: 10,
+            server_tick: 12,
+            server_time: 12.0 / 30.0,
+            is_resync: false,
+            created: Vec::new(),
+            updated: Vec::new(),
+            destroyed: Vec::new(),
+            projectile_created: Vec::new(),
+            projectile_updated: Vec::new(),
+            projectile_destroyed: Vec::new(),
+        }
+    }
+
+    /// T1: the ring shares its allocation. Two consecutive `get_latest` reads
+    /// must hand out the exact same `Arc` (`ptr_eq`), and a merged result
+    /// re-stored through `write_arc` must stay the caller's allocation —
+    /// a deep clone at either site is one whole-world copy per applied delta
+    /// again.
+    #[test]
+    fn the_buffer_hands_out_shared_allocations_not_deep_copies() {
+        let buffer = SnapshotBuffer::new(8);
+        buffer.write_arc(Arc::new(base_snapshot()));
+
+        let first = buffer.get_latest().expect("the written snapshot is readable");
+        let second = buffer.get_latest().expect("the written snapshot is still there");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two get_latest reads must hand out the SAME allocation, not two \
+             deep copies of the whole world"
+        );
+
+        let merge = delta();
+        let merged = Arc::new(first.apply_delta_on(&merge, None));
+        buffer.write_arc(merged.clone());
+        let re_stored = buffer.get_latest().expect("the re-stored snapshot is readable");
+        assert!(
+            Arc::ptr_eq(&merged, &re_stored),
+            "write_arc must store the caller's allocation, not a copy of it"
+        );
+    }
+
+    /// T2: the reference twin is behaviorally identical to the by-value
+    /// merge — created/upsert, partial update, destroyed and both projectile
+    /// halves — and it leaves the shared base untouched.
+    #[test]
+    fn the_reference_merge_twin_matches_the_by_value_merge() {
+        let mut d = delta();
+        d.created = vec![wire_entity(3, 70.0)];
+        d.updated.push(EntityStateUpdate {
+            entity_id: EntityId::new(1),
+            transform: None,
+            velocity: Some(Vec3f::new(7.0, 0.0, 0.0)),
+            angular_velocity: None,
+            health: Some(42.0),
+            flags: None,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        });
+        d.destroyed = vec![EntityId::new(2)];
+        d.projectile_created = vec![wire_projectile(600)];
+        d.projectile_updated.push(ProjectileStateUpdate {
+            entity_id: EntityId::new(500),
+            position: None,
+            velocity: Some(Vec3f::new(4.0, 0.0, 0.0)),
+            lifetime: Some(6.0),
+        });
+
+        let owned = base_snapshot().apply_delta(&d);
+        let shared = Arc::new(base_snapshot());
+        let on_ref = shared.apply_delta_on(&d, None);
+
+        assert_eq!(on_ref.tick, owned.tick, "both twins stamp the delta's tick");
+        assert_eq!(on_ref.time, owned.time, "both twins stamp the delta's time");
+        assert_eq!(
+            on_ref.entities, owned.entities,
+            "created/upsert/updated/destroyed must behave identically through \
+             the reference twin"
+        );
+        assert_eq!(
+            on_ref.projectiles, owned.projectiles,
+            "the projectile half must behave identically through the reference twin"
+        );
+        assert_eq!(
+            shared.entities.len(),
+            2,
+            "the twin must not mutate the shared base's entities"
+        );
+        assert_eq!(
+            shared.projectiles.len(),
+            1,
+            "the twin must not mutate the shared base's projectiles"
+        );
+    }
+
+    /// T3: a resync is a full layer replace — stale entities of the resolve
+    /// layer must not survive in the result, a projectile-layer resync clears
+    /// the shells, other layers' entities stay — and all pruning happens in
+    /// the fresh result, never on the shared base in place.
+    #[test]
+    fn a_resync_replaces_only_its_own_layer_in_the_result_not_its_neighbors() {
+        // A player entity (layer 2) rides in the base next to the ships.
+        let mut base = base_snapshot();
+        base.entities.push(EntitySnapshot {
+            entity_id: EntityId::new(9),
+            entity_type: EntityType::Player,
+            transform: Transform::new(Vec3f::new(5.0, 0.0, 5.0), Quatf::IDENTITY, Vec3f::ONE),
+            velocity: Vec3f::ZERO,
+            angular_velocity: Vec3f::ZERO,
+            health: 88.0,
+            max_health: 100.0,
+            flags: EntityFlags::NONE,
+            ship_data: None,
+            station_data: None,
+            player_data: None,
+        });
+        let mut d = delta();
+        d.is_resync = true;
+        d.created = vec![wire_entity(4, 99.0)];
+
+        let shared = Arc::new(base);
+        let merged = shared.apply_delta_on(&d, Some(LAYER_SHIP as usize));
+
+        assert!(
+            !merged.entities.iter().any(|e| e.entity_id == EntityId::new(1))
+                && !merged.entities.iter().any(|e| e.entity_id == EntityId::new(2)),
+            "a layer-0 resync replaces the layer's content: stale ships must \
+             not linger as ghosts"
+        );
+        assert!(
+            merged.entities.iter().any(|e| e.entity_id == EntityId::new(4)),
+            "the resync delta's created records still apply"
+        );
+        assert!(
+            merged.entities.iter().any(|e| e.entity_id == EntityId::new(9)),
+            "a resync of layer 0 must not prune other layers' entities"
+        );
+        assert_eq!(
+            shared.entities.len(),
+            3,
+            "the resync prunes the RESULT (a fresh allocation), never the \
+             shared base in place"
+        );
+
+        // A projectile-layer resync clears the shells and leaves every
+        // entity layer alone.
+        let mut dp = delta();
+        dp.layer = LAYER_PROJECTILE;
+        dp.is_resync = true;
+        let merged_p = shared.apply_delta_on(&dp, Some(LAYER_PROJECTILE as usize));
+        assert!(
+            merged_p.projectiles.is_empty(),
+            "a projectile-layer resync clears the projectile list"
+        );
+        assert_eq!(
+            merged_p.entities.len(),
+            3,
+            "a projectile-layer resync leaves every entity layer alone"
+        );
+        assert_eq!(
+            shared.projectiles.len(),
+            1,
+            "the shared base's projectiles are untouched by the twin"
+        );
+    }
+
+    /// T4: the interpolator stores the shared samples whole and the Bug №20
+    /// truncation guard still applies on the Arc path (an oversized sample
+    /// pays the old deep-copy-then-truncate price instead of ballooning).
+    #[test]
+    fn the_interpolator_keeps_arc_samples_and_still_truncates_oversized_ones() {
+        let mut interp = SnapshotInterpolator::new(4);
+        interp.add_arc(Arc::new(base_snapshot())); // tick 10, time 10/30
+        let mut late = base_snapshot();
+        late.tick = Tick(11);
+        late.time = 14.0 / 30.0;
+        interp.add_arc(Arc::new(late));
+
+        // Before the interval: the first sample's content comes back intact.
+        let early = interp
+            .interpolate(f64::NEG_INFINITY)
+            .expect("the interpolator answers for any time");
+        assert_eq!(
+            early.entities.len(),
+            2,
+            "the shared samples are stored whole — nothing was lost on the Arc path"
+        );
+        assert_eq!(early.projectiles.len(), 1);
+
+        // Past every sample: the newest one comes back. Make it oversized on
+        // both caps and expect the guards to hold.
+        let oversized = Snapshot {
+            tick: Tick(20),
+            time: 20.0 / 30.0,
+            entities: (0..(MAX_ENTITIES_PER_SNAPSHOT as u64 + 4))
+                .map(|i| entity(i, 100.0))
+                .collect::<Vec<_>>(),
+            projectiles: (0..(MAX_PROJECTILES_PER_SNAPSHOT as u64 + 2))
+                .map(|i| projectile(i + 10_000, 1.0))
+                .collect::<Vec<_>>(),
+            events: Vec::new(),
+        };
+        interp.add_arc(Arc::new(oversized));
+
+        let truncated = interp
+            .interpolate(1.0)
+            .expect("the newest sample is answerable");
+        assert_eq!(
+            truncated.entities.len(),
+            MAX_ENTITIES_PER_SNAPSHOT,
+            "the entity cap applies on the shared path too"
+        );
+        assert_eq!(
+            truncated.projectiles.len(),
+            MAX_PROJECTILES_PER_SNAPSHOT,
+            "the projectile cap applies on the shared path too"
         );
     }
 }

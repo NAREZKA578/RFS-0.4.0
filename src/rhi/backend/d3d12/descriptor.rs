@@ -192,6 +192,16 @@ impl DescriptorHeaps {
         Ok(taken)
     }
 
+    /// Gives `count` descriptors back unspent: a creation transaction whose
+    /// later steps failed rewinds the slots it reserved but never filled,
+    /// so a refusal does not permanently eat the pool.
+    pub(crate) fn rewind(&self, kind: DescriptorKind, count: usize) {
+        let slot = kind_index(kind);
+        let before = self.used[slot].fetch_sub(count, Ordering::AcqRel);
+        debug_assert!(before >= count, "rewound past the pool's zero line");
+    }
+
+    /// The CPU descriptor address for one slot in a kind's pool.
     /// The CPU descriptor address for one slot in a kind's pool.
     pub(crate) fn cpu(&self, kind: DescriptorKind, index: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = kind_index(kind);

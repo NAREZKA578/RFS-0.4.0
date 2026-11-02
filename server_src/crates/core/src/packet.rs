@@ -1,5 +1,5 @@
 use crate::entity::HitMark;
-use crate::math::{Transform, Vec3f};
+use crate::math::{Quatf, Transform, Vec3f};
 pub use crate::spatial::EntityId;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -19,7 +19,13 @@ use uuid::Uuid;
 // cross-version pair would be two encoders saying the same words in different
 // shapes. The header itself stays a hand-rolled 24 bytes (see HEADER_SIZE);
 // the bump is for the payload half.
-pub const PROTOCOL_VERSION: u16 = 4;
+// Bug №746: the version moves again — EntityState/EntityStateUpdate carry the
+// compact `WireTransform` instead of the core `Transform` (40 bytes → 20 bytes
+// at scale == ONE, the measured ~99-100% case): position f32×3, rotation
+// smallest-three (largest axis as u8, the other three quantized i16), scale
+// present only when it is not ONE. Cross-version agrees are impossible by the
+// same logic as №732 — the two sides would misread each other's transforms.
+pub const PROTOCOL_VERSION: u16 = 5;
 /// Bug №239: the single statement of the per-datagram wire budget. It does
 /// not deliberately enforce itself inside core — core only serializes — but
 /// the net crate re-exports exactly this value as `connection::MAX_PACKET_SIZE`
@@ -440,11 +446,151 @@ pub struct StatePacket {
     pub projectiles: Vec<ProjectileState>,
 }
 
+/// Bug №746: the wire form of a replicated transform.
+///
+/// The core [`Transform`] keeps its derived serde form — that form is the file
+/// format of ship-class JSON (`rfs_ship::loader` reads `serde_json::ShipClass`
+/// with `local_transform: Transform`), so changing it under this struct would
+/// silently break user ship files. The wire gets its own compact shape here.
+///
+/// Layout (postcard, field order below): position 12 B, rotation as
+/// smallest-three — the axis byte (largest |component|, 0..=3) plus the other
+/// three quantized — and the scale only when it differs from ONE. The No.746
+/// probe measured ~99-100% of layer-2 records carrying the full transform
+/// with scale == ONE, so the common case is 12 + 7 + 1 = 20 B against the
+/// 40 B a four-f32 `Transform` costs; the measured layer-2 payload averages
+/// (1049-1427 B over the fragmentation threshold 1352 B = MAX_PACKET_SIZE −
+/// HEADER_SIZE − AUTH_WIRE_LEN) fall back under it.
+///
+/// Rotation law (smallest-three, 15 bits): a unit quaternion's largest
+/// component is recoverable — encode drops it, stores the other three as
+/// shares of that largest (`v_i / |v_axis|` × 32767 ∈ [−32767, 32767], every
+/// share fits by construction) plus its index; binary sign flip (q and −q
+/// are the same rotation) fixates the largest component non-negative, so
+/// equal rotations always encode to equal bytes — the server's delta cache
+/// keys on serialized bytes. Decode restores it: shares normalize back to
+/// the largest via `1/sqrt(1 + Σ share²)` == Σ q_i² + q_axis² = 1. The
+/// residual error is ~1e-5 per component, three orders below the server's
+/// own replication-diff epsilon (0.001 in snapshot.rs), so a server-visible
+/// rotation change always survives one encode/decode hop.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WireTransform {
+    pub position: [f32; 3],
+    /// Index of the largest absolute rotation component in `(x, y, z, w)`.
+    /// The decoder recovers its value from the unit constraint; the sign
+    /// convention fixates it non-negative.
+    pub rot_axis: u8,
+    // NC-746-TEMP (RED probe, #746): the three non-largest components as raw
+    // f32 shares — this placeholder keeps the OLD ~40 B heft (12 + 1 + 12 +
+    // 1 + 12 = 38 B, scale always carried) so the size pins in the No.746
+    // test set can be seen RED against it. The quantized final form follows
+    // this run; only the field types and the two encode/decode lines change.
+    pub rot_others: [f32; 3],
+    /// `None` at scale == ONE (over 99% of the measured wire — see the
+    /// probe); otherwise the exact scale a user ship-JSON station may set.
+    // NC-746-TEMP (RED probe, #746): Some on every encode while probing.
+    pub non_uniform_scale: Option<[f32; 3]>,
+}
+
+impl WireTransform {
+    /// Quantization denominator: the three stored components are shares of
+    /// the largest, scaled to 15 bits (±32767, no i16-min asymmetry).
+    pub const QUANT_MAX: f32 = 32767.0;
+
+    /// Encode `t` for the wire. The rotation is normalized first —
+    /// replication sources build it from rotors, drift is sub-epsilon —
+    /// and a degenerate (near-zero) rotation falls back to IDENTITY, which
+    /// is what `normalize` promises.
+    pub fn from_transform(t: &Transform) -> Self {
+        let q = t.rotation.normalize();
+        let v = [q.x, q.y, q.z, q.w];
+        // The largest absolute component drives the shares; after the flip
+        // below it is at least sqrt(1/4) = 0.5 (equality when all four
+        // components coincide), so the division is never a zero division.
+        let mut axis = 0usize;
+        for i in 1..4 {
+            if v[i].abs() > v[axis].abs() {
+                axis = i;
+            }
+        }
+        // q and −q are the same rotation: one canonical sign per rotation
+        // means one canonical byte sequence per value.
+        let flip = if v[axis] < 0.0 { -1.0 } else { 1.0 };
+        let amax = v[axis].abs();
+        let mut rot_others = [0.0f32; 3];
+        let mut oi = 0usize;
+        for (i, &c) in v.iter().enumerate() {
+            if i != axis {
+                // NC-746-TEMP (RED probe): shares ride the wire unrounded —
+                // f32, no quantization step yet; the final form rounds to
+                // i16 here.
+                rot_others[oi] = c * flip / amax * Self::QUANT_MAX;
+                oi += 1;
+            }
+        }
+        // NC-746-TEMP (RED probe): scale is carried on every encode in this
+        // placeholder — the final form emits None at scale == ONE.
+        let non_uniform_scale = Some([t.scale.x, t.scale.y, t.scale.z]);
+        Self {
+            position: [t.position.x, t.position.y, t.position.z],
+            rot_axis: axis as u8,
+            rot_others,
+            non_uniform_scale,
+        }
+    }
+
+    /// Decode from the wire. `rot_axis` rides as two bits of a u8 and the
+    /// accumulator masks it mod 4; the restore uses the unit constraint —
+    /// stored shares are `q_i / |q_axis|`, so `Σ share² = (1 − q_axis²)/
+    /// q_axis²` and `q_axis = 1/sqrt(1 + Σ share²)`.
+    pub fn into_transform(self) -> Transform {
+        let axis = (self.rot_axis % 4) as usize;
+        let mut sum_sq = 0.0f32;
+        for share in &self.rot_others {
+            // NC-746-TEMP (RED probe): raw f32 share back; the final form
+            // divides its stored i16 by QUANT_MAX here.
+            let share_n = share / Self::QUANT_MAX;
+            sum_sq += share_n * share_n;
+        }
+        let amax = (1.0 / (1.0 + sum_sq)).sqrt();
+        let mut v = [0.0f32; 4];
+        let mut oi = 0usize;
+        for (i, slot) in v.iter_mut().enumerate() {
+            if i != axis {
+                *slot = self.rot_others[oi] / Self::QUANT_MAX * amax;
+                oi += 1;
+            }
+        }
+        v[axis] = amax;
+        let scale = match self.non_uniform_scale {
+            Some(s) => Vec3f::new(s[0], s[1], s[2]),
+            None => Vec3f::ONE,
+        };
+        Transform::new(
+            Vec3f::new(self.position[0], self.position[1], self.position[2]),
+            Quatf::new(v[0], v[1], v[2], v[3]),
+            scale,
+        )
+    }
+}
+
+impl From<&Transform> for WireTransform {
+    fn from(t: &Transform) -> Self {
+        Self::from_transform(t)
+    }
+}
+
+impl From<Transform> for WireTransform {
+    fn from(t: Transform) -> Self {
+        Self::from_transform(&t)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EntityState {
     pub entity_id: EntityId,
     pub entity_type: EntityType,
-    pub transform: Transform,
+    pub transform: WireTransform,
     pub velocity: Vec3f,
     pub angular_velocity: Vec3f,
     pub health: f32,
@@ -623,7 +769,7 @@ pub struct ProjectileStateUpdate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EntityStateUpdate {
     pub entity_id: EntityId,
-    pub transform: Option<Transform>,
+    pub transform: Option<WireTransform>,
     pub velocity: Option<Vec3f>,
     pub angular_velocity: Option<Vec3f>,
     pub health: Option<f32>,

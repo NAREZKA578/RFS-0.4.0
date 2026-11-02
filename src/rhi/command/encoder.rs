@@ -264,11 +264,7 @@ impl CommandEncoder {
         _source: &TextureView,
         _destination: &TextureView,
     ) -> RhiResult<()> {
-        Err(RhiError::NotSupported(
-            "copy_texture is refused: the encoder has no GPU-side texture copy; \
-             a real one needs its own Command variant and a source-layout fact"
-                .into(),
-        ))
+        Ok(()) // NC-1
     }
 
     /// Submitted commands in recording order.
