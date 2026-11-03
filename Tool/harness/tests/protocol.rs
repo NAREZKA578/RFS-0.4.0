@@ -148,11 +148,16 @@ use rfs_core::math::{Quatf, Transform, Vec3f};
 const ROTATION_WIRE_EPS: f32 = 1.5e-4;
 
 fn assert_rotation_wire_close(got: Quatf, want: Quatf) {
+    // №746: the wire canonizes the binary sign (q ≡ −q are one rotation),
+    // so a component-wise compare must align hemispheres first — otherwise
+    // the SAME rotation reads as a whole-component sign flip.
+    let aligned_dot = got.x * want.x + got.y * want.y + got.z * want.z + got.w * want.w;
+    let s = if aligned_dot < 0.0 { -1.0 } else { 1.0 };
     let err = [
-        (got.x - want.x).abs(),
-        (got.y - want.y).abs(),
-        (got.z - want.z).abs(),
-        (got.w - want.w).abs(),
+        (s * got.x - want.x).abs(),
+        (s * got.y - want.y).abs(),
+        (s * got.z - want.z).abs(),
+        (s * got.w - want.w).abs(),
     ]
     .into_iter()
     .fold(0.0f32, f32::max);
@@ -163,12 +168,15 @@ fn assert_rotation_wire_close(got: Quatf, want: Quatf) {
 }
 
 #[test]
-fn the_no746_wire_transform_pins_the_one_scale_case_to_twenty_bytes() {
-    // The common case: scale == ONE stays implicit. 12 (position) + 1 (axis
-    // byte) + 6 (three i16 shares) + 1 (None tag) = 20 bytes; the core
-    // Transform would cost 40. The №746 layer-2 payloads averaged
-    // 1049-1427 B over the 1352 B threshold — this pin is the budget that
-    // carries them back under it.
+fn the_no746_wire_transform_pins_the_one_scale_case_under_the_no746_budget() {
+    // The common case: scale == ONE stays implicit. The heft is bounded
+    // above (postcard frames the i16 shares as zigzag varints — small
+    // shares, the常态 for dominant-component rotations, ride 1-2 B each):
+    // 12 (position) + 1 (axis byte) + up to 9 (three i16 at the full
+    // ±32767 swing) + 1 (None tag) = 23 B worst case, against the 40 B a
+    // four-f32 core Transform costs. The №746 layer-2 payloads averaged
+    // 1049-1427 B over the 1352 B threshold — this budget carries them
+    // back under it.
     let t = Transform::new(
         Vec3f::new(12.5, -3.5, 1021.29),
         Quatf::from_euler(0.3, -1.7, 2.9),
@@ -176,11 +184,37 @@ fn the_no746_wire_transform_pins_the_one_scale_case_to_twenty_bytes() {
     );
     let bytes = <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&t))
         .unwrap();
+    assert!(
+        bytes.len() <= 23,
+        "ONE-scale WireTransform exceeded the №746 budget: {} > 23",
+        bytes.len()
+    );
+    assert!(
+        bytes.len() < 40,
+        "the wire form must stay under the core Transform's own 40 B"
+    );
+}
+
+#[test]
+fn the_no746_wire_transform_encodes_an_identity_exactly_seventeen_bytes() {
+    // The identity rides the fast path: shares are all zero (one byte each
+    // in postcard's varint), axis 3 carries nothing, the None scale tag
+    // closes the form — 12 + 1 + 3 + 1 = 17 bytes, bit-stable across
+    // encodes. A drift here means the field order or the varint behaviour
+    // moved: PROTOCOL_VERSION bump with a note about who depends on it.
+    let t = Transform::new(Vec3f::new(7.5, -2.0, 88.0), Quatf::IDENTITY, Vec3f::ONE);
+    let bytes = <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&t))
+        .unwrap();
     assert_eq!(
         bytes.len(),
-        20,
-        "the ONE-scale wire transform moved; №746 budgets it at 20 B (was 40)"
+        17,
+        "the identity WireTransform moved; №746 pins it at 17 B"
     );
+    let back = <WireTransform as Serializable>::deserialize(&bytes)
+        .unwrap()
+        .into_transform();
+    assert_eq!(back.scale, Vec3f::ONE);
+    assert_eq!(back.rotation, Quatf::IDENTITY, "identity must round-trip exact");
 }
 
 #[test]
@@ -196,10 +230,10 @@ fn the_no746_wire_transform_carries_a_non_one_scale_losslessly() {
     );
     let wire = <WireTransform as Serializable>::serialize(&WireTransform::from_transform(&t))
         .unwrap();
-    assert_eq!(
-        wire.len(),
-        32,
-        "the non-ONE-scale wire transform moved; №746 budgets it at 32 B"
+    assert!(
+        wire.len() <= 36,
+        "non-ONE-scale WireTransform exceeded the №746 budget: {} > 36",
+        wire.len()
     );
     let back = <WireTransform as Serializable>::deserialize(&wire)
         .unwrap()
@@ -276,11 +310,13 @@ fn a_transform_only_delta_record_stays_far_below_the_fragmentation_threshold() {
         player_data: None,
     };
     let bytes = <EntityStateUpdate as Serializable>::serialize(&update).unwrap();
-    // id varint (1) + Some-transform (1 + 20) + seven None tags = 29.
-    assert_eq!(
-        bytes.len(),
-        29,
-        "the transform-only record moved; №746 budgets it at 29 B"
+    // Worst-case budget: id varint (1) + Some-transform (1 + 23) + seven
+    // None tags (7) = 32; typicallys smaller as dominant-component
+    // rotations ride the short varints.
+    assert!(
+        bytes.len() <= 32,
+        "the transform-only record exceeded the №746 budget: {} > 32",
+        bytes.len()
     );
     assert!(
         bytes.len() <= MAX_PACKET_SIZE - HEADER_SIZE - AUTH_WIRE_LEN,

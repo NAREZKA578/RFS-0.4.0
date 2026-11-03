@@ -937,6 +937,25 @@ impl D3D12Device {
         }
     }
 
+    /// The render pass description its tracked handle carries: a D3D12
+    /// render pass is only its description, and the recorded
+    /// `BeginRenderPass` reads it back.
+    pub(crate) fn pass_description(&self, handle: u64) -> RhiResult<RenderPassDesc> {
+        match self.lookup(handle, "render pass")? {
+            D3DObject::Pass(desc) => Ok(desc),
+            _ => Err(RhiError::InternalError(
+                "a render pass handle lost its kind".into(),
+            )),
+        }
+    }
+
+    /// The raw device, for the recorder's temporary-view creations: a
+    /// standalone clear binds its view through a CPU pool slot the recorder
+    /// owns, and the descriptor creator it needs is the device's.
+    pub(crate) fn raw_device(&self) -> &ID3D12Device {
+        &self.device.0
+    }
+
     pub(crate) fn pipeline_entry(&self, handle: u64) -> RhiResult<GraphicsPipelineEntry> {
         match self.lookup(handle, "graphics pipeline")? {
             D3DObject::GraphicsPipeline(entry) => Ok(entry),

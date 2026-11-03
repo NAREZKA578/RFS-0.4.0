@@ -1996,7 +1996,13 @@ mod apply_delta_tests {
         assert_eq!(restored.transform.scale, source.transform.scale, "scale dropped");
         let r = restored.transform.rotation;
         let s = source.transform.rotation;
-        for (a, b, what) in [(r.x, s.x, "x"), (r.y, s.y, "y"), (r.z, s.z, "z"), (r.w, s.w, "w")] {
+        // The wire canonizes the binary sign (q ≡ −q): align hemispheres
+        // before the component compare.
+        let dot = r.x * s.x + r.y * s.y + r.z * s.z + r.w * s.w;
+        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+        for (a, b, what) in
+            [(r.x * sign, s.x, "x"), (r.y * sign, s.y, "y"), (r.z * sign, s.z, "z"), (r.w * sign, s.w, "w")]
+        {
             assert!(
                 (a - b).abs() <= 1.5e-4,
                 "rotation.{what} drifted by {:.2e} through the quantized wire",
@@ -2035,11 +2041,18 @@ mod apply_delta_tests {
         let got = merged.entities[0].transform;
         assert_eq!(got.position, target.position, "position is exact through the wire");
         assert_eq!(got.scale, Vec3f::ONE, "the ONE-scale fast path decodes to exactly ONE");
+        // The wire canonizes the binary sign (q ≡ −q): align hemispheres
+        // before the component compare.
+        let dot = got.rotation.x * target.rotation.x
+            + got.rotation.y * target.rotation.y
+            + got.rotation.z * target.rotation.z
+            + got.rotation.w * target.rotation.w;
+        let s = if dot < 0.0 { -1.0 } else { 1.0 };
         let worst = [
-            (got.rotation.x - target.rotation.x).abs(),
-            (got.rotation.y - target.rotation.y).abs(),
-            (got.rotation.z - target.rotation.z).abs(),
-            (got.rotation.w - target.rotation.w).abs(),
+            (s * got.rotation.x - target.rotation.x).abs(),
+            (s * got.rotation.y - target.rotation.y).abs(),
+            (s * got.rotation.z - target.rotation.z).abs(),
+            (s * got.rotation.w - target.rotation.w).abs(),
         ]
         .into_iter()
         .fold(0.0f32, f32::max);

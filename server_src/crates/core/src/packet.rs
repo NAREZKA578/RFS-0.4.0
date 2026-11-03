@@ -464,15 +464,23 @@ pub struct StatePacket {
 ///
 /// Rotation law (smallest-three, 15 bits): a unit quaternion's largest
 /// component is recoverable — encode drops it, stores the other three as
-/// shares of that largest (`v_i / |v_axis|` × 32767 ∈ [−32767, 32767], every
-/// share fits by construction) plus its index; binary sign flip (q and −q
-/// are the same rotation) fixates the largest component non-negative, so
-/// equal rotations always encode to equal bytes — the server's delta cache
-/// keys on serialized bytes. Decode restores it: shares normalize back to
-/// the largest via `1/sqrt(1 + Σ share²)` == Σ q_i² + q_axis² = 1. The
-/// residual error is ~1e-5 per component, three orders below the server's
-/// own replication-diff epsilon (0.001 in snapshot.rs), so a server-visible
-/// rotation change always survives one encode/decode hop.
+/// shares of that largest (`v_i / |v_axis|` rounded to i16, every share fits
+/// by construction: no |v_i| exceeds |v_axis|) plus its index; binary sign
+/// flip (q and −q are the same rotation) fixates the largest component
+/// non-negative, so equal rotations always encode to equal bytes — the
+/// server's delta cache keys on serialized bytes. Decode restores the
+/// largest via `1/sqrt(1 + Σ share²)` == Σ q_i² + q_axis² = 1 and scales the
+/// shares back by it. The residual is ~1e-5 per component, three orders
+/// below the server's own replication-diff epsilon (0.001 in snapshot.rs),
+/// so a server-visible rotation change always survives one encode/decode
+/// hop: the 0.001 component step is ~30 quantization steps.
+///
+/// Wire budget of this type is pinned by the №746 test set at
+/// Tool/harness/tests/protocol.rs: identity rides exact 17 B, the ONE-scale
+/// form stays under 23 B worst-case (12 + 1 + up to 9 varint-backed share
+/// bytes + 1 None tag), a non-ONE scale under 36 B, a transform-only delta
+/// record under 32 B — every byte above the pins means a PROTOCOL_VERSION
+/// bump with a note about who depends on it.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WireTransform {
     pub position: [f32; 3],
@@ -480,21 +488,19 @@ pub struct WireTransform {
     /// The decoder recovers its value from the unit constraint; the sign
     /// convention fixates it non-negative.
     pub rot_axis: u8,
-    // NC-746-TEMP (RED probe, #746): the three non-largest components as raw
-    // f32 shares — this placeholder keeps the OLD ~40 B heft (12 + 1 + 12 +
-    // 1 + 12 = 38 B, scale always carried) so the size pins in the No.746
-    // test set can be seen RED against it. The quantized final form follows
-    // this run; only the field types and the two encode/decode lines change.
-    pub rot_others: [f32; 3],
-    /// `None` at scale == ONE (over 99% of the measured wire — see the
-    /// probe); otherwise the exact scale a user ship-JSON station may set.
-    // NC-746-TEMP (RED probe, #746): Some on every encode while probing.
+    /// The three non-largest rotation components as shares of the largest,
+    /// quantized to 15 bits (±32767, no i16-min asymmetry).
+    pub rot_others: [i16; 3],
+    /// `None` at scale == ONE (the probe's ~99-100% of the wire); otherwise
+    /// the exact scale a user ship-JSON station may set.
     pub non_uniform_scale: Option<[f32; 3]>,
 }
 
 impl WireTransform {
     /// Quantization denominator: the three stored components are shares of
-    /// the largest, scaled to 15 bits (±32767, no i16-min asymmetry).
+    /// the largest, scaled to 15 bits. Zero shares decode to an exact
+    /// identity (amax = 1/sqrt(1+0) = 1), so the common IDENTITY case
+    /// round-trips bit-exact.
     pub const QUANT_MAX: f32 = 32767.0;
 
     /// Encode `t` for the wire. The rotation is normalized first —
@@ -517,20 +523,25 @@ impl WireTransform {
         // means one canonical byte sequence per value.
         let flip = if v[axis] < 0.0 { -1.0 } else { 1.0 };
         let amax = v[axis].abs();
-        let mut rot_others = [0.0f32; 3];
+        let mut rot_others = [0i16; 3];
         let mut oi = 0usize;
         for (i, &c) in v.iter().enumerate() {
             if i != axis {
-                // NC-746-TEMP (RED probe): shares ride the wire unrounded —
-                // f32, no quantization step yet; the final form rounds to
-                // i16 here.
-                rot_others[oi] = c * flip / amax * Self::QUANT_MAX;
+                // No |v_i| exceeds |v_axis| — the share is in ±1 by
+                // construction; the clamp only tolerates the f32 rounding
+                // that could otherwise land a hair outside the i16 range.
+                let share = (c * flip / amax * Self::QUANT_MAX)
+                    .round()
+                    .clamp(-Self::QUANT_MAX, Self::QUANT_MAX) as i16;
+                rot_others[oi] = share;
                 oi += 1;
             }
         }
-        // NC-746-TEMP (RED probe): scale is carried on every encode in this
-        // placeholder — the final form emits None at scale == ONE.
-        let non_uniform_scale = Some([t.scale.x, t.scale.y, t.scale.z]);
+        let non_uniform_scale = if t.scale == Vec3f::ONE {
+            None
+        } else {
+            Some([t.scale.x, t.scale.y, t.scale.z])
+        };
         Self {
             position: [t.position.x, t.position.y, t.position.z],
             rot_axis: axis as u8,
@@ -547,9 +558,7 @@ impl WireTransform {
         let axis = (self.rot_axis % 4) as usize;
         let mut sum_sq = 0.0f32;
         for share in &self.rot_others {
-            // NC-746-TEMP (RED probe): raw f32 share back; the final form
-            // divides its stored i16 by QUANT_MAX here.
-            let share_n = share / Self::QUANT_MAX;
+            let share_n = f32::from(*share) / Self::QUANT_MAX;
             sum_sq += share_n * share_n;
         }
         let amax = (1.0 / (1.0 + sum_sq)).sqrt();
@@ -557,7 +566,7 @@ impl WireTransform {
         let mut oi = 0usize;
         for (i, slot) in v.iter_mut().enumerate() {
             if i != axis {
-                *slot = self.rot_others[oi] / Self::QUANT_MAX * amax;
+                *slot = f32::from(self.rot_others[oi]) / Self::QUANT_MAX * amax;
                 oi += 1;
             }
         }

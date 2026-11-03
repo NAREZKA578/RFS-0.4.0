@@ -7,10 +7,11 @@
 //! which every `submit_commands` submission rides).
 //!
 //! Deliberately narrow, in the shape of the Vulkan translator: the copy and
-//! state commands are translated, and the commands belonging to the render
-//! path (M3, Баг№707) and the compute path (M4, Баг№708) are refused rather
-//! than skipped. A silently dropped command draws a wrong picture and looks
-//! like a flaky GPU to whoever hunts it.
+//! state commands are translated, the render path (M3, Баг№707) is translated
+//! on top of the same state tracker — one pass in flight, targets driven
+//! through tracked transitions — and the compute path (M4, Баг№708) is
+//! refused rather than skipped. A silently dropped command draws a wrong
+//! picture and looks like a flaky GPU to whoever hunts it.
 //!
 //! State tracking: D3D12's `ResourceBarrier` must name the resource's exact
 //! current `StateBefore`. The recorder therefore tracks one state belief per
@@ -32,23 +33,36 @@
 use std::collections::HashMap;
 
 use super::convert;
-use super::device::D3D12Device;
+use super::descriptor::DescriptorKind;
+use super::device::{D3D12Device, GraphicsPipelineEntry};
 use crate::command::commands::Command;
+use crate::command::pass::render::LoadOp;
 use crate::error::{RhiError, RhiResult};
 use crate::resource::TextureDesc;
-use crate::types::{AccessFlags, TextureDimensions};
+use crate::types::{AccessFlags, ClearValue, IndexType, Rect2D, TextureDimensions};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::{
+    D3D12_CLEAR_FLAGS, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_FLAG_STENCIL,
+    D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_INDEX_BUFFER_VIEW,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER,
     D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER_TYPE_UAV,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
-    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ,
-    D3D12_RESOURCE_STATES, D3D12_RESOURCE_UAV_BARRIER,
+    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATE_COMMON,
+    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES, D3D12_RESOURCE_UAV_BARRIER,
     D3D12_SUBRESOURCE_FOOTPRINT, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_VIEWPORT, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12DescriptorHeap, ID3D12GraphicsCommandList,
+    ID3D12Resource,
 };
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
+
+/// One render pass in flight: the textures the begin moved into their
+/// render states (`resource`, tracked handle, home state). `EndRenderPass`
+/// walks every one of them back to COMMON through the same tracker.
+struct ActivePass {
+    targets: Vec<(ID3D12Resource, u64, D3D12_RESOURCE_STATES)>,
+}
 
 /// The recorder for one submitted list.
 struct Recorder<'a> {
@@ -58,6 +72,16 @@ struct Recorder<'a> {
     /// with the home `COMMON` (see the module comment); every recorded
     /// transition updates it.
     states: HashMap<u64, D3D12_RESOURCE_STATES>,
+    /// The pass whose targets sit in the render states, for EndRenderPass.
+    active_pass: Option<ActivePass>,
+    /// The graphics pipeline the draw state carries: its input-layout
+    /// strides feed `BindVertexBuffers`.
+    pipeline: Option<GraphicsPipelineEntry>,
+    /// The currently bound index-buffer view, when one is bound.
+    index_view: Option<D3D12_INDEX_BUFFER_VIEW>,
+    /// `SetDescriptorHeaps` is a per-list binding, not a per-set one: the
+    /// two shader-visible heaps are bound the first time a set binds.
+    heaps_set: bool,
 }
 
 impl Recorder<'_> {
@@ -139,6 +163,10 @@ pub(crate) fn record(
         list,
         device,
         states: HashMap::new(),
+        active_pass: None,
+        pipeline: None,
+        index_view: None,
+        heaps_set: false,
     };
     for command in commands {
         replay(&mut rec, command)?;
@@ -148,27 +176,542 @@ pub(crate) fn record(
 
 fn replay(rec: &mut Recorder<'_>, command: &Command) -> RhiResult<()> {
     match command {
-        // ---------- render and dispatch commands: M3/M4 replace these ----------
-        Command::BindGraphicsPipeline(_)
-        | Command::BindComputePipeline(_)
-        | Command::BindDescriptorSets { .. }
+        // ---------- the M3 graphics path (Баг№707) ----------
+        Command::BeginRenderPass(info) => {
+            if rec.active_pass.is_some() {
+                return Err(RhiError::BackendError(
+                    "BeginRenderPass records into a pass already in flight; \
+                     the list supports one pass at a time"
+                        .into(),
+                ));
+            }
+            let Some(fb_gpu) = info.framebuffer.backend() else {
+                return Err(RhiError::BackendError(
+                    "the render pass's framebuffer has no GPU backing".into(),
+                ));
+            };
+            let fb = rec.device.framebuffer_entry(fb_gpu.handle)?;
+            let Some(pass_gpu) = info.render_pass.backend() else {
+                return Err(RhiError::BackendError(
+                    "the begin's render pass has no GPU backing".into(),
+                ));
+            };
+            let pass = rec.device.pass_description(pass_gpu.handle)?;
+            if info.clear_values.len() > pass.attachments.len() {
+                return Err(RhiError::BackendError(format!(
+                    "the begin names {} clear values for {} attachments; the \
+                     values are positional, so there is nothing for the rest \
+                     to sit on",
+                    info.clear_values.len(),
+                    pass.attachments.len()
+                )));
+            }
+
+            // The begins' clear values decode before anything is recorded:
+            // a kind mismatch at position 5 must kill the begin, not draw
+            // its first four targets and throw the rest away.
+            let mut clears: Vec<PassClear> = Vec::new();
+            let mut colour_ord = 0usize;
+            for (index, attachment) in pass.attachments.iter().enumerate() {
+                if convert::typeless_base(attachment.format).is_some() {
+                    if attachment.load_op != LoadOp::Clear {
+                        continue;
+                    }
+                    let Some(ClearValue::DepthStencil { depth, stencil }) =
+                        info.clear_values.get(index)
+                    else {
+                        return Err(RhiError::BackendError(format!(
+                            "the pass loads depth attachment {} Clear, but the \
+                             clear value at that position is not a DepthStencil \
+                             one",
+                            index
+                        )));
+                    };
+                    let Some(slot) = fb.dsv_slot else {
+                        return Err(RhiError::InternalError(
+                            "the pass clears a depth attachment, its \
+                             framebuffer reserved no DSV slot"
+                                .into(),
+                        ));
+                    };
+                    clears.push(PassClear::Depth {
+                        slot,
+                        depth: *depth,
+                        stencil: *stencil,
+                        stencil_plane: matches!(
+                            attachment.format,
+                            crate::types::Format::D24_UNORM_S8_UINT
+                                | crate::types::Format::D32_SFLOAT_S8_UINT
+                        ),
+                    });
+                } else {
+                    let Some(slot) = fb.rtv_slots.get(colour_ord).copied() else {
+                        return Err(RhiError::InternalError(format!(
+                            "the pass declares colour attachment {} beyond the \
+                             {} RTVs its framebuffer reserves",
+                            index,
+                            fb.rtv_slots.len()
+                        )));
+                    };
+                    colour_ord += 1;
+                    if attachment.load_op != LoadOp::Clear {
+                        continue;
+                    }
+                    let Some(ClearValue::Color { r, g, b, a }) =
+                        info.clear_values.get(index)
+                    else {
+                        return Err(RhiError::BackendError(format!(
+                            "the pass loads colour attachment {} Clear, but the \
+                             clear value at that position is not a Colour one",
+                            index
+                        )));
+                    };
+                    clears.push(PassClear::Colour {
+                        slot,
+                        colour: [*r, *g, *b, *a],
+                    });
+                }
+            }
+
+            // The targets transit their tracked textures into the render
+            // states. A heap-pinned home has no transition in it and no
+            // render-target use either: the refusal is spoken here, not left
+            // for the driver's validation text (the №744 lesson).
+            let mut targets: Vec<(ID3D12Resource, u64, D3D12_RESOURCE_STATES)> =
+                Vec::with_capacity(fb.rtv_handles.len() + fb.dsv_handle.iter().count());
+            for handle in fb.rtv_handles.iter().copied() {
+                targets.push(target_of(rec.device, handle)?);
+            }
+            if let Some(handle) = fb.dsv_handle {
+                targets.push(target_of(rec.device, handle)?);
+            }
+            for (resource, handle, home) in &targets {
+                let after = if handle == &fb.dsv_handle.unwrap_or(u64::MAX) {
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE
+                } else {
+                    D3D12_RESOURCE_STATE_RENDER_TARGET
+                };
+                rec.go(resource, *handle, *home, after);
+            }
+
+            // The pass binds its descriptors by pointer once: the RTV/DSV
+            // slots were allocated at framebuffer creation.
+            let rtv_cpus: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = fb
+                .rtv_slots
+                .iter()
+                .map(|slot| rec.device.heaps().cpu(DescriptorKind::Rtv, *slot))
+                .collect();
+            let dsv_cpu: Option<D3D12_CPU_DESCRIPTOR_HANDLE> = fb
+                .dsv_slot
+                .map(|slot| rec.device.heaps().cpu(DescriptorKind::Dsv, slot));
+            unsafe {
+                rec.list.OMSetRenderTargets(
+                    rtv_cpus.len() as u32,
+                    if rtv_cpus.is_empty() {
+                        None
+                    } else {
+                        Some(rtv_cpus.as_ptr())
+                    },
+                    false,
+                    dsv_cpu.as_ref().map(std::ptr::from_ref),
+                );
+            }
+
+            // Then the clears: whole-target view clear depths and colours,
+            // as D3D12 has no per-pass load at all.
+            for clear in &clears {
+                match clear {
+                    PassClear::Colour { slot, colour } => {
+                        let cpu = rec.device.heaps().cpu(DescriptorKind::Rtv, *slot);
+                        unsafe { rec.list.ClearRenderTargetView(cpu, colour, None) };
+                    }
+                    PassClear::Depth {
+                        slot,
+                        depth,
+                        stencil,
+                        stencil_plane,
+                    } => {
+                        let cpu = rec.device.heaps().cpu(DescriptorKind::Dsv, *slot);
+                        let flags = if *stencil_plane {
+                            D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH.0 | D3D12_CLEAR_FLAG_STENCIL.0)
+                        } else {
+                            D3D12_CLEAR_FLAG_DEPTH
+                        };
+                        unsafe {
+                            rec.list.ClearDepthStencilView(cpu, flags, *depth, *stencil as u8, None)
+                        };
+                    }
+                }
+            }
+
+            rec.active_pass = Some(ActivePass { targets });
+            Ok(())
+        }
+
+        Command::EndRenderPass => {
+            let Some(flight) = rec.active_pass.take() else {
+                return Err(RhiError::BackendError(
+                    "EndRenderPass closes no begin: the list is outside a \
+                     render pass"
+                        .into(),
+                ));
+            };
+            for (resource, handle, home) in &flight.targets {
+                rec.go(resource, *handle, *home, D3D12_RESOURCE_STATE_COMMON);
+            }
+            Ok(())
+        }
+
+        Command::BindGraphicsPipeline(pipeline) => {
+            let gpu = pipeline.backend().ok_or_else(|| {
+                RhiError::BackendError("the graphics pipeline has no GPU backing".into())
+            })?;
+            let entry = rec.device.pipeline_entry(gpu.handle)?;
+            unsafe {
+                rec.list.SetGraphicsRootSignature(Some(entry.root_signature()));
+                rec.list.SetPipelineState(Some(entry.pso()));
+                rec.list.IASetPrimitiveTopology(entry.topology());
+            }
+            let viewports: Vec<D3D12_VIEWPORT> = entry
+                .viewports()
+                .iter()
+                .map(|v| D3D12_VIEWPORT {
+                    TopLeftX: v.x,
+                    TopLeftY: v.y,
+                    Width: v.width,
+                    Height: v.height,
+                    MinDepth: v.min_depth,
+                    MaxDepth: v.max_depth,
+                })
+                .collect();
+            if !viewports.is_empty() {
+                unsafe { rec.list.RSSetViewports(&viewports) };
+            }
+            let scissors: Vec<RECT> = entry
+                .scissors()
+                .iter()
+                .map(|s| RECT {
+                    left: s.offset.x,
+                    top: s.offset.y,
+                    right: s.offset.x.saturating_add(s.extent.width as i32),
+                    bottom: s.offset.y.saturating_add(s.extent.height as i32),
+                })
+                .collect();
+            if !scissors.is_empty() {
+                unsafe { rec.list.RSSetScissorRects(&scissors) };
+            }
+            unsafe { rec.list.OMSetBlendFactor(Some(&entry.blend_factor())) };
+            rec.pipeline = Some(entry);
+            Ok(())
+        }
+
+        Command::BindDescriptorSets {
+            pipeline,
+            first_set,
+            sets,
+        } => {
+            let gpu = pipeline.backend().ok_or_else(|| {
+                RhiError::BackendError("a descriptor set's pipeline has no GPU backing".into())
+            })?;
+            let entry = rec.device.pipeline_entry(gpu.handle)?;
+            let first = *first_set as usize;
+            if first + sets.len() > entry.num_sets() {
+                return Err(RhiError::BackendError(format!(
+                    "the sets bind at {}: the pipeline declares {} set slots \
+                     and {} sets would overtake it",
+                    first,
+                    entry.num_sets(),
+                    sets.len()
+                )));
+            }
+            // The two shader-visible heaps are a per-list binding, bound the
+            // first time a set binds — not per set.
+            if !rec.heaps_set {
+                let heaps = [
+                    Some(rec.device.heaps().cbv_srv_uav_heap().clone()),
+                    Some(rec.device.heaps().sampler_heap().clone()),
+                ];
+                unsafe { rec.list.SetDescriptorHeaps(&heaps) };
+                rec.heaps_set = true;
+            }
+            for (offset, set) in sets.iter().enumerate() {
+                let Some(set_gpu) = set.backend() else {
+                    return Err(RhiError::BackendError(format!(
+                        "descriptor set {} has no GPU backing",
+                        first_set as usize + offset
+                    )));
+                };
+                let set_entry = rec.device.set_entry(set_gpu.handle)?;
+                let parameter = first_set + offset as u32;
+                // One table per set: the set's block sits in exactly one
+                // heap (the layout classification refused the mixed ones),
+                // and an empty set binds nothing.
+                if let Some(base) = set_entry.block_base() {
+                    let gpu_handle = rec
+                        .device
+                        .heaps()
+                        .gpu(DescriptorKind::CbvSrvUav, base)?;
+                    unsafe {
+                        rec.list
+                            .SetGraphicsRootDescriptorTable(parameter, gpu_handle)
+                    };
+                } else if let Some(base) = set_entry.sampler_block_base() {
+                    let gpu_handle = rec.device.heaps().gpu(DescriptorKind::Sampler, base)?;
+                    unsafe {
+                        rec.list
+                            .SetGraphicsRootDescriptorTable(parameter, gpu_handle)
+                    };
+                }
+            }
+            Ok(())
+        }
+
+        Command::BindVertexBuffers { first_binding, buffers } => {
+            let Some(entry) = rec.pipeline.clone() else {
+                return Err(RhiError::BackendError(
+                    "BindVertexBuffers records with no graphics pipeline \
+                     bound: its input layout owns the strides"
+                        .into(),
+                ));
+            };
+            let mut views: Vec<D3D12_VERTEX_BUFFER_VIEW> = Vec::with_capacity(buffers.len());
+            for (index, (buffer, offset)) in buffers.iter().enumerate() {
+                let slot = first_binding + index as u32;
+                let Some((_, stride)) = entry
+                    .vertex_strides()
+                    .iter()
+                    .find(|(bound, _)| bound == &slot)
+                else {
+                    return Err(RhiError::BackendError(format!(
+                        "the pipeline binds no vertex input at slot {slot}; \
+                         a view has no stride to take"
+                    )));
+                };
+                if stride % 4 != 0 {
+                    return Err(RhiError::NotSupported(format!(
+                        "the vertex input at slot {slot} strides {stride} \
+                         bytes; the input assembler wants four-byte strides"
+                    )));
+                }
+                let gpu = buffer.backend().ok_or_else(|| {
+                    RhiError::BackendError("a vertex buffer has no GPU backing".into())
+                })?;
+                let buffer_entry = rec.device.buffer_entry(gpu.handle)?;
+                check_range(*offset, 0, buffer_entry.size(), "vertex buffer")?;
+                let space = buffer_entry.size() - *offset;
+                if space > u32::MAX as u64 {
+                    return Err(RhiError::BackendError(format!(
+                        "a vertex buffer view of {space} bytes after offset \
+                         {offset} exceeds the u32 bound D3D12's view carries"
+                    )));
+                }
+                let location =
+                    unsafe { buffer_entry.resource().GetGPUVirtualAddress() } + *offset;
+                views.push(D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: location,
+                    SizeInBytes: space as u32,
+                    StrideInBytes: *stride,
+                });
+            }
+            unsafe { rec.list.IASetVertexBuffers(*first_binding, Some(&views)) };
+            Ok(())
+        }
+
+        Command::BindIndexBuffer {
+            buffer,
+            offset,
+            index_type,
+        } => {
+            let gpu = buffer.backend().ok_or_else(|| {
+                RhiError::BackendError("the index buffer has no GPU backing".into())
+            })?;
+            let entry = rec.device.buffer_entry(gpu.handle)?;
+            check_range(*offset, 0, entry.size(), "index buffer")?;
+            let space = entry.size() - *offset;
+            if space > u32::MAX as u64 {
+                return Err(RhiError::BackendError(format!(
+                    "an index buffer view of {space} bytes after offset \
+                     {offset} exceeds the u32 bound D3D12's view carries"
+                )));
+            }
+            let view = D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: unsafe { entry.resource().GetGPUVirtualAddress() }
+                    + *offset,
+                SizeInBytes: space as u32,
+                Format: match index_type {
+                    IndexType::U16 => DXGI_FORMAT_R16_UINT,
+                    IndexType::U32 => DXGI_FORMAT_R32_UINT,
+                },
+            };
+            unsafe { rec.list.IASetIndexBuffer(Some(&view)) };
+            rec.index_view = Some(view);
+            Ok(())
+        }
+
+        Command::Draw {
+            vertex_count,
+            instance_count,
+            first_vertex,
+            first_instance,
+        } => {
+            if rec.active_pass.is_none() {
+                return Err(RhiError::BackendError(
+                    "Draw records outside a render pass: a draw commands a \
+                     render target, and none is bound"
+                        .into(),
+                ));
+            }
+            unsafe {
+                rec.list.DrawInstanced(
+                    *vertex_count,
+                    *instance_count,
+                    *first_vertex,
+                    *first_instance,
+                )
+            };
+            Ok(())
+        }
+
+        Command::DrawIndexed {
+            index_count,
+            instance_count,
+            first_index,
+            vertex_offset,
+            first_instance,
+        } => {
+            if rec.active_pass.is_none() {
+                return Err(RhiError::BackendError(
+                    "DrawIndexed records outside a render pass: a draw \
+                     commands a render target, and none is bound"
+                        .into(),
+                ));
+            }
+            if rec.index_view.is_none() {
+                return Err(RhiError::BackendError(
+                    "DrawIndexed records with no index buffer bound"
+                        .into(),
+                ));
+            }
+            unsafe {
+                rec.list.DrawIndexedInstanced(
+                    *index_count,
+                    *instance_count,
+                    *first_index,
+                    *vertex_offset,
+                    *first_instance,
+                )
+            };
+            Ok(())
+        }
+
+        Command::ClearColor {
+            texture,
+            value,
+            rects,
+        } => {
+            let ClearValue::Color { r, g, b, a } = value else {
+                return Err(RhiError::BackendError(
+                    "ClearColor names a depth/stencil value; \
+                     ClearDepthStencil is the command for a depth plane"
+                        .into(),
+                ));
+            };
+            let (resource, handle, home, view) = standalone_target(rec.device, texture)?;
+            if convert::typeless_base(view.rhi_format()).is_some() {
+                return Err(RhiError::BackendError(
+                    "ClearColor names a depth texture: its view binds a DSV, \
+                     not an RTV; ClearDepthStencil is the command for it"
+                        .into(),
+                ));
+            }
+            // One temporary RTV slot from the device's own CPU pool: the
+            // clear needs a descriptor for the time of the call, and the
+            // slot goes straight back after the clear.
+            let slot = rec.device.heaps().alloc(DescriptorKind::Rtv, 1)?;
+            let desc = D3D12Device::framebuffer_rtv_desc(&view, 0, 0)?;
+            unsafe {
+                rec.device.raw_device().CreateRenderTargetView(
+                    view.resource(),
+                    Some(&desc),
+                    rec.device.heaps().cpu(DescriptorKind::Rtv, slot),
+                );
+            }
+            rec.go(&resource, handle, home, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            let rects = clear_rects(rects);
+            unsafe {
+                rec.list.ClearRenderTargetView(
+                    rec.device.heaps().cpu(DescriptorKind::Rtv, slot),
+                    &[*r, *g, *b, *a],
+                    rects.as_deref(),
+                );
+            }
+            rec.go(&resource, handle, home, D3D12_RESOURCE_STATE_COMMON);
+            rec.device.heaps().rewind(DescriptorKind::Rtv, 1);
+            Ok(())
+        }
+
+        Command::ClearDepthStencil {
+            texture,
+            depth,
+            stencil,
+            rects,
+        } => {
+            let (resource, handle, home, view) = standalone_target(rec.device, texture)?;
+            if convert::typeless_base(view.rhi_format()).is_none() {
+                return Err(RhiError::BackendError(
+                    "ClearDepthStencil names a colour texture: its view binds \
+                     an RTV, not a DSV; ClearColor is the command for it"
+                        .into(),
+                ));
+            }
+            let slot = rec.device.heaps().alloc(DescriptorKind::Dsv, 1)?;
+            let desc = D3D12Device::framebuffer_dsv_desc(&view, 0, 0)?;
+            unsafe {
+                rec.device.raw_device().CreateDepthStencilView(
+                    view.resource(),
+                    Some(&desc),
+                    rec.device.heaps().cpu(DescriptorKind::Dsv, slot),
+                );
+            }
+            let flags = if matches!(
+                view.rhi_format(),
+                crate::types::Format::D24_UNORM_S8_UINT | crate::types::Format::D32_SFLOAT_S8_UINT
+            ) {
+                D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH.0 | D3D12_CLEAR_FLAG_STENCIL.0)
+            } else {
+                D3D12_CLEAR_FLAG_DEPTH
+            };
+            rec.go(&resource, handle, home, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            let rects = clear_rects(rects);
+            unsafe {
+                rec.list.ClearDepthStencilView(
+                    rec.device.heaps().cpu(DescriptorKind::Dsv, slot),
+                    flags,
+                    *depth,
+                    *stencil as u8,
+                    rects.as_deref(),
+                );
+            }
+            rec.go(&resource, handle, home, D3D12_RESOURCE_STATE_COMMON);
+            rec.device.heaps().rewind(DescriptorKind::Dsv, 1);
+            Ok(())
+        }
+
+        // ---------- the M4 compute path refuses until its terrain ----------
+        Command::BindComputePipeline(_)
         | Command::BindComputeDescriptorSets { .. }
-        | Command::BindVertexBuffers { .. }
-        | Command::BindIndexBuffer { .. }
-        | Command::Draw { .. }
-        | Command::DrawIndexed { .. }
-        | Command::BeginRenderPass(_)
-        | Command::EndRenderPass
-        | Command::NextSubpass
-        | Command::ClearColor { .. }
-        | Command::ClearDepthStencil { .. }
         | Command::Dispatch { .. } => Err(RhiError::NotSupported(format!(
-            "the D3D12 recorder does not replay {} yet: the render-target path \
-             (Баг№707, M3) owns the pipeline/root-signature layer, the compute \
-             path (Баг№708, M4) owns Dispatch; refusing instead of dropping the \
+            "the D3D12 recorder does not replay {} yet: the compute path \
+             (Баг№708, M4) owns it; refusing instead of dropping the \
              command into a wrong picture",
             discriminant(command)
         ))),
+
+        Command::NextSubpass => Err(RhiError::NotSupported(
+            "this backend supports single-subpass render passes; NextSubpass \
+             has no subpass to step into"
+                .into(),
+        )),
 
         // ---------- the M2 surface ----------
         Command::CopyBuffer { src, dst, regions } => {
@@ -431,6 +974,22 @@ fn replay(rec: &mut Recorder<'_>, command: &Command) -> RhiResult<()> {
     }
 }
 
+/// One attachment clear the begin decoded: a D3D12 clear names a
+/// descriptor, not an attachment, so the positional values turn into
+/// whole-target clear facts before anything is recorded.
+enum PassClear {
+    Colour {
+        slot: usize,
+        colour: [f32; 4],
+    },
+    Depth {
+        slot: usize,
+        depth: f32,
+        stencil: u32,
+        stencil_plane: bool,
+    },
+}
+
 /// A range is refused before any part of it is recorded: offset shall lie at
 /// or before the limit, and offset + size shall not overtake the end of it.
 fn check_range(offset: u64, size: u64, limit: u64, what: &str) -> RhiResult<()> {
@@ -443,24 +1002,75 @@ fn check_range(offset: u64, size: u64, limit: u64, what: &str) -> RhiResult<()> 
     Ok(())
 }
 
-/// A human name for the refusal messages, so every M3/M4 arm can point at
-/// the command family instead of spelling the same words again.
+/// The tracked texture behind a render target: the resource to move, its
+/// tracked handle, and the home state the transit leaves from. A
+/// heap-pinned home is refused here — a pinned state cannot become a
+/// render target either, and emitting a transition for it would only hand
+/// the runtime a rejection (the №744 lesson).
+fn target_of(
+    device: &D3D12Device,
+    handle: u64,
+) -> RhiResult<(ID3D12Resource, u64, D3D12_RESOURCE_STATES)> {
+    let entry = device.texture_entry(handle)?;
+    let home = entry.home_state();
+    if heap_stuck(home) {
+        return Err(RhiError::NotSupported(format!(
+            "a render target (texture {handle}) lives in a pinned heap \
+             state ({home:?}) that cannot name a transition, let alone a \
+             render-state one; the backend refuses instead of recording a \
+             barrier the runtime would throw out"
+        )));
+    }
+    Ok((entry.resource().clone(), handle, home))
+}
+
+/// The tracked texture behind a standalone clear's view, plus the view
+/// itself (the descriptor factories take one): the same pinned-home
+/// refusal. The colour/depth split belongs to the individual arms, where
+/// the arrived command's demand is known and the mismatch can name it.
+fn standalone_target(
+    device: &D3D12Device,
+    texture: &crate::resource::TextureView,
+) -> RhiResult<(
+    ID3D12Resource,
+    u64,
+    D3D12_RESOURCE_STATES,
+    super::device::ViewEntry,
+)> {
+    let gpu = texture.backend().ok_or_else(|| {
+        RhiError::BackendError("the clear target view has no GPU backing".into())
+    })?;
+    let view = device.view_entry(gpu.handle)?;
+    let (resource, handle, home) = target_of(device, view.texture_handle())?;
+    Ok((resource, handle, home, view))
+}
+
+/// The rects of a clear command as the D3D12 clear calls name them; an
+/// empty list means the whole target, expressed as `None` — the API's way
+/// of saying "no rect windows, clear everything".
+fn clear_rects(rects: &[Rect2D]) -> Option<Vec<RECT>> {
+    if rects.is_empty() {
+        return None;
+    }
+    Some(
+        rects
+            .iter()
+            .map(|rect| RECT {
+                left: rect.offset.x,
+                top: rect.offset.y,
+                right: rect.offset.x.saturating_add(rect.extent.width as i32),
+                bottom: rect.offset.y.saturating_add(rect.extent.height as i32),
+            })
+            .collect(),
+    )
+}
+
+/// A human name for the refusal messages, so the M4 refusal arm can point
+/// at the command family instead of spelling the same words again.
 fn discriminant(command: &Command) -> &'static str {
     match command {
-        Command::BindGraphicsPipeline(_) => "BindGraphicsPipeline",
         Command::BindComputePipeline(_) => "BindComputePipeline",
-        Command::BindDescriptorSets { .. } => "BindDescriptorSets",
         Command::BindComputeDescriptorSets { .. } => "BindComputeDescriptorSets",
-        Command::BindVertexBuffers { .. } => "BindVertexBuffers",
-        Command::BindIndexBuffer { .. } => "BindIndexBuffer",
-        Command::Draw { .. } => "Draw",
-        Command::DrawIndexed { .. } => "DrawIndexed",
-        Command::BeginRenderPass(_) => "BeginRenderPass",
-        Command::EndRenderPass => "EndRenderPass",
-        Command::NextSubpass => "NextSubpass",
-        Command::ClearColor { .. } => "ClearColor",
-        Command::ClearDepthStencil { .. } => "ClearDepthStencil",
-        Command::Dispatch { .. } => "Dispatch",
         _ => "the command",
     }
 }

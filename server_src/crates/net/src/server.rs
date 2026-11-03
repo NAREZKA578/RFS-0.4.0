@@ -2417,10 +2417,6 @@ impl NetServer {
                         },
                     );
                     if let Some(bytes) = cached {
-                        // NC-746-TEMP: probe the fragment share of cached sends too.
-                        if layer_u8 == 2 {
-                            nc746_probe::live_bytes(bytes.len(), true);
-                        }
                         for packet in conn.send_state_delta_bytes(bytes) {
                             out.push((conn.clone(), packet));
                         }
@@ -2474,18 +2470,10 @@ impl NetServer {
                         // a lost delta left its base behind, and prunes the old layer.
                         let mut state_delta = delta.to_state_delta();
                         state_delta.is_resync = resync;
-                        // NC-746-TEMP: layer-2 composition probe.
-                        if layer_u8 == 2 {
-                            nc746_probe::live_fresh(&state_delta);
-                        }
                         let bytes = match conn.serialize_state_delta(state_delta) {
                             Some(b) => b,
                             None => continue,
                         };
-                        // NC-746-TEMP: payload accounting for the fresh branch.
-                        if layer_u8 == 2 {
-                            nc746_probe::live_bytes(bytes.len(), false);
-                        }
                         delta_cache.lock().insert(
                             key,
                             (
@@ -3006,167 +2994,6 @@ impl NetServer {
 
     pub fn interest_stats(&self) -> crate::interest::InterestStats {
         self.interest_manager.stats()
-    }
-}
-
-// NC-746-TEMP: layer-2 wire composition probe. Added to measure what a
-// layer-2 delta actually carries (records per delta, which fields are
-// Some, postcard bytes per record and per player_data, share of payloads
-// above the fragmentation threshold). REVERT ENTIRELY after the run.
-pub mod nc746_probe {
-    use rfs_core::packet::{encode, StateDeltaPacket};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    use std::time::Duration;
-    use tracing::info;
-
-    /// 1400 (MAX_PACKET_SIZE) - 24 (HEADER_SIZE) - 24 (AUTH_WIRE_LEN):
-    /// payloads above this are fragmented into two datagrams.
-    const FRAG_THRESHOLD: usize = 1352;
-
-    struct Probe {
-        deltas_fresh: AtomicU64,
-        deltas_cached: AtomicU64,
-        bytes_sum: AtomicU64,
-        bytes_over: AtomicU64,
-        recs: AtomicU64,
-        rec_bytes: AtomicU64,
-        rec_transform: AtomicU64,
-        rec_velocity: AtomicU64,
-        rec_angular: AtomicU64,
-        rec_health: AtomicU64,
-        rec_flags: AtomicU64,
-        rec_ship: AtomicU64,
-        rec_station: AtomicU64,
-        rec_pdata: AtomicU64,
-        rec_pdata_bytes: AtomicU64,
-        rec_name_bytes: AtomicU64,
-        resyncs: AtomicU64,
-    }
-
-    impl Probe {
-        const fn zeroed() -> Self {
-            Self {
-                deltas_fresh: AtomicU64::new(0),
-                deltas_cached: AtomicU64::new(0),
-                bytes_sum: AtomicU64::new(0),
-                bytes_over: AtomicU64::new(0),
-                recs: AtomicU64::new(0),
-                rec_bytes: AtomicU64::new(0),
-                rec_transform: AtomicU64::new(0),
-                rec_velocity: AtomicU64::new(0),
-                rec_angular: AtomicU64::new(0),
-                rec_health: AtomicU64::new(0),
-                rec_flags: AtomicU64::new(0),
-                rec_ship: AtomicU64::new(0),
-                rec_station: AtomicU64::new(0),
-                rec_pdata: AtomicU64::new(0),
-                rec_pdata_bytes: AtomicU64::new(0),
-                rec_name_bytes: AtomicU64::new(0),
-                resyncs: AtomicU64::new(0),
-            }
-        }
-    }
-
-    static PROBE: OnceLock<Probe> = OnceLock::new();
-
-    pub fn probe() -> &'static Probe {
-        PROBE.get_or_init(|| {
-            std::thread::spawn(|| {
-                loop {
-                    std::thread::sleep(Duration::from_secs(5));
-                    let Some(p) = PROBE.get() else { continue };
-                    let fresh = p.deltas_fresh.swap(0, Ordering::Relaxed);
-                    let cached = p.deltas_cached.swap(0, Ordering::Relaxed);
-                    let bytes = p.bytes_sum.swap(0, Ordering::Relaxed);
-                    let over = p.bytes_over.swap(0, Ordering::Relaxed);
-                    let recs = p.recs.swap(0, Ordering::Relaxed);
-                    let rec_bytes = p.rec_bytes.swap(0, Ordering::Relaxed);
-                    let tr = p.rec_transform.swap(0, Ordering::Relaxed);
-                    let v = p.rec_velocity.swap(0, Ordering::Relaxed);
-                    let a = p.rec_angular.swap(0, Ordering::Relaxed);
-                    let h = p.rec_health.swap(0, Ordering::Relaxed);
-                    let f = p.rec_flags.swap(0, Ordering::Relaxed);
-                    let sh = p.rec_ship.swap(0, Ordering::Relaxed);
-                    let st = p.rec_station.swap(0, Ordering::Relaxed);
-                    let pd = p.rec_pdata.swap(0, Ordering::Relaxed);
-                    let pdb = p.rec_pdata_bytes.swap(0, Ordering::Relaxed);
-                    let nb = p.rec_name_bytes.swap(0, Ordering::Relaxed);
-                    let rs = p.resyncs.swap(0, Ordering::Relaxed);
-                    let total_d = fresh + cached;
-                    let avg_payload = if total_d > 0 { bytes as f64 / total_d as f64 } else { 0.0 };
-                    let over_pct = if total_d > 0 { 100.0 * over as f64 / total_d as f64 } else { 0.0 };
-                    let avg_rec = if recs > 0 { rec_bytes as f64 / recs as f64 } else { 0.0 };
-                    let pca = |n: u64| if recs > 0 { 100.0 * n as f64 / recs as f64 } else { 0.0 };
-                    let avg_pd = if pd > 0 { pdb as f64 / pd as f64 } else { 0.0 };
-                    let avg_name = if pd > 0 { nb as f64 / pd as f64 } else { 0.0 };
-                    info!(
-                        "NC746 window: l2 fresh={} cached={} avg_payload={:.0}B fragments={:.1}% recs={} avg_rec={:.1}B \
-                         tr%={:.0} vel%={:.0} ang%={:.0} h%={:.0} f%={:.0} ship%={:.0} st%={:.0} pdata%={:.0} \
-                         avg_pdb={:.0}B avg_name={:.1} resyncs={}",
-                        fresh, cached, avg_payload, over_pct, recs, avg_rec,
-                        pca(tr), pca(v), pca(a), pca(h), pca(f), pca(sh), pca(st), pca(pd),
-                        avg_pd, avg_name, rs
-                    );
-                }
-            });
-            Probe::zeroed()
-        })
-    }
-
-    /// Fresh (non-cached) delta: full composition. NC-746-TEMP.
-    pub fn live_fresh(d: &StateDeltaPacket) {
-        let p = probe();
-        p.deltas_fresh.fetch_add(1, Ordering::Relaxed);
-        if d.is_resync {
-            p.resyncs.fetch_add(1, Ordering::Relaxed);
-        }
-        for u in &d.updated {
-            p.recs.fetch_add(1, Ordering::Relaxed);
-            if let Ok(b) = encode(u) {
-                p.rec_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
-            }
-            if u.transform.is_some() {
-                p.rec_transform.fetch_add(1, Ordering::Relaxed);
-            }
-            if u.velocity.is_some() {
-                p.rec_velocity.fetch_add(1, Ordering::Relaxed);
-            }
-            if u.angular_velocity.is_some() {
-                p.rec_angular.fetch_add(1, Ordering::Relaxed);
-            }
-            if u.health.is_some() {
-                p.rec_health.fetch_add(1, Ordering::Relaxed);
-            }
-            if u.flags.is_some() {
-                p.rec_flags.fetch_add(1, Ordering::Relaxed);
-            }
-            if u.ship_data.is_some() {
-                p.rec_ship.fetch_add(1, Ordering::Relaxed);
-            }
-            if u.station_data.is_some() {
-                p.rec_station.fetch_add(1, Ordering::Relaxed);
-            }
-            if let Some(pd) = &u.player_data {
-                p.rec_pdata.fetch_add(1, Ordering::Relaxed);
-                if let Ok(pb) = encode(pd) {
-                    p.rec_pdata_bytes.fetch_add(pb.len() as u64, Ordering::Relaxed);
-                }
-                p.rec_name_bytes.fetch_add(pd.name.len() as u64, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Payload-bytes accounting for both branches (fresh and cache-hit). NC-746-TEMP.
-    pub fn live_bytes(bytes_len: usize, cached: bool) {
-        let p = probe();
-        p.bytes_sum.fetch_add(bytes_len as u64, Ordering::Relaxed);
-        if bytes_len > FRAG_THRESHOLD {
-            p.bytes_over.fetch_add(1, Ordering::Relaxed);
-        }
-        if cached {
-            p.deltas_cached.fetch_add(1, Ordering::Relaxed);
-        }
     }
 }
 
