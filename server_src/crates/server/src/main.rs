@@ -4,9 +4,12 @@
 //! untouched.
 
 use anyhow::{Context, Result};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use rfs_core::entity::{EntityId, PlayerEntity, ProjectileEntity};
 use rfs_core::math::{Quatf, Transform, Vec3f};
-use rfs_core::packet::{InputAckPacket, PlayerPosture, ServerCommand};
+use rfs_core::packet::{
+    DisconnectReason, GameEvent, InputAckPacket, PlayerPosture, ServerCommand,
+};
 use rfs_core::time::TICK_DURATION_MS;
 use rfs_damage::damage::DamageSystem;
 use rfs_net::*;
@@ -21,11 +24,22 @@ use rfs_server::net::handle_command;
 use rfs_server::tick::{apply_input, core_game_event, resolve_deferred_shots, DeferredShot};
 use rfs_server::votes::{handle_vote_kick, VoteKickState};
 use rfs_sim::tick::{GameEvent as SimGameEvent, TickSystem};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+use rfs_server::control::commands::RedactedConfig;
+use rfs_server::control::journal::ActionJournal;
+use rfs_server::control::server::{
+    ControlDoor, ControlOrder, ControlSettings, ControlEnv, EventHub, QUEUE_CAP,
+};
+use rfs_server::control::status::{
+    EntitiesStatus, NetStatus, PerfStatus, PlayerStatus, ServerStatus, StatusHandle,
+};
+use parking_lot::RwLock;
 
 /// План H5 («Считать память сервера» / TODO: «Track server memory»): память
 /// сервера берётся у ОС, а не оценивается. Рабочее множество читается раз
@@ -55,11 +69,116 @@ fn working_set_mb() -> f64 {
     0.0
 }
 
+/// The control token file's path: the config may name it; the default sits
+/// next to the config. Same resolution `ctl` does on its side — the two
+/// agreeing is what makes the operator's copy-and-run work like the plan
+/// describes.
+fn resolve_token_path(
+    config_path: &std::path::Path,
+    control: &rfs_server::config::ControlConfig,
+) -> PathBuf {
+    let name = control
+        .token_file
+        .clone()
+        .unwrap_or_else(|| rfs_server::control::token::DEFAULT_TOKEN_FILE_NAME.to_string());
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// The action journal's path (stage 2, А.2 item 6): the config may name the
+/// file (`control.action_log_file`), the default sits next to the config —
+/// the same resolution shape `resolve_token_path` runs, so all three of a
+/// run's operator files (config, token, journal) live together by default.
+fn resolve_action_log_path(
+    config_path: &std::path::Path,
+    control: &rfs_server::config::ControlConfig,
+) -> PathBuf {
+    let name = control
+        .action_log_file
+        .clone()
+        .filter(|file| !file.trim().is_empty())
+        .unwrap_or_else(|| "control_actions.jsonl".to_string());
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// The net half of the once-per-second refresh: every counter copied from
+/// the net server's own tallies — computed once by their owner, read by the
+/// door (plan section 6.3: a read never recomputes).
+fn net_status_snapshot(net: &NetServer) -> NetStatus {
+    let bandwidth = net.bandwidth_stats();
+    let (rounds, packets) = net.snapshot_totals();
+    NetStatus {
+        sent_bps: bandwidth.sent_bps,
+        received_bps: bandwidth.received_bps,
+        sent_bytes_total: bandwidth.sent_bytes_total,
+        received_bytes_total: bandwidth.received_bytes_total,
+        sent_packets_total: bandwidth.sent_packets_total,
+        received_packets_total: bandwidth.received_packets_total,
+        avg_packet_size_sent: bandwidth.avg_packet_size_sent,
+        avg_packet_size_received: bandwidth.avg_packet_size_received,
+        snapshot_rounds_total: rounds,
+        snapshot_packets_total: packets,
+        sent_deltas_by_layer_total: net.sent_deltas_by_layer(),
+        dropped_events: net.dropped_events(),
+        dropped_outbox: net.dropped_outbox(),
+        first_fulls_total: net.first_fulls_built(),
+        session_rejects: net.session_rejects(),
+        pending_challenges: net.pending_challenges(),
+    }
+}
+
+/// The players half of the same refresh: one row per connected player, from
+/// the loop's own bookkeeping plus the net connection's live numbers. The
+/// name is the one the bookkeeping holds today (the placeholder until the
+/// entrance packet's name is threaded through — plan risk item 1; fixing
+/// that is stage 3's work, and the row stays honest about it).
+fn player_list_snapshot(
+    net: &NetServer,
+    players: &HashMap<u32, PlayerMeta>,
+) -> Vec<PlayerStatus> {
+    players
+        .iter()
+        .map(|(connection_id, meta)| match net.get_connection(*connection_id) {
+            Some(connection) => PlayerStatus {
+                connection_id: *connection_id,
+                name: meta.name.clone(),
+                addr: connection.addr.to_string(),
+                ship_id: meta.ship_id.0,
+                ping_ms: connection.rtt.lock().as_secs_f64() * 1000.0,
+                age_s: connection.age_connected().as_secs(),
+            },
+            None => PlayerStatus {
+                connection_id: *connection_id,
+                name: meta.name.clone(),
+                ship_id: meta.ship_id.0,
+                ..PlayerStatus::default()
+            },
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
+    // The console format is the one `fmt()` used to build (full lines to
+    // stdout); the ring layer rides along in the same registry and copies
+    // every emitted event into the control door's journal (plan А.1 item 2).
+    // The EnvFilter sits on top of the stack and filters for the whole set —
+    // the same directive the old single-layer subscriber applied.
+    let (ring_layer, control_ring) =
+        rfs_server::control::ring::RingLayer::new(rfs_server::control::ring::DEFAULT_RING_CAP);
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(ring_layer)
+        .with(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("info".parse()?),
         )
         .init();
 
@@ -106,8 +225,15 @@ async fn main() -> Result<()> {
              Set `auth_token` to require the HMAC key."
         );
     }
+    // The boolean is decided before the token itself moves into the net
+    // server's config — the control door's `config` answer only ever says
+    // whether a secret is set, never what it was.
+    let wire_token_set = wire_token.is_some();
     let net = Arc::new(NetServer::new(ServerConfig {
-        auth_token: wire_token,
+        // Cloned, not moved: the door's reload diff compares the running
+        // key against the file's candidate (stage 2), so main keeps the
+        // value after the net config took its copy.
+        auth_token: wire_token.clone(),
         ..ServerConfig::default()
     }).await?);
     let mut events = net.get_event_receiver().expect("server event receiver");
@@ -196,6 +322,86 @@ async fn main() -> Result<()> {
         ships.len(),
     );
 
+    // ---- the control door (stage 1 of `server-interface-plan.md`) ----
+    // The snapshot is built once here and handed to the door; the loop
+    // below writes through the same handle. `ctl` needs the address and the
+    // token — the config's own file and the token file next to it.
+    //
+    // Stage 2 (А.2): the queue into the tick loop and the loop's shared
+    // pieces (the redacted config behind a lock the reload application
+    // writes, the action journal) are built here too, whether or not the
+    // door exists — the reader side must exist for a drained queue even on
+    // a doorless run.
+    let local_addr = net.local_addr().context("reading the game listener's address")?;
+    let status_handle = StatusHandle::new(ServerStatus::starting(
+        net.match_id().to_string(),
+        local_addr.to_string(),
+        local_addr.port(),
+    ));
+    let hub = EventHub::new();
+    let (control_tx, mut control_rx) =
+        tokio::sync::mpsc::channel::<ControlOrder>(QUEUE_CAP);
+    let loop_redacted = Arc::new(RwLock::new(RedactedConfig {
+        auth_token_set: wire_token_set,
+        allow_unsigned: match_config.allow_unsigned,
+        vote_kick: match_config.vote_kick.clone(),
+        control: match_config.control.clone(),
+    }));
+    // The action journal is the door's own record (А.2 item 6): a doorless
+    // run mutates nothing, so it writes no journal — opening one for every
+    // `--control disabled` start would be a file nobody asked for.
+    let actions: Option<ActionJournal> = if match_config.control.enabled {
+        let actions_path = resolve_action_log_path(&config_path, &match_config.control);
+        let journal = ActionJournal::open(&actions_path)
+            .with_context(|| format!("opening the action journal {}", actions_path.display()))?;
+        info!("control: action journal at {}", actions_path.display());
+        Some(journal)
+    } else {
+        None
+    };
+    let control_door: Option<ControlDoor> = if match_config.control.enabled {
+        let token_path = resolve_token_path(&config_path, &match_config.control);
+        let token = rfs_server::control::token::ensure_token_file(&token_path)
+            .with_context(|| format!("preparing the control token file {}", token_path.display()))?;
+        let env = ControlEnv {
+            status: status_handle.clone(),
+            ring: control_ring.clone(),
+            config: loop_redacted.clone(),
+            auth_token: wire_token.clone(),
+            queue: control_tx,
+            actions: actions.clone().expect("the journal exists when the door does"),
+            config_path: config_path.clone(),
+        };
+        let door = rfs_server::control::server::spawn(
+            token,
+            ControlSettings::from(&match_config.control),
+            env,
+            hub.clone(),
+        )
+        .await
+        .context("starting the control door")?;
+        info!(
+            "control: door open on {} — status, perf, net, players, config, log, watch, say, kick, stop, reload, audit",
+            door.local_addr
+        );
+        Some(door)
+    } else {
+        info!("control: the door is disabled in the config; this run serves no commands");
+        // The door goes nowhere, nothing will ever be queued, and the
+        // receiver below expects to see a closed channel rather than one
+        // that silently never answers.
+        drop(control_tx);
+        None
+    };
+    // The handle's whole job is finished (the log line above). The receive
+    // side of the connection feed lives in `hub` — the loop below publishes
+    // to it whether or not the door was enabled — and the accept task keeps
+    // the listener alive as long as the process runs. Dropping this clone
+    // changes nothing at the door.
+    drop(control_door);
+    let started = std::time::Instant::now();
+    let mut last_status_refresh = std::time::Instant::now();
+
     let mut tick_interval = tokio::time::interval(Duration::from_millis(TICK_DURATION_MS));
     tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -260,6 +466,34 @@ async fn main() -> Result<()> {
     // above, which is why it reads the same way in the log.
     let mut last_skipped = 0u64;
 
+    // ---- stage 2: the soft-stop state (А.2 item 2) ----
+    // `Some` from the moment a queued `stop` named a wait: the loop counts
+    // the announcement thresholds down on its own cadence, and the
+    // empty-server rule ends the wait early. `stop 0` / an empty server at
+    // dequeue never opens a StopState — they stop the same iteration.
+    struct StopState {
+        delay_s: u64,
+        deadline: Instant,
+        /// One bit per STOP_THRESHOLDS entry: a threshold announces once.
+        fired: u8,
+    }
+    // The plan's 60/30/10 s announcements, at their crossings; a wait that
+    // starts below a threshold never says it (`stop 30` never claims
+    // "через 60 с").
+    const STOP_THRESHOLDS: [u64; 3] = [60, 30, 10];
+    let mut stopping: Option<StopState> = None;
+    let stop_records = |actions: &Option<ActionJournal>, command: &str, outcome: &str| {
+        if let Some(journal) = actions {
+            journal.record("loop", command, outcome);
+        }
+    };
+
+    // Stage 2: the snapshot started as `starting`; the loop's first act
+    // marks it `running`. From here the state word moves only where the
+    // loop means it (the stop order below) — `update_tick` stopped
+    // re-asserting `running` every tick exactly so this word survives.
+    status_handle.set_state("running");
+
     loop {
         // Bug №610: the shutdown signal is raced against the tick instead of
         // being awaited after it. Awaiting the tick first would mean a Ctrl-C
@@ -277,6 +511,163 @@ async fn main() -> Result<()> {
                 cadence.observe(deadline, tick_period);
             }
         }
+
+        // ---- stage 2: the control queue (А.2 item 1) ----
+        // Drained at the START of a tick, before anything measured — the
+        // same "commands execute between ticks" section 6.3 fixes. The door
+        // gated these orders; the loop still owns the live state, so a race
+        // against a disconnect or a second stop resolves idempotently here,
+        // and every outcome lands in the journal.
+        let mut stop_at_once = false;
+        while let Ok(order) = control_rx.try_recv() {
+            // The journal line pairs door and loop by identical text —
+            // computed before the destructure consumes the order.
+            let order_line = order.journal_line();
+            if stopping.is_some() {
+                // A stop is already running: the door refuses new changes,
+                // a snapshot-raced duplicate lands here and is ignored —
+                // visible in the journal, not silently lost.
+                stop_records(
+                    &actions,
+                    &order_line,
+                    "ignored: a stop is already running",
+                );
+                continue;
+            }
+            match order {
+                ControlOrder::Say { text } => {
+                    net.broadcast_event(GameEvent::Announcement { text });
+                    stop_records(
+                        &actions,
+                        &order_line,
+                        "announced to every connected player",
+                    );
+                }
+                ControlOrder::Kick { connection_id, reason } => {
+                    // The reason rides first, then the boot: both leave this
+                    // socket in enqueue order. Delivery is best effort (the
+                    // event path is unreliable by №272), so the outcome says
+                    // when the reason could not be counted on; the journal
+                    // carries it either way.
+                    let player_text = if reason.trim().is_empty() {
+                        "Вы исключены с сервера.".to_string()
+                    } else {
+                        format!("Вы исключены с сервера: {reason}")
+                    };
+                    let told = net.send_event_to(
+                        connection_id,
+                        GameEvent::Announcement { text: player_text },
+                    );
+                    let removed = net.disconnect_client(connection_id, DisconnectReason::Kicked);
+                    let outcome = if removed {
+                        if told {
+                            "kicked; the reason was queued"
+                        } else {
+                            "kicked; the reason may not have arrived (the event path is unreliable)"
+                        }
+                    } else if told {
+                        "the target was already gone; only the reason rode the wire"
+                    } else {
+                        "the target was already gone; nothing was removed"
+                    };
+                    stop_records(&actions, &order_line, outcome);
+                }
+                ControlOrder::Stop { delay_s } => {
+                    // А.2 item 2: a stop on an empty server, or with no
+                    // delay, stops this iteration; a wait opens the
+                    // announcement machinery instead. Either way the state
+                    // moves here, where the loop means it.
+                    status_handle.set_state("stopping");
+                    hub.publish(json!({
+                        "event": "state",
+                        "state": "stopping",
+                        "text": format!("the server stops in {delay_s} s (0 = now)"),
+                    }));
+                    if players.is_empty() || delay_s == 0 {
+                        stop_records(
+                            &actions,
+                            &order_line,
+                            "stopping immediately (empty server or zero delay)",
+                        );
+                        net.broadcast_event(GameEvent::Announcement {
+                            text: "Сервер останавливается.".into(),
+                        });
+                        stop_at_once = true;
+                    } else {
+                        stop_records(
+                            &actions,
+                            &order_line,
+                            "waiting with announcements at 60/30/10 s",
+                        );
+                        stopping = Some(StopState {
+                            delay_s,
+                            deadline: Instant::now() + Duration::from_secs(delay_s),
+                            fired: 0,
+                        });
+                    }
+                }
+                ControlOrder::ReloadVoteKick { vote_kick: reloaded } => {
+                    // The only live-applyable section (А.2 item 5): the open
+                    // vote keeps its tally, the next ballot counts under the
+                    // new strength, and the door's `config` answer reads the
+                    // RUNNING arrangement again through the shared lock.
+                    vote_kick.apply_config(reloaded.clone());
+                    loop_redacted.write().vote_kick = reloaded;
+                    stop_records(
+                        &actions,
+                        &order_line,
+                        "applied live; an open vote keeps its tally",
+                    );
+                }
+            }
+        }
+        if stop_at_once {
+            break;
+        }
+        if let Some(wait) = &mut stopping {
+            let remaining = wait.deadline.saturating_duration_since(Instant::now()).as_secs();
+            // The thresholds announce on their crossings. `stop 60` says
+            // "через 60 с" on the first check (the wait just crossed into
+            // that bracket); `stop 30` never claims a minute.
+            for (index, threshold) in STOP_THRESHOLDS.iter().enumerate() {
+                if wait.fired & (1_u8 << index) != 0 {
+                    continue;
+                }
+                if wait.delay_s < *threshold {
+                    continue;
+                }
+                if remaining <= *threshold {
+                    wait.fired |= 1_u8 << index;
+                    net.broadcast_event(GameEvent::Announcement {
+                        text: format!("Сервер будет остановлен через {threshold} с"),
+                    });
+                    stop_records(
+                        &actions,
+                        &format!("stop {}", wait.delay_s),
+                        &format!("announcement: {threshold} s left"),
+                    );
+                }
+            }
+            // The empty-server rule holds during the wait: whoever left was
+            // the case for keeping it.
+            if players.is_empty() {
+                stop_records(
+                    &actions,
+                    &format!("stop {}", wait.delay_s),
+                    "the server emptied; stopping at once",
+                );
+                break;
+            }
+            if remaining == 0 {
+                stop_records(
+                    &actions,
+                    &format!("stop {}", wait.delay_s),
+                    "the deadline passed; shutting down",
+                );
+                break;
+            }
+        }
+
         // Bug №265: the `perf:` line below starts its timer at `sim.tick()`,
         // which is AFTER the event drain and input handling above. So it timed
         // "sim+sync" at 0.7 ms while the loop only reached 23 Hz against a
@@ -295,6 +686,15 @@ async fn main() -> Result<()> {
                     addr,
                 } => {
                     info!("client {connection_id} connected from {addr}");
+                    // The connection feed for `watch` subscriptions (plan
+                    // 6.1): the hub serves whoever is watching, publishing
+                    // to nobody costs nothing.
+                    hub.publish(json!({
+                        "event": "conn",
+                        "what": "connected",
+                        "id": connection_id,
+                        "addr": addr.to_string(),
+                    }));
                     let ship_idx = connection_id as usize % ships.len();
                     if let Some(ship) = sim.get_ship(ships[ship_idx].id) {
                         players.insert(
@@ -303,12 +703,26 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
-                ServerEvent::ClientDisconnected { connection_id, .. } => {
+                ServerEvent::ClientDisconnected {
+                    connection_id,
+                    reason,
+                } => {
                     info!("client {connection_id} disconnected");
+                    hub.publish(json!({
+                        "event": "conn",
+                        "what": "disconnected",
+                        "id": connection_id,
+                        "reason": format!("{reason:?}"),
+                    }));
                     despawn_player(&sim, &net, connection_id, &mut players);
                 }
                 ServerEvent::ClientTimeout { connection_id } => {
                     info!("client {connection_id} timed out");
+                    hub.publish(json!({
+                        "event": "conn",
+                        "what": "timeout",
+                        "id": connection_id,
+                    }));
                     despawn_player(&sim, &net, connection_id, &mut players);
                 }
                 ServerEvent::ClientInput {
@@ -708,6 +1122,41 @@ async fn main() -> Result<()> {
                     budget = TICK_DURATION_MS as f64,
                 );
             }
+            // The same numbers the `perf:` line above just printed, as data
+            // the control door serves: the panel and the log cannot change
+            // their minds about what the last window measured, because both
+            // read this window once.
+            status_handle.publish_perf(
+                PerfStatus {
+                    sim_sync_avg_ms: avg_ms,
+                    sim_sync_max_ms: tick_time_max.as_secs_f64() * 1000.0,
+                    phase_events_ms: event_drain_ms,
+                    phase_sim_ms: sim_ms,
+                    phase_entity_sync_ms: entity_sync_ms,
+                    phase_interest_ms: interest_ms,
+                    phase_broadcast_ms: broadcast_ms,
+                    loop_avg_ms,
+                    loop_max_ms: loop_time_max.as_secs_f64() * 1000.0,
+                    budget_ms: TICK_DURATION_MS as f64,
+                    ticks_ran: ran_this_report,
+                    ticks_skipped_cumulative: cadence.skipped(),
+                    window_ticks: tick_time_count,
+                    window_rounds: rounds_delta,
+                    window_packets: packets_delta,
+                    rounds_per_tick: rounds_delta as f64 / tick_time_count.max(1) as f64,
+                    packets_per_round: packets_delta as f64 / rounds_delta.max(1) as f64,
+                    window_sent_deltas_by_layer: sent_by_layer.clone(),
+                    window_first_fulls: first_fulls_delta,
+                    working_set_mb: working_set_mb(),
+                },
+                EntitiesStatus {
+                    ships: stats.ships,
+                    players: stats.players,
+                    stations: stats.stations,
+                    compartments: stats.compartments,
+                    projectiles: stats.projectiles,
+                },
+            );
             tick_time_sum = Duration::ZERO;
             tick_time_max = Duration::ZERO;
             loop_time_sum = Duration::ZERO;
@@ -728,6 +1177,31 @@ async fn main() -> Result<()> {
             // measurement so the two cannot drift apart.
             event_drain_time_sum = Duration::ZERO;
             tick_time_count = 0;
+        }
+
+        // The cheap status numbers, every tick (plan А.1 item 3): the tick
+        // counter, uptime and the two counts are the values the `status`
+        // command names first. They are copied from values the loop already
+        // holds — no new computation sits between one tick's end and the
+        // next one's start.
+        status_handle.update_tick(
+            result.tick.0,
+            started.elapsed().as_secs(),
+            players.len(),
+            ships.len(),
+        );
+        // Once a second, and never inside a measured phase: the net half
+        // and the player listing cost an iterator walk, and that walk must
+        // not sit between two accumulators the `perf:` window averages
+        // over. `refresh_world` updates net + players + connection count
+        // together, so a reader cannot catch the halves disagreeing.
+        if last_status_refresh.elapsed() >= Duration::from_secs(1) {
+            last_status_refresh = std::time::Instant::now();
+            status_handle.refresh_world(
+                net_status_snapshot(&net),
+                player_list_snapshot(&net, &players),
+                net.connection_count(),
+            );
         }
     }
 

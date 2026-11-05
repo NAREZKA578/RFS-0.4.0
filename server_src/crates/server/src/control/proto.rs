@@ -56,7 +56,13 @@ pub enum Incoming {
 /// Why a line could not become a request the protocol understands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError {
+    /// Not JSON at all — a broken client, not a client speaking v1 wrong.
     NotJson,
+    /// JSON of the right dialect but the wrong shape; the string is serde's
+    /// own complaint ("missing field `token`"), which is exactly the named
+    /// refusal the negative checks ask for.
+    Malformed(String),
+    /// A bare newline / whitespace line: a dead keep-alive, not a request.
     Empty,
 }
 
@@ -73,14 +79,18 @@ pub fn parse_line(line: &str) -> Result<Incoming, ParseError> {
     }
     let value: serde_json::Value =
         serde_json::from_str(line).map_err(|_| ParseError::NotJson)?;
-    let hello: Option<Hello> = value.get("hello").and_then(|h| serde_json::from_value(h.clone()).ok());
-    if let Some(hello) = hello {
-        // A line carrying "hello" is a hello, whatever else sits next to it.
+    // A "hello" key makes the line a hello attempt: whatever else it carries
+    // cannot rescue it into a command (the auth gate must see it first). The
+    // Hello struct describes the *inner* object — the token lives inside it,
+    // not on the envelope.
+    if let Some(hello_value) = value.get("hello") {
+        let hello: Hello =
+            serde_json::from_value(hello_value.clone())
+                .map_err(|e| ParseError::Malformed(e.to_string()))?;
         return Ok(Incoming::Hello(hello));
     }
-    // Not a hello: it must be a complete command. `from_value` on a borrowed
-    // shape clones internally — the value is small, the clarity is worth it.
-    let command: Command = serde_json::from_value(value).map_err(|_| ParseError::NotJson)?;
+    let command: Command =
+        serde_json::from_value(value).map_err(|e| ParseError::Malformed(e.to_string()))?;
     Ok(Incoming::Command(command))
 }
 
@@ -147,11 +157,27 @@ mod proto_tests {
     #[test]
     fn anything_else_is_a_parse_error_not_a_panic() {
         assert_eq!(parse_line("not json"), Err(ParseError::NotJson));
-        assert_eq!(parse_line("[1,2,3]"), Err(ParseError::NotJson));
-        assert_eq!(parse_line(r#"{"cmd":"status"}"#), Err(ParseError::NotJson)); // no id
-        assert_eq!(parse_line(r#"{"id":1}"#), Err(ParseError::NotJson)); // no cmd
         assert_eq!(parse_line("\r\n"), Err(ParseError::Empty));
         assert_eq!(parse_line("   "), Err(ParseError::Empty));
+        // Pronounced shape leftovers carry serde's complaint — the reason a
+        // "token not transmitted" question receives the field name as its
+        // response.
+        match parse_line("[1,2,3]") {
+            Err(ParseError::Malformed(text)) => assert!(text.contains("type"), "{text}"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        match parse_line(r#"{"cmd":"status"}"#) {
+            Err(ParseError::Malformed(text)) => assert!(text.contains("id"), "{text}"),
+            other => panic!("expected Malformed naming the id, got {other:?}"),
+        }
+        match parse_line(r#"{"id":1}"#) {
+            Err(ParseError::Malformed(text)) => assert!(text.contains("cmd"), "{text}"),
+            other => panic!("expected Malformed naming the cmd, got {other:?}"),
+        }
+        match parse_line(r#"{"hello":{"proto":1}}"#) {
+            Err(ParseError::Malformed(text)) => assert!(text.contains("token"), "{text}"),
+            other => panic!("expected Malformed naming the token, got {other:?}"),
+        }
     }
 
     #[test]

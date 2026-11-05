@@ -907,6 +907,23 @@ pub enum GameEvent {
     ShipSinkingStarted {
         ship: EntityId,
     },
+
+    /// The stage-2 control port's `say` (`.DOC/new/server-interface-plan.md`,
+    /// Приложение А, А.2 item 3): the operator's announcement to every player.
+    /// The event names no entity — the operator's text is world news, not an
+    /// event about a ship — so the interest fan-out reads it the way
+    /// `TeamScoreChanged`/`MatchStateChanged` are read: no subject, everyone
+    /// gets it.
+    ///
+    /// Appended last so the positional coding of every earlier variant (bug
+    /// №60) stays where it was — the same rule `ShipSinkingStarted` rides.
+    /// An append needs no PROTOCOL_VERSION bump (the MapDescription/LayerSync
+    /// precedent on `PacketType`): an older sender never emits this tail, and
+    /// an older client that cannot decode it reports the failure and keeps
+    /// the connection — only the announcement datagram itself degrades.
+    Announcement {
+        text: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

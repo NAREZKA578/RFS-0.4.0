@@ -1,5 +1,21 @@
 //! The main loop's own housekeeping: cadence accounting that a real loop
 //! cannot drive with testable deadlines, so it lives apart from the loop.
+//!
+//! The `control/` children are the control door of
+//! `.DOC/new/server-interface-plan.md` (stage 1, Приложение А):
+//! `proto` — the wire, `status` — the shared snapshot, `commands` — the pure
+//! state+request→answer layer, `ring` — the event ring the `log` command
+//! reads, `token` — the door's key file, `journal` — the action journal
+//! (stage 2, А.2 item 6), `server` — the listener and its caps. This file
+//! stays the module's root and keeps the tick-cadence machinery.
+
+pub mod commands;
+pub mod journal;
+pub mod proto;
+pub mod ring;
+pub mod server;
+pub mod status;
+pub mod token;
 
 use std::time::Duration;
 

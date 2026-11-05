@@ -2755,6 +2755,11 @@ impl NetServer {
                     _ => subjects.push(*player),
                 }
             }
+            GameEvent::Announcement { .. } => {
+                // Stage 2 (`say`): the operator's text names no entity, so it
+                // takes the same no-subject rule as TeamScore/MatchState —
+                // an empty list means every Connected viewer sees it.
+            }
         }
         subjects
     }
@@ -2825,6 +2830,40 @@ impl NetServer {
                 self.enqueue(conn, packets);
             }
         }
+    }
+
+    /// One event to exactly one connection — the stage-2 `kick` carries the
+    /// operator's reason to the player it dismisses, and a fan-out is the
+    /// wrong shape for one addressee.
+    ///
+    /// The guards are `broadcast_event`'s, applied to the single receiver:
+    /// Connected state (a connection still handshaking gets nothing), the
+    /// interest rule, and the same enqueue path, so the announcement and any
+    /// `Disconnect` leave this socket in enqueue order. The delivery itself
+    /// rides the unreliable event channel (bug №272: notifications, not
+    /// state), so "the player read why" is best effort — the reason also
+    /// lives in the journal where it cannot be lost.
+    ///
+    /// `false` means nothing reached the wire: a gone or unconnected id (the
+    /// caller journals that) or an unrepresentable payload.
+    pub fn send_event_to(&self, connection_id: u32, event: GameEvent) -> bool {
+        let Some(conn) = self.get_connection(connection_id) else {
+            return false;
+        };
+        if conn.state() != ConnectionState::Connected {
+            return false;
+        }
+        if !Self::event_reaches(&self.interest_manager, connection_id, &event) {
+            return false;
+        }
+        let packets = conn.send_event(EventPacket {
+            events: vec![event],
+        });
+        if packets.is_empty() {
+            return false;
+        }
+        self.enqueue(conn, packets);
+        true
     }
 
     pub fn send_command_ack(
@@ -3835,6 +3874,12 @@ mod event_interest_tests {
         assert!(empty(GameEvent::MatchStateChanged {
             state: MatchState::Waiting
         }));
+        // Stage 2: the operator's announcement names no entity, deliberately —
+        // filtering it would mean dropping the text for viewers whose interest
+        // does not cover the whole match, and the words have no subject.
+        assert!(empty(GameEvent::Announcement {
+            text: "test".into()
+        }));
 
         let named = [
             GameEvent::ShipHit {
@@ -3984,6 +4029,30 @@ mod event_interest_tests {
         assert!(
             !NetServer::event_reaches(&mgr, VIEWER, &far_chat),
             "a far player's narrow chat leaked through the event path"
+        );
+    }
+
+    /// Stage 2 (`say`): the announcement reaches every viewer wherever their
+    /// interest sits — the words have no subject to filter on, so a viewer
+    /// whose snapshot shares nothing with the event still gets them (the
+    /// same rule all-chat reads).
+    #[test]
+    fn an_announcement_reaches_every_viewer_wherever_their_interest_sits() {
+        let mgr = world();
+        assert!(
+            !mgr.should_replicate_entity(VIEWER, EntityId::new(FAR_SHIP)),
+            "the fixture is not actually invisible, so this proves nothing"
+        );
+        let announcement = GameEvent::Announcement {
+            text: "server stops in 10 s".into(),
+        };
+        assert!(
+            NetServer::event_subjects(&announcement).is_empty(),
+            "the announcement named a subject, so its fan-out would be filtered"
+        );
+        assert!(
+            NetServer::event_reaches(&mgr, VIEWER, &announcement),
+            "an operator's announcement was dropped on a viewer without overlapping interest"
         );
     }
 

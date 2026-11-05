@@ -323,3 +323,52 @@ fn a_transform_only_delta_record_stays_far_below_the_fragmentation_threshold() {
         "a transform-only delta record must never fragment"
     );
 }
+
+// Stage 2 (`server-interface-plan.md`, Приложение А, А.2 item 1): the
+// operator's `say` rides a new GameEvent variant. Appended after
+// ShipSinkingStarted per the LayerSync precedent — every prior variant keeps
+// its positional code, so no PROTOCOL_VERSION bump is required (an older
+// receiver gets decode Err on the tail only, which net/client.rs already
+// survives).
+
+/// The Announcement pin, on the №267 shape: the variant's positional code,
+/// the one-byte warn (every prior code below it is pinned by construction of
+/// the append rule), and the payload round-trip.
+#[test]
+fn the_announcement_pins_the_appended_slot_and_roundtrips() {
+    let announcement = GameEvent::Announcement {
+        text: "server stops in 10 s".to_string(),
+    };
+    let bytes = <GameEvent as Serializable>::serialize(&announcement).unwrap();
+    // Ordinal 20: the previous appends — ShipRam (18), ShipSinkingStarted
+    // (19) — hold their slots, Announcement takes 20. One varint byte; the
+    // event keeps the same one-byte framing class the pinned appends fixed.
+    assert_eq!(
+        bytes[0], 20,
+        "Announcement's positional code moved; bump PROTOCOL_VERSION and rebase every reader"
+    );
+    // And the earlier tail holds: ShipSinkingStarted is still 19 — an
+    // insertion before it would have shifted Announcement without moving the
+    // wire (the decode of an old sender would read the wrong event).
+    let sink_started = GameEvent::ShipSinkingStarted {
+        ship: EntityId::new(7),
+    };
+    let sink_bytes = <GameEvent as Serializable>::serialize(&sink_started).unwrap();
+    assert_eq!(sink_bytes[0], 19, "ShipSinkingStarted's own slot moved");
+
+    // The payload round-trips through the EventPacket carrier the server
+    // actually sends (net/server.rs), so the words a kicked player gets are
+    // the words the operator typed. (GameEvent itself names no PartialEq —
+    // the pin reads the payload back field by field.)
+    let packet = EventPacket {
+        events: vec![announcement],
+    };
+    let wire = <EventPacket as Serializable>::serialize(&packet).unwrap();
+    let back = <EventPacket as Serializable>::deserialize(&wire).unwrap();
+    match &back.events[0] {
+        GameEvent::Announcement { text } => {
+            assert_eq!(text, "server stops in 10 s", "the text drifted on the wire");
+        }
+        other => panic!("decode gave {other:?}; the announcement became something else"),
+    }
+}

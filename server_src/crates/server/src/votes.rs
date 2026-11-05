@@ -61,6 +61,16 @@ impl VoteKickState {
         self.config.enabled
     }
 
+    /// Stage 2 `reload`: replaces the counting rules from the next ballot.
+    /// An already-open vote keeps its target and its tallies — the ballots
+    /// already cast were counted against the rules their voters saw, and
+    /// re-deciding a verdict in flight is how a quorum turns into a lie. The
+    /// re-armed window (`window_ticks`) also applies to the *next* ballot,
+    /// not retroactively to the one standing.
+    pub fn apply_config(&mut self, config: VoteKickConfig) {
+        self.config = config;
+    }
+
     /// The vote floor and share: `max(min_votes, ceil(majority * online))`.
     fn votes_needed(&self, online: usize) -> u32 {
         let by_share = (self.config.majority * online.max(1) as f32).ceil();
@@ -351,6 +361,51 @@ mod vote_kick_tests {
             state.cast(p(1), p(5), 10),
             VoteOutcome::OtherVoteRunning { target },
             "nine ticks after the ballot the re-armed vote must still be running"
+        );
+    }
+
+    /// Stage 2 `reload`: the counting rules change from the next ballot. An
+    /// open vote keeps its target and its tallies — the ballots in flight were
+    /// counted against the strength their voters saw, and wiping or passing
+    /// them on apply would both rewrite a verdict. The next ballot recounts
+    /// against the new strength (the same live-need rule every cast uses), so
+    /// it neither passes nor re-opens the vote it joined.
+    #[test]
+    fn apply_config_keeps_an_open_vote_and_re_rules_the_next_ballot() {
+        let mut state = VoteKickState::new(config());
+        let target = p(2);
+
+        // Five online, old rules: need = max(2, ceil(3)) = 3; two ballots stand.
+        assert_eq!(
+            state.cast(p(1), target, 5),
+            VoteOutcome::Opened { votes_left: 2 }
+        );
+        assert_eq!(
+            state.cast(p(3), target, 5),
+            VoteOutcome::Counted { votes_left: 1 }
+        );
+
+        // The reloaded version demands unanimity and the floor of one.
+        state.apply_config(VoteKickConfig {
+            enabled: true,
+            min_votes: 1,
+            majority: 1.0,
+            window_ticks: 10,
+        });
+
+        // The applied config must not close a standing vote...
+        assert!(
+            state.resolve().is_none(),
+            "an applied config must not close the vote it found underway"
+        );
+        // ...and its third ballot joins the STANDING vote, counted against the
+        // NEW need (max(1, ceil(5)) = 5): three ballots stand, one short. The
+        // no-op probe would pass it at the old quorum of 3; a tally-wipe
+        // probe would re-open at 1.
+        assert_eq!(
+            state.cast(p(11), target, 5),
+            VoteOutcome::Counted { votes_left: 2 },
+            "tallies must survive the reload and count under the new strength"
         );
     }
 }
