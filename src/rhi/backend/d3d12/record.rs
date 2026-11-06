@@ -43,7 +43,7 @@ use crate::types::{AccessFlags, ClearValue, IndexType, Rect2D, TextureDimensions
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CLEAR_FLAGS, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_FLAG_STENCIL,
-    D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_INDEX_BUFFER_VIEW,
+    D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_INDEX_BUFFER_VIEW,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER,
     D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
     D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATE_COMMON,
@@ -52,7 +52,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES, D3D12_RESOURCE_UAV_BARRIER,
     D3D12_SUBRESOURCE_FOOTPRINT, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12DescriptorHeap, ID3D12GraphicsCommandList,
+    D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12GraphicsCommandList,
     ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
@@ -286,7 +286,7 @@ fn replay(rec: &mut Recorder<'_>, command: &Command) -> RhiResult<()> {
                 targets.push(target_of(rec.device, handle)?);
             }
             for (resource, handle, home) in &targets {
-                let after = if handle == &fb.dsv_handle.unwrap_or(u64::MAX) {
+                let after = if fb.dsv_handle == Some(*handle) {
                     D3D12_RESOURCE_STATE_DEPTH_WRITE
                 } else {
                     D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -438,7 +438,7 @@ fn replay(rec: &mut Recorder<'_>, command: &Command) -> RhiResult<()> {
                 let Some(set_gpu) = set.backend() else {
                     return Err(RhiError::BackendError(format!(
                         "descriptor set {} has no GPU backing",
-                        first_set as usize + offset
+                        first + offset
                     )));
                 };
                 let set_entry = rec.device.set_entry(set_gpu.handle)?;

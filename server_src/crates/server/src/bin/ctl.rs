@@ -45,6 +45,27 @@ fn usage() -> String {
         .to_string()
 }
 
+/// Bug №750 (double-click finding): a console window the operator launched
+/// by double-clicking closes the instant the process exits, and the usage
+/// line is exactly what such a launch needs to read. The boundary is the
+/// argument list alone, so the rule is pure: nothing typed after the
+/// program name means double-click, and double-click means pause. Nothing
+/// sniffs a tty and nothing else guesses at being interactive.
+fn should_pause_on_exit(args_after_program: &[String]) -> bool {
+    args_after_program.is_empty()
+}
+
+/// The pause. A closed or empty stdin answers `read_line` with `Ok(0)` — a
+/// clean end of input, not an error — so a paused process whose console is
+/// gone (or whose caller piped an empty stdin) falls straight through and
+/// exits instead of hanging. The Enter the operator presses is read and
+/// discarded.
+fn pause_for_console() {
+    println!("press Enter to close...");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+}
+
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
@@ -442,7 +463,16 @@ async fn main() -> Result<()> {
         }
         match found {
             Some(i) => (args[i].clone(), i),
-            None => bail!("{} — no command given", usage()),
+            None => {
+                // Bug №750: the usage a double-clicked window shows closes
+                // with its window in the same blink on the bare launch; the
+                // pause holds it on screen. A scripted run always carries a
+                // command, so its exit is untouched.
+                if should_pause_on_exit(&args) {
+                    pause_for_console();
+                }
+                bail!("{} — no command given", usage())
+            }
         }
     };
     let command_index = command.1;
@@ -646,4 +676,49 @@ async fn ask_following(
 ) -> Result<Inbound> {
     let answer = one_round(reader, writer, "log", None, id).await?;
     Ok(answer)
+}
+
+#[cfg(test)]
+mod exit_pause_tests {
+    //! Bug №750 (double-click finding): the usage line a double-clicked
+    //! window shows closes with the window in the same blink. The rule lives
+    //! in `should_pause_on_exit` — pure, so it is machine-checkable: an
+    //! argument list of nothing but the program name is the double-click
+    //! shape, and that is the only shape that pauses.
+
+    use super::*;
+
+    #[test]
+    fn a_bare_launch_pauses_so_the_usage_survives_the_window() {
+        let args: Vec<String> = vec!["ctl.exe".to_string()];
+        assert!(
+            should_pause_on_exit(&args[1..]),
+            "nothing after the program name is the double-click shape"
+        );
+    }
+
+    #[test]
+    fn an_argument_means_a_script_and_no_pause() {
+        let scripts = [
+            vec!["ctl.exe".to_string(), "status".to_string()],
+            vec![
+                "ctl.exe".to_string(),
+                "--config".to_string(),
+                "server_config.json".to_string(),
+            ],
+            vec![
+                "ctl.exe".to_string(),
+                "--config".to_string(),
+                "server_config.json".to_string(),
+                "log".to_string(),
+                "--follow".to_string(),
+            ],
+        ];
+        for args in &scripts {
+            assert!(
+                !should_pause_on_exit(&args[1..]),
+                "a scripted launch must exit immediately: {args:?}"
+            );
+        }
+    }
 }

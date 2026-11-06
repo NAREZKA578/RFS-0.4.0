@@ -136,7 +136,20 @@ impl MatchConfig {
             // The create-on-first-start the owner asked for: the default file
             // is written so there is something to edit, and the same defaults
             // are used for this run.
-            let default = Self::default();
+            //
+            // Bug №748 (double-click finding): the seeded file must pass the
+            // same `validate()` every later start runs. The derived default
+            // keeps №216's fail-closed shape for FILES a missing field means,
+            // so the seeded default states the unsigned dialect itself — the
+            // file on disk owns that choice, and the first start and every
+            // later one run exactly the arrangement it records.
+            let default = MatchConfig {
+                allow_unsigned: true,
+                ..Self::default()
+            };
+            default
+                .validate()
+                .context("the seeded default must pass the same validation a later start runs")?;
             default
                 .write(path)
                 .with_context(|| format!("writing the default config to {}", path.display()))?;
@@ -281,7 +294,16 @@ mod config_tests {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("the file was written"))
                 .expect("the written file must parse");
         assert_eq!(config, on_disk);
-        assert_eq!(config, MatchConfig::default());
+
+        // Bug №748: the seeded file owns the №216 choice itself — the
+        // unsigned dialect is stated in the file, so the first start and
+        // every later one run the same arrangement without bypassing
+        // `validate()`. Everything else stays the derived default.
+        let seeded = MatchConfig {
+            allow_unsigned: true,
+            ..MatchConfig::default()
+        };
+        assert_eq!(config, seeded);
         assert!(config.vote_kick.enabled);
     }
 
@@ -505,5 +527,28 @@ mod config_tests {
             text.contains("\"control\""),
             "the default file must expose the section: {text}"
         );
+    }
+
+    /// Bug №748 (double-click finding): the file the FIRST start seeds must
+    /// pass the same gate every later start runs. Before the fix the seeded
+    /// default was returned unvalidated and every second start died on the
+    /// file's own `auth_token is empty and allow_unsigned is false` refusal.
+    #[test]
+    fn the_file_created_on_the_first_start_is_accepted_on_the_next_start() {
+        let dir = temp_dir("double-click-748");
+        let path = dir.join("server_config.json");
+        let first = MatchConfig::load(&path).expect("first run creates the file");
+        assert!(
+            first.allow_unsigned,
+            "the seeded default must state the unsigned dialect itself: {first:?}"
+        );
+        let text = std::fs::read_to_string(&path).expect("the file was written");
+        assert!(
+            text.contains("\"allow_unsigned\": true"),
+            "the seeded file must own the choice on disk: {text}"
+        );
+        let second = MatchConfig::load(&path)
+            .expect("the seeded file must pass the same gate a later start runs");
+        assert_eq!(first, second);
     }
 }

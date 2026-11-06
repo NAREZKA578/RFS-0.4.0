@@ -107,14 +107,16 @@ const RELIABLE_ADMIT_BUDGET: std::time::Duration = std::time::Duration::from_mil
 /// Bug №175: capacity of the client event queue. State updates bypass it
 /// (see `latest_state`), so this only has to cover the low-rate lifecycle and
 /// per-entity events; a full queue means the consumer is not keeping up, and
-/// the oldest event is dropped rather than growing without bound.
-const CLIENT_EVENT_QUEUE: usize = 4096;
+/// the oldest event is dropped rather than growing without bound. №755:
+/// ×4 from the №175 baseline (owner order 2026-11-06).
+const CLIENT_EVENT_QUEUE: usize = 16384;
 
 /// Bug №613: capacity of the outbox. Same reasoning as the event queue — a full
 /// queue means the writer is not keeping up, so the newest datagram is dropped
 /// and counted rather than buffered until the process dies. Generous next to
 /// `CLIENT_EVENT_QUEUE` because state updates legitimately queue in bursts.
-const CLIENT_OUTBOX_QUEUE_LIMIT: usize = 8192;
+/// №755: ×4 from the №613 baseline (owner order 2026-11-06).
+const CLIENT_OUTBOX_QUEUE_LIMIT: usize = 32768;
 
 /// Bug №732: the size gate keeps its job but loses its shape — postcard has
 /// no Options dial, so the cap is an explicit check against the slice, then
@@ -490,7 +492,9 @@ impl Default for ClientConfig {
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             server_addr: "127.0.0.1:7777".parse().unwrap(),
             connection_config: ConnectionConfig::default(),
-            snapshot_history: 128,
+            // №755: 512 slots — the same resident window as the server side
+            // (the merge-base ring and the interpolator both size from it).
+            snapshot_history: 512,
             tick_rate: TICK_RATE,
             max_bandwidth_bps: 512.0 * 1024.0,
             enable_bandwidth_limit: false,
@@ -3785,5 +3789,17 @@ mod map_description_tests {
         assert_eq!(server.connection_count(), 1);
         assert!(server.world_description().is_none());
         client.disconnect(DisconnectReason::ClientQuit);
+    }
+}
+
+#[cfg(test)]
+mod buffer_expansion_tests {
+    use super::*;
+
+    /// №755: the merge-base ring and the interpolator both build from this
+    /// default; the size is the client's resident snapshot budget.
+    #[test]
+    fn the_client_ring_default_is_pinned() {
+        assert_eq!(ClientConfig::default().snapshot_history, 512);
     }
 }

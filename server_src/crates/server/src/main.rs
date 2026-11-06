@@ -108,6 +108,29 @@ fn resolve_action_log_path(
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+/// Bug №751: the fair rotation (`connection_id % ships.len()`) may name a
+/// hull the sim has already taken — №57 removes a sunk ship from the sim,
+/// and a connection that arrives after that used to be skipped silently
+/// (`if let Some`) with no player and no first full forever. The rule
+/// №160 already runs for EXISTING players applies to the NEW connection:
+/// walk the roster onward from the fair slot onto the first living hull.
+/// `None` names the one honest dead end: every hull in the world is gone.
+/// Pure via the `alive` lookup, so the rule is machine-checkable.
+fn target_ship_for_connection(
+    roster: &[EntityId],
+    connection_id: u32,
+    alive: impl Fn(EntityId) -> bool,
+) -> Option<EntityId> {
+    if roster.is_empty() {
+        return None;
+    }
+    let start = connection_id as usize % roster.len();
+    (0..roster.len())
+        .map(|k| (start + k) % roster.len())
+        .map(|i| roster[i])
+        .find(|id| alive(*id))
+}
+
 /// The net half of the once-per-second refresh: every counter copied from
 /// the net server's own tallies — computed once by their owner, read by the
 /// door (plan section 6.3: a read never recomputes).
@@ -695,12 +718,46 @@ async fn main() -> Result<()> {
                         "id": connection_id,
                         "addr": addr.to_string(),
                     }));
-                    let ship_idx = connection_id as usize % ships.len();
-                    if let Some(ship) = sim.get_ship(ships[ship_idx].id) {
-                        players.insert(
-                            connection_id,
-                            spawn_player(&net, &ship, connection_id, "player"),
-                        );
+                    // Bug №751 (at the wave acceptance of the №748-750
+                    // fixes): the fair rotation may land a fresh connection
+                    // on a hull the sim has already removed — a ship №57
+                    // sank between the start and this connection. The old
+                    // `if let Some` skipped the spawn SILENTLY: the client
+                    // was admitted, received the world description, and was
+                    // left with no player — no first full snapshot ever, and
+                    // every input answered `accepted = false` from the
+                    // resolve that could never be satisfied. One dead hull
+                    // name-for-name cost exactly one starving bot per wave
+                    // (machine link, 2026-11-06: ships 14 → 19/20 live;
+                    // ships 13 → 17/20). The rule №160 already runs for
+                    // EXISTING players applies to the NEW connection too:
+                    // walk the roster onward from the fair slot onto the
+                    // first living hull; when no hull survives at all, the
+                    // honest answer is a disconnect with a reason, never a
+                    // silent skip.
+                    let roster: Vec<EntityId> = ships.iter().map(|e| e.id).collect();
+                    let target = target_ship_for_connection(
+                        &roster,
+                        connection_id,
+                        |id| sim.get_ship(id).is_some(),
+                    );
+                    match target {
+                        Some(entity_id) => {
+                            let ship = sim
+                                .get_ship(entity_id)
+                                .expect("the roster walk just confirmed it lives");
+                            players.insert(
+                                connection_id,
+                                spawn_player(&net, &ship, connection_id, "player"),
+                            );
+                        }
+                        None => {
+                            warn!(
+                                "client {connection_id} connected but no living ship remains; \
+                                 the connection is dropped with a reason"
+                            );
+                            net.disconnect_client(connection_id, DisconnectReason::Error);
+                        }
                     }
                 }
                 ServerEvent::ClientDisconnected {
@@ -1214,4 +1271,67 @@ async fn main() -> Result<()> {
     net.stop_gracefully().await;
     info!("match stopped after {} ships", ships.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod spawn_target_tests {
+    //! Bug №751: a connection whose fair slot names a hull the sim already
+    //! removed (№57 sank it) must not silently skip the spawn — that was
+    //! the admitted-but-playerless starve: no first full snapshot, every
+    //! input answered `accepted = false`. The roster walk guarantees a
+    //! living hull when one exists and names `None` only when none does.
+
+    use super::*;
+
+    fn roster(n: u64) -> Vec<EntityId> {
+        (0..n)
+            .map(|i| EntityId::new(SHIP_ID + i * SHIP_ID_STRIDE))
+            .collect()
+    }
+
+    #[test]
+    fn a_connection_lands_on_its_fair_slot_while_every_ship_lives() {
+        let ships = roster(4);
+        // The fair rotation kept: connection 6 of 4 ships → slot 2, not slot 0.
+        let target = target_ship_for_connection(&ships, 6, |id| id != EntityId::new(0));
+        assert_eq!(target, Some(ships[2]), "6 % 4 = 2 is the fair slot");
+    }
+
+    #[test]
+    fn a_sunk_fair_slot_moves_the_connection_to_the_next_living_hull() {
+        let ships = roster(4);
+        let sunk = ships[1];
+        let target = target_ship_for_connection(&ships, 1, |id| id != sunk);
+        assert_eq!(
+            target,
+            Some(ships[2]),
+            "the walk moves onward from the fair slot onto the first living hull"
+        );
+    }
+
+    #[test]
+    fn the_walk_wraps_around_the_end_of_the_roster() {
+        let ships = roster(4);
+        let sunk = &ships[3];
+        // Connection 11 → fair slot 3 (sunk); walking on wraps to slot 0.
+        let target = target_ship_for_connection(&ships, 11, |id| id != *sunk);
+        assert_eq!(target, Some(ships[0]), "the walk wraps to the roster head");
+    }
+
+    #[test]
+    fn every_dead_hull_names_none_instead_of_guessing() {
+        let ships = roster(3);
+        let target = target_ship_for_connection(&ships, 1, |_id| false);
+        assert_eq!(
+            target, None,
+            "no living hull anywhere is the honest dead end, not a silent skip"
+        );
+    }
+
+    #[test]
+    fn an_empty_roster_is_none_not_a_panic() {
+        let empty: Vec<EntityId> = Vec::new();
+        assert_eq!(target_ship_for_connection(&empty, 1, |_id| true), None);
+        assert_eq!(target_ship_for_connection(&empty, 1, |_id| false), None);
+    }
 }

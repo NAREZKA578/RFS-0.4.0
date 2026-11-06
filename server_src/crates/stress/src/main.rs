@@ -915,7 +915,37 @@ async fn main() -> Result<()> {
     info!(
         "stress layers: server_tick_max={srv_tick} layer0_max={l0} layer1_max={l1} layer2_max={l2} layer3_max={l3}",
     );
+
+    // Bug №750: a double-clicked window gobbles the totals the moment the
+    // process exits. A bare launch — nothing typed after the program name,
+    // exactly what a double-click produces — pauses before exiting so the
+    // summary stays readable; a scripted launch always names something and
+    // never pauses.
+    if should_pause_on_exit(&args[1..]) {
+        pause_for_console();
+    }
     Ok(())
+}
+
+/// Bug №750 (double-click finding): a console window the operator launched
+/// by double-clicking closes the instant the process exits, taking every
+/// summary line with it. The boundary is the argument list alone, so the
+/// rule is pure: nothing typed after the program name means double-click,
+/// and double-click means pause. Nothing sniffs a tty and nothing else
+/// guesses at being interactive.
+fn should_pause_on_exit(args_after_program: &[String]) -> bool {
+    args_after_program.is_empty()
+}
+
+/// The pause. A closed or empty stdin answers `read_line` with `Ok(0)` — a
+/// clean end of input, not an error — so a paused process whose console is
+/// gone (or whose caller piped an empty stdin) falls straight through and
+/// exits instead of hanging. The Enter the operator presses is read and
+/// discarded.
+fn pause_for_console() {
+    println!("press Enter to close...");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
 }
 
 /// Bug №72: the per-bot figures divide by the fleet that was REQUESTED, not
@@ -1113,5 +1143,43 @@ mod tick_observation_tests {
         assert_eq!(report.missed_tick_publishes, 0);
         assert_eq!(report.first_tick, Some(40));
         assert_eq!(report.server_tick, 40);
+    }
+}
+
+#[cfg(test)]
+mod exit_pause_tests {
+    //! Bug №750 (double-click finding): the summary a double-clicked window
+    //! shows closes with the window in the same blink. The rule lives in
+    //! `should_pause_on_exit` — pure, so it is machine-checkable: an
+    //! argument list of nothing but the program name is the double-click
+    //! shape, and that is the only shape that pauses.
+
+    use super::*;
+
+    #[test]
+    fn a_bare_launch_pauses_so_the_totals_survive_the_window() {
+        let args: Vec<String> = vec!["stress.exe".to_string()];
+        assert!(
+            should_pause_on_exit(&args[1..]),
+            "nothing after the program name is the double-click shape"
+        );
+    }
+
+    #[test]
+    fn an_argument_means_a_script_and_no_pause() {
+        let scripts = [
+            vec!["stress.exe".to_string(), "127.0.0.1:7777".to_string()],
+            vec![
+                "stress.exe".to_string(),
+                "127.0.0.1:7777".to_string(),
+                "20".to_string(),
+            ],
+        ];
+        for args in &scripts {
+            assert!(
+                !should_pause_on_exit(&args[1..]),
+                "a scripted launch must exit immediately: {args:?}"
+            );
+        }
     }
 }

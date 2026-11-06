@@ -293,7 +293,7 @@ fn apply_resync_request(conn: &Connection, payload: &[u8]) -> bool {
 /// client holds and is installed into `client_layers` as that layer's
 /// confirmed base — which displaces the old blind "advance the base on every
 /// queue" bookkeeping, because a queued send is not a delivered send.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ClientLayerTrack {
     /// Per layer, the queued-but-unconfirmed sends, oldest first.
     pending: [VecDeque<LayerBase>; LAYER_COUNT],
@@ -301,12 +301,26 @@ struct ClientLayerTrack {
     last_self_resync: [u64; LAYER_COUNT],
 }
 
+impl Default for ClientLayerTrack {
+    /// №755: each layer's ring preallocates its cap — resident slots once.
+    fn default() -> Self {
+        Self {
+            pending: std::array::from_fn(|_| VecDeque::with_capacity(MAX_PENDING_CONFIRMS)),
+            last_self_resync: [0; LAYER_COUNT],
+        }
+    }
+}
+
 /// Bug №30 (B): how many pending-confirmation entries one layer's ring keeps.
 /// Reports travel every ~100 ms and layers queue at their own intervals, so a
 /// healthy ring is a few entries deep; the cap exists for the worst case (a
 /// client that never reports), where the ring would otherwise keep whatever
 /// the pass queued for as long as the connection lived.
-pub(crate) const MAX_PENDING_CONFIRMS: usize = 4;
+///
+/// №755 (owner order 2026-11-06): 4 evicted under the measured 100-client
+/// ramp bursts and cost confirmations/rounded resyncs; 16 keeps the proof
+/// window across a full burst and costs a few KB per connection.
+pub(crate) const MAX_PENDING_CONFIRMS: usize = 16;
 
 /// Bug №30 (B): the self-shield spacing. When the oldest queued send has gone
 /// this many ticks without the client confirming anything, arm a resync:
@@ -450,6 +464,13 @@ const FIRST_FULL_BUDGET_PER_ROUND: usize = 4;
 /// or the TTL expires, so the table is the one state an address sprayer can
 /// grow — it must be finite.
 const PENDING_CHALLENGE_CAP: usize = 1024;
+
+// №755: the event and outbox capacities moved to module scope so tests can
+// pin them (they used to live as private numbers inside `new`) and were
+// raised ×4 by the owner's 2026-11-06 buffer order. The №613 property is
+// untouched — a flood is dropped, never buffered into OOM.
+pub(crate) const EVENT_QUEUE_LIMIT: usize = 16384;
+pub(crate) const OUTBOX_QUEUE_LIMIT: usize = 32768;
 /// Bug №216: how long a pending challenge is honored. An honest handshake
 /// completes in three datagrams (Challenge, Confirm, Accept) — well under a
 /// second on anything the game targets.
@@ -479,10 +500,20 @@ struct PendingChallenge {
 /// storm cannot grow the queue with copies of itself) and by `CAP` (a queue
 /// longer than this is a queue nobody can drain in any sane number of
 /// rounds; exceptions are refused and re-discovered the next round).
-#[derive(Default)]
 struct FirstFullQueue {
     queue: VecDeque<u32>,
     waiting: HashSet<u32>,
+}
+
+impl Default for FirstFullQueue {
+    /// №755: both members preallocate for the cap outright — resident slots
+    /// once, no geometric regrowth under the storm the cap exists for.
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::with_capacity(Self::CAP),
+            waiting: HashSet::with_capacity(Self::CAP),
+        }
+    }
 }
 
 impl FirstFullQueue {
@@ -652,7 +683,12 @@ impl Default for ServerConfig {
             max_connections: 256,
             connection_config: ConnectionConfig::default(),
             interest_config: InterestConfig::default(),
-            snapshot_history: 128,
+            // №755: 512 slots of merge-base history. The ring shares
+            // allocations (№745), so the resident cost is one window of
+            // recent fulls, and a deeper window the consumer can lag into
+            // feeds the coalescing slot a still-valid base instead of a
+            // stall-until-resync.
+            snapshot_history: 512,
             tick_rate: TICK_RATE,
             max_bandwidth_bps: 1024.0 * 1024.0,
             enable_bandwidth_limit: false,
@@ -705,11 +741,9 @@ pub enum ServerEvent {
 impl NetServer {
     pub async fn new(config: ServerConfig) -> Result<Self, std::io::Error> {
         let socket = Arc::new(UdpSocket::bind(config.bind_addr).await?);
-        // Bug №613: bounded, with a measured cap. 4096 events is far more than a
-        // healthy tick loop ever has in flight, and small enough that a flood is
-        // dropped rather than buffered until the process dies.
-        const EVENT_QUEUE_LIMIT: usize = 4096;
-        const OUTBOX_QUEUE_LIMIT: usize = 8192;
+        // Bug №613: bounded, with a measured cap — the numbers are the
+        // module-level №755 constants now; the flood property (drop rather
+        // than buffer until the process dies) stays.
         let (event_sender, event_receiver) = mpsc::channel(EVENT_QUEUE_LIMIT);
         // Bug №172: the outbox and the channel holding its receiving end. The
         // receiver is moved into the writer task when the server starts.
@@ -719,8 +753,10 @@ impl NetServer {
         let server = Self {
             socket,
             config: config.clone(),
-            connections: Arc::new(RwLock::new(HashMap::new())),
-            connection_by_addr: Arc::new(RwLock::new(HashMap::new())),
+            // №755: the hot tables enter the world already resident — CAP
+            // slots of buckets before the first connect, no regrowth sprees.
+            connections: Arc::new(RwLock::new(HashMap::with_capacity(CONNECT_TABLE_CAP))),
+            connection_by_addr: Arc::new(RwLock::new(HashMap::with_capacity(CONNECT_TABLE_CAP))),
             next_connection_id: Arc::new(Mutex::new(1)),
             snapshot_buffer: Arc::new(SnapshotBuffer::new(config.snapshot_history)),
             snapshot_rounds: Arc::new(AtomicU64::new(0)),
@@ -730,8 +766,8 @@ impl NetServer {
             // Bug №274: per-layer send counter, see the field.
             sent_deltas_by_layer: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             delta_compressor: Arc::new(DeltaCompressor::new()),
-            client_layers: Arc::new(RwLock::new(HashMap::new())),
-            pending_confirms: Arc::new(Mutex::new(HashMap::new())),
+            client_layers: Arc::new(RwLock::new(HashMap::with_capacity(CONNECT_TABLE_CAP))),
+            pending_confirms: Arc::new(Mutex::new(HashMap::with_capacity(CONNECT_TABLE_CAP))),
             interest_manager: Arc::new(InterestManager::new(config.interest_config)),
             bandwidth_tracker: Arc::new(BandwidthTracker::with_window(config.bandwidth_window)),
             // Bug №31: tick_rate 0 panics on 1000/0 and >1000 busy-loops the
@@ -745,7 +781,7 @@ impl NetServer {
             event_sender,
             event_receiver: Mutex::new(Some(event_receiver)),
             match_id,
-            connect_limits: Arc::new(Mutex::new(HashMap::new())),
+            connect_limits: Arc::new(Mutex::new(HashMap::with_capacity(CONNECT_TABLE_CAP))),
             outbox,
             outbox_handle: Mutex::new(None),
             outbox_rx: Mutex::new(Some(outbox_rx)),
@@ -761,7 +797,7 @@ impl NetServer {
                 auth.set_token(config.auth_token.clone());
                 auth
             }),
-            pending_challenges: Arc::new(RwLock::new(HashMap::new())),
+            pending_challenges: Arc::new(RwLock::new(HashMap::with_capacity(PENDING_CHALLENGE_CAP))),
             session_rejects: Arc::new(AtomicU64::new(0)),
         };
 
@@ -1175,8 +1211,25 @@ impl NetServer {
             return Ok(());
         }
 
+        // Bug №749: the handshake owns the address before any session does.
+        // Connect and ConnectConfirm take the challenge flow even when the
+        // address already maps to a connection: a client re-connecting from a
+        // port the server still believes belongs to a zombie (a client that
+        // died without a disconnect; the reused UDP port of the next client)
+        // must reach the handshake. The old routing swallowed that Connect
+        // into the dead session — the newcomer starved on a silent socket
+        // while its inputs rode the zombie's session to `accepted = false`
+        // acks from an already-despawned player.
+        let packet_type = PacketType::from_u8(header.packet_type);
+        let existing = if matches!(
+            packet_type,
+            Some(PacketType::Connect) | Some(PacketType::ConnectConfirm)
+        ) {
+            None
+        } else {
+            connection_by_addr.read().get(&addr).copied()
+        };
         let connection_id = {
-            let existing = connection_by_addr.read().get(&addr).copied();
             if let Some(id) = existing {
                 id
             } else {
@@ -1187,7 +1240,7 @@ impl NetServer {
                 // Confirm answers a challenge we sent, and is the ONLY packet
                 // that may complete the registration of an unknown address.
                 if !matches!(
-                    PacketType::from_u8(header.packet_type),
+                    packet_type,
                     Some(PacketType::Connect) | Some(PacketType::ConnectConfirm)
                 ) {
                     return Ok(());
@@ -1228,6 +1281,8 @@ impl NetServer {
                                         server_time,
                                         match_id,
                                         world_description,
+                                        pending_confirms,
+                                        client_layers,
                                         pending.connect,
                                         addr,
                                     )
@@ -1594,6 +1649,11 @@ impl NetServer {
         server_time: &Arc<Mutex<f64>>,
         match_id: Uuid,
         world_description: &Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
+        // Bug №749: the address claim retires whichever session the maps
+        // still believed belonged here — the eviction needs the rings the
+        // replaced session owned too.
+        pending_confirms: &Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
+        client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
         // The claimed identity, already version-checked at the challenge
         // stage. Kept on the signature so the admit path stays reviewable
         // as "this connect packet became this connection" — the fields the
@@ -1631,7 +1691,6 @@ impl NetServer {
                 conn.set_state(ConnectionState::Connected);
                 let conn_arc = Arc::new(conn);
                 conns.insert(id, conn_arc.clone());
-                connection_by_addr.write().insert(addr, id);
                 Some((id, conn_arc))
             }
         };
@@ -1652,6 +1711,29 @@ impl NetServer {
             send_reject(socket, addr, &packet_data, auth, bandwidth).await?;
             return Ok(());
         };
+
+        // Bug №749: the address's honest listener answered this address's
+        // challenge, so it owns the address now. Whoever the maps still
+        // believed belonged here — the zombie of a client that died without a
+        // disconnect — is retired with real cleanup and ONE timeout event,
+        // which despawns the leftover exactly the way the sweep would have
+        // once the zombie's own liveness ran out.
+        let replaced = Self::claim_addr_and_evict_replaced_session(
+            connections,
+            connection_by_addr,
+            pending_confirms,
+            client_layers,
+            event_sender,
+            dropped_events,
+            addr,
+            id,
+        );
+        if let Some(old_id) = replaced {
+            info!(
+                "connection {old_id} at {addr} was replaced by a fresh handshake \
+                 (the client re-bound to a port the server still believed alive)"
+            );
+        }
 
         let accept = {
             let tick = current_tick.lock().value();
@@ -2101,6 +2183,39 @@ impl NetServer {
         pending_confirms.lock().remove(&connection_id);
         client_layers.write().remove(&connection_id);
         removed.is_some()
+    }
+
+    /// Bug №749: claim the address for a fresh connection and retire whoever
+    /// the maps still believed belonged there. A client that dies without a
+    /// disconnect leaves its session until the timeout sweep runs; when a
+    /// re-connecting client (re-bound to the same UDP port) answers that
+    /// address's challenge, its new session must not inherit the zombie's
+    /// rows — and the zombie's leftover must reach the game layer through the
+    /// same event the sweep itself would have raised, so `players` is
+    /// despawned by one path only.
+    // The shared maps and event plumbing stay explicit, like send_snapshots
+    // above, keeping each lock's borrow scope narrow at its use sites.
+    #[allow(clippy::too_many_arguments)]
+    fn claim_addr_and_evict_replaced_session(
+        connections: &Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
+        connection_by_addr: &Arc<RwLock<HashMap<SocketAddr, u32>>>,
+        pending_confirms: &Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
+        client_layers: &Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+        event_sender: &mpsc::Sender<ServerEvent>,
+        dropped_events: &AtomicU64,
+        addr: SocketAddr,
+        new_id: u32,
+    ) -> Option<u32> {
+        let old_id = connection_by_addr.write().insert(addr, new_id)?;
+        connections.write().remove(&old_id);
+        pending_confirms.lock().remove(&old_id);
+        client_layers.write().remove(&old_id);
+        emit_event(
+            event_sender,
+            dropped_events,
+            ServerEvent::ClientTimeout { connection_id: old_id },
+        );
+        Some(old_id)
     }
 
     fn build_snapshot(tick: Tick, time: f64, interest_manager: &Arc<InterestManager>) -> Snapshot {
@@ -3415,7 +3530,8 @@ mod layer_confirm_tests {
     fn the_ring_caps_at_the_confirms_limit() {
         let mut track = ClientLayerTrack::default();
         let ring = &mut track.pending[3];
-        for t in 1..=6u64 {
+        let total = (MAX_PENDING_CONFIRMS * 2 + 2) as u64;
+        for t in 1..=total {
             ring.push_back(LayerBase {
                 entities: Vec::new(),
                 projectiles: Vec::new(),
@@ -3426,7 +3542,9 @@ mod layer_confirm_tests {
             }
         }
         let ticks: Vec<u64> = ring.iter().map(|e| e.base_tick).collect();
-        assert_eq!(ticks, vec![3, 4, 5, 6], "the oldest give way to the newest");
+        let expected: Vec<u64> =
+            ((total + 1 - MAX_PENDING_CONFIRMS as u64)..=total).collect();
+        assert_eq!(ticks, expected, "the oldest give way to the newest");
     }
 
     #[test]
@@ -4154,5 +4272,286 @@ mod event_interest_tests {
             ),
             "an untracked viewer was handed a match event"
         );
+    }
+}
+
+/// Bug №749: a client that dies without a disconnect leaves its session in
+/// the maps until the timeout sweep runs. A live client re-connecting over
+/// that same UDP port — the OS hands fresh sockets the dead one's port —
+/// must reach the handshake instead of being swallowed by the zombie's
+/// session: the swallowed newcomer starves forever (no first full), while
+/// every input it sends rides the zombie's session and is answered
+/// `accepted = false` from the despawned player it can never see.
+#[cfg(test)]
+mod address_reconnect_tests {
+    use super::*;
+
+    struct Fixture {
+        socket: Arc<UdpSocket>,
+        connections: Arc<RwLock<HashMap<u32, Arc<Connection>>>>,
+        by_addr: Arc<RwLock<HashMap<SocketAddr, u32>>>,
+        next_id: Arc<Mutex<u32>>,
+        config: ServerConfig,
+        bandwidth: BandwidthTracker,
+        connect_limits: Arc<Mutex<HashMap<SocketAddr, ConnectLimit>>>,
+        event_tx: mpsc::Sender<ServerEvent>,
+        /// Drained through a lock: `try_recv` takes `&mut`, and the fixture
+        /// fields stay individually reachable without moving the receiver out.
+        event_rx: std::sync::Mutex<mpsc::Receiver<ServerEvent>>,
+        dropped: Arc<AtomicU64>,
+        current_tick: Arc<Mutex<Tick>>,
+        server_time: Arc<Mutex<f64>>,
+        pending_confirms: Arc<Mutex<HashMap<u32, ClientLayerTrack>>>,
+        client_layers: Arc<RwLock<HashMap<u32, [LayerBase; LAYER_COUNT]>>>,
+        auth: Arc<WireAuth>,
+        world: Arc<RwLock<Option<rfs_core::world::MapDescription>>>,
+        pending_challenges: Arc<RwLock<HashMap<SocketAddr, PendingChallenge>>>,
+        session_rejects: Arc<AtomicU64>,
+        match_id: Uuid,
+    }
+
+    impl Fixture {
+        async fn handle(&self, addr: SocketAddr, data: &[u8]) {
+            NetServer::handle_received_packet(
+                &self.socket,
+                &self.connections,
+                &self.by_addr,
+                &self.next_id,
+                &self.config,
+                &self.bandwidth,
+                false,
+                &self.connect_limits,
+                &self.event_tx,
+                &self.dropped,
+                &self.current_tick,
+                &self.server_time,
+                self.match_id,
+                &self.pending_confirms,
+                &self.client_layers,
+                &self.auth,
+                &self.world,
+                &self.pending_challenges,
+                &self.session_rejects,
+                addr,
+                data,
+            )
+            .await
+            .expect("a packet the loop would have handled");
+        }
+    }
+
+    async fn fixture() -> Fixture {
+        let (event_tx, event_rx) = mpsc::channel(1024);
+        Fixture {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            by_addr: Arc::new(RwLock::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(1)),
+            config: ServerConfig::default(),
+            bandwidth: BandwidthTracker::new(),
+            connect_limits: Arc::new(Mutex::new(HashMap::with_capacity(CONNECT_TABLE_CAP))),
+            event_tx,
+            event_rx: std::sync::Mutex::new(event_rx),
+            dropped: Arc::new(AtomicU64::new(0)),
+            current_tick: Arc::new(Mutex::new(Tick(0))),
+            server_time: Arc::new(Mutex::new(0.0)),
+            pending_confirms: Arc::new(Mutex::new(HashMap::new())),
+            client_layers: Arc::new(RwLock::new(HashMap::new())),
+            auth: Arc::new(WireAuth::new()),
+            world: Arc::new(RwLock::new(None)),
+            pending_challenges: Arc::new(RwLock::new(HashMap::with_capacity(PENDING_CHALLENGE_CAP))),
+            session_rejects: Arc::new(AtomicU64::new(0)),
+            match_id: Uuid::new_v4(),
+        }
+    }
+
+    fn connect_bytes(counter: &mut u32) -> Vec<u8> {
+        let connect = ConnectPacket {
+            client_id: Uuid::new_v4(),
+            protocol_version: PROTOCOL_VERSION,
+            player_name: "reconnect-bot".into(),
+            build_version: "test".into(),
+        };
+        let header = PacketHeader::new(
+            PacketType::Connect,
+            ChannelType::ReliableOrdered,
+            *counter,
+            0,
+            0,
+            0,
+        );
+        *counter += 1;
+        serialize_packet(&connect, header).expect("connect serializes")
+    }
+
+    fn confirm_bytes(nonce: u128, counter: &mut u32) -> Vec<u8> {
+        let header = PacketHeader::new(
+            PacketType::ConnectConfirm,
+            ChannelType::ReliableOrdered,
+            *counter,
+            0,
+            0,
+            0,
+        );
+        *counter += 1;
+        serialize_packet(&ConnectConfirmPacket { nonce }, header).expect("confirm serializes")
+    }
+
+    #[test]
+    fn the_claimed_address_retires_its_old_session_with_one_timeout_event() {
+        let addr: SocketAddr = "127.0.0.1:30472".parse().unwrap();
+        let connections = Arc::new(RwLock::new(HashMap::new()));
+        let zombie = Arc::new(Connection::new(5, addr, ConnectionConfig::default()));
+        zombie.set_state(ConnectionState::Connected);
+        let fresh = Arc::new(Connection::new(9, addr, ConnectionConfig::default()));
+        fresh.set_state(ConnectionState::Connected);
+        connections.write().insert(5, zombie);
+        connections.write().insert(9, fresh);
+        let by_addr = Arc::new(RwLock::new(HashMap::from([(addr, 5)])));
+        let pending_confirms: Arc<Mutex<HashMap<u32, ClientLayerTrack>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        pending_confirms.lock().insert(5, ClientLayerTrack::default());
+        let client_layers = Arc::new(RwLock::new(HashMap::new()));
+        client_layers.write().insert(5, Default::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        let replaced = NetServer::claim_addr_and_evict_replaced_session(
+            &connections,
+            &by_addr,
+            &pending_confirms,
+            &client_layers,
+            &tx,
+            &dropped,
+            addr,
+            9,
+        );
+        assert_eq!(replaced, Some(5), "the address's previous claim was named");
+
+        let conns = connections.read();
+        assert!(!conns.contains_key(&5), "the replaced session left the map");
+        assert!(conns.contains_key(&9), "the claimant stays");
+        drop(conns);
+        assert_eq!(*by_addr.read().get(&addr).unwrap(), 9);
+        assert!(!client_layers.read().contains_key(&5));
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerEvent::ClientTimeout { connection_id: 5 })),
+            "the leftover's despawn rides the same event the sweep would raise"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one event, not a storm");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_connect_from_a_believed_dead_address_reaches_the_handshake() {
+        let f = fixture().await;
+        let addr_a: SocketAddr = "127.0.0.1:30471".parse().unwrap();
+        let mut counter = 1_u32;
+
+        // The first, honest handshake: Connect → Challenge → Confirm → admit.
+        f.handle(addr_a, &connect_bytes(&mut counter)).await;
+        let nonce = {
+            let pending = f.pending_challenges.read();
+            let challenge = pending.get(&addr_a).expect("the connect was challenged");
+            challenge.nonce
+        };
+        f.handle(addr_a, &confirm_bytes(nonce, &mut counter)).await;
+        assert!(f.connections.read().contains_key(&1), "the honest handshake admitted a connection");
+        assert_eq!(*f.by_addr.read().get(&addr_a).unwrap(), 1, "the address claimed");
+
+        // Phase one reports itself: exactly one ClientConnected, the game
+        // layer spawning quite an ordinary first join. Clearing it here makes
+        // the drain below read only what the №749 replacement produced.
+        // The first guard is scoped: a held lock must not ride the awaits
+        // between the two drains below.
+        {
+            let mut events = f.event_rx.lock().expect("the event lock is sane");
+            let first = events.try_recv().expect("the first admit reported the connect");
+            assert!(
+                matches!(first, ServerEvent::ClientConnected { connection_id: 1, .. }),
+                "the honest handshake's game event: {first:?}"
+            );
+            assert!(
+                events.try_recv().is_err(),
+                "an honest first handshake emits exactly one game event"
+            );
+        }
+
+        // №749: a FRESH Connect from the same address — the port was re-used
+        // and the old session is a zombie — takes the challenge flow instead
+        // of being swallowed into the dead session.
+        f.handle(addr_a, &connect_bytes(&mut counter)).await;
+        assert!(
+            f.pending_challenges.read().contains_key(&addr_a),
+            "a fresh Connect from a known address must be challenged again"
+        );
+
+        // The fresh listener answers; the zombie retires with real events
+        // (despawn rides the timeout), the newcomer's spawn rides Connected.
+        let new_nonce = {
+            let pending = f.pending_challenges.read();
+            pending.get(&addr_a).expect("the re-connect was challenged").nonce
+        };
+        assert_ne!(new_nonce, nonce, "the address's latest claim owns the nonce");
+        f.handle(addr_a, &confirm_bytes(new_nonce, &mut counter)).await;
+
+        let conns = f.connections.read();
+        assert!(
+            !conns.contains_key(&1),
+            "the replaced session was evicted, not left behind"
+        );
+        assert!(
+            conns.contains_key(&2),
+            "the replaced address runs the fresh session"
+        );
+        drop(conns);
+        assert_eq!(*f.by_addr.read().get(&addr_a).unwrap(), 2);
+        assert!(
+            !f.client_layers.read().contains_key(&1),
+            "the zombie's layer rows went with its session"
+        );
+        assert!(
+            !f.pending_challenges.read().contains_key(&addr_a),
+            "the consumed confirm leaves the table empty"
+        );
+        // Re-lock for the final №749 drain: the first guard was scoped above,
+        // so none of its lifetime rides the awaits between the two drains.
+        let mut events = f.event_rx.lock().expect("the event lock is sane");
+        let mut saw_timeout = false;
+        let mut saw_connected = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ServerEvent::ClientTimeout { connection_id: 1 } => saw_timeout = true,
+                ServerEvent::ClientConnected { connection_id: 2, .. } => saw_connected = true,
+                other => panic!("unexpected event on the re-handshake: {other:?}"),
+            }
+        }
+        assert!(saw_timeout, "the game layer learned the zombie is gone");
+        assert!(saw_connected, "the game layer learned the newcomer arrived");
+        assert_eq!(
+            f.session_rejects.load(Ordering::Relaxed),
+            0,
+            "an honest re-handshake must not surface as session rejects"
+        );
+        assert_eq!(
+            f.dropped.load(Ordering::Relaxed),
+            0,
+            "every history-critical event fit the queue"
+        );
+    }
+}
+
+#[cfg(test)]
+mod buffer_expansion_tests {
+    use super::*;
+
+    /// №755: the owner ordered every buffer expanded with the resident-RAM
+    /// headroom to boot. These pins keep the sizes from silently creeping
+    /// back down: a shrink here is a failed build, not a slow regression.
+    #[test]
+    fn the_expanded_buffer_budget_is_pinned() {
+        assert_eq!(ServerConfig::default().snapshot_history, 512);
+        assert_eq!(EVENT_QUEUE_LIMIT, 16384);
+        assert_eq!(OUTBOX_QUEUE_LIMIT, 32768);
+        assert_eq!(MAX_PENDING_CONFIRMS, 16);
     }
 }

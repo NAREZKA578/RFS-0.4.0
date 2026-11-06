@@ -76,7 +76,7 @@ impl Channel {
     pub fn new(config: ChannelConfig) -> Self {
         Self {
             config,
-            ledger: Mutex::new(VecDeque::new()),
+            ledger: Mutex::new(VecDeque::with_capacity(64)), // №755 prealloc
             stats: Mutex::new(ChannelStats::default()),
         }
     }

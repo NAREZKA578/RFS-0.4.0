@@ -31,7 +31,8 @@ use tracing::warn;
 /// The tail `audit` reads from and the ring keeps: recent actions, capped.
 /// A journal is an operational record, not an archive — the file carries
 /// the whole history, the ring only what a scan can see at a glance.
-pub const RING_CAP: usize = 512;
+/// №755: ×4 — the scan window grows with the volume the panel now sees.
+pub const RING_CAP: usize = 2048;
 
 /// One journaled action. `ts` is UTC wall time (`…T…Z`), `source` is the
 /// door (`"door"`) or the tick loop (`"loop"`), `command` is the command

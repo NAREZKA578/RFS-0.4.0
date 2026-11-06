@@ -21,8 +21,8 @@ impl Default for BandwidthTracker {
 impl BandwidthTracker {
     pub fn new() -> Self {
         Self {
-            sent_history: Mutex::new(VecDeque::new()),
-            received_history: Mutex::new(VecDeque::new()),
+            sent_history: Mutex::new(VecDeque::with_capacity(128)),
+            received_history: Mutex::new(VecDeque::with_capacity(128)),
             window: Duration::from_secs(1),
             sent_bytes: Mutex::new(0),
             received_bytes: Mutex::new(0),
@@ -39,8 +39,8 @@ impl BandwidthTracker {
             window
         };
         Self {
-            sent_history: Mutex::new(VecDeque::new()),
-            received_history: Mutex::new(VecDeque::new()),
+            sent_history: Mutex::new(VecDeque::with_capacity(128)),
+            received_history: Mutex::new(VecDeque::with_capacity(128)),
             window,
             sent_bytes: Mutex::new(0),
             received_bytes: Mutex::new(0),

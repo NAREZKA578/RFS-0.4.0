@@ -300,7 +300,7 @@ impl Connection {
             remote_sequence: Mutex::new(0),
             remote_ack: Mutex::new(0),
             remote_ack_bitfield: Mutex::new(0),
-            pending_acks: Mutex::new(VecDeque::new()),
+            pending_acks: Mutex::new(VecDeque::with_capacity(64)), // №755 prealloc
             pending_ack_drops: AtomicU64::new(0),
             first_pending_ack_drop: Mutex::new(None),
             last_received: Mutex::new(Instant::now()),
@@ -546,6 +546,31 @@ impl Connection {
             Some(PacketType::Command) => Vec::new(),
             Some(PacketType::EventAck) => Vec::new(),
             Some(PacketType::Rpc) => Vec::new(),
+            Some(PacketType::LayerSync) => {
+                // Bug №753: the applied-layer report is normal, server-handled
+                // traffic — the №216 session gate has already checked its echo
+                // and `NetServer` applies the report in its own dispatch
+                // (№30 (B)). Like Input/EventAck above, the session level owes
+                // it no reply and no noise. The old catch-all shouted "Unhandled
+                // packet type" per report: ~10 reports a second per connected
+                // client (№30 (B) reports every ~100 ms), so a single second of
+                // the shutdown flood carried ~1000 warn lines — a storm that
+                // teaches the log reader to ignore WARN entirely (the same
+                // lesson №272 already fixed for Disconnect on the normal exit
+                // path).
+                Vec::new()
+            }
+            Some(PacketType::ResyncRequest) => {
+                // Bug №754: the same lesson the same surface taught twice.
+                // A resync request is honest client traffic applied by
+                // NetServer's own dispatch (№267 (A): apply_resync_request →
+                // request_resync arms the next snapshot pass) — like the
+                // LayerSync report above, the session level owes it no reply
+                // and no per-request warn. The old catch-all produced a WARN
+                // for every legitimate request: 5 per 3-wave stress run with
+                // two sunk ships, more whenever layers actually drift.
+                Vec::new()
+            }
             Some(PacketType::Disconnect) => {
                 // Bug №272: handled one level up, in
                 // `NetServer::handle_received_packet`, which removes the
@@ -1940,4 +1965,153 @@ pub enum ConnectionError {
     Timeout,
     #[error("Connection closed")]
     Closed,
+}
+
+#[cfg(test)]
+mod quiet_client_traffic_tests {
+    //! Bugs №753 + №754: server-handled client traffic must not warn at the
+    //! session level. LayerSync (№30 (B)) arrives in `handle_packet` on every
+    //! client's layer-report beat while the session lives and the OLD catch-all
+    //! warned "Unhandled packet type" per report — ~10 warns a second per
+    //! client (№30 (B) reports every ~100 ms), ~1000 a second in the
+    //! bot-shutdown flood window. ResyncRequest
+    //! (№267 (A)) warned likewise for every legitimate request. Both are
+    //! normal traffic NetServer applies in its own dispatch, so the session
+    //! surface must stay silent on both. Machine-checkable through a capture
+    //! subscriber: a WARN on an ordinary report/request is the defect.
+
+    use super::*;
+    use std::sync::Arc;
+
+    /// A subscriber that only remembers events' composed messages.
+    struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl WarnCapture {
+        fn new() -> (Self, Arc<parking_lot::Mutex<Vec<String>>>) {
+            let store: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+            (Self(store.clone()), store)
+        }
+    }
+
+    struct MessageOf<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageOf<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0.push_str(value);
+            }
+        }
+
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = event.metadata().level().to_string();
+            event.record(&mut MessageOf(&mut message));
+            self.0.lock().push(message);
+        }
+
+        fn enter(&self, _span: &tracing::Id) {}
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    /// The wire body of an ordinary applied-layer report, as №30 (B) frames
+    /// it: four layer clocks and the session echo.
+    fn sync_report_payload() -> Vec<u8> {
+        rfs_core::packet::encode(&LayerSyncPacket {
+            applied: [12, 34, 56, 78],
+            session: 42,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_ordinary_layer_sync_report_warns_nothing_and_replies_nothing() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let conn = Connection::new(7, addr, ConnectionConfig::default());
+        // The echo rides every gated packet (№216); handle_packet itself does
+        // not verify it — that is the gate's job one level up.
+        let header = PacketHeader::new(
+            PacketType::LayerSync,
+            ChannelType::UnreliableSequenced,
+            1,
+            0,
+            0,
+            42,
+        );
+        let (capture, seen) = WarnCapture::new();
+        let outgoing = tracing::subscriber::with_default(capture, || {
+            conn.handle_packet(header, &sync_report_payload())
+                .expect("an ordinary report is not an error")
+        });
+
+        assert!(
+            outgoing.outgoing.is_empty(),
+            "a server-handled report owes the session level no reply packets"
+        );
+        let warned = seen.lock();
+        assert!(
+            warned.is_empty(),
+            "no WARN may attach to an ordinary LayerSync report: {warned:?}"
+        );
+    }
+
+    /// The wire body of an ordinary resync request (№267 (A)): the layer the
+    /// client wants healed in full. Ungated (№216 lists its set explicitly),
+    /// applied by NetServer's own dispatch.
+    fn resync_request_payload() -> Vec<u8> {
+        rfs_core::packet::encode(&ResyncRequestPacket { layer: 2 }).unwrap()
+    }
+
+    #[test]
+    fn an_ordinary_resync_request_warns_nothing_and_replies_nothing() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let conn = Connection::new(7, addr, ConnectionConfig::default());
+        // As №753 frames it for the report type: the session echo is the
+        // gate's business one level up; handle_packet itself does not verify it.
+        let header = PacketHeader::new(
+            PacketType::ResyncRequest,
+            ChannelType::UnreliableSequenced,
+            1,
+            0,
+            0,
+            0,
+        );
+        let (capture, seen) = WarnCapture::new();
+        let outgoing = tracing::subscriber::with_default(capture, || {
+            conn.handle_packet(header, &resync_request_payload())
+                .expect("an ordinary request is not an error")
+        });
+
+        assert!(
+            outgoing.outgoing.is_empty(),
+            "a server-handled request owes the session level no reply packets"
+        );
+        let warned = seen.lock();
+        assert!(
+            warned.is_empty(),
+            "no WARN may attach to an ordinary ResyncRequest: {warned:?}"
+        );
+    }
 }

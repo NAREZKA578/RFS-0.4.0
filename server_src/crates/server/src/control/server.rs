@@ -61,9 +61,10 @@ pub enum ControlOrder {
 
 /// How many orders may wait between ticks. The door pushes at most
 /// `commands_per_second` per connection, the loop drains once per tick —
-/// 64 is seconds of headroom at the plan's caps, and a full one means the
-/// loop has not ticked for that long, which is the operator's real story.
-pub const QUEUE_CAP: usize = 64;
+/// a full one means the loop has not ticked for that long, which is the
+/// operator's real story. №755: 256 — seconds of storm headroom and a
+/// margin over the old 64 without changing the drain loop.
+pub const QUEUE_CAP: usize = 256;
 
 impl ControlOrder {
     /// The journal's `command` field for whatever the loop does with this
@@ -1473,5 +1474,16 @@ mod door_tests {
         assert_eq!(settings.commands_per_second, config.commands_per_second);
         assert_eq!(settings.max_bad_tokens, config.max_bad_tokens);
         assert_eq!(settings.bad_token_cooldown_s, config.bad_token_cooldown_s);
+    }
+}
+
+#[cfg(test)]
+mod buffer_expansion_tests {
+    /// №755: the control-plane queues expanded with the rest of the order.
+    #[test]
+    fn the_control_buffer_budget_is_pinned() {
+        assert_eq!(super::QUEUE_CAP, 256);
+        assert_eq!(crate::control::ring::SUBSCRIBER_QUEUE, 4096);
+        assert_eq!(crate::control::journal::RING_CAP, 2048);
     }
 }

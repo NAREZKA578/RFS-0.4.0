@@ -26,8 +26,9 @@ pub const DEFAULT_RING_CAP: usize = 5000;
 /// may fall before the server stops queueing for it. Dropping a subscriber
 /// is the only behaviour that keeps a command storm from filling memory; a
 /// lagging reader is told so and keeps going (the `watch` forwarder turns the
-/// error into a `lagged` event line, not a silent gap).
-pub const SUBSCRIBER_QUEUE: usize = 1024;
+/// error into a `lagged` event line, not a silent gap). №755: ×4 (owner
+/// order 2026-11-06).
+pub const SUBSCRIBER_QUEUE: usize = 4096;
 
 /// One journal line as the panel sees it: the bare level and the formatted
 /// fields. No timestamp — every copy of the ring would disagree with the file
@@ -82,7 +83,7 @@ impl LogRing {
         let (tx, _) = broadcast::channel(SUBSCRIBER_QUEUE);
         Self {
             shared: Arc::new(Shared {
-                buf: Mutex::new(VecDeque::with_capacity(cap.min(64))),
+                buf: Mutex::new(VecDeque::with_capacity(cap)), // №755 resident
                 tx,
                 cap,
             }),
