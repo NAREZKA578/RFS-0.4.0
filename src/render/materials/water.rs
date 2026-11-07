@@ -112,7 +112,10 @@ impl WaterMaterial {
     /// Set clarity
     pub fn set_clarity(&mut self, clarity: f32) {
         self.clarity = clarity.clamp(0.0, 1.0);
-        self.base.set_float("water_clarity", clarity);
+        // Bug №117: the raw argument went into the uniform while the struct
+        // kept the clamped one — the shader saw a clarity the struct never
+        // agreed to. Send the same value that is stored.
+        self.base.set_float("water_clarity", self.clarity);
     }
 
     /// Set wave speed
@@ -348,5 +351,34 @@ impl WaterMaterial {
         material.set_wave_scale(0.2);
         material.set_wave_height(0.05);
         material
+    }
+}
+
+#[cfg(test)]
+mod bug_117 {
+    use super::*;
+
+    // Bug №117: set_clarity sent the raw argument to the uniform while the
+    // struct kept the clamped value.
+    #[test]
+    fn set_clarity_sends_the_clamped_value_to_the_uniform() {
+        let mut water = WaterMaterial::new("probe_water");
+
+        water.set_clarity(2.5);
+        assert_eq!(water.clarity, 1.0);
+        assert_eq!(
+            water.base.parameters.floats.get("water_clarity"),
+            Some(&1.0),
+            "the uniform must carry the clamped value, not the raw one"
+        );
+
+        water.set_clarity(-0.7);
+        assert_eq!(water.clarity, 0.0);
+        assert_eq!(water.base.parameters.floats.get("water_clarity"), Some(&0.0));
+
+        // A value inside the range is passed through unchanged.
+        water.set_clarity(0.4);
+        assert_eq!(water.clarity, 0.4);
+        assert_eq!(water.base.parameters.floats.get("water_clarity"), Some(&0.4));
     }
 }

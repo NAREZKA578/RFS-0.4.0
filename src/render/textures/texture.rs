@@ -98,8 +98,12 @@ impl From<TextureUsage> for RhiTextureUsage {
             | TextureUsage::AmbientOcclusion
             | TextureUsage::Emissive
             | TextureUsage::Height
-            | TextureUsage::Sampled
-            | TextureUsage::Storage => RhiTextureUsage::SAMPLED,
+            | TextureUsage::Sampled => RhiTextureUsage::SAMPLED,
+            // Bug №116: Storage mapped to SAMPLED only, so the STORAGE bit was
+            // silently gone — a compute pass that binds the texture to write
+            // (SSAO, SSR) received an image without the usage it was promised,
+            // and the binding fails validation at best.
+            TextureUsage::Storage => RhiTextureUsage::SAMPLED | RhiTextureUsage::STORAGE,
             TextureUsage::Depth | TextureUsage::Stencil => {
                 RhiTextureUsage::DEPTH_STENCIL_ATTACHMENT | RhiTextureUsage::SAMPLED
             }
@@ -506,5 +510,27 @@ impl TextureBuilder {
             self.usage,
             device,
         )?)
+    }
+}
+
+#[cfg(test)]
+mod bug_116 {
+    use super::*;
+
+    // Bug №116: Storage mapped to SAMPLED and dropped the STORAGE bit.
+    #[test]
+    fn storage_usage_keeps_the_storage_bit() {
+        let usage = RhiTextureUsage::from(TextureUsage::Storage);
+        assert!(usage.contains(RhiTextureUsage::STORAGE));
+        assert!(usage.contains(RhiTextureUsage::SAMPLED));
+    }
+
+    #[test]
+    fn other_usages_are_unchanged() {
+        assert_eq!(RhiTextureUsage::from(TextureUsage::Diffuse), RhiTextureUsage::SAMPLED);
+        assert!(RhiTextureUsage::from(TextureUsage::Depth)
+            .contains(RhiTextureUsage::DEPTH_STENCIL_ATTACHMENT));
+        assert!(RhiTextureUsage::from(TextureUsage::RenderTarget)
+            .contains(RhiTextureUsage::COLOR_ATTACHMENT));
     }
 }

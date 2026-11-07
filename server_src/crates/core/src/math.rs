@@ -321,6 +321,16 @@ impl Transform {
     }
 
     pub fn inverse(&self) -> Self {
+        // A zero or non-finite scale component has no inverse — dividing by it
+        // fabricates inf/NaN and silently corrupts the transform. Guard at the
+        // door: a non-invertible transform falls back to IDENTITY, the same way
+        // Quatf::normalize returns IDENTITY for a degenerate quaternion.
+        if !self.scale.x.is_finite() || self.scale.x == 0.0
+            || !self.scale.y.is_finite() || self.scale.y == 0.0
+            || !self.scale.z.is_finite() || self.scale.z == 0.0
+        {
+            return Transform::IDENTITY;
+        }
         let inv_rot = self.rotation.inverse();
         let inv_scale = Vec3f::new(1.0 / self.scale.x, 1.0 / self.scale.y, 1.0 / self.scale.z);
         let inv_pos = inv_rot.mul_vec3(-self.position * inv_scale);
@@ -465,7 +475,7 @@ impl Bounds {
 }
 #[cfg(test)]
 mod tests {
-    use super::{Bounds, Vec3f};
+    use super::{Bounds, Quatf, Transform, Vec3f};
 
     /// Bug №199: a box whose corners arrive swapped used to stay that way, and
     /// `size()` then reported a negative extent.
@@ -704,5 +714,37 @@ mod tests {
             (n.x - 0.6).abs() < 1e-6 && (n.y - 0.8).abs() < 1e-6,
             "got {n:?}"
         );
+    }
+
+    /// Inverting a transform with a zero scale component must not fabricate
+    /// inf/NaN — it falls back to IDENTITY instead.
+    #[test]
+    fn inverse_with_zero_scale_returns_identity() {
+        let t = Transform::new(
+            Vec3f::new(1.0, 2.0, 3.0),
+            Quatf::IDENTITY,
+            Vec3f::new(0.0, 1.0, 1.0),
+        );
+        assert_eq!(t.inverse(), Transform::IDENTITY);
+
+        let t = Transform::new(
+            Vec3f::new(1.0, 2.0, 3.0),
+            Quatf::IDENTITY,
+            Vec3f::new(1.0, f32::INFINITY, 1.0),
+        );
+        assert_eq!(t.inverse(), Transform::IDENTITY);
+    }
+
+    /// Inverting a well-formed transform is still exact.
+    #[test]
+    fn inverse_of_well_formed_transform_is_exact() {
+        let t = Transform::new(
+            Vec3f::new(1.0, 2.0, 3.0),
+            Quatf::IDENTITY,
+            Vec3f::new(2.0, 2.0, 2.0),
+        );
+        let inv = t.inverse();
+        assert_eq!(inv.scale, Vec3f::new(0.5, 0.5, 0.5));
+        assert_eq!(inv.position, Vec3f::new(-0.5, -1.0, -1.5));
     }
 }

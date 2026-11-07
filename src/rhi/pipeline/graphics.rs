@@ -4,6 +4,7 @@
 
 use crate::resource::sampler::CompareOp;
 use crate::shader::ShaderModule;
+pub use crate::types::ColorComponentFlags;
 use crate::types::*;
 
 /// Vertex attribute
@@ -178,10 +179,14 @@ pub fn mip_level_size(format: Format, width: u32, height: u32, depth: u32) -> u6
 /// Primitive topology
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PrimitiveTopology {
-    #[default]
     PointList,
     LineList,
     LineStrip,
+    /// Bug №230: the `#[default]` used to sit on `PointList` — a forgotten
+    /// `topology` in a pipeline description silently drew the whole scene as
+    /// scattered points with no diagnostics at all. The meaningful default for
+    /// this layer is the one real renderers expect: triangles.
+    #[default]
     TriangleList,
     TriangleStrip,
     TriangleFan,
@@ -409,6 +414,20 @@ pub struct ColorBlendAttachment {
     pub color_write_mask: ColorComponentFlags,
 }
 
+impl ColorBlendAttachment {
+    /// Opaque write-through attachment: no blending, all four channels written.
+    pub fn no_blend() -> Self {
+        Self {
+            blend_enable: false,
+            color_write_mask: ColorComponentFlags::R
+                | ColorComponentFlags::G
+                | ColorComponentFlags::B
+                | ColorComponentFlags::A,
+            ..Default::default()
+        }
+    }
+}
+
 /// Logic operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum LogicOp {
@@ -442,8 +461,19 @@ pub struct ColorBlendState {
 
 impl ColorBlendState {
     /// Constructor for an opaque (disabled) blend state.
-    pub fn disabled() -> Self {
-        Self::default()
+    ///
+    /// Bug №231: this used to return `Self::default()` — an *empty* attachment
+    /// list. Fed to a pipeline drawing into colour attachments, that became
+    /// `attachmentCount = 0` in the blend info, which is invalid: the count has
+    /// to match the render pass. The count is only known where the pass is
+    /// known, so the constructor takes it; `ColorBlendState::disabled()` with
+    /// no arguments no longer compiles instead of silently producing an
+    /// invalid state.
+    pub fn disabled(attachment_count: usize) -> Self {
+        Self {
+            attachments: vec![ColorBlendAttachment::no_blend(); attachment_count],
+            ..Default::default()
+        }
     }
 
     /// Constructor for standard alpha blending.
@@ -629,3 +659,36 @@ pub type BlendDesc = ColorBlendState;
 
 /// Render-layer alias for `ColorBlendAttachment`.
 pub type ColorTargetDesc = ColorBlendAttachment;
+
+#[cfg(test)]
+mod bug_230_231 {
+    use super::*;
+
+    // Bug №230: the #[default] used to sit on PointList, so a pipeline
+    // without an explicit topology silently rendered as scattered points.
+    #[test]
+    fn default_topology_is_triangle_list() {
+        assert_eq!(PrimitiveTopology::default(), PrimitiveTopology::TriangleList);
+    }
+
+    // Bug №231: disabled() used to return an empty attachment list —
+    // attachmentCount = 0 versus the render pass.
+    #[test]
+    fn disabled_fills_every_attachment_with_no_blend() {
+        let state = ColorBlendState::disabled(3);
+        assert_eq!(state.attachments.len(), 3);
+        let full_mask = ColorComponentFlags::R
+            | ColorComponentFlags::G
+            | ColorComponentFlags::B
+            | ColorComponentFlags::A;
+        for attachment in &state.attachments {
+            assert!(!attachment.blend_enable);
+            assert_eq!(attachment.color_write_mask, full_mask);
+        }
+    }
+
+    #[test]
+    fn disabled_zero_keeps_zero_attachments() {
+        assert!(ColorBlendState::disabled(0).attachments.is_empty());
+    }
+}

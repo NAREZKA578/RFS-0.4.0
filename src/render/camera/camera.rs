@@ -2,9 +2,49 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat3, Mat4, Quat, Vec3};
 use std::any::Any;
 use std::fmt::Debug;
+
+/// The rotation that looks from `position` to `target`, with the caller's
+/// `up` fixing the roll.
+///
+/// Bug №212: both cameras used to compute the orthogonalised `up` and then
+/// throw it away (`let _ = up_safe;`, `_up`), so the roll was always the
+/// minimal turn from +Z and a camera facing straight down produced the same
+/// picture whatever up the caller asked for. The basis here is the real
+/// orthonormal triad: local +Z along `forward`, local +Y along the caller's
+/// up projected onto the plane orthogonal to the look direction, local +X
+/// completing the right-handed set (`up × forward`). Degenerate directions
+/// fall back instead of producing NaN.
+fn look_rotation(position: Vec3, target: Vec3, up: Vec3) -> Quat {
+    let dir = target - position;
+    let forward = if !dir.is_finite() || dir.length_squared() < 1e-12 {
+        Vec3::NEG_Z
+    } else {
+        dir.normalize()
+    };
+    let up_n = if !up.is_finite() || up.length_squared() < 1e-12 {
+        Vec3::Y
+    } else {
+        up.normalize()
+    };
+    let up_picked = if forward.cross(up_n).length_squared() < 1e-12 {
+        // `up` is (anti)parallel to the look direction: any axis not parallel
+        // to it fixes the roll instead.
+        if forward.y.abs() < 0.99 {
+            Vec3::Y
+        } else {
+            Vec3::X
+        }
+    } else {
+        up_n
+    };
+    // Gram–Schmidt: the caller's up projected onto the plane ⊥ forward.
+    let true_up = (up_picked - forward * up_picked.dot(forward)).normalize();
+    let right = true_up.cross(forward);
+    Quat::from_mat3(&Mat3::from_cols(right, true_up, forward))
+}
 
 /// Camera trait
 pub trait Camera: Send + Sync + Debug {
@@ -101,29 +141,8 @@ impl PerspectiveCamera {
         near: f32,
         far: f32,
     ) -> Self {
-        let dir = target - position;
-        let forward = if dir.length_squared() < 1e-12 {
-            Vec3::NEG_Z
-        } else {
-            dir.normalize()
-        };
-        let up_n = if up.length_squared() < 1e-12 {
-            Vec3::Y
-        } else {
-            up.normalize()
-        };
-        let up_safe = if forward.cross(up_n).length_squared() < 1e-12 {
-            if forward.y.abs() < 0.99 {
-                Vec3::Y
-            } else {
-                Vec3::X
-            }
-        } else {
-            up_n
-        };
-        let rotation = Quat::from_rotation_arc(Vec3::Z, forward);
-        let rotation = Quat::from_rotation_arc(Vec3::Y, up_safe) * rotation;
-        Self::new(position, fov, aspect_ratio, near, far).with_rotation(rotation)
+        Self::new(position, fov, aspect_ratio, near, far)
+            .with_rotation(look_rotation(position, target, up))
     }
 
     pub fn with_position(mut self, position: Vec3) -> Self {
@@ -287,12 +306,10 @@ impl OrthographicCamera {
         }
     }
 
-    pub fn look_at(position: Vec3, target: Vec3, _up: Vec3, size: f32, near: f32, far: f32) -> Self {
-        let forward = (target - position).normalize();
-        let rotation = Quat::from_rotation_arc(Vec3::Z, forward);
+    pub fn look_at(position: Vec3, target: Vec3, up: Vec3, size: f32, near: f32, far: f32) -> Self {
         Self::new(-size, size, -size, size, near, far)
             .with_position(position)
-            .with_rotation(rotation)
+            .with_rotation(look_rotation(position, target, up))
     }
 
     pub fn with_position(mut self, position: Vec3) -> Self {
@@ -524,5 +541,95 @@ impl CameraBuilder {
                 .with_rotation(self.rotation),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod bug_212 {
+    use super::*;
+
+    // Bug №212: the caller's up used to be computed and thrown away
+    // (`let _ = up_safe;` / `_up`), so the roll never followed it.
+
+    #[test]
+    fn look_at_rolls_with_the_callers_up() {
+        // Facing straight down (forward = -Y) with up = +X: the camera's
+        // local up must point along +X, not fall back to the world's Y.
+        let cam = PerspectiveCamera::look_at(
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::ZERO,
+            Vec3::X,
+            1.0,
+            1.0,
+            0.1,
+            100.0,
+        );
+        assert!((cam.forward() - Vec3::NEG_Y).length() < 1e-4);
+        assert!((cam.up() - Vec3::X).length() < 1e-3);
+    }
+
+    #[test]
+    fn look_at_horizon_look_keeps_the_worlds_y_up() {
+        let cam = PerspectiveCamera::look_at(
+            Vec3::new(0.0, 0.0, 5.0),
+            Vec3::ZERO,
+            Vec3::Y,
+            1.0,
+            1.0,
+            0.1,
+            100.0,
+        );
+        assert!((cam.forward() - Vec3::NEG_Z).length() < 1e-4);
+        assert!((cam.up() - Vec3::Y).length() < 1e-3);
+    }
+
+    #[test]
+    fn look_at_up_parallel_to_forward_degrades_to_a_pickable_axis() {
+        // Looking straight down with up = Y — the degenerate case. The roll
+        // axis falls back (X here), but stays finite and orthogonal, and
+        // forward is exact.
+        let cam = PerspectiveCamera::look_at(
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::ZERO,
+            Vec3::Y,
+            1.0,
+            1.0,
+            0.1,
+            100.0,
+        );
+        assert!((cam.forward() - Vec3::NEG_Y).length() < 1e-4);
+        let up = cam.up();
+        assert!(up.is_finite() && (up.length() - 1.0).abs() < 1e-3);
+        assert!(up.cross(cam.forward()).length() > 0.99);
+    }
+
+    #[test]
+    fn ortho_look_at_honours_the_callers_up_too() {
+        let cam = OrthographicCamera::look_at(
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::ZERO,
+            Vec3::X,
+            10.0,
+            0.1,
+            100.0,
+        );
+        assert!((cam.forward() - Vec3::NEG_Y).length() < 1e-4);
+        assert!((cam.up() - Vec3::X).length() < 1e-3);
+    }
+
+    #[test]
+    fn look_at_degenerate_directions_do_not_produce_nan() {
+        let cam = PerspectiveCamera::look_at(
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::Y,
+            1.0,
+            1.0,
+            0.1,
+            100.0,
+        );
+        assert!(cam.position.is_finite());
+        assert!(cam.forward().is_finite() && cam.up().is_finite());
+        assert!((cam.forward().length() - 1.0).abs() < 1e-3);
     }
 }

@@ -39,8 +39,9 @@ struct TokenFile {
 fn usage() -> String {
     "usage: ctl <command> [--config <path>] [--port <n>] [--token-file <path>] \
      [--follow] [--interval <ms>]\n\
-     reads:   status perf net players config log watch\n\
-     writes:  say <text> | kick <connection-id> [reason…] | stop [delay-seconds] | reload\n\
+     reads:   status perf net players config log watch banlist\n\
+     writes:  say <text> | kick <connection-id> [reason…] | stop [delay-seconds] | reload | ban <target> [reason…] | unban <target>\n\
+     match:   end_match | start_match | restart_match\n\
      journal: audit [tail]"
         .to_string()
 }
@@ -178,8 +179,9 @@ fn print_answer(command: &str, answer: &Inbound) {
             "status" => {
                 let num = |key: &str| data.get(key).map(pretty_number).unwrap_or_else(|| "-".to_string());
                 println!(
-                    "state={} match={} addr={} tick={} tick_rate={} players={} ships={} uptime={}s connections={}",
+                    "state={} match_state={} match={} addr={} tick={} tick_rate={} players={} ships={} uptime={}s connections={}",
                     data.get("state").and_then(Value::as_str).unwrap_or("-"),
+                    data.get("match_state").and_then(Value::as_str).unwrap_or("-"),
                     data.get("match_id").and_then(Value::as_str).unwrap_or("-"),
                     data.get("addr").and_then(Value::as_str).unwrap_or("-"),
                     num("tick"),
@@ -302,6 +304,30 @@ fn print_answer(command: &str, answer: &Inbound) {
                 if let Some(note) = data.get("note").and_then(Value::as_str) {
                     println!("  note: {note}");
                 }
+            }
+            "ban" | "unban" => {
+                println!(
+                    "{command} queued target={}",
+                    data.get("target").and_then(Value::as_str).unwrap_or("-")
+                );
+            }
+            "banlist" => {
+                let returned = data.get("returned").and_then(Value::as_u64).unwrap_or(0);
+                println!("banlist returned={returned}");
+                if let Some(list) = data.get("banned").and_then(Value::as_array) {
+                    for entry in list {
+                        println!(
+                            "  {} banned_by={} at {}: {}",
+                            entry.get("target").and_then(Value::as_str).unwrap_or("-"),
+                            entry.get("banned_by").and_then(Value::as_str).unwrap_or("-"),
+                            entry.get("banned_at").and_then(Value::as_str).unwrap_or("-"),
+                            entry.get("reason").and_then(Value::as_str).unwrap_or(""),
+                        );
+                    }
+                }
+            }
+            "end_match" | "start_match" | "restart_match" => {
+                println!("{command} queued");
             }
             "audit" => {
                 for action in data
@@ -437,6 +463,33 @@ fn build_command_args(command: &str, positional: &[String]) -> Result<Option<Val
                 Ok(Some(json!({ "tail": tail })))
             }
         },
+        "ban" => {
+            if positional.is_empty() {
+                bail!("ban needs the target first — {}", usage());
+            }
+            let target = positional[0].clone();
+            let reason = positional[1..].join(" ");
+            Ok(Some(json!({ "target": target, "reason": reason })))
+        }
+        "unban" => {
+            if positional.is_empty() {
+                bail!("unban needs the target first — {}", usage());
+            }
+            let target = positional[0].clone();
+            Ok(Some(json!({ "target": target })))
+        }
+        "banlist" => match positional.first() {
+            None => Ok(None),
+            Some(raw) => {
+                let tail: u64 = raw.parse().map_err(|_| {
+                    anyhow::anyhow!("banlist's positional must be the tail length (a number) — {}", usage())
+                })?;
+                Ok(Some(json!({ "tail": tail })))
+            }
+        },
+        "end_match" => Ok(None),
+        "start_match" => Ok(None),
+        "restart_match" => Ok(None),
         _ => Ok(None),
     }
 }
@@ -479,7 +532,7 @@ async fn main() -> Result<()> {
     let command = command.0.as_str();
     // The stage-2 writes say what they are about on the same line; the
     // reads stay flag-driven (stage 1 shaped them that way).
-    if !matches!(command, "status" | "perf" | "net" | "players" | "config" | "log" | "watch") {
+    if !matches!(command, "status" | "perf" | "net" | "players" | "config" | "log" | "watch" | "banlist") {
         if arg_value(&args, "--interval").is_some() {
             bail!("`{command}` says something once; --interval is for the polling reads — {}", usage());
         }

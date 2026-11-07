@@ -85,7 +85,7 @@ struct BotReport {
     /// Last tick applied per layer. Both drop counters are zero, so the gap is
     /// about which layers carry data, not about loss. This makes that visible.
     layers: [u64; LAYER_COUNT],
-    /// Bug №274: deltas APPLIED, counted at the apply site.
+    /// Bug №175: deltas APPLIED, counted at the apply site.
     ///
     /// This is the honest delivery figure, and it is reported next to
     /// `state_updates` precisely because the two disagree. `state_updates`
@@ -96,7 +96,7 @@ struct BotReport {
     /// "throughput" when it is really "consumption rate" is what produced the
     /// false conclusions about the 200-bot wall.
     applied_deltas: u64,
-    /// Bug №274: the same, per layer, so a slow layer is distinguishable from a
+    /// Bug №175: the same, per layer, so a slow layer is distinguishable from a
     /// slow consumer.
     applied_deltas_by_layer: Vec<u64>,
 }
@@ -123,7 +123,7 @@ impl BotReport {
     }
 }
 
-/// Bug №274: what the bot learned about the world from one snapshot.
+/// Bug №175: what the bot learned about the world from one snapshot.
 ///
 /// A bot that only sends symmetric input leaves the world unchanged: ships
 /// barely move, so layer 0 emits a delta every 2 ticks at best, and layer 2 —
@@ -273,7 +273,7 @@ async fn run_bot(
         stale_deltas: 0,
         stalls_by_layer: vec![0; LAYER_COUNT],
         layers: [0; LAYER_COUNT],
-        // Bug №274: read from the client at report time.
+        // Bug №175: read from the client at report time.
         applied_deltas: 0,
         applied_deltas_by_layer: vec![0; LAYER_COUNT],
     };
@@ -307,7 +307,7 @@ async fn run_bot(
     let mut tick: u32 = 0;
     let mut last_server_tick: u64 = u64::MAX;
     let mut live_entities: HashSet<rfs_core::entity::EntityId> = HashSet::new();
-    // Bug №274: load realism. See `scan_world` for why a bot that only sends
+    // Bug №175: load realism. See `scan_world` for why a bot that only sends
     // symmetric input measures an idle world.
     let mut world = WorldView::default();
     let mut entered_gun = false;
@@ -357,7 +357,7 @@ async fn run_bot(
                     live_entities.clear();
                     live_entities.extend(snapshot.entities.iter().map(|e| e.entity_id));
                     live_entities.extend(snapshot.projectiles.iter().map(|p| p.entity_id));
-                    // Bug №274: re-scan on every state. The world changes as
+                    // Bug №175: re-scan on every state. The world changes as
                     // ships move and guns get occupied, and the bot needs the
                     // current gun and a current target to be worth anything.
                     world = scan_world(&snapshot, client.connection_id());
@@ -419,7 +419,7 @@ async fn run_bot(
                 // Per-bot phase offset so inputs differ across the fleet.
                 let phase = (tick as f32) * 0.05 + id as f32 * 0.7;
 
-                // Bug №274: asymmetric throttle. `phase.sin() * 0.6` averaged to
+                // Bug №175: asymmetric throttle. `phase.sin() * 0.6` averaged to
                 // zero, so ships barely moved — and a ship that does not move
                 // produces almost no deltas: layer 0 is on a 2-tick interval and
                 // layer 2 rides the ship, so both went nearly silent. Measured:
@@ -447,7 +447,7 @@ async fn run_bot(
                 report.sent += 1;
                 tick = tick.wrapping_add(1);
 
-                // Bug №274: occupy the gun once we know which one it is.
+                // Bug №175: occupy the gun once we know which one it is.
                 // Firing requires occupation — the server rejects a shot from a
                 // non-occupant — so this has to land before the first round.
                 if !entered_gun {
@@ -465,7 +465,7 @@ async fn run_bot(
                     }
                 }
 
-                // Bug №274: fire at an enemy ship. This is what loads layer 3
+                // Bug №175: fire at an enemy ship. This is what loads layer 3
                 // (projectiles), ballistics, collision and damage — the whole
                 // combat path. A gun firing into empty water exercises none of
                 // it. `FireWeapon` also slews the turret to the target, so the
@@ -549,7 +549,7 @@ fn finish(client: NetClient, mut report: BotReport, live: usize) -> BotReport {
     report.resync_requests = client.resync_requests_sent();
     report.stalls_by_layer = client.base_mismatch_drops_by_layer();
     report.layers = client.applied_layer_ticks();
-    // Bug №274: the honest delivery figure, read alongside `state_updates`.
+    // Bug №175: the honest delivery figure, read alongside `state_updates`.
     // If the two disagree sharply, the gap is coalescing in the state slot,
     // not loss on the wire.
     report.applied_deltas = client.applied_delta_count();
@@ -775,7 +775,7 @@ async fn main() -> Result<()> {
         "stress applied: state_updates_total={updates} state_updates_hz_aggregate={update_hz:.2}",
     );
 
-    // Bug №274: the same figure measured where the deltas are actually applied,
+    // Bug №175: the same figure measured where the deltas are actually applied,
     // next to the coalesced one above.
     //
     // `state_updates` counts reads of a single overwrite slot, so when several
@@ -801,7 +801,7 @@ async fn main() -> Result<()> {
     info!(
         "stress delivery: applied_deltas_total={applied_deltas} applied_deltas_hz={applied_deltas_hz:.2} \
          by_layer={applied_by_layer:?} (state_updates_hz={update_hz:.2} is a COALESCED consumption \
-         rate, not delivery — see bug №274)",
+         rate, not delivery — see bug №175)",
     );
     // Name the discrepancy rather than leaving two numbers side by side.
     if applied_deltas > 0 && (updates as f64) < applied_deltas as f64 * 0.8 {

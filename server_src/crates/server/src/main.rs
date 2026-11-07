@@ -36,6 +36,7 @@ use rfs_server::control::journal::ActionJournal;
 use rfs_server::control::server::{
     ControlDoor, ControlOrder, ControlSettings, ControlEnv, EventHub, QUEUE_CAP,
 };
+use rfs_server::control::banlist::BanList;
 use rfs_server::control::status::{
     EntitiesStatus, NetStatus, PerfStatus, PlayerStatus, ServerStatus, StatusHandle,
 };
@@ -101,6 +102,25 @@ fn resolve_action_log_path(
         .clone()
         .filter(|file| !file.trim().is_empty())
         .unwrap_or_else(|| "control_actions.jsonl".to_string());
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// The ban list's path (stage 3): `control.ban_file` names it, the default
+/// sits next to the config — same shape as token and journal, all three
+/// operator files together.
+fn resolve_ban_path(
+    config_path: &std::path::Path,
+    control: &rfs_server::config::ControlConfig,
+) -> PathBuf {
+    let name = control
+        .ban_file
+        .clone()
+        .filter(|file| !file.trim().is_empty())
+        .unwrap_or_else(|| "control_bans.json".to_string());
     config_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -382,6 +402,20 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // The ban list (stage 3): loaded once, shared with the control door and
+    // checked when every player connects. Even when the door is disabled the
+    // list still exists so a connection can be refused at the door.
+    let ban_path = resolve_ban_path(&config_path, &match_config.control);
+    let ban_list = BanList::load(&ban_path)
+        .with_context(|| format!("loading the ban list {}", ban_path.display()))?;
+    info!(
+        "control: ban list at {} — {} entr{}",
+        ban_path.display(),
+        ban_list.len(),
+        if ban_list.len() == 1 { "y" } else { "ies" }
+    );
+    let loop_ban_list = Arc::new(RwLock::new(ban_list));
+
     let control_door: Option<ControlDoor> = if match_config.control.enabled {
         let token_path = resolve_token_path(&config_path, &match_config.control);
         let token = rfs_server::control::token::ensure_token_file(&token_path)
@@ -394,6 +428,8 @@ async fn main() -> Result<()> {
             queue: control_tx,
             actions: actions.clone().expect("the journal exists when the door does"),
             config_path: config_path.clone(),
+            ban_list: loop_ban_list.clone(),
+            ban_path,
         };
         let door = rfs_server::control::server::spawn(
             token,
@@ -642,6 +678,76 @@ async fn main() -> Result<()> {
                         "applied live; an open vote keeps its tally",
                     );
                 }
+                ControlOrder::Ban { target, reason } => {
+                    // Stage 3: the ban list file was already written by the
+                    // door. A reconnect from this address is refused by the
+                    // ClientConnected check above; a live disconnect of an
+                    // already-connected player requires net to expose the
+                    // connection id by address — left for the Steam ID stage
+                    // of step 3, when targets are Steam IDs rather than raw
+                    // addresses.
+                    stop_records(
+                        &actions,
+                        &order_line,
+                        "queued; ban list file updated, reconnect refused at connect",
+                    );
+                }
+                ControlOrder::Unban { target } => {
+                    // Stage 3: the list file was already updated by the door.
+                    // Nothing live to do — a reconnect is now allowed.
+                    stop_records(
+                        &actions,
+                        &order_line,
+                        "queued; removed from the ban list file",
+                    );
+                }
+                ControlOrder::EndMatch => {
+                    // Stage 4: move to ending, announce to everyone. The
+                    // server keeps running — a later start_match or
+                    // restart_match moves it onwards. All clients are
+                    // disconnected with Banned? No — ServerShutdown is the
+                    // end-of-match farewell, and they can reconnect.
+                    status_handle.set_match_state("ending");
+                    hub.publish(json!({
+                        "event": "state",
+                        "state": "ending",
+                        "text": "the match is ending",
+                    }));
+                    net.broadcast_event(GameEvent::Announcement {
+                        text: "Матч завершается.".into(),
+                    });
+                    stop_records(
+                        &actions,
+                        &order_line,
+                        "queued; match ending announced",
+                    );
+                }
+                ControlOrder::StartMatch => {
+                    status_handle.set_match_state("in_progress");
+                    hub.publish(json!({
+                        "event": "state",
+                        "state": "in_progress",
+                        "text": "the match is in progress",
+                    }));
+                    stop_records(
+                        &actions,
+                        &order_line,
+                        "queued; match is now in progress",
+                    );
+                }
+                ControlOrder::RestartMatch => {
+                    status_handle.set_match_state("waiting");
+                    hub.publish(json!({
+                        "event": "state",
+                        "state": "waiting",
+                        "text": "the match is waiting for players",
+                    }));
+                    stop_records(
+                        &actions,
+                        &order_line,
+                        "queued; match reset to waiting",
+                    );
+                }
             }
         }
         if stop_at_once {
@@ -708,6 +814,16 @@ async fn main() -> Result<()> {
                     connection_id,
                     addr,
                 } => {
+                    // Stage 3: refuse a banned address before the player is
+                    // admitted — the ban survives restarts, so a reconnect
+                    // after a ban is still refused.
+                    if loop_ban_list.read().is_banned(&addr.to_string()) {
+                        warn!(
+                            "client {connection_id} from {addr} is banned; connection refused"
+                        );
+                        net.disconnect_client(connection_id, DisconnectReason::Banned);
+                        continue;
+                    }
                     info!("client {connection_id} connected from {addr}");
                     // The connection feed for `watch` subscriptions (plan
                     // 6.1): the hub serves whoever is watching, publishing
@@ -1079,7 +1195,7 @@ async fn main() -> Result<()> {
             // emits nothing is counted too — from the client it is
             // indistinguishable from a round that never happened.
             let (rounds, packets) = net.snapshot_totals();
-            // Bug №274: sent deltas per layer. A low CLIENT-side per-layer count
+            // Bug №175: sent deltas per layer. A low CLIENT-side per-layer count
             // has two possible causes, and only this distinguishes them: the
             // server diffed an unchanged layer to nothing, or the client dropped
             // something that was sent.

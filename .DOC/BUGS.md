@@ -668,97 +668,113 @@ NC ×3 (машинные, откатанные): (a) merge «присваива�
 Баг в файле: C:\RFS-0.4.0\src\rhi\resource\buffer.rs (структура Buffer, строки 20-30)
 В чём заключается баг: Buffer не реализует Clone (14 мест: деривайте Clone в дескрипторных массивах, в т.ч. в связке (Buffer, u64)) и Default (1 место). cargo check: "the trait bound `resource::buffer::Buffer: Clone` is not satisfied" ×14 и "`: Default`" ×1 — 15 ошибок E0277 на один тип. Рендер-граф не может клонировать/дефолтить буферы.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX, класс compile-дефектов снят). Derives на месте: `src/rhi/resource/buffer.rs:11` — BufferDesc `#[derive(Debug, Clone, Default, PartialEq)]`, `:72` — Buffer `#[derive(Debug, Clone, Default)]`; класс E0277 не воспроизводится: `cargo check --workspace --all-targets` (root workspace, target-registry) — CARGO_EXIT=0, 2026-11-07.
 
 Баг№78
 Баг в файле: C:\RFS-0.4.0\src\rhi\types\flags.rs (bitflags AccessFlags ст.87, PipelineStage ст.71, ColorComponentFlags ст.142, ShaderStage ст.21+57, TextureAspectFlags ст.48)
 В чём заключается баг: пять bitflags не реализуют Default: AccessFlags — 8 ошибок, PipelineStage — 4, штучно ColorComponentFlags/ShaderStage/TextureAspectFlags — по 1. Всего 15 ошибок E0277. Каждый `#[derive(Default)]` на структурах с этими полями (пайплайны, барьеры, сабпассы) не собирается; флагу нельзя задать «пустое» значение по умолчанию.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Все пять bitflags записи несут Default: TextureAspectFlags (types/flags.rs:47), ShaderStage (:56), PipelineStage (:71), AccessFlags (:118), ColorComponentFlags (:152) — плюс BufferUsage (:21), TextureUsage (:35), MemoryPropertyFlags (:97). Класс E0277 не воспроизводится: cargo check --workspace --all-targets — CARGO_EXIT=0, 2026-11-07.
 
 Баг№79
 Баг в файле: C:\RFS-0.4.0\src\rhi\resource\texture.rs (enum TextureLayout ст.70, struct TextureView ст.63)
 В чём заключается баг: TextureLayout не реализует Default (5 ошибок — везде используются дефолтные значения при создании вью/аспектов), TextureView не реализует Clone (4 ошибки). Итого 9 ошибок E0277. Нельзя сделать вью клонируемой и задать layout по умолчанию.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `src/rhi/resource/texture.rs:287` — TextureView `#[derive(Debug, Clone, Default, PartialEq)]`, `:341` — TextureLayout `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]`; класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№80
 Баг в файле: C:\RFS-0.4.0\src\rhi\pipeline\graphics.rs (enum'ы ст.61-178) + C:\RFS-0.4.0\src\rhi\types\primitives.rs (PrimitiveTopology ст.184)
 В чём заключается баг: enum'ы состояния растеризации не реализуют Default: BlendFactor (4), StencilOp (3), BlendOp (2), PipelineShaderStage (2), PolygonMode (1), CullMode (1), FrontFace (1), LogicOp (1) — в graphics.rs, PrimitiveTopology (1) — в primitives.rs; плюс GraphicsPipeline не реализует Clone (1). Итого 17 ошибок E0277. GraphcisPipelineDesc не может собраться с derive(Default).
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Каждый из перечисленных enum'ов несёт `Default` и `#[default]`-вариант (pipeline/graphics.rs: BlendFactor/StencilOp/BlendOp/PipelineShaderStage/PolygonMode/CullMode/FrontFace/LogicOp — derives :27-:435, `#[default]` на:180/:200/:209/:219/:281/:366/:391/:415), GraphicsPipeline :560 `#[derive(Debug, Clone)]`. Дубль PrimitiveTopology в primitives.rs удалён — одно определение в graphics.rs:180 (prelude re-export :13). Класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№81
 Баг в файле: C:\RFS-0.4.0\src\rhi\resource\sampler.rs (enum FilterMode ст.11, AddressMode ст.18, CompareOp ст.28, BorderColor ст.41, struct Sampler ст.70)
 В чём заключается баг: FilterMode (3), AddressMode (3), CompareOp (3), BorderColor (1) не реализуют Default, Sampler не реализует Clone (1). Итого 11 ошибок E0277. Нельзя создать сэмплер со значениями по умолчанию и клонировать его при передаче в декс.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). SamplerDesc/FilterMode/AddressMode/CompareOp/BorderColor несут Default (`resource/sampler.rs:10/18/29/43/55`), Sampler — Clone (:149); класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№82
 Баг в файле: C:\RFS-0.4.0\src\rhi\shader\module.rs (enum ShaderFormat ст.11, struct ShaderModule ст.30) + C:\RFS-0.4.0\src\rhi\shader\compiler.rs (OptimizationLevel ст.30, ShaderTargetEnv ст.38)
 В чём заключается баг: ShaderModule не реализует Clone (2), ShaderFormat/OptimizationLevel/ShaderTargetEnv не реализуют Default (по 1). Итого 5 ошибок. Модуль шейдера нельзя клонировать в кэш, компилятору нельзя задать параметры по умолчанию.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `shader/module.rs` — derives на :10/:22/:31 (ShaderFormat Default, модуль Clone/Default), `shader/compiler.rs` — на :19/:28/:37/:51 (OptimizationLevel/ShaderTargetEnv Default); класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№83
 Баг в файле: C:\RFS-0.4.0\src\rhi\command\pass\render.rs (enum LoadOp ст.12, StoreOp ст.20, PipelineBindPoint ст.47, SubpassFlags ст.55, DependencyFlags ст.75; struct RenderPass ст.103, Framebuffer ст.136)
 В чём заключается баг: LoadOp (2), StoreOp (2), PipelineBindPoint/SubpassFlags/DependencyFlags (по 1) не реализуют Default; RenderPass не реализует Clone (2)+Default (2), Framebuffer — Clone (1)+Default (1). Итого 13 ошибок. RenderPassDesc/FramebufferDesc с derive(Default) не собираются.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `command/pass/render.rs`: LoadOp/StoreOp/PipelineBindPoint/SubpassFlags/DependencyFlags несут Default (:10-:76), RenderPassDesc :97 и RenderPass :105 `#[derive(Debug, Clone, Default)]`, FramebufferDesc :139, FramebufferAttachment :149 Clone; класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№84
 Баг в файле: C:\RFS-0.4.0\src\rhi\swapchain\swapchain.rs (ColorSpace ст.13, PresentMode ст.22, SurfaceTransform ст.31, CompositeAlpha ст.41, FullscreenExclusive ст.50) + C:\RFS-0.4.0\src\rhi\swapchain\surface.rs (struct Surface ст.16)
 В чём заключается баг: все пять enum — по 1 ошибке Default, Surface — по 1 Default и 1 Clone. Итого 7 ошибок. SwapchainDesc не собирается с derive(Default), Surface нельзя клонировать при передаче в контекст/обмен.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Все пять enum (ColorSpace/PresentMode/SurfaceTransform/CompositeAlpha/FullscreenExclusive — `swapchain/swapchain.rs:11/21/31/42/52`) несут Default с `#[default]`-вариантами, SwapChainDesc :61 Default; Surface — `surface.rs:15` `#[derive(Debug, Clone, Default)]`; класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№85
 Баг в файле: C:\RFS-0.4.0\src\rhi\command\buffer.rs (CommandBufferLevel ст.12, CommandBufferFlags ст.30) + C:\RFS-0.4.0\src\rhi\command\pool.rs (CommandPoolFlags ст.22)
 В чём заключается баг: CommandBufferLevel, CommandBufferFlags и CommandPoolFlags не реализуют Default — по 1 ошибке на каждый, итого 3. Descriptor/дескс командного буфера и пула с derive(Default) не собираются.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). CommandBufferLevel — `command/buffer.rs:11` Default, CommandBufferFlags — :33 Default, CommandPoolFlags — `command/pool.rs:10` Default; класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№86
 Баг в файле: C:\RFS-0.4.0\src\rhi\query\pool.rs (enum QueryType ст.11, bitflags QueryPoolFlags ст.22)
 В чём заключается баг: QueryType и QueryPoolFlags не реализуют Default — 2 ошибки. QueryPoolDesc с derive(Default) не собирается.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `query/pool.rs:9` QueryType Default (#[default] Occlusion), :21 QueryPoolFlags Default, QueryPoolDesc :28 Default; класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№87
 Баг в файле: C:\RFS-0.4.0\src\rhi\sync\semaphore.rs (bitflags SemaphoreFlags ст.12)
 В чём заключается баг: SemaphoreFlags не реализует Default — 1 ошибка. SemaphoreDesc с derive(Default) не собирается.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `sync/semaphore.rs:11` SemaphoreFlags Default, SemaphoreDesc :18 Default; класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№88
 Баг в файле: C:\RFS-0.4.0\src\rhi\resource\acceleration\blas.rs (struct Blas ст.95) + C:\RFS-0.4.0\src\rhi\resource\acceleration\tlas.rs (struct Tlas ст.42)
 В чём заключается баг: Blas не реализует Clone (2), Tlas — Clone (1). Итого 3 ошибки. BLAS/TLAS нельзя клонировать при построении иерархии ускорения.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `resource/acceleration/blas.rs:94` Blas `#[derive(Debug, Clone)]`, `tlas.rs:40` Tlas `#[derive(Debug, Clone)]`; класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№89
 Баг в файле: C:\RFS-0.4.0\src\rhi\descriptor\set.rs (struct DescriptorSet ст.12) + C:\RFS-0.4.0\src\rhi\descriptor\layout.rs (struct DescriptorSetLayout ст.53)
 В чём заключается баг: DescriptorSet не реализует Clone (2), DescriptorSetLayout — Clone (1). Итого 3 ошибки. Дескрипторные сеты/лейауты нельзя клонировать при переиспользовании в пайплайнах.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `descriptor/set.rs:10` DescriptorSet `#[derive(Debug, Clone)]`, `descriptor/layout.rs:55` DescriptorSetLayout `#[derive(Debug, Clone)]`; класс E0277 не воспроизводится: cargo check --workspace --all-targets (root workspace, target-registry) — CARGO_EXIT=0, 2026-11-07.
 
 Баг№90
 Баг в файле: C:\RFS-0.4.0\src\rhi\pipeline\compute.rs (struct ComputePipeline ст.17)
 В чём заключается баг: ComputePipeline не реализует Clone — 1 ошибка. Вычислительный пайплайн нельзя клонировать при реюзе в графе/контексте.
 Тип бага: Компиляция (этикетки трейтов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `pipeline/compute.rs:32` ComputePipeline `#[derive(Debug, Clone)]`; класс E0277 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№91
 Баг в файле: C:\RFS-0.4.0\src\rhi\descriptor\layout.rs (строка 33)
 В чём заключается баг: E0425 — "cannot find type `Sampler` in this scope". Поле immutable_samplers: Option<Vec<Sampler>> в DescriptorSetLayoutDesc объявлено без импорта типа Sampler (resource::sampler::Sampler). Даже после добавления Clone/Default дескс не скомпилируется без этого импорта.
 Тип бага: Синтаксический (отсутствующий импорт)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Импорт на месте: `descriptor/layout.rs:5` `use crate::resource::sampler::Sampler;` (поле `immutable_samplers: Option<Vec<Sampler>>` — :35); E0425 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№92
 Баг в файле: C:\RFS-0.4.0\src\rhi\shader\stage.rs (строка 15)
 В чём заключается баг: E0599 — "no associated function or constant named `INTERSECTION` found for struct `flags::ShaderStage`". Констá INTERSECTION_SHADER использует ShaderStage::INTERSECTION, но в bitflags ShaderStage (types/flags.rs) такого флага нет (только VERTEX/FRAGMENT/COMPUTE/RAY_GEN/ANY_HIT/CLOSEST_HIT/MISS и т.п.). Нельзя объявить интерсекшн-шейдер.
 Тип бага: Синтаксический (несуществующий член bitflags)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Флаг существует: `types/flags.rs:65` `const INTERSECTION = 1 << 7;` в ShaderStage; `shader/stage.rs:15` INTERSECTION_SHADER на него ссылается; E0599 не воспроизводится (CARGO_EXIT=0, 2026-11-07). Полная геометрия стадий — см. №126 (добавлены GEOMETRY/TESS/MESH/TASK/CALLABLE).
 
 Баг№93
 Баг в файле: C:\RFS-0.4.0\src\render (весь модуль, 78 файлов) — блокируется багами №77-92
@@ -772,55 +788,64 @@ NC ×3 (машинные, откатанные): (a) merge «присваива�
 Баг в файле: C:\RFS-0.4.0\src\rhi\lib.rs (строки 26-49)
 В чём заключается баг: rhi не реэкспортирует на корень типы из resource/pipeline/shader/command/descriptor/sync/swapchain/query (реэкспортируются только config/error/types/core/backend::Backend). Любой `use crate::rhi::{Texture, Buffer, Sampler, CommandEncoder, RenderPass, Pipeline, ...}` в render-коде даёт E0432/E0433. Это корень десятков битых импортов во всех пассах, материалах, мешах, текстурах.
 Тип бага: Битые связи модулей (реэкспорт)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Полный набор glob-реэкспортов на корне: `rhi/lib.rs:61-98` — config/core/error/types + command/descriptor/memory/pipeline/query/resource/shader/swapchain/sync; класс E0432/E0433 не воспроизводится: cargo check --workspace --all-targets (root, target-registry) — CARGO_EXIT=0, 2026-11-07.
 
 Баг№95
 Баг в файле: C:\RFS-0.4.0\src\lib.rs (строки 42-50)
 В чём заключается баг: корень rfs-client делает `pub use rhi::{BufferDesc, CommandBuffer, DeviceFeatures, DeviceType, FormatCaps, GraphicsPipeline, Image, ImageDesc, ImageUsage, PipelineLayoutDesc, QueueType, Sampler, ShaderModule, SwapChain, Texture, ...}` — большинства этих имён нет в корне rhi (нет DeviceFeatures — есть Features, нет DeviceType — есть PhysicalDeviceType, нет FormatCaps — есть DeviceCaps, нет Image/ImageDesc/ImageUsage/QueueType/PipelineLayoutDesc вообще; текстурные/баферные/командные типы не реэкспортированы). E0432 прямо в lib.rs — весь клиент не собирается.
 Тип бага: Битые связи модулей (реэкспорт)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Список переписан на имена, которые есть: `src/lib.rs:41-47` — Backend, Buffer/BufferDesc, CommandBuffer/CommandEncoder, Device, DeviceCaps (не FormatCaps), Features (не DeviceFeatures), Format, GraphicsPipeline(+Desc), PhysicalDeviceType (не DeviceType), PipelineLayout, RhiError/RhiResult, Sampler(+SamplerDesc), ShaderModule(+Desc/TargetEnv), ShaderStage, Surface(+Desc), SwapChain(+Desc), Texture(+Desc/TextureUsage). E0432 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№96
 Баг в файле: C:\RFS-0.4.0\src\rhi\mod.rs (строка 8) + C:\RFS-0.4.0\src\rhi\prelude.rs (строка 5)
 В чём заключается баг: mod.rs объявляет `pub mod lib;` (циклическое самовключение), prelude.rs делает `pub use crate::rhi::{...}` на несуществующий модуль crate::rhi (корень — lib.rs). Оба файла «мёртвые», ни один не объявлен в lib.rs. Если их включить — крейт не соберётся.
 Тип бага: Синтаксический (битые пути/цикл модулей)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Файлы стали шимом: `src/rhi/mod.rs:1-7` — «Re-export of the external `rhi` crate» (`pub use ::rhi::*;`), physical crate живёт в `src/rhi/` со своим Cargo.toml; prelude `pub use crate::rhi::{...}` разрешается через шим (prelude.rs:5). Цикла нет, E0432 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№97
 Баг в файле: C:\RFS-0.4.0\Cargo.toml (строки 27-30, 54-62) + C:\RFS-0.4.0\src\lib.rs (строка 27)
 В чём заключается баг: rhi одновременно зависит как path-крейт (`rhi = { path = "src/rhi" }`, `[workspace] members = ["src/rhi", "."]`, `[workspace.dependencies] rhi = ...`) И объявлен локальным модулем `pub mod rhi;`. Внутренние пути use crate::types::* / crate::error::* внутри src/rhi/ при компиляции как встроенного модуля ссылаются на rfs-client (где таких модулей нет) — каскад E0432. Зависимости неоднозначны, дублируются.
 Тип бага: Архитектурный (структура крейта/workspace)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). rhi — отдельный крейт: `Cargo.toml:60-64` `[workspace] members = ["src/rhi", "."]`, `rhi = { path = "src/rhi" }` (Cargo.toml:11); в клиенте `pub mod rhi;` (src/lib.rs:26) — это шим-реэкспорт `pub use ::rhi::*;` (src/rhi/mod.rs:7), двойной компиляции нет. Каскад E0432 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№98
 Баг в файле: C:\RFS-0.4.0\src\render\core\renderer.rs (строки 39,41,45-50,56-69,92-104,138,148,156-157,168-176,223)
 В чём заключается баг: Renderer::new использует: raw_window_handle::HasRawWindowHandle (зависимость winit/raw-window-handle закомментирована в Cargo.toml — E0432); crate::rhi::create_device_and_queues(...), device.create_swapchain(...), device.name()/vendor()/memory()/features()/limits(), config.width/height/vsync (у RhiConfig таких полей нет), self.swapchain.present(&Queue) (реально present(u32)), swapchain.resize()/extent() (методов нет). RenderContext::new ждёт GraphicsSettings, а передаёт RendererSettings. Все — E0599/E0308. Плюс unwrap() на acquire_next_image/present/resize (паника на стабах).
 Тип бага: Битые связи модулей (API Device/SwapChain/RhiConfig)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Renderer переписан на настоящий présente-API: `renderer.rs:77-82` — `crate::rhi::present::Swapchain` + WindowSurface, attach_presentation (:173-214) вместо несуществующего device.create_swapchain; очередь через graphics_queue().cloned().unwrap_or(...) (:117) — рефолбэк, а не паника; naked `.unwrap()` на acquire/present/resize отсутствуют (grep `.unwrap()` по renderer.rs = 0, только unwrap_or-фолбэк). Класс E0599/E0308 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№99
 Баг в файле: C:\RFS-0.4.0\src\render\core\settings.rs (строки 278-285 и 640-646)
 В чём заключается баг: `pub enum RayTracingQuality` объявлен ДВАЖДЫ в одном файле — E0428 (duplicate definition), плюс пресеты apply_high/apply_medium_preset (стр. 566 и др.) присваивают advanced.ray_tracing_quality. Файл не компилируется.
 Тип бага: Синтаксический (дубликат типа)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Одно определение: `core/settings.rs:283` — единственный `pub enum RayTracingQuality` (grep по src/render = 1 совпадение); E0428 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№100
 Баг в файле: C:\RFS-0.4.0\src\render\core\context.rs (строки 8,20,53,68,75,79,83,90-103) + C:\RFS-0.4.0\src\render\core\resource_manager.rs (строки 5,8,161-170,369)
 В чём заключается баг: context.rs импортирует rhi::{Swapchain, Texture, TextureView, TextureViewDesc} — их нет на корне rhi (есть SwapChain). Методы swapchain.extent()/get_current_view()/image_count(), texture.create_view()/extent(), device.create_texture(), Format::Depth32Float — не существуют. resource_manager.rs импортирует Texture дважды (rhi и render::textures — E0252), вызывает Mesh::load/cone/torus, Texture::load/color/procedural, Material::load, MaterialLibrary::insert, Device::default() — таких методов/реализаций нет.
 Тип бага: Битые связи модулей (API RHI) + Синтаксический
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Оба файла собираются: imports context/resource_manager разрешаются через glob-реэкспорты корня rhi (см. №94), конфликтный двойной импорт Texture / несуществующие методы сняты переписанными файлами; grep `Device::default` и несуществующих членов `Format::{RGBA16Float,RGBA8Unorm,R8Unorm,Depth32Float}` по src/render = 0 совпадений. E0599/E0252 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№101
 Баг в файле: C:\RFS-0.4.0\src\render\graph\node.rs (строка 6,10) + C:\RFS-0.4.0\src\render\graph\resource.rs (строки 85,110)
 В чём заключается баг: `ResourceUsage` импортирован приватно (`use super::types::ResourceUsage`) и не попал в `pub use` — все 7 пассов (base.rs:31, gbuffer.rs:18, lighting.rs:18, shadow.rs:16, transparent.rs:14, ui.rs:13, water.rs:17) дают `use crate::render::graph::node::ResourceUsage` → E0432. Также node.rs:6 и resource.rs:85,110 используют rhi::{CommandEncoder, TextureView} (нет в корне) и `Format::Undefined` (нет такого варианта в rhi).
 Тип бага: Битые связи модулей (приватный реэкспорт)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `ResourceUsage` — открытый тип `graph/types.rs:36` (структура-флаги поверх u8, констаны pub) — пассы импортируют из graph::types (forward.rs:158); node.rs CommandEncoder разрешается через корень rhi (lib.rs:82); `Format::Undefined` не употребляется (grep = 0). E0432 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№102
 Баг в файле: C:\RFS-0.4.0\src\render\graph\types.rs (строки 25-38)
 В чём заключается баг: оператор BitOr у ResourceUsage НЕ коммутативен и теряет комбинации: Sampled | Storage → Sampled, Storage | Sampled → Storage, ColorAttachment | Sampled → ColorAttachment. Объединение usage ресурса, используемого несколькими пассами, схлопывается в неверную комбинацию — тихий отбор неправильного формата/вью.
 Тип бага: Логический (операторы)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: (та же работа, что №281) `graph/types.rs:36-67` — ResourceUsage стал структурой-флагами поверх u8: объявления констант pub, `|` означает объединение (коммутативно), `contains` вместо match; ColorAttachment | Sampled сохраняет оба бита (документировано в комментарии :20-34). Класс «объединение схлопывается в один вариант» не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№103
 Баг в файле: C:\RFS-0.4.0\src\render\graph\graph.rs (строки ~33-43, 66-155, 199-232) + resource.rs (строка 121)
@@ -833,7 +858,8 @@ NC ×3 (машинные, откатанные): (a) merge «присваива�
 Баг в файле: C:\RFS-0.4.0\src\render\graph\graph.rs (строки ~118-124) vs C:\RFS-0.4.0\src\render\passes\shadow.rs (строка 62) vs lighting.rs (строки 86, 283-285)
 В чём заключается баг: в графе регистрируется одна текстура "shadow_map", а пассы создают/читают "shadow_map_cascade_{0..3}" (итерация (0..4) в lighting.rs жёстко зашита, не зависит от cascade_count). Граф никогда не свяжет ресурс с пассом — тени молча не работают.
 Тип бага: Логический (несогласованность имён ресурсов)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Одна сеть имён: граф регистрирует ровно `shadow_map` (graph.rs:196), пасс экспортирует `SHADOW_MAP_RESOURCE = "shadow_map"` (shadow.rs:54), forward объявляет зависимости Sampled по тому же имени (forward.rs:158/176), mirror читает его же (mirror.rs:148/323); `shadow_map_cascade_{0..3}` в src не встречается (grep = 0); каскады живут как Vec<Textures> в SharedState (shadow.rs:312). «Граф не свяжет ресурс с пассом» не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№105
 Баг в файле: C:\RFS-0.4.0\src\render\scene\scene.rs (строка 220) + C:\RFS-0.4.0\src\render\scene\culling.rs (строки 89-100, 188)
@@ -845,7 +871,8 @@ NC ×3 (машинные, откатанные): (a) merge «присваива�
 Баг в файле: C:\RFS-0.4.0\src\render\scene\entity.rs (строка 206) + C:\RFS-0.4.0\src\render\scene\components.rs (строки 152, 180, 241, 267-271)
 В чём заключается баг: context.camera_position() не существует (метод есть у Scene) — E0599, вся LOD-логика (distance_from_camera) сломана. Производные `#[derive(Clone, Debug)]` на SceneComponent/MeshComponent/MaterialComponent при полях Arc<Mesh>/Material/PbrMaterial/WaterMaterial и Arc<dyn Camera> без супертрейта Debug — E0277. Entity::create_standard_camera выдаёт заглушку.
 Тип бага: Синтаксический (E0599/E0277)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `context.camera_position()` существует и употребляется (entity.rs:205 — LOD считывается от камеры через контекст); derives Clone/Debug на компонентах собираются (CARGO_EXIT=0); заглушка Entity::create_standard_camera удалена (grep по entity.rs = 0). E0599/E0277 не воспроизводятся (2026-11-07).
 
 Баг№107
 Баг в файле: C:\RFS-0.4.0\src\render\camera\controller.rs (строки ~214-225) + C:\RFS-0.4.0\src\render\camera\camera.rs (строки 78, 82-86, 221-227)
@@ -857,19 +884,22 @@ NC ×3 (машинные, откатанные): (a) merge «присваива�
 Баг в файле: C:\RFS-0.4.0\src\render\passes\water.rs (строки 116,120 vs 159,161 и 301,339)
 В чём заключается баг: поля объявлены как reflection_framebuffer/water_framebuffer, конструктор инициализирует и использует reflection_frame_buffer/water_frame_buffer (другие имена) — E0560 (struct has no field) + E0063 (missing fields). Файл не компилируется.
 Тип бага: Синтаксический (опечатка имён полей)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Файл переписан (№688/№691); поля консистентны: `framebuffer`/`framebuffer_pinned` (water.rs:171-172), `shared_framebuffer`/`shared_framebuffer_depth_generation` (:180-183); фреймбуфер создаётся через устройство (`create_gpu_framebuffer`, water.rs:424-443). E0560/E0063 не воспроизводятся (CARGO_EXIT=0, 2026-11-07).
 
 Баг№109
 Баг в файле: C:\RFS-0.4.0\src\render\passes\transparent.rs (строки 15, 27, 257, 296)
 В чём заключается баг: импорт `use crate::render::passes::base::{BaseRenderPass, BlendMode}` — в base.rs BlendMode НЕТ (E0432) + локально в transparent.rs объявлен СВОЙ pub enum BlendMode (E0255-конфликт, и ещё один BlendMode есть в materials::material). entity.blend_mode() возвращает materials::material::BlendMode, а TransparentObject.blend_mode — локальный transparent::BlendMode — несовпадение типов (E0308).
 Тип бага: Синтаксический (несуществующий импорт/дубль типа) + Логический
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). base.rs не объявляет BlendMode (grep = 0, №113-class); один BlendMode торгуется в materials (material.rs:30) и НЕ конфликтует с pass-версией: transparent.rs:633-639 — явная конверсия `scene::components::BlendMode` → pass-BlendMode (Opaque→Alpha осознанно), emitter.rs:49 использует materials::BlendMode, material.rs:181-185 сводит всё к rhi-BlendDesc (disabled/alpha/additive/multiplicative/screen). E0432/E0255/E0308 не воспроизводятся (CARGO_EXIT=0, 2026-11-07).
 
 Баг№110
 Баг в файле: C:\RFS-0.4.0\src\render\passes\lighting.rs (строки 224, 292, 298, 301)
 В чём заключается баг: `let clear_colors: Vec<[f32;4]> = vec![...]` затем push — нет mut (E0596); `attachments.len() - 1 as u32` — usize - u32 (E0308); (0..4) жёстко зашито в чтении каскадов теней вместо config.cascade_count (логический).
 Тип бага: Синтаксический (E0596/E0308) + Логический
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: файл удалён (№741): свет теперь раскладывается cluster-пассом в буфер света, и forward читает его (forward.rs:9-13); жёсткое (0..4) чтение каскадов умерло вместе с файлом — каскады теперь Vec из SharedState (shadow.rs:312). «Файл не компилируется» не воспроизводится: `src/render/passes/lighting.rs` не существует (glob = 0), CARGO_EXIT=0 (2026-11-07).
 
 Баг№111
 Баг в файле: C:\RFS-0.4.0\src\render\lighting\light.rs (строки 139-163, 365-381)
@@ -881,13 +911,15 @@ NC ×3 (машинные, откатанные): (a) merge «присваива�
 Баг в файле: C:\RFS-0.4.0\src\render\passes\mod.rs (строка 13) + C:\RFS-0.4.0\src\render\passes\base.rs (строка 10) + C:\RFS-0.4.0\src\render\lighting\shadows.rs (строки 168, 259)
 В чём заключается баг: passes/mod.rs делает `pub use base::RenderPass;`, но RenderPass в base.rs импортирован приватно (use crate::render::graph::node::{RenderPass, ...}) — E0365 (private re-export). shadows.rs вызывает crate::rhi::Device::default().create_texture(...) — Device не реализует Default и create_texture не существует (E0599/E0277).
 Тип бага: Синтаксический (приватный реэкспорт, несуществующие методы)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). E0365-реэкспорта больше нет: `passes/mod.rs` не содержит `pub use base::RenderPass` (grep `use base` = 0), пассы импортируют RenderPass прямо из graph::node (base.rs:6); `Device::default()` в lighting/shadows.rs отсутствует (grep = 0). E0365/E0599 не воспроизводятся (CARGO_EXIT=0, 2026-11-07).
 
 Баг№113
 Баг в файле: C:\RFS-0.4.0\src\render\passes\ui.rs (строки 211-212, 126-132) + C:\RFS-0.4.0\src\render\passes\gbuffer.rs (строки 81-85, 122, 246) + transparent.rs (строки 144, 166, 282) + shadow.rs (строки 103, 127, 193) + water.rs (строки 207, 250, 351)
 В чём заключается баг: пассы используют несуществующие члены RHI: Format::RGBA16Float/RGBA8Unorm/R8Unorm/Depth32Float (в rhi есть SCREAMING_SNAKE имена: RGBA32_SFLOAT, D32_SFLOAT и т.п.), TextureLayout::ColorAttachmentOptimal (его нет), AttachmentDescription.samples передаётся числом 1 вместо SampleCount::X1, Rect2D задаётся плоскими полями {x,y,width,height} вместо {offset, extent}. В ui.rs методы трейта Camera используются без импорта трейта.
 Тип бага: Синтаксический (несовпадение API с rhi)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Несуществующие члены RHI не употребляются: `Format::{RGBA16Float,RGBA8Unorm,R8Unorm,Depth32Float}` по src/render = 0 (пассы пишут SCREAMING-имена: D32_SFLOAT и т.п.); `TextureLayout::ColorAttachmentOptimal` существует в rhi и легален (passes/forward.rs:216 и др.); Rect2D/SampleCount в текущем API сабмиссии и валидаторе. E-класс не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№114
 Баг в файле: C:\RFS-0.4.0\src\render\meshes\mesh.rs (строки 120-121, 278-302, 316-366, 431-432, 445-450, 489-495, 509-521)
@@ -928,7 +960,8 @@ FBX: новый модуль `src/render/meshes/fbx.rs`. ASCII FBX разбир�
 Баг в файле: C:\RFS-0.4.0\src\render\postprocess\manager.rs (строка 83) + C:\RFS-0.4.0\src\render\postprocess\mod.rs (строки 26-30) + C:\RFS-0.4.0\src\render\effects\manager.rs (строки 319-322)
 В чём заключается баг: postprocess/manager.rs вызывает scene.get_velocity_texture() — у Scene такого метода/текстуры нет (E0599). PostProcessConfig.bloom/motion_blur/hdr — это bool, а effects/manager.rs читает их как вложенные `.bloom.enabled` (PostProcessSettings-модель из core/settings.rs) — код смешивает две несовместимые модели настроек. Плюс Format::RGBA16Float/Depth32Float в initialize (см. №113).
 Тип бага: Синтаксический (E0599) + Логический (конфликт моделей настроек)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). `postprocess/manager.rs` переписан (пассов нет — №688/№693: postprocess/manager.rs перестает быть отдельным менеджером), конфликт «bool vs вложенные модели» умер вместе с effects/manager.rs (каталог `src/render/effects/` удалён — glob = 0, см. №120); get_velocity_texture/пера из импорта lighting пайпа не воспроизводятся: vel-текстуры нет, единый EffectSettings — core/settings.rs:195. E0599 не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№120
 Баг в файле: C:\RFS-0.4.0\src\render\mod.rs (строки 63, 67) + C:\RFS-0.4.0\src\render\particles\mod.rs (строки 12-15) + C:\RFS-0.4.0\src\render\particles\effect_manager.rs + C:\RFS-0.4.0\src\render\effects\manager.rs + C:\RFS-0.4.0\src\render\core\settings.rs (строки 45, 192-199)
@@ -960,6 +993,7 @@ FBX: новый модуль `src/render/meshes/fbx.rs`. ASCII FBX разбир�
 В чём заключается баг: дублирование типов с одинаковым именем: PrimitiveTopology (types/primitives.rs и pipeline/graphics.rs), MemoryHeap (core/device.rs {size,flags} и memory/heap.rs {index,size,flags}), SamplerDesc (rhi/resource/sampler.rs и render/textures/texture.rs). При glob-импортах — E0659 ambiguity, тихая подмена значений по контракту.
 Тип бага: Архитектурный (дубли типов)
 Статус: Не сделано
+Примечание 2026-11-07 (AGENT-FIX): из трёх дублей списка снят PrimitiveTopology — одна копия в pipeline/graphics.rs:180 (дубль types/primitives.rs удалён, prelude re-export, см. №80). Живые: MemoryHeap (core/device.rs:44 и memory/heap.rs:9) и SamplerDesc (resource/sampler.rs и render/textures/texture.rs:142).
 
 Баг№125
 Баг в файле: C:\RFS-0.4.0\src\rhi\sync\barrier.rs (строки 28-35, 57-60, 18-25) + C:\RFS-0.4.0\src\rhi\command\pass\render.rs (строки 83-92)
@@ -996,7 +1030,8 @@ FBX: новый модуль `src/render/meshes/fbx.rs`. ASCII FBX разбир�
 Баг в файле: C:\RFS-0.4.0\src\rhi\resource\buffer.rs (строки 20-30, поле device_address) + C:\RFS-0.4.0\src\rhi\resource\sampler.rs (строки 70-72) + C:\RFS-0.4.0\src\rhi\swapchain\swapchain.rs (строки 76, 83, images) 
 В чём заключается баг: Buffer.device_address всегда None, геттера нет — поле мёртвое (ускоренные бэкенды не могут получить адрес буфера). Sampler не имеет конструктора (публичных полей нет) — неконструируем. SwapChainImage — мёртвый тип: images = Vec::new() в new(), acquire/current_image_index никогда не заполняются.
 Тип бага: Архитектурный (мёртвые поля/неконструируемые типы)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Buffer.device_address жив: getter/setter (`resource/buffer.rs:142-148`); Sampler конструируем — пятерка пресетов + new/from_desc (`resource/sampler.rs:75-122/156-159`); SwapChainImage заполняется: `ensure_images` строит значения при acquire (`swapchain/swapchain.rs:114-135`, вызовы в :140). Мёртвое поле/неконструируемый тип не воспроизводятся (CARGO_EXIT=0, 2026-11-07).
 
 Баг№131
 Баг в файле: C:\RFS-0.4.0\src\render\particles\effects.rs + C:\RFS-0.4.0\src\render\particles\system.rs + C:\RFS-0.4.0\src\render\particles\emitter.rs
@@ -1009,19 +1044,22 @@ FBX: новый модуль `src/render/meshes/fbx.rs`. ASCII FBX разбир�
 Баг в файле: C:\RFS-0.4.0\src\render\ui\ (hud.rs, minimap.rs, menu.rs) + C:\RFS-0.4.0\src\render\passes\ui.rs (строки 57-58, 119-132, 195, 289)
 В чём заключается баг: ui pass использует swapchain.load_op: Load и layout TransferDstOptimal→TransferSrcOptimal, но никто не делает TransferSrc-конверсию перед презентом — логическая незавершённость цепочки рендера UI. ui.rs:57-58 зависит от "water/water" и "transparent/final", но ресурс "water" в графе не зарегистрирован. self.output_view.as_ref().and_then(|v| v.texture().device()) — TextureView.texture()/device() не существуют.
 Тип бага: Логический + Синтаксический
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). Пасс переписан (№693): grep `TransferDst|TransferSrc|load_op|output_view|texture()` по passes/ui.rs = 0 — цепочка TransferSrc-конверсии больше не заявляется; зависимости `water`/`final` легальны: water-пасс объявляет выход `add_output("water")` (water.rs:212/228), `final` это ресурс графа (graph.rs:218-224), а demand-механизм создаёт только то, что реально производит/читает кадр (graph.rs:243-306). Несуществующие методы TextureView не употребляются (CARGO_EXIT=0, 2026-11-07).
 
 Баг№133
 Баг в файле: C:\RFS-0.4.0\src\render\core\renderer.rs (строки ~132, ~151)
 В чём заключается баг: frame_number инкрементится ДВАЖДЫ за кадр (в begin_frame и в конце render_frame) — статистика FPS/кадров завышена вдвое. RenderStats создаётся, но нигде не заполняется наружу (мёртвый код).
 Тип бага: Логический (двойной инкремент)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: renderer.rs:508-511 — двойного инкремента нет, в комментарии прямо сказано «This used to increment it a second time...» (место, где дело делалось дважды, удалено; единственный инкремент — в begin_frame); накопленная статистика публикуется: `RenderStats` отдаётся наружу через `pub fn stats() -> &RenderStats` (renderer.rs:824). Проверено CARGO_EXIT=0, 2026-11-07.
 
 Баг№134
 Баг в файле: C:\RFS-0.4.0\src\rhi\command\commands.rs (строки 88-94) + C:\RFS-0.4.0\src\rhi\sync\barrier.rs (строки 38-45)
 В чём заключается баг: Command::PipelineBarrier полностью дублирует структуру PipelineBarrier из sync/barrier.rs (src_stage/dst_stage/memory_barriers/buffer_barriers/texture_barriers). При эволюции типов они расползутся — заложенная мина рассинхронизации (сейчас поля совпадают).
 Тип бага: Архитектурный (дублирование структуры)
 Статус: Не сделано
+Примечание 2026-11-07 (AGENT-FIX): рефактор затрагивает чужие зоны — Command::PipelineBarrier создаётся в `src/rhi/ui/renderer.rs:2421` (SBF2) и потребляется в `src/rhi/backend/d3d12/record.rs:874` (GLM5). Правку делать могу только целиком — откладываю до согласования с коллегами.
 
 Баг№135
 Баг в файле: C:\RFS-0.4.0\src\render\particles\effect_manager.rs (EffectSettings, строки 41-66) + C:\RFS-0.4.0\src\render\effects\manager.rs (EffectSettings, строки 51-59) + C:\RFS-0.4.0\src\render\core\settings.rs (EffectSettings, строки 192-199, 315, 391)
@@ -1033,7 +1071,8 @@ FBX: новый модуль `src/render/meshes/fbx.rs`. ASCII FBX разбир�
 Баг в файле: C:\RFS-0.4.0\src\render\passes\base.rs (строки 25-40) + C:\RFS-0.4.0\src\render\passes\shadow.rs (строки 20-39)
 В чём заключается баг: BaseRenderPass регистрирует пустые pipelines: HashMap::new() и заглушку execute() — «проход» ничего не рисует. ShadowPass имеет cascаде-count жёстко зашитый (0..4 в lighting, и 4 каскада в shadow.rs) без привязки к ShadowConfig из lighting — конфиги рассинхронизированы.
 Тип бага: Логический (пустые пайплайны, жёсткие каскады)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX). BaseRenderPass держит только name/dependencies/outputs/enabled (base.rs:14-19) — пустых `pipelines: HashMap`-заглушек нет; execute() не притворяется, что рисует: возвращает `PassOutcome::skipped("the base pass does nothing")` (base.rs:72) — это диагностик №653; ShadowPass живёт каскадами из конфигурации: cascade_count из ShadowConfig (shadow.rs:312 `Vec::with_capacity(cascade_count)`), не жёсткие 0..4. «Пасс выглядит работающим, но пуст» не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№137
 Баг в файле: C:\RFS-0.4.0\src\render\passes\water.rs (строки 242, 453-460) + C:\RFS-0.4.0\src\render\water\ (surface.rs, waves.rs, interaction.rs, mod.rs)
@@ -1059,7 +1098,8 @@ FBX: новый модуль `src/render/meshes/fbx.rs`. ASCII FBX разбир�
 Баг в файле: C:\RFS-0.4.0\src\rhi\types\flags.rs (строки 22, 35, 57, 71, 87, 107, 142, 48)
 В чём заключается баг: разнобой в derive: BufferUsage/TextureUsage/MemoryPropertyFlags имеют Default, а ShaderStage/PipelineStage/AccessFlags/TextureAspectFlags/ColorComponentFlags — нет (см. №78). Это создаёт асимметричный контракт: половина bitflags дефолтна, половина нет — источник каскадных E0277 везде, где derive(Default). Требуется единая политика.
 Тип бага: Архитектурный (асимметрия derive)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: закрыто попутно (2026-11-07, AGENT-FIX, через №78). Все типы из записи несут Default: TextureAspectFlags (flags.rs:47), ShaderStage (:56), PipelineStage (:71), AccessFlags (:97), ColorComponentFlags (:152); derive-политика для флагов едина. Вне записи по смыслу остаются без Default QueueFlags (:9), MemoryHeapFlags (:129), PipelineFlags (:135), DynamicState (:143) — у них нет «пустого» осмысленного дефолта; требуемая асимметрия снята (CARGO_EXIT=0, 2026-11-07).
 ---
 
 Баг№141
@@ -1554,14 +1594,14 @@ guarded-хелпер или маркер скипа для CI): не начат�
 Статус: Сделано
 ДОПОЛНЕНИЕ 2026-10-30 (SBF1, сверка фактов по дереву в ходе №177; код №204 трогался): список вызовов протух частично. Живые на момент сверки: copy_texture — manager.rs:102, bloom.rs:142/151, motion_blur.rs:106, fxaa.rs:77, hdr.rs:86/87/90, dof.rs:105 (9 мест); bind_texture — bloom.rs:170/214/247/248 (4 места). Вызовы particles/system.rs (166,171) исчезли — разговор пайплайна частиц после №728. Форма подсистемы крупнее дефекта: постпроцесс целиком не собран — пайплайны literal None (bloom.rs:106-109, «For now, we'll leave them as None»), квадов нет, PostprocessManager нигде не конструируется (grep по src даёт только pub use постпроцесса в render/mod.rs:62) — вызовы заглушек живут в мёртвом коде. Реализация требует либо нового варианта `Command` (но d3d11 record.rs матчает `Command` исчерпывающе БЕЗ wildcard, руки заканчиваются ~:336 — новый вариант ломает сборку чужой зоны, только по согласованию владельца), либо постройки постпроцесс-подсистемы (конструирование manager/пайплайнов) до кода энкодера. Оба пути заявлены в чат на согласование владельца; до согласования — не ход.
 
-ДОПОЛНЕНИЕ 2026-11-06 (SBF1, ход исполнен по приказу владельца «Мёртвыми заглушками займись»; форма выбрана чест.startActivity отказов, без добавления варианта `Command` и без постройки подсистемы):
+ДОПОЛНЕНИЕ 2026-11-06 (SBF1, ход исполнен по приказу владельца «Мёртвыми заглушками займись»; форма выбрана — честные отказы, без добавления варианта `Command` и без постройки подсистемы):
 - Энкодер (`src/rhi/command/encoder.rs`): `bind_uniform_buffer`/`bind_texture` удалены как мёртвый API — байндинги легальны только через дескрипторные наборы (`Command::BindDescriptorSets` несёт пайплайн), их собственные комментарии это признавали; grep по дереву: ноль вызовов вне постпроцесса. `copy_texture` — честный отказ `-> RhiResult<()>` c `RhiError::NotSupported(...)`: реальной GPU-копии не существует — ни варианта `Command`, ни факта о layout источника (трекер лайаутов — факт сабмита, энкодеру невидим). Форма метода сохранена ради будущего GPU-copy хода.
-- Постпроцесс — вызывающая поверхность тех же заглушек: все 13 call-sites сняты (9 fake-copy + 4 `bind_texture`). Пять эффектов (`bloom/fxaa/dof/hdr/motion_blur`) и `manager` переписаны в честную shell-форму: реальные config/builder/enabled остаются; `apply`/`initialize` → `RhiResult` — disabled есть честный no-op, enabled есть отказ `NotSupported`; мёртвые texture/pipeline-поля и imитирующие функции (bright_pass/blur/composite) удалены; у bloom/fxaa сохранён builder/resize, у остальных resize делегирует отказу initialize. Manager: `apply` → `RhiResult` с пропагацией через `?`; включённый DOF без depth-входа — отказ вместо тихого пропуска; ветка «все эффекты выключены» — no-op при期权 одном view, а при различ — `encoder.copy_texture(..)?`: отказ энкодера доезжает наружу без утаивания. Геттеры и поле `device` сохранены. Постпроцесс-ядро не рисует — это судьба подсистемы (пайплайны/квады/шейдеры — отдельный ход под общее шейдерное решение владельца), не дефект слоя.
+- Постпроцесс — вызывающая поверхность тех же заглушек: все 13 call-sites сняты (9 fake-copy + 4 `bind_texture`). Пять эффектов (`bloom/fxaa/dof/hdr/motion_blur`) и `manager` переписаны в честную shell-форму: реальные config/builder/enabled остаются; `apply`/`initialize` → `RhiResult` — disabled — честный no-op, enabled — отказ `NotSupported`; мёртвые texture/pipeline-поля и имитирующие функции (bright_pass/blur/composite) удалены; у bloom/fxaa сохранён builder/resize, у остальных resize делегирует отказу initialize. Manager: `apply` → `RhiResult` с пропагацией через `?`; включённый DOF без depth-входа — отказ вместо тихого пропуска; ветка «все эффекты выключены» — no-op при одном view, а при разных — `encoder.copy_texture(..)?`: отказ энкодера доезжает наружу без утаивания. Геттеры и поле `device` сохранены. Постпроцесс-ядро не рисует — это судьба подсистемы (пайплайны/квады/шейдеры — отдельный ход под общее шейдерное решение владельца), не дефект слоя.
 - Вариант `Command` НЕ добавлялся: он сломал бы исчерпывающие match'ы чужих зон d3d11/d3d12 record.rs без приказа владельца.
 Исправлен как: честные отказы вместо молчаливых заглушек, форма методов сохранена для будущего; `FXAAEffect::initialize` получил сигнатуру `(device, context, input_format)` по согласованности с остальными эффектами; headless-устройство в тестах нужно только для `RenderContext::headless` (сами отказы CPU).
 Проверка (RED→GREEN машинные, target-sbf1, 2026-11-06):
 - до NC: rhi_command 37/0 + postprocess 19/0, exit 0 (исходный GREEN, 03.11);
-- NC-1 (`copy_texture`): тест `the_encoder_refuses_a_texture_copy_instead_of_faking_it`. Пробка «Ok(())» была поставлена 03.11 и НЕ откачена в тот же ход — снимки 04–06.11 закоммитили её (da5b345→9c9717e); консолидированный факт исправления: HEAD (с пробкой) прогнан RED 36/1 exit 101 — тест поймал закоммиченный тихий стейт; восстановление честной формы — GREEN 37/0 exit 0. Архемонтская ошибка моя: NC-пробки обязаны жить минуты, а не сутки; зафиксировано в отчёте владельцу;
+- NC-1 (`copy_texture`): тест `the_encoder_refuses_a_texture_copy_instead_of_faking_it`. Пробка «Ok(())» была поставлена 03.11 и НЕ откачена в тот же ход — снимки 04–06.11 закоммитили её (da5b345→9c9717e); подтверждение исправления: HEAD (с пробкой) прогнан RED 36/1 exit 101 — тест поймал закоммиченный тихий стейт; восстановление честной формы — GREEN 37/0 exit 0. Ошибка процесса — моя: NC-пробки обязаны жить минуты, а не сутки; зафиксировано в отчёте владельцу;
 - NC-2 (`fxaa.apply` enabled→Ok): RED 17/2 exit 101 — `fxaa_refuses_to_apply_instead_of_faking_antialiasing` и (тот же корень) `an_enabled_unbuilt_effect_refuses_through_the_manager`; откат — GREEN 19/0;
 - NC-3 (manager else-ветка без пропагации копии): RED 18/1 exit 101 — `the_chain_with_every_effect_disabled_refuses_to_copy_distinct_views`; откат — GREEN 19/0;
 - маркеры NC удалены; grep маркеров по файлам хода — ноль; финал: rhi_command 37/0 + postprocess 19/0 exit 0, `cargo check -p rfs-client` exit 0.
@@ -1585,7 +1625,8 @@ guarded-хелпер или маркер скипа для CI): не начат�
 Баг в файле: C:\RFS-0.4.0\src\render\graph\graph.rs (220-231)
 В чём заключается баг: алгоритм Кана без обнаружения циклов. Если пасса A зависит от B, а B — от A (в т.ч. самозависимость), in_degree для узлов цикла никогда не станет 0, они не попадут в очередь и молча выпадут из execution_order — execute() отрисует кадр неполным, без ошибки и паники. Проверки `execution_order.len() == nodes.len()` нет.
 Тип бага: Логика (отсутствует валидация, тихая частичная отрисовка)
-Статус: Не сделано
+Статус: Сделано
+Исправлен как: уже в коде (подтверждено 2026-11-07, AGENT-FIX). Спасибо №653: Kahn в graph.rs:357-366 помещает всё, что может, после чего проверка `execution_order.len() < nodes.len()` (:379) находит узлы, не вошедшие в порядок, и цикл ДЕКЛАРИРУЕТСЯ громко: `crate::error!("graph", "the pass dependencies contain a cycle…")` (:387-391), а узлы цикла НЕ выпадают молча — они добавляются в порядок в порядке добавления (:392-396). «Тихая частичная отрисовка» не воспроизводится (CARGO_EXIT=0, 2026-11-07).
 
 Баг№208
 Баг в файле: C:\RFS-0.4.0\src\render\graph\resource.rs (158-176)
@@ -5092,7 +5133,7 @@ GBuffer — техника deferred. Владелец выбрал **Forward+ (�
 В чём заключается баг: клиентский apply-путь платил глубокими клонами целого мира на каждую применённую дельту: base читался из кольца клоном, merged-снапшот сохранялся кольцу и интерполятору ещё двумя клонами, слот latest_state получал move-исходник (по три полных копии на дельту сверх результата); StateFull — два клона полного мира. Замер за ходом №697: merge-путь 3.48 мс/дельту при 100 ботах против 0.60 мс при 20 — потолок потребления ~3k дельт/с на процесс; чистый прогон 100×15: per_bot_hz_p50 9.87 при номинале 30, применено 52.2 дельты/с/бот, стагнов 5774, ботов со стагнами 100/100, resync-запросов 1225.
 Тип бага: Расходный клон на горячем пути (потолок потребления дельт клиентом)
 Статус: Сделано
-Исправлен как: (1) кольцо хранит Arc<Snapshot>: write_arc складывает аллокацию вызывающего (write_snapshot остался owned-обёрткой), get_latest/get_snapshot отдают шаринг, а не клон — два чтения руками выдают ту же аллокацию. (2) Интерполятор — Vec<Arc<Snapshot>> + add_arc: сэмплы шарятся с кольцом и слотом; гвард усечения №20 сохранён — oversized-сэмпл платит старую цену клон+truncate, обычный трафик проходится нулём копий. (3) Слияние вынесено в один merge_delta(entities, projectiles, delta, resync_layer): механика №637 (индексная) дословно; новый параметр resync_layer переносит правило ресинка («слой заменяется целиком») внутрь собираемого результата — чистка соседствующего слоя из дельты идёт в свежую аллокацию, а не мутацией чужой базы; apply_delta(self) делегирует с None ( прежний контракт), новый apply_delta_on(&self, delta, resync_layer) — ref-twin по общей базе: содержимое базы клонируется ровно один раз в результат. (4) Клиент: base_arc = get_latest() (шаринг), target = base.apply_delta_on(&delta, delta.is_resync.then_some(layer)), затем ОДИН Arc::new(target) шарится всеми тремя хранилищами — write_arc в кольцо, add_arc в интерполятор, move в latest_state; ClientEvent::StateUpdate { snapshot: Arc<Snapshot> }; StateFull-ветка строит Arc(Snapshot::from(&state)) один раз и раздаёт его же; счётчик №274 остался ровно один (по месту base-advance); boot-ветка (нет полного состояния) сохранена с write_snapshot(boot.clone()). (5) server.rs publish — Arc-фолбэк .unwrap_or_else(|| Arc::new(Snapshot {...})). Потребители события (stress 100×15-харнесс) читают через Deref — не тронуты. Остаток отрыва от номинала при 100 ботах — зона №746 (слой-2 >MTU): после снятия клонов applied-дельты 73.19/с/бот против номинальной суммы слоёв ~75/с — потребление больше не потолок.
+Исправлен как: (1) кольцо хранит Arc<Snapshot>: write_arc складывает аллокацию вызывающего (write_snapshot остался owned-обёрткой), get_latest/get_snapshot отдают шаринг, а не клон — два чтения руками выдают ту же аллокацию. (2) Интерполятор — Vec<Arc<Snapshot>> + add_arc: сэмплы шарятся с кольцом и слотом; гвард усечения №20 сохранён — oversized-сэмпл платит старую цену клон+truncate, обычный трафик проходится нулём копий. (3) Слияние вынесено в один merge_delta(entities, projectiles, delta, resync_layer): механика №637 (индексная) дословно; новый параметр resync_layer переносит правило ресинка («слой заменяется целиком») внутрь собираемого результата — чистка соседствующего слоя из дельты идёт в свежую аллокацию, а не мутацией чужой базы; apply_delta(self) делегирует с None ( прежний контракт), новый apply_delta_on(&self, delta, resync_layer) — ref-twin по общей базе: содержимое базы клонируется ровно один раз в результат. (4) Клиент: base_arc = get_latest() (шаринг), target = base.apply_delta_on(&delta, delta.is_resync.then_some(layer)), затем ОДИН Arc::new(target) шарится всеми тремя хранилищами — write_arc в кольцо, add_arc в интерполятор, move в latest_state; ClientEvent::StateUpdate { snapshot: Arc<Snapshot> }; StateFull-ветка строит Arc(Snapshot::from(&state)) один раз и раздаёт его же; счётчик №175 остался ровно один (по месту base-advance); boot-ветка (нет полного состояния) сохранена с write_snapshot(boot.clone()). (5) server.rs publish — Arc-фолбэк .unwrap_or_else(|| Arc::new(Snapshot {...})). Потребители события (stress 100×15-харнесс) читают через Deref — не тронуты. Остаток отрыва от номинала при 100 ботах — зона №746 (слой-2 >MTU): после снятия клонов applied-дельты 73.19/с/бот против номинальной суммы слоёв ~75/с — потребление больше не потолок.
 Проверка (RED→GREEN): NC-тесты в snapshot.rs, модуль snapshot_sharing_tests_745 (4 шт., машинные прогоны RED/GREEN по отдельности): (T1) the_buffer_hands_out_shared_allocations_not_deep_copies — два get_latest выдают Arc::ptr_eq-одну аллокацию, write_arc сохраняет аллокацию вызывающего; RED-проба: временный deep-клон внутри get_latest — упал только T1, откат. (T2) the_reference_merge_twin_matches_the_by_value_merge — created/upsert/updated/destroyed/проектайлы тождественны owned-merge, база нетронута; (T3) a_resync_replaces_only_its_own_layer_in_the_result_not_its_neighbors — слой заменяется содержимым дельты, чужие слои живы, база не мутится, проектайл-ресинк чистит снаряды; RED-проба на T2/T3: временный twin, игнорирующий destroyed и resync_layer — упали только T2 и T3, откат. (T4) the_interpolator_keeps_arc_samples_and_still_truncates_oversized_ones — сэмплы на Arc хранятся целыми, гвард №20 на Arc-пути усекает; RED-проба: временный add_arc без усечения — упал только T4, откат. Маркеры сняты, grep по NC-745-TEMP — ноль. GREEN: cargo test -p rfs_net — 129/0 (было 125, +4); cargo build --release -p rfs_server -p rfs_stress — EXIT 0, Finished (build_745_final.log). Прогон 100×15 (server --ships 4 + stress |target-analysis|): per_bot_hz_p50 9.87 → 27.22 (номинал 30), p05 7.83 → 25.91; applied_deltas_hz 52.22 → 73.19; coalesced state_updates 10.73 → 28.29; stalled_deltas 5774 → 417 (−93%), ботов со стагнами 100/100 → 56/100; resync_requests 1225 → 166; missed_tick_publishes 29337 → 2899; rx_per_bot 117.7 → 154.0/s; errors 0. Контроль 20×15: per_bot_hz_p50 30.18 (базовая 30.19) — health сохранён, стагнов 53.
 
 Баг№746
@@ -5177,9 +5218,33 @@ GBuffer — техника deferred. Владелец выбрал **Forward+ (�
 
 Баг№755
 Баг в файле: не дефект — заказ владельца (2026-11-06: «протестируй сервер и расширь буферы все, также пусть больше выгрузки в оперативку для ускорения работы»), в реестре по формату №747 по прецеденту №752. Файлы правки (8): `C:\RFS-0.4.0\server_src\crates\net\src\server.rs`, `...\net\src\client.rs`, `...\net\src\connection.rs`, `...\net\src\channel.rs`, `...\net\src\bandwidth.rs`, `...\server\src\control\server.rs`, `...\control\ring.rs`, `...\control\journal.rs`
-В чём заключается: мотив помечен приёмкой, не дефектом кода. Тяжёлая волна 100×45 на снимке `91bf123` зелёная (100/100, errors=0, серверные дропы 0/0), но на разгоне/под нагрузке — ~150 клиентских LAYER-столлов «delta base N != applied N+2» (слои 0/1/2) — цена мелких колец поверх одиночного стакана №274: дефолт `snapshot_history` 128, `MAX_PENDING_CONFIRMS` 4. Столлы самолечатся ресинком (№754/№30), но кормят клиентов рвано (база: p05 25,58 при p50 30,27). Заказ: расширить ВСЕ буферы ветки и перенести нагрузку в резидентную оперативку — упреждающая предаллокация вместо ленивого роста, ускорение работы.
+В чём заключается: мотив помечен приёмкой, не дефектом кода. Тяжёлая волна 100×45 на снимке `91bf123` зелёная (100/100, errors=0, серверные дропы 0/0), но на разгоне/под нагрузке — ~150 клиентских LAYER-столлов «delta base N != applied N+2» (слои 0/1/2) — цена мелких колец поверх одиночного стакана №175: дефолт `snapshot_history` 128, `MAX_PENDING_CONFIRMS` 4. Столлы самолечатся ресинком (№754/№30), но кормят клиентов рвано (база: p05 25,58 при p50 30,27). Заказ: расширить ВСЕ буферы ветки и перенести нагрузку в резидентную оперативку — упреждающая предаллокация вместо ленивого роста, ускорение работы.
 Тип бага: Расширение всех буферов/очередей ×4 + упреждающая предаллокация горячих структур (заказ владельца, не дефект кода)
 Статус: Сделано
 Исправлен как: (1) серверные очереди ×4: `EVENT_QUEUE_LIMIT` 4096→16384 и `OUTBOX_QUEUE_LIMIT` 8192→32768, поднятые из ctor в module-level `pub(crate)` — числа закреплены тестами; №613-свойство «флуд дропается, а не буферизуется до OOM» сохранено. (2) клиентские очереди ×4: `CLIENT_EVENT_QUEUE` 4096→16384, `CLIENT_OUTBOX_QUEUE_LIMIT` 8192→32768. (3) дефолт `snapshot_history` 128→512 в ОБОИХ конфигах (сервер+клиент) — merge-base-буфер и интерполятор держат окно 512 (№745: аллокации общие, резидентная цена — одно окно). (4) `MAX_PENDING_CONFIRMS` 4→16 (выгружался под пиками disconnect-батчей при разгоне 100 клиентов; цена — килобайты на соединение); `ClientLayerTrack` получил честный Default — каждая layer-кольцевка предаллоцирована на полный капасит. (5) control-plane: `QUEUE_CAP` 64→256, `SUBSCRIBER_QUEUE` 1024→4096, `RING_CAP` журнала 512→2048; ring-prealloc без `.min(64)` — буфер журнала резидентен целиком. (6) упреждающая предаллокация: connections/connection_by_addr/client_layers/pending_confirms/connect_limits → `HashMap::with_capacity(CONNECT_TABLE_CAP)` (4096; рабочий ctor и тест-фикстура), pending_challenges → `with_capacity(PENDING_CHALLENGE_CAP)` (1024, оба места), `FirstFullQueue` — честный Default (queue и waiting → `with_capacity(CAP)` 256), `pending_acks` → 64, ledger канала → 64, обе истории bandwidth → 128 (все четыре init-места) — геометрический regrowth под нагрузкой больше не происходит. (7) тест `the_ring_caps_at_the_confirms_limit` разведён от константы (подачи = 2×16+2), не от магической шестёрки.
 Проверка (RED→GREEN): §10.8 честно — три теста-скрепы новых размеров написаны ДО правок со старыми числами, маркер `NC-755-TEMP`, все три краснели: сервер-скрепа «left: 128 / right: 512» (server.rs:4518), клиент-скрепа «left: 128 / right: 512» (client.rs:3800), control-скрепа «left: 64 / right: 256» (control/server.rs:1485). После правок GREEN: rfs_net **137/0** (+2), rfs_server lib **122/0** (+1), ctl **2/0**, bin **5/0**. Маркеры сняты, grep `NC-755-TEMP` по server_src — **0**.
-Прогон: stress **11/0**; Tool/harness **214/0** (target-analysis; все зелёные). Clippy `--workspace --all-targets`: BUILD=0, warning-строк 8 — ровно прежние 5 pre-existing + 3 агрегата, новых ноль (ни один не указывает на строки партии). Release пересобран (BUILD=0, бинарь 10:05:52) после остановки baseline-сервера живым. Supervised-приёмка на расширенных буферах: волна 20×15 — 20/20, errors=0, stalled 0, p50 30,19; тяжёлая 100×45 — первая попытка оборвана моей pipe-обрезкой стресс-вывода (метод-инцидент, код вне подозрений; first_fulls=50), повтор полным сбором — **100/100 live, errors=0, rejected 0, stalled 0, p05=30,23 / p50=30,26** против базовых p05=25,58 / p50=30,27 — равномерность per-bot на разгоне заметно выросла; delivery 340 062 применённых дельты, stall_rows=144 (тот же класс race-стакана №274: расширенные кольца смягчают глубину, частоту не меняют, самолечение ресинком №754/№30). Серверные дропы по `ctl net` на всех волнах **0/0** (dropped_events=0, dropped_outbox=0, first_fulls=250 суммарно за три волны). Полный лог сервера (3 волны, 2918 строк): Unhandled/LayerSync/ResyncRequest — по **0**; WARN 34: reliable-windows «aged out» ×28 (по одному на событие при disconnect-батчах; пред-existing вид peer-канала, вне буферной партии — в базе 13 на одну волну), spawn-placement ×5, auth ×1; против базового лога perf-WARNs исчезли целиком (skipped-ticks ×10 и «only N snapshot rounds» ×2 база — в расширенном ноль). Клиентские match_id-storm WARN при старте волны — вид стресс-харнесса, вне партии. Сервер остановлен живым, стреров нет.
+Прогон: stress **11/0**; Tool/harness **214/0** (target-analysis; все зелёные). Clippy `--workspace --all-targets`: BUILD=0, warning-строк 8 — ровно прежние 5 pre-existing + 3 агрегата, новых ноль (ни один не указывает на строки партии). Release пересобран (BUILD=0, бинарь 10:05:52) после остановки baseline-сервера живым. Supervised-приёмка на расширенных буферах: волна 20×15 — 20/20, errors=0, stalled 0, p50 30,19; тяжёлая 100×45 — первая попытка оборвана моей pipe-обрезкой стресс-вывода (метод-инцидент, код вне подозрений; first_fulls=50), повтор полным сбором — **100/100 live, errors=0, rejected 0, stalled 0, p05=30,23 / p50=30,26** против базовых p05=25,58 / p50=30,27 — равномерность per-bot на разгоне заметно выросла; delivery 340 062 применённых дельты, stall_rows=144 (тот же класс race-стакана №175: расширенные кольца смягчают глубину, частоту не меняют, самолечение ресинком №754/№30). Серверные дропы по `ctl net` на всех волнах **0/0** (dropped_events=0, dropped_outbox=0, first_fulls=250 суммарно за три волны). Полный лог сервера (3 волны, 2918 строк): Unhandled/LayerSync/ResyncRequest — по **0**; WARN 34: reliable-windows «aged out» ×28 (по одному на событие при disconnect-батчах; пред-existing вид peer-канала, вне буферной партии — в базе 13 на одну волну), spawn-placement ×5, auth ×1; против базового лога perf-WARNs исчезли целиком (skipped-ticks ×10 и «only N snapshot rounds» ×2 база — в расширенном ноль). Клиентские match_id-storm WARN при старте волны — вид стресс-харнесса, вне партии. Сервер остановлен живым, стреров нет.
+
+Баг№756
+Баг в файле: ссылки в server_src\crates\stress\src\main.rs (12 комментариев + вывод summary), crates\net\src\server.rs (7), crates\net\src\client.rs (11), crates\server\src\main.rs (1); ship-тема в crates\net\src\snapshot.rs (:117, :999, :1174, :1427) и crates\core\src\packet.rs (:704); мои записи .DOC\BUGS.md (:5095, :5180, :5185) и .DOC\AGENT_CHAT.md (:6800, :6909, :6911, :6913)
+В чём заключается: битые ссылки «Bug №274» — стресс-харнесс (все свои комментарии и вывод summary «…is a COALESCED consumption rate, not delivery — see bug №274») и сетевой код (счётчики применённых/отправленных дельт) цитировали номер, под которым в текущем реестре лежит чужая запись (Vulkan-fence, src\rhi\backend\vulkan\device.rs). Происхождение прострочено археологией git: комментарии родом из stash-восстановления `50f6bf7` (2026-10-01), их «№274» приходился на нумерацию ДО консолидации документации (`9a47763`, тем же числом позже), а та нумерация сама была перетасована дефектом нумерования (:3827: «запись про утечки стояла под номером 274, а про fence дважды»); старый реестр `.DOC/BUGS_CLIENT.md` того же коммита под №274 держал ASTC-имена рендера — третья несовпадающая нумерация. Оригинал истинной записи восстановлению не подлежит; правило «ссылка проверяется текстом записи прежде правки» — единственное лекарство от такого переливания номеров.
+Тип бага: Документация/Ссылки (битые номера в коде и записях)
+Статус: Сделано
+Исправлен как: (1) счётная/коалесинговая тема — 31 ссылка (stress 12, net/server.rs 7, net/client.rs 11, server/main.rs 1) — перенесена на **№175**; подтверждение реестром: Баг№175 (:1329, файловый список — сам харнесс), :1334 «полные StateUpdate выведены из очереди в слот слияния latest_state», «updates_total больше не вычисляется вхолостую: summary сверяет его с суммой по отчётам» — ровно смысл вывода «COALESCED consumption rate, not delivery». (2) Пять ссылок ship-темы (`current_ship` в PlayerStateData/PlayerSnapshotData: snapshot.rs :117/:999/:1174/:1427, packet.rs :704) нейтрализованы в содержательные комментарии без номера: оригинальная запись при перенумерованиях потеряна, ссылку-выдумку ставить нельзя (сам прецедент №756 того стоит). (3) Мои записи №755 (BUGS :5095/:5180/:5185) и чат (:6800/:6909/:6911) переведены с №274 на №175; в чате :6913 моя же гипотеза «стакан = №680» снята чтением — Баг№680 (:4594) — пул present-семафоров рендера, к сети не относится; истина: слот слияния latest_state = №175. (4) Легитимные №274 не тронуты: заголовок реестра (:3782), кросс-ссылка «Связано с №274» (:3844), исторические строки чата (:919, :1552), счёт тестов «274/0» (:5344), номера строк (:5999), и Tool\client_tests\tests\rhi_vulkan_graphics.rs:228 (тест настоящего fence-фикса — зона рендер-агента).
+Проверка: git grep '№274' по server_src — **0**; по .DOC остаются только легитимные (BUGS :3782/:3844; чат :919/:1552/:6913-описание дефекта). Вывод summary читает «— see bug №175)», и эта ссылка соответствует тексту №175.
+
+Баг№757
+Баг в файле: C:\RFS-0.4.0\server_src\crates\net\src\server.rs (apply_layer_sync_report: take из `pending_confirms.lock()` и запись ряда в `client_layers.write()` — два разных замка в разных руках, окно зазора между ними; publish-проход send_snapshots при сухом кольце анкерился старым рядом из `client_layers`)
+В чём заключается баг: редкие layer-столлы «delta base N != applied N+2 — дальнейшие дельты слоя сбрасываются до ресинка» на тяжёлых волнах (100×45: 89 → 36 → 43 столла в трёх подряд прогонах при расширенных буферах №755; слои 0/1/2, самолечения ресинком №30/№754 не достаточно — клиент кормится рвано на разгоне). Приборная кампания (клиентские NC757-TEMP-поля full_ticks/deltas_since_full + расширенный stall-WARN; серверные NC-757-SERVER-маркеры) дала точный кортеж: slope applied−base = **+2** (80/89), dsrv−applied = **+1** (71/89); stale_fulls/stale_deltas — нули; все fulls — только адмиссионные (86 строк, `max_applied_before=0`); и триада серверных маркеров на живой волне: **anchor-behind = 41–50 строк, каждая `ring_back=None ring_len=0`** (кольцо сухо, анкер из ряда стоит на 2 позади reported: `last_sent=445 reported=447` и т.п.), **push-behind = 0, ring-lost = 0, install-lag = 0**. Пуш всегда впереди отчёта, клиентские applied никогда не превышали кольцо, каждая инсталляция доезжала — противоречие в статике возможно только одним способом: **зазор между двумя окнами замков** в `apply_layer_sync_report` — take под `pending_confirms.lock()` съедает exact-match-запись и очищает старшие, отпускает замок, и только ПОСЛЕ этого ряд переписывается в `client_layers` (дисциплина №79 «не держать два замка в одной руке»). Параллельный publish-проход (rayon по клиентам в фоне с приёмным циклом) попадает в этот зазор: кольцо уже сухо, ряд ещё старый (confirmed-копии не было вовсе — база бралась из ряда), и проход штампует дельту базой на 2 позади applied-часов клиента → дроп «delta base N != applied N+2» → столл слоя до ресинка. Окно реальное: `LAYER_REPORT_INTERVAL` = 50 мс ≈ 2 тика наклона «+2».
+Тип бага: Гонка двух окон замков вокруг одного факта (confirmed-база живёт в двух хранилищах, шаги разнесены по разным замкам — read-анкер прохода видит половину факта: кольцо уже пусто, ряд ещё старый)
+Статус: Сделано
+Исправлен как: подготовленная копия подтверждённой базы переезжает ВНУТРЬ трека в `pending_confirms` — туда же, где живёт кольцо: (1) `ClientLayerTrack` получил поле `confirmed: [Option<LayerBase>; LAYER_COUNT]` (+ честный Default: `std::array::from_fn`); (2) новый хелпер `install_confirmed_base(track, layer, applied)` — `take_confirmed_base` + `track.confirmed[layer] = Some(entry.clone())` ОДНИМ окном `pending_confirms.lock()`; обработчик отчёта вызывает его под замком, зеркальная запись ряда в `client_layers` остаётся после release — дисциплина №79 сохранена (два замка по-прежнему не в одной руке); after-take-порядок семантики `take_confirmed_base` не тронут (exact-match → remove, pop_front ниже applied); (3) анкер-фолбэк publish-прохода при сухом кольце сменил порядок: `ring.back()` → `track.confirmed[layer]` (та же одна блокировка) → ряд «первого контакта» (адмиссионный) только для клиента, отчёт которого ещё не долетел. Кэш-ключ, `base_empty`-семантика, shield-правило №30 (B), self-resync — не тронуты (`LayerBase` в snapshot.rs уже несёт Clone/Default).
+Проверка (RED→GREEN): тест `a_taken_entry_advances_the_tracks_confirmed_copy` (layer_confirm_tests): `pending[0] = ring(&[445,447])`, `install_confirmed_base(&mut track, 0, 447)` → entry == 447, кольцо сухо, `track.confirmed[0].base_tick == 447`. RED-проба §10.8 маркером `NC-757-TEMP`: строка копии-install временно закомментирована — тест краснеет честным сообщением «the copy is advanced in the same window, not left at the old row» (`left: None / right: Some(447)`), остальные 137 тестов не тронуты (137 filtered out); маркер снят, restore → GREEN `cargo test -p rfs_net --lib` — **138/0** (+1). Маркеры сняты все: клиентские nc757_full_ticks/deltas_since_full (11 точек client.rs: поля, ctor, клоны, 4 параметра, 2 вызова, full-блок, расширенный stall-WARN — возвращён собственный формат №30 (B)), серверные NC-757-SERVER anchor-behind/push-behind/install-lag (3 блока server.rs); grep `NC-757-TEMP|NC757-TEMP|NC-757-SERVER|nc757_full_ticks|nc757_deltas_since_full` по server_src — **0**.
+Прогон: полный сьют-матрикс (target-analysis): net **138/0**, server lib **122/0**, ctl **2/0**, bin **5/0**, core 37/0, damage 28/0, ship 39/0, sim 78/0, stress **11/0**; Tool/harness — exit 0 (все 0 failed; protocol 11/0 и пр.). Release пересобран ЧИСТОГО дерева (BUILD=0) после остановки живого сервера; supervised-приёмка на исправленном бинаре: контрольная волна 20×15 — **столлов 0**, aborted_bots=0, p50 30,18, first_fulls=20; тяжёлая 100×45 — **столлов 0** (против 89/36/43 до фикса), bots=100 connected_at_end=100, **errors=0**, rejected 0/0, events_dropped=0, 30,27 Гц aggr/p50 30,26, delivery 340 235 применённых дельт by_layer [68017, 136109, 136109, 0]; `ctl net` — dropped_events=0, dropped_outbox=0, session_rejects=0, first_fulls=120. Сервер остановлен живым Stop-Process, стреров нет. Метод-наблюдение (вне реестра): конфиг `target-analysis\release\server_config.json` был переписан при 23:41-локал-старте (mtime = секунда старта; `allow_unsigned: false` при сид-конфиге №748 с `true`) и пересобранный бинарь честно отказал стартом «auth_token is empty and allow_unsigned is false»; выставил `allow_unsigned: true` вручную (unsigned-диалект станка анализа, как весь день и работало); точный писатель false-конфига не восстановлен.
+
+Баг№760
+Баг в файле: C:\RFS-0.4.0\server_src\crates\server\src\main.rs — стартовая цепочка (placed-предупреждения :308 clamp-вариант и :314 obstacle-вариант внутри спавн-цикла кораблей; auth-no-secret warn :245 из №700 читающей половины)
+В чём заключается баг: стартовый лог сервера шумит повторяющимися spawn-placement предупреждениями и этим перегружает полезную часть старта. На дефолтном процедурном мире (`open_sea`, `PROCEDURAL_MAP_SEED`) спавн-линия `i * SHIP_SPACING` по X (match_.rs SHIP_ID/SHIP_ID_STRIDE/SHIP_SPACING) не учитывает сгенерированные препятствия, поэтому каждый запуск выдаёт один и тот же набор строк — по одной на каждый корабль вне свободного места (наблюдение приёмкой №755: spawn-placement ×5 на EntityId 100010–140010 за прогоны). Информация разовая по сути (один и тот же факт о конфигурации карты), подана построчно в счёт кораблей. Остальные стартовые строки (config :223, auth-no-secret :245, world load match_.rs:119/:139, ship classes :182/:190, listening :341, control :380/:406/:412) — честная информация, шумом не считаются и правится не будут.
+Тип бага: Лог-шум (повторяющиеся per-ship строки на каждом старте без агрегации)
+Статус: Не сделано
+Исправлен как: (план, до правки) агрегировать размещение спавна в одну итоговую строку на весь стартовый список: один warn с общим счётом, списком EntityId и раскладкой причин (clamped N / inside-obstacle M); поединичные строки уходят в debug! для тех, кому нужен по-корабельный разбор. Прогон коробки и мира не меняется (спавн внутри препятствий — отдельная геймплейная тема, не эта запись). Тест агрегатора RED→GREEN в match_.rs.

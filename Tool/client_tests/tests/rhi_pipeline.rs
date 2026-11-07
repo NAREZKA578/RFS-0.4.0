@@ -1,8 +1,8 @@
 use rhi::pipeline::compute::{ComputePipeline, ComputePipelineDesc};
 use rhi::pipeline::graphics::{
-    format_size, ColorBlendState, CullMode, DepthStencilState, FrontFace, GraphicsPipeline,
-    GraphicsPipelineDesc, PipelineShaderStage, PolygonMode, PrimitiveTopology, RasterizerState,
-    VertexInputRate, VertexInputState,
+    format_size, ColorBlendState, ColorComponentFlags, CullMode, DepthStencilState, FrontFace,
+    GraphicsPipeline, GraphicsPipelineDesc, PipelineShaderStage, PolygonMode, PrimitiveTopology,
+    RasterizerState, VertexInputRate, VertexInputState,
 };
 use rhi::pipeline::state::{PipelineLayout, PushConstantRange};
 use rhi::shader::module::{ShaderFormat, ShaderModule, ShaderModuleDesc};
@@ -103,8 +103,19 @@ fn depth_stencil_presets() {
 
 #[test]
 fn blend_presets_exist() {
-    let disabled = ColorBlendState::disabled();
-    assert!(disabled.attachments.is_empty());
+    // Bug №231: the opaque blend state must populate the attachments it
+    // covers — an empty attachment list was an invalid attachmentCount = 0
+    // against every colour-attachment pass.
+    let disabled = ColorBlendState::disabled(2);
+    assert_eq!(disabled.attachments.len(), 2);
+    assert!(disabled.attachments.iter().all(|a| !a.blend_enable));
+    assert!(disabled
+        .attachments
+        .iter()
+        .all(|a| a.color_write_mask.contains(ColorComponentFlags::R)
+            && a.color_write_mask.contains(ColorComponentFlags::G)
+            && a.color_write_mask.contains(ColorComponentFlags::B)
+            && a.color_write_mask.contains(ColorComponentFlags::A)));
 
     let alpha = ColorBlendState::alpha();
     assert!(!alpha.attachments.is_empty());

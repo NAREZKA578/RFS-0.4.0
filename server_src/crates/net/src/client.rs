@@ -340,10 +340,10 @@ pub struct NetClient {
     /// Newest applied server tick per replication layer (plan №3.4). Layered
     /// deltas apply to the latest snapshot; stale ones are dropped.
     last_applied_layer: Arc<Mutex<[u64; LAYER_COUNT]>>,
-    /// Bug №274: deltas actually applied, counted where they are applied. The
+    /// Bug №175: deltas actually applied, counted where they are applied. The
     /// `latest_state` slot cannot be used for this — it coalesces.
     applied_delta_count: Arc<AtomicU64>,
-    /// Bug №274: the same, per layer, so one slow layer is distinguishable
+    /// Bug №175: the same, per layer, so one slow layer is distinguishable
     /// from a slow client.
     applied_delta_count_by_layer: Arc<parking_lot::Mutex<Vec<u64>>>,
     /// Bug #267: how many deltas were dropped because their base tick did not
@@ -1077,7 +1077,7 @@ impl NetClient {
         let entity_states = self.entity_states.clone();
         let projectile_states = self.projectile_states.clone();
         let last_applied_layer = self.last_applied_layer.clone();
-        // Bug №274: shared with the apply site so it can count deltas where they
+        // Bug №175: shared with the apply site so it can count deltas where they
         // are applied, rather than inferring it from the coalescing slot.
         let applied_delta_count = self.applied_delta_count.clone();
         let applied_delta_count_by_layer = self.applied_delta_count_by_layer.clone();
@@ -1158,7 +1158,7 @@ impl NetClient {
                             &entity_states,
                             &projectile_states,
                             &last_applied_layer,
-                            // Bug №274: passed through so the apply site can
+                            // Bug №175: passed through so the apply site can
                             // count deltas without relying on the coalescing
                             // `latest_state` slot.
                             &applied_delta_count,
@@ -1239,7 +1239,7 @@ impl NetClient {
         entity_states: &Arc<RwLock<HashMap<EntityId, EntitySnapshot>>>,
         projectile_states: &Arc<RwLock<HashMap<EntityId, ProjectileSnapshot>>>,
         last_applied_layer: &Arc<Mutex<[u64; LAYER_COUNT]>>,
-        // Bug №274: the honest delivery counter. The `latest_state` slot
+        // Bug №175: the honest delivery counter. The `latest_state` slot
         // coalesces, so it cannot measure how much arrived.
         applied_delta_count: &Arc<AtomicU64>,
         applied_delta_count_by_layer: &Arc<parking_lot::Mutex<Vec<u64>>>,
@@ -1542,7 +1542,7 @@ impl NetClient {
                     entity_states,
                     projectile_states,
                     last_applied_layer,
-                    // Bug №274: same as the direct path — a
+                    // Bug №175: same as the direct path — a
                     // fragmented delta is applied the same way.
                     applied_delta_count,
                     applied_delta_count_by_layer,
@@ -1578,7 +1578,7 @@ impl NetClient {
                                 entity_states,
                                 projectile_states,
                                 last_applied_layer,
-                                // Bug №274: threaded through so the apply site
+                                // Bug №175: threaded through so the apply site
                                 // can count deltas instead of inferring it from
                                 // the coalescing slot.
                                 applied_delta_count,
@@ -1794,7 +1794,7 @@ impl NetClient {
         entity_states: &Arc<RwLock<HashMap<EntityId, EntitySnapshot>>>,
         projectile_states: &Arc<RwLock<HashMap<EntityId, ProjectileSnapshot>>>,
         last_applied_layer: &Arc<Mutex<[u64; LAYER_COUNT]>>,
-        // Bug №274: counted where a delta's base advances, so the figure
+        // Bug №175: counted where a delta's base advances, so the figure
         // cannot be lost to the coalescing `latest_state` slot.
         applied_delta_count: &Arc<AtomicU64>,
         applied_delta_count_by_layer: &Arc<parking_lot::Mutex<Vec<u64>>>,
@@ -1968,7 +1968,7 @@ impl NetClient {
                              delta for this layer is dropped until the next resync (reported \
                              once per layer; see base_mismatch_drops for the count)",
                             delta.base_tick,
-                            last_applied_layer.lock()[layer]
+                            last_applied_layer.lock()[layer],
                         );
                     }
                 }
@@ -2043,7 +2043,7 @@ impl NetClient {
                     boot.apply_delta_on(&delta, delta.is_resync.then_some(layer))
                 }
             };
-            // Bug №274: count the delta HERE — at the moment its base
+            // Bug №175: count the delta HERE — at the moment its base
             // advances, which is the one place that cannot be undone and
             // cannot coalesce. `latest_state` cannot serve as the counter:
             // it is a single overwrite slot, so when several layers' deltas
@@ -2561,7 +2561,7 @@ impl NetClient {
         *guard
     }
 
-    /// Bug №274: how many deltas were APPLIED, counted at the point of
+    /// Bug №175: how many deltas were APPLIED, counted at the point of
     /// application — never coalesced, never sampled.
     ///
     /// This exists because `applied rate`, measured from the `latest_state`
@@ -2578,7 +2578,7 @@ impl NetClient {
         self.applied_delta_count.load(Ordering::Relaxed)
     }
 
-    /// Bug №274: `applied_delta_count` broken down per layer, so a slow layer
+    /// Bug №175: `applied_delta_count` broken down per layer, so a slow layer
     /// can be told apart from a slow client.
     pub fn applied_delta_count_by_layer(&self) -> Vec<u64> {
         self.applied_delta_count_by_layer.lock().clone()

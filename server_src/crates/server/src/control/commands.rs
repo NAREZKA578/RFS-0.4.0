@@ -13,6 +13,7 @@
 //! belongs to the loop, the door only decides.
 
 use crate::config::{ControlConfig, MatchConfig, VoteKickConfig};
+use super::banlist::BanList;
 use super::journal::{ActionJournal, Entry};
 use super::ring::{level_rank, LogEvent, LogRing};
 use super::status::{PlayerStatus, ServerStatus};
@@ -28,6 +29,10 @@ pub const COMMANDS: &[&str] = &[
     "status", "perf", "net", "players", "config", "log", "watch",
     // stage 2
     "say", "kick", "stop", "reload", "audit",
+    // stage 3
+    "ban", "unban", "banlist",
+    // stage 4
+    "end_match", "start_match", "restart_match",
 ];
 
 /// The topics a `watch` subscription may name. The journal (the ring exists)
@@ -93,6 +98,14 @@ pub enum Request {
     Stop { delay_s: u64 },
     Reload,
     Audit { tail: usize },
+    // stage 3
+    Ban { target: String, reason: String },
+    Unban { target: String },
+    BanList,
+    // stage 4
+    EndMatch,
+    StartMatch,
+    RestartMatch,
 }
 
 /// Turns the wire's `cmd` + free-form `args` into a request, or the refusal
@@ -113,6 +126,14 @@ pub fn parse_request(cmd: &str, args: Option<&Value>) -> Result<Request, Refusal
         "stop" => parse_stop(args),
         "reload" => Ok(Request::Reload),
         "audit" => parse_audit(args),
+        // stage 3
+        "ban" => parse_ban(args),
+        "unban" => parse_unban(args),
+        "banlist" => parse_banlist(args),
+        // stage 4
+        "end_match" => Ok(Request::EndMatch),
+        "start_match" => Ok(Request::StartMatch),
+        "restart_match" => Ok(Request::RestartMatch),
         _ => Err((
             "unknown_command",
             format!(
@@ -297,6 +318,75 @@ fn parse_audit(args: Option<&Value>) -> Result<Request, Refusal> {
     Ok(Request::Audit { tail })
 }
 
+/// `ban` needs a `target` (Steam ID or address) and an optional `reason`. The
+/// reason shares `say`'s byte cap — one event, one budget.
+fn parse_ban(args: Option<&Value>) -> Result<Request, Refusal> {
+    let map = args_map(args)?;
+    let map = map.ok_or_else(|| bad_arguments("ban needs args {\"target\": \"…\", \"reason\": \"…\"}"))?;
+    let target = map
+        .get("target")
+        .ok_or_else(|| bad_arguments("ban needs a \"target\" (Steam ID or address)"))?
+        .as_str()
+        .ok_or_else(|| bad_arguments("ban \"target\" must be a string"))?;
+    if target.trim().is_empty() {
+        return Err(bad_arguments("ban: the target is empty; there is no one to ban"));
+    }
+    let reason = match map.get("reason") {
+        None | Some(Value::Null) => String::new(),
+        Some(raw) => {
+            let reason = raw
+                .as_str()
+                .ok_or_else(|| bad_arguments("ban \"reason\" must be a string"))?;
+            if reason.len() > SAY_MAX_BYTES {
+                return Err(bad_arguments(format!(
+                    "ban: the reason is {} bytes; the cap is {SAY_MAX_BYTES}",
+                    reason.len()
+                )));
+            }
+            reason.to_string()
+        }
+    };
+    Ok(Request::Ban {
+        target: target.to_string(),
+        reason,
+    })
+}
+
+/// `unban` needs a `target` (Steam ID or address).
+fn parse_unban(args: Option<&Value>) -> Result<Request, Refusal> {
+    let map = args_map(args)?;
+    let map = map.ok_or_else(|| bad_arguments("unban needs args {\"target\": \"…\"}"))?;
+    let target = map
+        .get("target")
+        .ok_or_else(|| bad_arguments("unban needs a \"target\" (Steam ID or address)"))?
+        .as_str()
+        .ok_or_else(|| bad_arguments("unban \"target\" must be a string"))?;
+    if target.trim().is_empty() {
+        return Err(bad_arguments("unban: the target is empty; there is no one to unban"));
+    }
+    Ok(Request::Unban {
+        target: target.to_string(),
+    })
+}
+
+/// `banlist` takes an optional `tail` — the same rule as `audit`.
+fn parse_banlist(args: Option<&Value>) -> Result<Request, Refusal> {
+    let map = args_map(args)?;
+    let mut tail = 50usize;
+    if let Some(map) = map {
+        if let Some(tail_value) = map.get("tail") {
+            let raw = tail_value
+                .as_u64()
+                .ok_or_else(|| bad_arguments("banlist.tail must be a non-negative integer"))?;
+            if raw == 0 {
+                return Err(bad_arguments("banlist.tail of 0 asks for nothing; omit the field or ask for 1"));
+            }
+            tail = raw as usize;
+        }
+    }
+    Ok(Request::BanList)
+}
+
 /// Reads execute here — the pure "snapshot + request → answer" half. The
 /// mutating stage-2 commands never reach this fn: the listener routes them
 /// through the gates and the queue first (А.2 item 1), so an arm for them
@@ -307,6 +397,7 @@ pub fn dispatch(
     ring: &LogRing,
     config: &RedactedConfig,
     actions: &ActionJournal,
+    ban_list: &BanList,
 ) -> Result<Reply, Refusal> {
     match request {
         Request::Status => Ok(Reply::Data(status_data(status))),
@@ -319,12 +410,39 @@ pub fn dispatch(
             topics: topics.clone(),
         }),
         Request::Audit { tail } => Ok(Reply::Data(audit_data(actions, *tail))),
-        Request::Say { .. } | Request::Kick { .. } | Request::Stop { .. } | Request::Reload => {
+        Request::BanList => Ok(Reply::Data(banlist_data(ban_list))),
+        Request::Say { .. } | Request::Kick { .. } | Request::Stop { .. } | Request::Reload
+        | Request::Ban { .. } | Request::Unban { .. } => {
             Err(bad_arguments(
                 "a mutating command reached the read path; the listener must route it first",
             ))
         }
+        Request::EndMatch { .. } | Request::StartMatch { .. } | Request::RestartMatch { .. } => {
+            Err(bad_arguments(
+                "a match-lifecycle command reached the read path; the listener must route it first",
+            ))
+        }
     }
+}
+
+/// The `banlist` answer: every entry in the ban list, oldest first.
+pub fn banlist_data(ban_list: &BanList) -> Value {
+    let entries: Vec<Value> = ban_list
+        .entries()
+        .iter()
+        .map(|e| {
+            json!({
+                "target": e.target,
+                "reason": e.reason,
+                "banned_by": e.banned_by,
+                "banned_at": e.banned_at,
+            })
+        })
+        .collect();
+    json!({
+        "returned": entries.len(),
+        "banned": entries,
+    })
 }
 
 /// The `status` answer: the plan's sample keys (`state`, `tick`, `tick_rate`,
@@ -334,6 +452,7 @@ pub fn dispatch(
 pub fn status_data(status: &ServerStatus) -> Value {
     json!({
         "state": status.state,
+        "match_state": status.match_state,
         "match_id": status.match_id,
         "addr": status.addr,
         "port": status.port,
@@ -643,11 +762,11 @@ mod commands_tests {
         let journal = stage2_journal();
         for cmd in ["status", "perf", "net", "players", "config"] {
             let request = parse_request(cmd, None).unwrap_or_else(|e| panic!("{cmd}: {e:?}"));
-            dispatch(&request, &status, &ring, &config, &journal)
+            dispatch(&request, &status, &ring, &config, &journal, &BanList::default())
                 .unwrap_or_else(|e| panic!("{cmd}: {e:?}"));
         }
         let request = parse_request("audit", None).expect("audit reads the journal");
-        dispatch(&request, &status, &ring, &config, &journal)
+        dispatch(&request, &status, &ring, &config, &journal, &BanList::default())
             .expect("audit answers from the journal handle");
         assert!(parse_request("status", None).is_ok());
         assert!(parse_request("log", None).is_ok());

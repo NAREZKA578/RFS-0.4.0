@@ -840,3 +840,83 @@ mod tests {
         assert_eq!(counts.vertices, u32::MAX);
     }
 }
+
+#[cfg(test)]
+mod bug_207_cycle {
+    use super::RenderGraph;
+    use crate::render::graph::node::{PassDependency, PassOutcome, RenderPass, RenderPassNode};
+    use crate::render::graph::{GraphResource, ResourceUsage};
+    use crate::render::core::RenderContext;
+    use crate::render::scene::Scene;
+    use crate::rhi::CommandEncoder;
+    use std::collections::HashMap;
+
+    struct NullPass(String);
+
+    impl RenderPass for NullPass {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn dependencies(&self) -> &[PassDependency] {
+            &[]
+        }
+        fn outputs(&self) -> &[String] {
+            &[]
+        }
+        fn execute(
+            &mut self,
+            _encoder: &mut CommandEncoder,
+            _context: &mut RenderContext,
+            _scene: &mut Scene,
+            _resources: &HashMap<String, GraphResource>,
+        ) -> PassOutcome {
+            PassOutcome::skipped("cycle-probe stub")
+        }
+    }
+
+    fn node(name: &str, depends_on: &str) -> RenderPassNode {
+        RenderPassNode {
+            name: name.to_string(),
+            pass: Box::new(NullPass(name.to_string())),
+            dependencies: vec![PassDependency::new(depends_on, "noise", ResourceUsage::Sampled)],
+            outputs: Vec::new(),
+            enabled: true,
+            execution_order: 0,
+        }
+    }
+
+    // Bug №207: a dependency cycle used to leave nodes out of the order
+    // silently. Today every node stays in the order and the cycle is
+    // declared, so nothing is quietly dropped.
+    #[test]
+    fn a_dependency_cycle_is_declared_and_every_node_stays_in_the_order() {
+        let mut graph = RenderGraph::new();
+        graph.add_pass(node("a", "b"));
+        graph.add_pass(node("b", "a"));
+
+        graph.sort();
+
+        let order = graph.execution_order();
+        assert_eq!(
+            order.len(),
+            2,
+            "both cycle members must stay in the order, got {order:?}"
+        );
+        assert!(
+            order.contains(&0) && order.contains(&1),
+            "cycle members run in their addition order, got {order:?}"
+        );
+    }
+
+    // The happy path still sorts: a dependent pass comes after its producer.
+    #[test]
+    fn a_fresh_pass_still_sorts_after_its_producer() {
+        let mut graph = RenderGraph::new();
+        graph.add_pass(node("producer", "nonexistent"));
+        graph.add_pass(node("fresh", "producer"));
+
+        graph.sort();
+
+        assert_eq!(graph.execution_order(), &[0, 1]);
+    }
+}

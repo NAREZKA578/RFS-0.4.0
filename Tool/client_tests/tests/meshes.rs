@@ -241,6 +241,62 @@ fn cylinder_counts_and_bounds() {
 }
 
 #[test]
+fn cylinder_caps_use_their_own_ring() {
+    // Bug №210: each cap fan used to connect the OPPOSITE ring — the top
+    // fan took the bottom-ring (odd) vertices — so the mesh became a double
+    // cone through the whole body. Counts and bounds do not change when a
+    // cap picks the wrong ring, so the guard is membership: the center
+    // vertex participates only in its own cap, and therefore every
+    // triangle that contains it must lie flat on that cap and wind
+    // outward.
+    let mesh = Mesh::cylinder("cyl", 1.0, 2.0, 8);
+    let (half, eps) = (1.0_f32, 1e-4_f32);
+    let pos = |i: u32| mesh.vertices[i as usize].position;
+
+    for tri in mesh.indices.chunks_exact(3) {
+        let verts = [tri[0], tri[1], tri[2]];
+        let has_top_center = verts.iter().any(|&i| i == 0);
+        let has_bottom_center = verts.iter().any(|&i| i == 1);
+
+        if has_top_center {
+            let normal = (pos(tri[1]) - pos(tri[0])).cross(pos(tri[2]) - pos(tri[0]));
+            assert!(
+                normal.y > eps,
+                "top cap winds the wrong way, normal {normal:?}"
+            );
+            for i in verts {
+                assert!(
+                    (pos(i).y - half).abs() < eps,
+                    "top cap connects the bottom ring: vertex {i} y = {}",
+                    pos(i).y
+                );
+            }
+        }
+        if has_bottom_center {
+            for i in verts {
+                assert!(
+                    (pos(i).y + half).abs() < eps,
+                    "bottom cap connects the top ring: vertex {i} y = {}",
+                    pos(i).y
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_zero_segment_count_is_clamped_instead_of_becoming_nan() {
+    // Bug №210: segments = 0 divided by zero into NaN vertices and hit
+    // `% 0` in the cap loops. Three segments is the smallest primitive
+    // the caps can be built from.
+    let mesh = Mesh::cylinder("cyl0", 1.0, 2.0, 0);
+    assert_eq!(mesh.vertex_count(), 10);
+    assert_eq!(mesh.index_count(), 36);
+    let bounds = mesh.bounding_box();
+    assert!(bounds.min.is_finite() && bounds.max.is_finite());
+}
+
+#[test]
 fn fullscreen_quad_counts() {
     let quad = Mesh::fullscreen_quad("quad");
     assert_eq!(quad.vertex_count(), 4);

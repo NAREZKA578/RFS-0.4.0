@@ -186,6 +186,8 @@ mod tests {
     /// Bug №178: the old Vulkan table assigned R16_UNORM = 21 (that is
     /// R8G8_SINT) and RG8_UNORM = 43 (that is R8G8B8A8_SRGB). Both describe a
     /// different memory layout, so a buffer written one way was read another.
+    /// The depth-tail lines below used to pin the previous table's +2 shift
+    /// (126/128/129/131); they are the literal vulkan_core.h values now.
     #[test]
     fn vulkan_format_codes_are_the_spec_values() {
         // A representative sample of the ranges that were wrong.
@@ -201,10 +203,10 @@ mod tests {
         assert_eq!(Format::R32_SFLOAT.to_vulkan(), 100);
         assert_eq!(Format::RGBA32_SINT.to_vulkan(), 108);
         assert_eq!(Format::RGBA32_SFLOAT.to_vulkan(), 109);
-        assert_eq!(Format::D16_UNORM.to_vulkan(), 126);
-        assert_eq!(Format::D32_SFLOAT.to_vulkan(), 128);
-        assert_eq!(Format::S8_UINT.to_vulkan(), 129);
-        assert_eq!(Format::D24_UNORM_S8_UINT.to_vulkan(), 131);
+        assert_eq!(Format::D16_UNORM.to_vulkan(), 124);
+        assert_eq!(Format::D32_SFLOAT.to_vulkan(), 126);
+        assert_eq!(Format::S8_UINT.to_vulkan(), 127);
+        assert_eq!(Format::D24_UNORM_S8_UINT.to_vulkan(), 129);
         assert_eq!(Format::BC7_UNORM.to_vulkan(), 145);
     }
 
@@ -238,7 +240,9 @@ mod tests {
     }
 
     /// Bug №178: R8_SNORM = 62 and R8_UINT = 63 were swapped, R32_SFLOAT = 41
-    /// collided with R32_UINT, and RGBA8_SNORM = 74 is a YCBCR format.
+    /// collided with R32_UINT, and RGBA8_SNORM = 74 is a YCBCR format. The
+    /// R16/R32 lines below used to pin the interm fix's one-slot rotation
+    /// (55/40/41/42); they are the literal dxgiformat.h values now.
     #[test]
     fn dxgi_format_codes_are_the_spec_values() {
         assert_eq!(Format::R8_UNORM.to_dxgi(), 61);
@@ -246,11 +250,11 @@ mod tests {
         assert_eq!(Format::R8_SNORM.to_dxgi(), 63);
         assert_eq!(Format::R8_SINT.to_dxgi(), 64);
         assert_eq!(Format::R16_SFLOAT.to_dxgi(), 54);
-        assert_eq!(Format::R16_UNORM.to_dxgi(), 55);
+        assert_eq!(Format::R16_UNORM.to_dxgi(), 56);
         assert_eq!(Format::RG16_UNORM.to_dxgi(), 35);
-        assert_eq!(Format::R32_SFLOAT.to_dxgi(), 40);
-        assert_eq!(Format::R32_UINT.to_dxgi(), 41);
-        assert_eq!(Format::R32_SINT.to_dxgi(), 42);
+        assert_eq!(Format::R32_SFLOAT.to_dxgi(), 41);
+        assert_eq!(Format::R32_UINT.to_dxgi(), 42);
+        assert_eq!(Format::R32_SINT.to_dxgi(), 43);
         assert_eq!(Format::RGBA8_UNORM.to_dxgi(), 28);
         assert_eq!(Format::RGBA8_SNORM.to_dxgi(), 31);
         assert_eq!(Format::RGBA16_SFLOAT.to_dxgi(), 10);

@@ -9,6 +9,7 @@
 //! mutating commands are stage 2 and come with an action journal of their
 //! own.
 
+use super::banlist::BanList;
 use super::commands::{self, RedactedConfig, Reply, Request};
 use super::journal::ActionJournal;
 use super::proto::{self, ParseError};
@@ -57,6 +58,19 @@ pub enum ControlOrder {
     /// file and answered; the loop adopts the section between ticks and
     /// may keep a standing vote's tally.
     ReloadVoteKick { vote_kick: VoteKickConfig },
+    /// `ban` (stage 3): the door writes the ban to the list file and queues
+    /// the order so the loop disconnects the target between ticks.
+    Ban { target: String, reason: String },
+    /// `unban` (stage 3): the door removes the entry from the list file and
+    /// queues the order for the journal.
+    Unban { target: String },
+    /// `end_match` (stage 4): the loop moves the match to `ending`, then
+    /// disconnects everyone with `ServerShutdown`.
+    EndMatch,
+    /// `start_match` (stage 4): the loop moves the match to `in_progress`.
+    StartMatch,
+    /// `restart_match` (stage 4): the loop resets the match to `waiting`.
+    RestartMatch,
 }
 
 /// How many orders may wait between ticks. The door pushes at most
@@ -79,6 +93,13 @@ impl ControlOrder {
             } => format!("kick {connection_id} {reason:?}"),
             ControlOrder::Stop { delay_s } => format!("stop {delay_s}"),
             ControlOrder::ReloadVoteKick { .. } => "reload (vote_kick)".into(),
+            ControlOrder::Ban { target, reason } => {
+                format!("ban {target} {reason:?}")
+            }
+            ControlOrder::Unban { target } => format!("unban {target}"),
+            ControlOrder::EndMatch => "end_match".into(),
+            ControlOrder::StartMatch => "start_match".into(),
+            ControlOrder::RestartMatch => "restart_match".into(),
         }
     }
 }
@@ -110,6 +131,13 @@ pub struct ControlEnv {
     /// decision happens here — synchronously — so the answer can name
     /// field-level truth before anything is queued.
     pub config_path: PathBuf,
+    /// The ban list (stage 3): loaded from a file next to the config, survives
+    /// restarts, checked when each player connects. The door mutates it on
+    /// `ban`/`unban`, the tick loop reads it when a connection arrives.
+    pub ban_list: Arc<RwLock<BanList>>,
+    /// The ban list file's path, resolved next to the config file like
+    /// `token_file` and `action_log_file`.
+    pub ban_path: PathBuf,
 }
 
 /// The door's settings, split from the config file's `ControlConfig` so tests
@@ -604,11 +632,22 @@ async fn answer_command(
         Ok(request) => request,
         Err((code, text)) => return refusal_body(command.id, code, &text),
     };
+    // Stage 3: the ban list is cloned out of the lock (parking_lot, no async
+    // guard held across .await) and handed to the pure dispatch layer.
+    let ban_list = (*env.ban_list.read()).clone();
     match request {
         // Stage 2's mutating half: gates against the door's snapshot, the
         // reload's whole-file read, then one order into the queue. The
         // answer names what the door did itself, not what the loop will do.
-        Request::Say { .. } | Request::Kick { .. } | Request::Stop { .. } | Request::Reload => {
+        Request::Say { .. }
+        | Request::Kick { .. }
+        | Request::Stop { .. }
+        | Request::Reload
+        | Request::Ban { .. }
+        | Request::Unban { .. }
+        | Request::EndMatch
+        | Request::StartMatch
+        | Request::RestartMatch => {
             mutating_answer(command.id, request, env).await
         }
         _ => match commands::dispatch(
@@ -617,6 +656,7 @@ async fn answer_command(
             &env.ring,
             &env.config.read().clone(),
             &env.actions,
+            &ban_list,
         ) {
             Err((code, text)) => refusal_body(command.id, code, &text),
             Ok(Reply::Data(data)) => json!({
@@ -761,6 +801,111 @@ async fn mutating_answer(id: u64, request: Request, env: &ControlEnv) -> Value {
                 },
             })
         }
+        Request::Ban { target, reason } => {
+            // Stage 3: write the ban to the list file immediately so a
+            // reconnect is refused even before the loop processes the order,
+            // then queue the order so the loop disconnects the target between
+            // ticks and the action is journaled.
+            let is_new = {
+                let mut list = env.ban_list.write();
+                list.ban(target.clone(), reason.clone(), "door".into())
+            }; // write guard dropped here, before any .await
+            if let Err(error) = env.ban_list.read().save(&env.ban_path) {
+                journal(&format!("ban {target}"), &format!("refused: {error}"));
+                return refusal_body(
+                    id,
+                    "internal",
+                    &format!("ban list file could not be written: {error}"),
+                );
+            }
+            match env.queue.send(ControlOrder::Ban {
+                target: target.clone(),
+                reason: reason.clone(),
+            }).await {
+                Ok(()) => {
+                    journal(
+                        &format!("ban {target} {}", quote_text(&reason)),
+                        if is_new { "queued; new ban written to the list file" } else { "queued; existing ban updated" },
+                    );
+                    json!({ "id": id, "ok": true, "data": { "queued": true, "target": target } })
+                }
+                Err(_) => {
+                    journal(&format!("ban {target}"), "refused: the queue is not served");
+                    refusal_body(id, "internal", "the command queue is not being served; the match is not ticking")
+                }
+            }
+        }
+        Request::Unban { target } => {
+            let was_banned = {
+                let mut list = env.ban_list.write();
+                list.unban(&target)
+            }; // write guard dropped here, before any .await
+            if !was_banned {
+                journal(&format!("unban {target}"), "refused: target is not banned");
+                return refusal_body(
+                    id,
+                    "bad_arguments",
+                    &format!("{target} is not in the ban list"),
+                );
+            }
+            if let Err(error) = env.ban_list.read().save(&env.ban_path) {
+                journal(&format!("unban {target}"), &format!("refused: {error}"));
+                return refusal_body(
+                    id,
+                    "internal",
+                    &format!("ban list file could not be written: {error}"),
+                );
+            }
+            match env.queue.send(ControlOrder::Unban { target: target.clone() }).await {
+                Ok(()) => {
+                    journal(
+                        &format!("unban {target}"),
+                        "queued; removed from the ban list file",
+                    );
+                    json!({ "id": id, "ok": true, "data": { "queued": true, "target": target } })
+                }
+                Err(_) => {
+                    journal(&format!("unban {target}"), "refused: the queue is not served");
+                    refusal_body(id, "internal", "the command queue is not being served; the match is not ticking")
+                }
+            }
+        }
+        Request::EndMatch => {
+            match env.queue.send(ControlOrder::EndMatch).await {
+                Ok(()) => {
+                    journal("end_match", "queued; the loop moves the match to ending");
+                    json!({ "id": id, "ok": true, "data": { "queued": true } })
+                }
+                Err(_) => {
+                    journal("end_match", "refused: the queue is not served");
+                    refusal_body(id, "internal", "the command queue is not being served; the match is not ticking")
+                }
+            }
+        }
+        Request::StartMatch => {
+            match env.queue.send(ControlOrder::StartMatch).await {
+                Ok(()) => {
+                    journal("start_match", "queued; the loop moves the match to in_progress");
+                    json!({ "id": id, "ok": true, "data": { "queued": true } })
+                }
+                Err(_) => {
+                    journal("start_match", "refused: the queue is not served");
+                    refusal_body(id, "internal", "the command queue is not being served; the match is not ticking")
+                }
+            }
+        }
+        Request::RestartMatch => {
+            match env.queue.send(ControlOrder::RestartMatch).await {
+                Ok(()) => {
+                    journal("restart_match", "queued; the loop resets the match to waiting");
+                    json!({ "id": id, "ok": true, "data": { "queued": true } })
+                }
+                Err(_) => {
+                    journal("restart_match", "refused: the queue is not served");
+                    refusal_body(id, "internal", "the command queue is not being served; the match is not ticking")
+                }
+            }
+        }
         // The read commands cannot arrive here — the mutating variants were
         // all destructured above, so `_` here serves exactly the reads.
         _ => refusal_body(id, "internal", "a read command reached the mutating path"),
@@ -782,6 +927,12 @@ fn describe(request: &Request) -> String {
         Request::Kick { player, reason } => format!("kick {player} {}", quote_text(reason)),
         Request::Stop { delay_s } => format!("stop {delay_s}"),
         Request::Reload => "reload".into(),
+        Request::Ban { target, reason } => format!("ban {target} {}", quote_text(reason)),
+        Request::Unban { target } => format!("unban {target}"),
+        Request::BanList => "banlist".into(),
+        Request::EndMatch => "end_match".into(),
+        Request::StartMatch => "start_match".into(),
+        Request::RestartMatch => "restart_match".into(),
         other => format!("{other:?}"),
     }
 }
@@ -935,6 +1086,8 @@ mod door_tests {
                 queue: control_tx,
                 actions,
                 config_path: fixture_config_path(),
+                ban_list: Arc::new(RwLock::new(BanList::default())),
+                ban_path: PathBuf::from("untested-ban-target.json"),
             },
             control_rx,
         )
@@ -1026,16 +1179,12 @@ mod door_tests {
         send_line(stream, &line).await;
     }
 
-    /// A port the OS just proved free: bind :0 on the loopback, read the
-    /// number, drop the listener. Two tests cannot collide on it unless the
-    /// OS itself hands the same ephemeral port twice inside one release —
-    /// which is the soundest base available.
+    /// Port 0 lets the OS pick a free ephemeral port. The real bound port is
+    /// read from `door.local_addr()` after `spawn_door`, avoiding the Windows
+    /// race where a port freed by `free_port` isn't yet reusable when
+    /// `spawn_door` re-binds it (error 10048).
     fn free_port() -> u16 {
-        std::net::TcpListener::bind((LISTEN_ADDR, 0))
-            .expect("an ephemeral local port binds")
-            .local_addr()
-            .expect("the listener knows its address")
-            .port()
+        0
     }
 
     fn hello_line() -> String {
@@ -1067,9 +1216,9 @@ mod door_tests {
 
     #[tokio::test]
     async fn a_hello_a_command_an_answer_and_a_close() {
-        let port = free_port();
-        let (door, _ring, status) = spawn_door(default_test_settings(port)).await;
+        let (door, _ring, status) = spawn_door(default_test_settings(free_port())).await;
         assert!(door.local_addr.ip().is_loopback(), "the bind is the loopback's");
+        let port = door.local_addr.port();
 
         let mut stream = auth(port).await;
         send_command(
@@ -1090,9 +1239,9 @@ mod door_tests {
 
     #[tokio::test]
     async fn a_foreign_token_is_refused_and_the_door_survives() {
-        let port = free_port();
-        let (door, _ring, _status) = spawn_door(default_test_settings(port)).await;
+        let (door, _ring, _status) = spawn_door(default_test_settings(free_port())).await;
         let _ = door; // the door's survival is what the later conn proves
+        let port = door.local_addr.port();
 
         let mut stream = connect(port).await;
         send_line(
@@ -1129,9 +1278,9 @@ mod door_tests {
 
     #[tokio::test]
     async fn a_hello_without_the_token_is_refused_with_the_field_named() {
-        let port = free_port();
-        let (door, _ring, _status) = spawn_door(default_test_settings(port)).await;
+        let (door, _ring, _status) = spawn_door(default_test_settings(free_port())).await;
         let _ = door;
+        let port = door.local_addr.port();
 
         let mut stream = connect(port).await;
         send_line(&mut stream, r#"{"hello":{"proto":1}}"#).await;
@@ -1145,14 +1294,14 @@ mod door_tests {
 
     #[tokio::test]
     async fn repeated_wrong_tokens_pause_the_door_until_the_cooldown_passes() {
-        let port = free_port();
         let (door, _ring, _status) = spawn_door(ControlSettings {
             max_bad_tokens: 3,
             bad_token_cooldown_s: 1,
-            ..default_test_settings(port)
+            ..default_test_settings(free_port())
         })
         .await;
         let _ = door;
+        let port = door.local_addr.port();
 
         for _ in 0..3 {
             let mut stream = connect(port).await;
@@ -1193,13 +1342,13 @@ mod door_tests {
 
     #[tokio::test]
     async fn an_overlong_line_is_refused_without_killing_the_door() {
-        let port = free_port();
         let (door, _ring, _status) = spawn_door(ControlSettings {
             max_line_bytes: 256,
-            ..default_test_settings(port)
+            ..default_test_settings(free_port())
         })
         .await;
         let _ = door;
+        let port = door.local_addr.port();
 
         let mut stream = connect(port).await;
         let long = format!(r#"not json "{}""#, "x".repeat(600));
@@ -1222,13 +1371,13 @@ mod door_tests {
 
     #[tokio::test]
     async fn a_line_over_the_cap_during_commands_closes_only_that_connection() {
-        let port = free_port();
         let (door, _ring, _status) = spawn_door(ControlSettings {
             max_line_bytes: 128,
-            ..default_test_settings(port)
+            ..default_test_settings(free_port())
         })
         .await;
         let _ = door;
+        let port = door.local_addr.port();
 
         let mut stream = auth(port).await;
         let long = format!(r#"{{"id":9,"cmd":"log","args":{{"tail":{} }}}}"#, "9".repeat(200));
@@ -1240,13 +1389,13 @@ mod door_tests {
 
     #[tokio::test]
     async fn the_connection_allowance_is_held_and_released() {
-        let port = free_port();
         let (door, _ring, _status) = spawn_door(ControlSettings {
             max_connections: 2,
-            ..default_test_settings(port)
+            ..default_test_settings(free_port())
         })
         .await;
         let _ = door;
+        let port = door.local_addr.port();
 
         let first = auth(port).await;
         let second = auth(port).await;
@@ -1292,13 +1441,13 @@ mod door_tests {
 
     #[tokio::test]
     async fn the_command_rate_is_capped_per_connection() {
-        let port = free_port();
         let (door, _ring, _status) = spawn_door(ControlSettings {
             commands_per_second: 2,
-            ..default_test_settings(port)
+            ..default_test_settings(free_port())
         })
         .await;
         let _ = door;
+        let port = door.local_addr.port();
 
         let mut stream = auth(port).await;
         // Two commands, one right after the other: the bucket holds exactly
@@ -1323,9 +1472,9 @@ mod door_tests {
 
     #[tokio::test]
     async fn unknown_commands_and_bad_json_refuse_but_the_connection_survives() {
-        let port = free_port();
-        let (door, _ring, _status) = spawn_door(default_test_settings(port)).await;
+        let (door, _ring, _status) = spawn_door(default_test_settings(free_port())).await;
         let _ = door;
+        let port = door.local_addr.port();
 
         let mut stream = auth(port).await;
         send_command(&mut stream, json!({"id":9,"cmd":"explode"})).await;
@@ -1346,12 +1495,61 @@ mod door_tests {
         assert!(answer.contains("\"ok\":true"), "{answer}");
     }
 
+    // ---- section 10.3, continued ----
+
+    #[tokio::test]
+    async fn a_mid_line_close_refuses_what_it_has_and_keeps_the_door_alive() {
+        let (door, _ring, _status) = spawn_door(default_test_settings(free_port())).await;
+        let port = door.local_addr.port();
+
+        // Half a command, no newline, then the client hangs up mid-line.
+        let mut stream = connect(port).await;
+        send_line(&mut stream, &hello_line()).await;
+        let ack = read_line(&mut stream).await.expect("the hello answers");
+        assert!(
+            ack.contains("\"hello\":\"ok\""),
+            "the hello must ack: {ack}"
+        );
+        stream
+            .write_all(b"{\"id\":1,\"cmd\":\"status")
+            .await
+            .expect("the half-line writes");
+        drop(stream); // the "обрыв посреди строки" case
+
+        // The door itself is still alive: a fresh, fully-formed hello works.
+        let mut stream = auth(port).await;
+        send_command(&mut stream, json!({"id":2,"cmd":"status"})).await;
+        let answer = read_line(&mut stream).await.expect("the status answers");
+        assert!(answer.contains("\"ok\":true"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_command_during_stopping_refuses_with_shutting_down() {
+        let (door, _ring, status) = spawn_door(default_test_settings(free_port())).await;
+        let port = door.local_addr.port();
+
+        // Mark the snapshot as stopping: the mutating path gates on it.
+        status.set_state("stopping");
+
+        let mut stream = auth(port).await;
+        send_command(
+            &mut stream,
+            json!({"id":3,"cmd":"say","args":{"text":"nope"}}),
+        )
+        .await;
+        let refusal = read_line(&mut stream).await.expect("the refusal answers");
+        let refusal: Value = serde_json::from_str(&refusal).expect("the refusal is JSON");
+        assert_eq!(refusal["error"]["code"], "shutting_down", "{refusal}");
+
+        let _ = door;
+    }
+
     // ---- watch ----
 
     #[tokio::test]
     async fn a_watch_subscription_streams_the_ring_forward() {
-        let port = free_port();
-        let (door, ring, _status) = spawn_door(default_test_settings(port)).await;
+        let (door, ring, _status) = spawn_door(default_test_settings(free_port())).await;
+        let port = door.local_addr.port();
 
         let mut stream = auth(port).await;
         send_command(&mut stream, json!({"id":11,"cmd":"watch"})).await;
@@ -1377,9 +1575,9 @@ mod door_tests {
 
     #[tokio::test]
     async fn an_unknown_watch_topic_refuses_with_the_list_named() {
-        let port = free_port();
-        let (door, _ring, _status) = spawn_door(default_test_settings(port)).await;
+        let (door, _ring, _status) = spawn_door(default_test_settings(free_port())).await;
         let _ = door;
+        let port = door.local_addr.port();
 
         let mut stream = auth(port).await;
         send_command(
@@ -1403,9 +1601,9 @@ mod door_tests {
 
     #[tokio::test]
     async fn the_token_never_appears_in_answers_or_in_the_ring() {
-        let port = free_port();
-        let (door, ring, _status) = spawn_door(default_test_settings(port)).await;
+        let (door, ring, _status) = spawn_door(default_test_settings(free_port())).await;
         let _ = door;
+        let port = door.local_addr.port();
 
         let mut stream = auth(port).await;
         for (id, cmd) in [(20, "status"), (21, "perf"), (22, "net"), (23, "config")] {

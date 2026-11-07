@@ -257,9 +257,12 @@ fn graphics_api_variants() {
 
 #[test]
 fn color_blend_state_disabled() {
-    let s = ColorBlendState::disabled();
+    // Bug №231: disabled() now takes the colour-attachment count and fills it
+    // with blend-disabled attachments instead of returning an empty list.
+    let s = ColorBlendState::disabled(1);
     assert!(!s.logic_op_enable);
-    assert!(s.attachments.is_empty());
+    assert_eq!(s.attachments.len(), 1);
+    assert!(!s.attachments[0].blend_enable);
 }
 
 #[test]

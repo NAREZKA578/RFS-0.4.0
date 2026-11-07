@@ -3,6 +3,7 @@
 // Covers: Backend trait object safety, per-API backend stubs, and
 // create_backend dispatch.
 
+use rhi::backend::d3d11::compile::compile_hlsl;
 use rhi::backend::{create_backend, Backend};
 use rhi::backend::common::ReleaseKind;
 use rhi::backend::d3d11::D3D11Backend;
@@ -10,13 +11,31 @@ use rhi::backend::d3d12::D3D12Backend;
 use rhi::backend::opengl::OpenGLBackend;
 use rhi::backend::vulkan::VulkanBackend;
 use rhi::command::commands::Command;
+use rhi::command::pass::render::{
+    AttachmentDescription, AttachmentReference, LoadOp, RenderPassBeginInfo, RenderPassDesc,
+    StoreOp, SubpassDescription,
+};
 use rhi::config::RhiConfig;
 use rhi::core::device::{DeviceDesc, PhysicalDevice, PhysicalDeviceType};
-use rhi::resource::{BufferDesc, TextureDesc};
+use rhi::descriptor::{
+    DescriptorBinding, DescriptorInfo, DescriptorSetLayoutDesc, DescriptorType, DescriptorWrite,
+};
+use rhi::pipeline::compute::{ComputePipeline, ComputePipelineDesc};
+use rhi::pipeline::graphics::{
+    GraphicsPipelineDesc, InputAssemblyState, PipelineShaderStage, PrimitiveTopology,
+    VertexInputState, ViewportState,
+};
+use rhi::resource::{BufferDesc, TextureDesc, TextureLayout, TextureViewDesc, TextureViewType};
+use rhi::shader::module::ShaderModuleDesc;
+use rhi::shader::ShaderFormat;
 use rhi::sync::barrier::{BufferCopy, BufferTextureCopy};
 use rhi::types::GraphicsApi;
-use rhi::types::{BufferUsage, Format, MemoryPropertyFlags, SampleCount, SharingMode};
+use rhi::types::{
+    BufferUsage, Format, MemoryPropertyFlags, SampleCount, SharingMode, TextureAspectFlags,
+    ShaderStage,
+};
 use rhi::types::{Features, Limits, TextureDimensions, TextureUsage};
+use rhi::types::{ClearValue, Extent2D, IndexType, Offset2D, Rect2D, Viewport};
 use rhi::{MemoryProperties, RhiError};
 
 fn fake_physical_device() -> PhysicalDevice {
@@ -430,6 +449,553 @@ fn d3d12_device_texture_mip_chain_round_trip() {
     assert!(
         matches!(result, Err(RhiError::NotSupported(_))),
         "a two-layer upload must be a stated refusal, saw {result:?}"
+    );
+}
+
+// —————————————————————————————————————————————————————————————————————
+// M3 render path (BUGS №707): the recorded commands replay as real D3D12
+// draws, and the pixels report the truth. The shaders compile at test time
+// with the shared runtime helper (`rhi::backend::d3d11::compile` — the
+// comment there says "a helper everyone can share"): the SM 5.0 DXBC
+// containers D3D11 binds are the same finished containers the D3D12 device
+// accepts as `ShaderFormat::Dxil`.
+// —————————————————————————————————————————————————————————————————————
+
+const TRIANGLE_VS: &str = r#"struct VSIn
+{
+    float3 pos : TEXCOORD0;
+    float4 col : TEXCOORD1;
+};
+struct PSIn
+{
+    float4 pos : SV_Position;
+    float4 col : COLOR0;
+};
+PSIn main(VSIn input)
+{
+    PSIn output;
+    output.pos = float4(input.pos, 1.0);
+    output.col = input.col;
+    return output;
+}
+"#;
+
+// The PS mirrors the full VS output struct on purpose (BUGS №762): D3D12
+// links shader signatures by exact hardware register indexes — a pixel
+// shader that drops SV_Position shifts every following input down one
+// register, and COLOR0 lands on 0 while the VS writes it to 1; the PSO
+// creation then refuses with 0x80070057 and the debug layer names
+// CREATEGRAPHICSPIPELINESTATE_SHADER_LINKAGE_REGISTERINDEX. D3D11 links by
+// semantic name only, which is why the shape had to be written for the
+// stricter of the two backends.
+const VARIABLE_PS: &str = r#"struct PSIn
+{
+    float4 pos : SV_Position;
+    float4 col : COLOR0;
+};
+float4 main(PSIn input) : SV_Target
+{
+    return input.col;
+}
+"#;
+
+const VERTEX_ID_VS: &str = r#"struct PSIn
+{
+    float4 pos : SV_Position;
+};
+PSIn main(uint vertex_id : SV_VertexID)
+{
+    PSIn output;
+    float2 xy = float2(vertex_id == 1 ? 3.0 : -1.0, vertex_id == 2 ? 3.0 : -1.0);
+    output.pos = float4(xy, 0.0, 1.0);
+    return output;
+}
+"#;
+
+const TINT_PS: &str = r#"cbuffer tint : register(b0)
+{
+    float4 tint_color;
+};
+float4 main() : SV_Target
+{
+    return tint_color;
+}
+"#;
+
+/// The single-attachment RGBA8 render pass the pixel draws share: cleared
+/// on load, stored, one subpass.
+fn d3d12_pixel_render_pass() -> RenderPassDesc {
+    RenderPassDesc {
+        attachments: vec![AttachmentDescription {
+            format: Format::RGBA8_UNORM,
+            samples: SampleCount::X1,
+            load_op: LoadOp::Clear,
+            store_op: StoreOp::Store,
+            stencil_load_op: LoadOp::DontCare,
+            stencil_store_op: StoreOp::DontCare,
+            initial_layout: TextureLayout::Undefined,
+            final_layout: TextureLayout::ColorAttachmentOptimal,
+        }],
+        subpasses: vec![SubpassDescription {
+            color_attachments: vec![AttachmentReference {
+                attachment: 0,
+                layout: TextureLayout::ColorAttachmentOptimal,
+            }],
+            ..Default::default()
+        }],
+        dependencies: Vec::new(),
+    }
+}
+
+/// A 64x64 RGBA8 colour texture, its full view, and the framebuffer that
+/// sits the view into the pixel pass — the draw surface.
+fn d3d12_pixel_framebuffer(
+    device: &rhi::core::device::Device,
+    pass: &rhi::command::pass::render::RenderPass,
+) -> (rhi::resource::Texture, rhi::command::pass::render::Framebuffer) {
+    let texture = device
+        .create_texture_from_desc(&TextureDesc {
+            width: 64,
+            height: 64,
+            depth: 1,
+            mip_levels: 1,
+            array_layers: 1,
+            format: Format::RGBA8_UNORM,
+            usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+            sample_count: SampleCount::X1,
+            dimensions: TextureDimensions::D2,
+            sharing_mode: SharingMode::Exclusive,
+            queue_family_indices: Vec::new(),
+        })
+        .unwrap();
+    assert!(texture.has_gpu_backing());
+    let view = device
+        .create_texture_view(
+            &texture,
+            &TextureViewDesc {
+                texture: texture.clone(),
+                format: None,
+                view_type: TextureViewType::D2,
+                aspects: TextureAspectFlags::COLOR,
+                base_mip_level: 0,
+                mip_level_count: 0,
+                base_array_layer: 0,
+                array_layer_count: 0,
+            },
+        )
+        .unwrap();
+    let framebuffer = device.create_framebuffer(pass, vec![view], 64, 64).unwrap();
+    (texture, framebuffer)
+}
+
+fn d3d12_pixel_back(
+    device: &rhi::core::device::Device,
+    texture: &rhi::resource::Texture,
+) -> Vec<[u8; 4]> {
+    device
+        .download_texture(texture, 0, 0)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect()
+}
+
+// The pipeline draw: pass clears to black, one full-screen triangle paints
+// pure green over the whole 64x64 target, the fixed-function stage binds
+// what the pipeline declared, and the pixels report the whole trip: every
+// one of the 4096 must be exactly green — the D3D12 recorded draw path
+// (pass state, root signature, PSO, IA, OM and the tracked transits)
+// produced its picture (BUGS №707).
+#[test]
+fn d3d12_render_full_screen_triangle_pixels() {
+    let device = d3d12_test_device();
+    let pass = device.create_render_pass(&d3d12_pixel_render_pass()).unwrap();
+    let (texture, framebuffer) = d3d12_pixel_framebuffer(&device, &pass);
+
+    let vs_code = compile_hlsl(TRIANGLE_VS.as_bytes(), "main", "vs_5_0").unwrap();
+    let ps_code = compile_hlsl(VARIABLE_PS.as_bytes(), "main", "ps_5_0").unwrap();
+    let vs = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: vs_code,
+            format: ShaderFormat::Dxil,
+            entry_point: Some("main".into()),
+            name: Some("d3d12 m3 test vs".into()),
+        })
+        .unwrap();
+    let ps = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: ps_code,
+            format: ShaderFormat::Dxil,
+            entry_point: Some("main".into()),
+            name: Some("d3d12 m3 test ps".into()),
+        })
+        .unwrap();
+
+    let pipeline = device
+        .create_graphics_pipeline(
+            &GraphicsPipelineDesc {
+                shader_stages: vec![
+                    PipelineShaderStage {
+                        stage: ShaderStage::VERTEX,
+                        module: vs,
+                        entry_point: "main".into(),
+                    },
+                    PipelineShaderStage {
+                        stage: ShaderStage::FRAGMENT,
+                        module: ps,
+                        entry_point: "main".into(),
+                    },
+                ],
+                vertex_input_state: Some(VertexInputState::from_formats(&[
+                    (0, Format::R32G32B32_SFLOAT),
+                    (1, Format::RGBA32_SFLOAT),
+                ])),
+                input_assembly_state: InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    primitive_restart_enable: false,
+                },
+                viewport_state: ViewportState {
+                    viewports: vec![Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 64.0,
+                        height: 64.0,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                    scissors: vec![Rect2D {
+                        offset: Offset2D { x: 0, y: 0 },
+                        extent: Extent2D {
+                            width: 64,
+                            height: 64,
+                        },
+                    }],
+                },
+                ..Default::default()
+            },
+            &pass,
+            &[],
+        )
+        .unwrap();
+    assert!(pipeline.has_gpu_backing());
+
+    // The vertex layout mirrors VertexInputState::from_formats: position
+    // first (12 bytes), colour second (16), the stride 28 bytes — a stride
+    // 28 % 4 == 0 takes, and the D3D12 input assembler wants a four-byte
+    // multiple.
+    let positions = [
+        [-1.0f32, -1.0, 0.0],
+        [3.0, -1.0, 0.0],
+        [-1.0, 3.0, 0.0],
+    ];
+    let colour = [0.0f32, 1.0, 0.0, 1.0];
+    let mut vertex_bytes: Vec<u8> = Vec::new();
+    for pos in positions {
+        for v in pos {
+            vertex_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in colour {
+            vertex_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let vertex_buffer = device
+        .create_buffer(vertex_bytes.len() as u64, BufferUsage::VERTEX, true)
+        .unwrap();
+    device.upload_buffer::<u8>(&vertex_buffer, &vertex_bytes).unwrap();
+
+    device
+        .draw_framebuffer_indexed(
+            &framebuffer,
+            &pipeline,
+            &[],
+            Some((&vertex_buffer, 0)),
+            None,
+            IndexType::U32,
+            3,
+            0,
+            0,
+            0,
+            0,
+            &[ClearValue::color(0.0, 0.0, 0.0, 0.0)],
+        )
+        .unwrap();
+
+    let back = d3d12_pixel_back(&device, &texture);
+    assert_eq!(back.len(), 64 * 64);
+    for (index, pixel) in back.iter().enumerate() {
+        assert_eq!(pixel, &[0, 255, 0, 255], "pixel {index} must be green",);
+    }
+}
+
+// The pass clear on its own: a begin whose only colour attachment loads
+// Clear must paint every pixel with its positional clear value, and leave
+// the target back in its home state the recorded EndRenderPass walks it
+// to. The pixel truth of the clear load (BUGS №707).
+#[test]
+fn d3d12_render_pass_clear_only_pixels() {
+    let device = d3d12_test_device();
+    let pass_desc = d3d12_pixel_render_pass();
+    let pass = device.create_render_pass(&pass_desc).unwrap();
+    let (texture, framebuffer) = d3d12_pixel_framebuffer(&device, &pass);
+
+    device
+        .submit_recorded(&[
+            Command::BeginRenderPass(RenderPassBeginInfo {
+                render_pass: pass.clone(),
+                framebuffer: framebuffer.clone(),
+                render_area: Rect2D {
+                    offset: Offset2D { x: 0, y: 0 },
+                    extent: Extent2D {
+                        width: 64,
+                        height: 64,
+                    },
+                },
+                clear_values: vec![ClearValue::color(1.0, 0.0, 0.0, 1.0)],
+            }),
+            Command::EndRenderPass,
+        ])
+        .unwrap();
+
+    let back = d3d12_pixel_back(&device, &texture);
+    assert_eq!(back.len(), 64 * 64);
+    for (index, pixel) in back.iter().enumerate() {
+        assert_eq!(pixel, &[255, 0, 0, 255], "pixel {index} must be clear red",);
+    }
+}
+
+// The standalone clear: a view cleared through the recorder's temporary
+// RTV slot, tracked in and out of RENDER_TARGET around the clear. No pass
+// and no framebuffer — the pixels name the view's own truth.
+#[test]
+fn d3d12_standalone_clear_color_pixels() {
+    let device = d3d12_test_device();
+    let (texture, view) = {
+        let texture = device
+            .create_texture_from_desc(&TextureDesc {
+                width: 64,
+                height: 64,
+                depth: 1,
+                mip_levels: 1,
+                array_layers: 1,
+                format: Format::RGBA8_UNORM,
+                usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+                sample_count: SampleCount::X1,
+                dimensions: TextureDimensions::D2,
+                sharing_mode: SharingMode::Exclusive,
+                queue_family_indices: Vec::new(),
+            })
+            .unwrap();
+        let view = device
+            .create_texture_view(
+                &texture,
+                &TextureViewDesc {
+                    texture: texture.clone(),
+                    format: None,
+                    view_type: TextureViewType::D2,
+                    aspects: TextureAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    mip_level_count: 0,
+                    base_array_layer: 0,
+                    array_layer_count: 0,
+                },
+            )
+            .unwrap();
+        (texture, view)
+    };
+
+    device
+        .submit_recorded(&[Command::ClearColor {
+            texture: view,
+            value: ClearValue::color(1.0, 0.0, 0.0, 1.0),
+            rects: Vec::new(),
+        }])
+        .unwrap();
+
+    let back = d3d12_pixel_back(&device, &texture);
+    assert_eq!(back.len(), 64 * 64);
+    for (index, pixel) in back.iter().enumerate() {
+        assert_eq!(pixel, &[255, 0, 0, 255], "pixel {index} must be clear red",);
+    }
+}
+
+// The descriptor table: a fragment uniform block binding (CBV at b0) reads
+// its colour through a written descriptor set — SetDescriptorHeaps, then
+// the root descriptor table pointing at the set's block in the
+// shader-visible heap. The pixels prove the write reached the shader from
+// the one heap the whole M3 binding model draws from (BUGS №707).
+#[test]
+fn d3d12_descriptor_table_uniform_block_pixels() {
+    let device = d3d12_test_device();
+    let pass_desc = d3d12_pixel_render_pass();
+    let pass = device.create_render_pass(&pass_desc).unwrap();
+    let (texture, framebuffer) = d3d12_pixel_framebuffer(&device, &pass);
+
+    let layout = device
+        .create_descriptor_set_layout(&DescriptorSetLayoutDesc {
+            bindings: vec![DescriptorBinding {
+                binding: 0,
+                ty: DescriptorType::UniformBuffer,
+                count: 1,
+                stages: ShaderStage::FRAGMENT,
+                immutable_samplers: None,
+            }],
+        })
+        .unwrap();
+    let set = device.create_descriptor_set(&layout).unwrap();
+
+    // The tint the block carries: pure blue, so the f32-to-UNORM8 pixel
+    // conversion is exact and no rounding half-tie can flip a byte.
+    let mut tint: Vec<u8> = Vec::new();
+    for value in [0.0f32, 0.0, 1.0, 1.0] {
+        tint.extend_from_slice(&value.to_le_bytes());
+    }
+    let uniform = device
+        .create_buffer(tint.len() as u64, BufferUsage::UNIFORM, true)
+        .unwrap();
+    device.upload_buffer::<u8>(&uniform, &tint).unwrap();
+    device
+        .write_descriptors(&set, &[DescriptorWrite {
+            dst_set: set.clone(),
+            dst_binding: 0,
+            dst_array_element: 0,
+            descriptors: vec![DescriptorInfo::Buffer(uniform, 0, 16)],
+        }])
+        .unwrap();
+
+    let vs_code = compile_hlsl(VERTEX_ID_VS.as_bytes(), "main", "vs_5_0").unwrap();
+    let ps_code = compile_hlsl(TINT_PS.as_bytes(), "main", "ps_5_0").unwrap();
+    let vs = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: vs_code,
+            format: ShaderFormat::Dxil,
+            entry_point: Some("main".into()),
+            name: Some("d3d12 m3 test vid vs".into()),
+        })
+        .unwrap();
+    let ps = device
+        .create_shader_module(&ShaderModuleDesc {
+            code: ps_code,
+            format: ShaderFormat::Dxil,
+            entry_point: Some("main".into()),
+            name: Some("d3d12 m3 test tint ps".into()),
+        })
+        .unwrap();
+
+    let pipeline = device
+        .create_graphics_pipeline(
+            &GraphicsPipelineDesc {
+                shader_stages: vec![
+                    PipelineShaderStage {
+                        stage: ShaderStage::VERTEX,
+                        module: vs,
+                        entry_point: "main".into(),
+                    },
+                    PipelineShaderStage {
+                        stage: ShaderStage::FRAGMENT,
+                        module: ps,
+                        entry_point: "main".into(),
+                    },
+                ],
+                input_assembly_state: InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    primitive_restart_enable: false,
+                },
+                viewport_state: ViewportState {
+                    viewports: vec![Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 64.0,
+                        height: 64.0,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                    scissors: vec![Rect2D {
+                        offset: Offset2D { x: 0, y: 0 },
+                        extent: Extent2D {
+                            width: 64,
+                            height: 64,
+                        },
+                    }],
+                },
+                ..Default::default()
+            },
+            &pass,
+            &[&layout],
+        )
+        .unwrap();
+    assert!(pipeline.has_gpu_backing());
+
+    device
+        .draw_framebuffer(
+            &framebuffer,
+            &pipeline,
+            &[&set],
+            None,
+            3,
+            0,
+            &[ClearValue::color(0.0, 0.0, 0.0, 0.0)],
+        )
+        .unwrap();
+
+    let back = d3d12_pixel_back(&device, &texture);
+    assert_eq!(back.len(), 64 * 64);
+    for (index, pixel) in back.iter().enumerate() {
+        assert_eq!(pixel, &[0, 0, 255, 255], "pixel {index} must be tint blue",);
+    }
+}
+
+// The pass contract holds at the command layer too: a draw outside a pass
+// and vertex buffers without a bound pipeline are refused (a silent one
+// draws a wrong picture), and the compute path plus subpass stepping stay
+// honest refusals until their terrain (M4) and inside the single-subpass
+// scope the backend supports (BUGS №707).
+#[test]
+fn d3d12_render_refusals_pin_the_pass_contract() {
+    let device = d3d12_test_device();
+
+    let result = device.submit_recorded(&[Command::Draw {
+        vertex_count: 3,
+        instance_count: 1,
+        first_vertex: 0,
+        first_instance: 0,
+    }]);
+    assert!(
+        matches!(result, Err(RhiError::BackendError(_))),
+        "a draw outside a pass must be refused, got {result:?}"
+    );
+
+    let buffer = device.create_buffer(64, BufferUsage::VERTEX, true).unwrap();
+    let result = device.submit_recorded(&[Command::BindVertexBuffers {
+        first_binding: 0,
+        buffers: vec![(buffer, 0)],
+    }]);
+    assert!(
+        matches!(result, Err(RhiError::BackendError(_))),
+        "vertex buffers without a pipeline must be refused, got {result:?}"
+    );
+
+    let result = device.submit_recorded(&[Command::NextSubpass]);
+    assert!(
+        matches!(result, Err(RhiError::NotSupported(_))),
+        "subpass stepping must stay a stated refusal, got {result:?}"
+    );
+
+    let result = device.submit_recorded(&[Command::BindComputePipeline(
+        ComputePipeline::new(ComputePipelineDesc::default()),
+    )]);
+    assert!(
+        matches!(result, Err(RhiError::NotSupported(_))),
+        "the compute path must stay a stated refusal until M4, got {result:?}"
+    );
+
+    let result = device.submit_recorded(&[Command::Dispatch {
+        x: 1,
+        y: 1,
+        z: 1,
+    }]);
+    assert!(
+        matches!(result, Err(RhiError::NotSupported(_))),
+        "Dispatch must stay a stated refusal until M4, got {result:?}"
     );
 }
 

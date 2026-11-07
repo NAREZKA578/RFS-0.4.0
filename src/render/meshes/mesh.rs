@@ -508,8 +508,11 @@ impl Mesh {
             4, 6, 5, 4, 7, 6, // Top face
             8, 9, 10, 8, 10, 11, // Bottom face
             12, 14, 13, 12, 15, 14, // Right face
-            16, 17, 18, 16, 18, 19, // Left face
-            20, 22, 21, 20, 23, 22,
+            16, 17, 18, 16, 18, 19,
+            // Bug №114: the left face wound as (20,22,21)/(20,23,22), whose
+            // cross product is +X — into the cube — so the face did not draw
+            // with back-face culling. (20,21,22)/(20,22,23) give -X, outward.
+            20, 21, 22, 20, 22, 23,
         ];
 
         MeshBuilder::new(name)
@@ -552,13 +555,18 @@ impl Mesh {
                 let first = i * (sectors + 1) + j;
                 let second = first + sectors + 1;
 
+                // Bug №114: this pair was (first, second, first+1), whose
+                // cross product (v1-v0) x (v2-v0) points to the INSIDE of the
+                // sphere — the whole surface was back-faced from outside.
+                // Swapped so both triangles wind outward; the unit test walks
+                // each geometric normal against the position direction.
                 indices.push(first as u32);
-                indices.push(second as u32);
                 indices.push((first + 1) as u32);
+                indices.push(second as u32);
 
                 indices.push((first + 1) as u32);
-                indices.push(second as u32);
                 indices.push((second + 1) as u32);
+                indices.push(second as u32);
             }
         }
 
@@ -604,6 +612,10 @@ impl Mesh {
 
     /// Create a cylinder mesh
     pub fn cylinder(name: &str, radius: f32, height: f32, segments: usize) -> Self {
+        // Bug №210: `segments as f32` divided by zero, every vertex became a
+        // NaN and the cap loops hit `% 0`. Three segments is the minimum a
+        // primitive can be built from; less is not representable.
+        let segments = segments.max(3);
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
 
@@ -630,18 +642,27 @@ impl Mesh {
             );
         }
 
-        // Top cap indices
+        // Cap indices.
+        //
+        // Bug №210: each "cap" connected the OPPOSITE ring — the top fan used
+        // odd (bottom) vertices and the bottom fan even (top) — so the caps
+        // spanned the whole height of the cylinder and the mesh looked like a
+        // double cone seen through the body. Both fans now use their own
+        // ring, wound so the geometric normal ((v1-v0) x (v2-v0)) points
+        // outward: top (centre, ring[i+1], ring[i]) gives +Y, bottom
+        // (centre, ring[i], ring[i+1]) gives -Y.
         for i in 0..segments {
-            indices.push(0);
-            indices.push((2 + i * 2 + 1) as u32);
-            indices.push((2 + ((i + 1) % segments) * 2 + 1) as u32);
-        }
+            let next = (i + 1) % segments;
 
-        // Bottom cap indices
-        for i in 0..segments {
-            indices.push(1);
-            indices.push((2 + ((i + 1) % segments) * 2) as u32);
+            // Top cap (+Y): centre 0, own even (top) ring, reversed order.
+            indices.push(0);
+            indices.push((2 + next * 2) as u32);
             indices.push((2 + i * 2) as u32);
+
+            // Bottom cap (-Y): centre 1, own odd (bottom) ring, forward order.
+            indices.push(1);
+            indices.push((2 + i * 2 + 1) as u32);
+            indices.push((2 + next * 2 + 1) as u32);
         }
 
         // Side indices
@@ -678,5 +699,106 @@ impl Mesh {
             .with_vertices(vertices)
             .with_indices(indices)
             .build()
+    }
+}
+
+#[cfg(test)]
+mod bug_210_114 {
+    use super::*;
+
+    fn geometric_normal(mesh: &Mesh, a: u32, b: u32, c: u32) -> Vec3 {
+        let va = mesh.vertices[a as usize].position;
+        let vb = mesh.vertices[b as usize].position;
+        let vc = mesh.vertices[c as usize].position;
+        (vb - va).cross(vc - va).normalize_or_zero()
+    }
+
+    fn triangles(mesh: &Mesh) -> impl Iterator<Item = [u32; 3]> + '_ {
+        mesh.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]])
+    }
+
+    // NC-114-TEMP: the left cube face wound into the cube; every face must
+    // have its geometric normal agreeing with its vertex normals.
+    #[test]
+    fn nc_114_temp_every_cube_face_normal_points_outward() {
+        let mesh = Mesh::cube("probe_cube", 2.0);
+        for (i, tri) in triangles(&mesh).enumerate() {
+            let [a, b, c] = tri;
+            let geo = geometric_normal(&mesh, a, b, c);
+            let shading = mesh.vertices[a as usize].normal;
+            assert!(
+                geo.dot(shading) > 0.9,
+                "cube triangle {i} {tri:?}: geometric normal {geo:?} disagrees \
+                 with shading normal {shading:?}"
+            );
+        }
+    }
+
+    // NC-114-TEMP: the sphere was wound inside-out.
+    #[test]
+    fn nc_114_temp_sphere_normals_point_outward() {
+        let mesh = Mesh::sphere("probe_sphere", 3.0, 8, 12);
+        for tri in triangles(&mesh) {
+            let [a, b, c] = tri;
+            let geo = geometric_normal(&mesh, a, b, c);
+            let outward = mesh.vertices[a as usize].position.normalize_or_zero();
+            assert!(
+                geo.dot(outward) > 0.0,
+                "sphere triangle {tri:?} is wound inward at {:?}",
+                mesh.vertices[a as usize].position,
+            );
+        }
+    }
+
+    // NC-210-TEMP: the caps connected the opposite ring.
+    #[test]
+    fn nc_210_temp_cylinder_caps_use_their_own_ring_and_point_outward() {
+        let mesh = Mesh::cylinder("probe_cyl", 1.0, 4.0, 16);
+        for tri in triangles(&mesh) {
+            let [a, b, c] = tri;
+            let geo = geometric_normal(&mesh, a, b, c);
+            let va = mesh.vertices[a as usize].position;
+            let vb = mesh.vertices[b as usize].position;
+            let vc = mesh.vertices[c as usize].position;
+
+            let same_y = va.y == vb.y && va.y == vc.y && (va.y == 2.0 || va.y == -2.0);
+            if same_y {
+                // A cap triangle: its normal must be vertical and point away
+                // from the volume.
+                let expected = if va.y > 0.0 { Vec3::Y } else { Vec3::NEG_Y };
+                assert!(
+                    geo.dot(expected) > 0.99,
+                    "cap triangle {tri:?} must face {expected:?}, got {geo:?}"
+                );
+            } else {
+                // A side triangle: the normal must agree with the radial
+                // direction of whichever ring vertex anchors it.
+                let reference = [va, vb, vc]
+                    .iter()
+                    .find(|p| p.x * p.x + p.z * p.z > 1e-9)
+                    .copied()
+                    .unwrap_or(va);
+                let radial = Vec3::new(reference.x, 0.0, reference.z).normalize();
+                assert!(
+                    geo.dot(radial) > 0.0,
+                    "side triangle {tri:?} faces inward at {reference:?}"
+                );
+            }
+        }
+    }
+
+    // NC-210-TEMP: segments = 0 divided by zero (NaN vertices, `% 0` panic).
+    #[test]
+    fn nc_210_temp_cylinder_with_zero_segments_stays_finite() {
+        let mesh = Mesh::cylinder("probe_cyl0", 1.0, 4.0, 0);
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|v| v.position.is_finite() && v.normal.is_finite())
+        );
+        assert!(
+            mesh.bounding_sphere_radius.is_finite(),
+            "bounding radius must be finite"
+        );
     }
 }

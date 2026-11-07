@@ -144,6 +144,28 @@ pub struct ServerStatus {
     /// Sorted by connection id; refreshed at most once a second.
     #[serde(default)]
     pub player_list: Vec<PlayerStatus>,
+    /// Stage 4: the match lifecycle word — `waiting` (набор игроков),
+    /// `in_progress` (идёт бой), `ending` (завершается).
+    #[serde(default)]
+    pub match_state: String,
+    /// Players per side (filled when teams are tracked — stage 4).
+    #[serde(default)]
+    pub team1_players: u32,
+    #[serde(default)]
+    pub team2_players: u32,
+    /// Players waiting in the queue / in reserve (stage 4).
+    #[serde(default)]
+    pub queue_count: u32,
+    #[serde(default)]
+    pub reserve_count: u32,
+    /// Match tickets per side (stage 4).
+    #[serde(default)]
+    pub tickets_team1: u32,
+    #[serde(default)]
+    pub tickets_team2: u32,
+    /// Current weather (stage 4).
+    #[serde(default)]
+    pub weather: String,
 }
 
 impl ServerStatus {
@@ -229,6 +251,11 @@ impl StatusHandle {
     /// The state word (`running` here; stage 2 adds the rest).
     pub fn set_state(&self, state: &str) {
         self.inner.write().state = state.to_string();
+    }
+
+    /// Stage 4: the match lifecycle word — `waiting`, `in_progress`, `ending`.
+    pub fn set_match_state(&self, state: &str) {
+        self.inner.write().match_state = state.to_string();
     }
 }
 

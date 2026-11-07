@@ -85,6 +85,10 @@ pub struct ControlConfig {
     /// `validate_control` — an operator who named the field named a file.
     #[serde(default)]
     pub action_log_file: Option<String>,
+    /// The ban list's file name (stage 3), resolved relative to the config
+    /// file's directory like `token_file`. `None` keeps the default name.
+    #[serde(default)]
+    pub ban_file: Option<String>,
 }
 
 impl Default for ControlConfig {
@@ -99,6 +103,7 @@ impl Default for ControlConfig {
             max_bad_tokens: 5,
             bad_token_cooldown_s: 60,
             action_log_file: None,
+            ban_file: None,
         }
     }
 }

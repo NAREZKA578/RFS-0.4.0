@@ -93,14 +93,31 @@ pub struct ParticleEmitter {
     emitting: bool,
     particles_emitted: u32,
     emission_accumulator: f32,
+    /// Time since the last burst fired. Bug №236: `burst_count`/`burst_interval`
+    /// were declared in the config and never read.
+    burst_timer: f32,
+    /// Bursts fired since `new`/`reset` (diagnostics for the schedule above).
+    bursts_fired: u32,
+    /// Stable identity of this emitter. Bug №235: `Particle::emitter_id` used
+    /// to carry the pool slot, so a reshuffled pool re-pointed particles at
+    /// another emitter.
+    emitter_id: u32,
 }
+
+/// Bug №235: ids belong to emitters, not to pool slots, and must survive pool
+/// reshuffles; the atomic makes them unique across the process.
+static NEXT_EMITTER_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl ParticleEmitter {
     pub fn new(config: ParticleEmitterConfig) -> Self {
+        Self::with_id(config, NEXT_EMITTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn with_id(config: ParticleEmitterConfig, emitter_id: u32) -> Self {
         let mut particles = Vec::with_capacity(config.max_particles as usize);
-        for i in 0..config.max_particles {
+        for _ in 0..config.max_particles {
             particles.push(Particle {
-                emitter_id: i,
+                emitter_id,
                 ..Default::default()
             });
         }
@@ -120,6 +137,9 @@ impl ParticleEmitter {
             emitting: true,
             particles_emitted: 0,
             emission_accumulator: 0.0,
+            burst_timer: 0.0,
+            bursts_fired: 0,
+            emitter_id,
         }
     }
 
@@ -246,6 +266,20 @@ impl ParticleEmitter {
                 self.emit_particle();
             }
         }
+
+        // Bug №236: `burst_count`/`burst_interval` were declared in the
+        // config and never read — a scripted burst schedule silently emitted
+        // nothing. A burst fires on its own timer, independent of the
+        // continuous emission window, and stops when the emitter stops.
+        if self.emitting && self.config.burst_count > 0 && self.config.burst_interval > 0.0 {
+            let interval = self.config.burst_interval.max(0.001);
+            self.burst_timer += delta_seconds;
+            while self.burst_timer >= interval {
+                self.burst_timer -= interval;
+                self.burst(self.config.burst_count);
+                self.bursts_fired += 1;
+            }
+        }
     }
 
     fn emit_particle(&mut self) {
@@ -255,8 +289,11 @@ impl ParticleEmitter {
 
         let index = self.free_particles.pop().unwrap();
 
+        // Bug №234: `set_scale` wrote a value nothing read — the emission
+        // volume never grew with the emitter. The random shape offset is a
+        // local quantity and must scale with the emitter.
         // Compute values before taking a mutable borrow of `particles`
-        let position = self.position + self.get_random_position_in_shape();
+        let position = self.position + self.scale * self.get_random_position_in_shape();
         let velocity = self.config.particle_velocity + self.get_random_velocity();
         let size = self.config.particle_size + self.get_random_size();
         let color = self.config.particle_color + self.get_random_color();
@@ -277,7 +314,9 @@ impl ParticleEmitter {
         particle.rotation = rotation;
         particle.rotation_speed = rotation_speed;
         particle.texture_index = texture_index;
-        particle.emitter_id = index as u32;
+        // Bug №235: the id used to be the pool slot, so it changed on every
+        // respawn and one emitter's particles carried many different ids.
+        particle.emitter_id = self.emitter_id;
 
         self.active_particles.push(index);
         self.particles_emitted += 1;
@@ -305,10 +344,16 @@ impl ParticleEmitter {
                 use rand::Rng;
                 let mut rng = rand::thread_rng();
 
+                // Bug №189: `gen_range(-s..s)` with s == 0.0 is an empty range
+                // that panics on a path the default configuration can reach. A
+                // zero extent must sample to (almost) zero, not abort.
+                let hx = self.config.emitter_size.x.abs().max(0.001);
+                let hy = self.config.emitter_size.y.abs().max(0.001);
+                let hz = self.config.emitter_size.z.abs().max(0.001);
                 Vec3::new(
-                    rng.gen_range(-self.config.emitter_size.x..self.config.emitter_size.x),
-                    rng.gen_range(-self.config.emitter_size.y..self.config.emitter_size.y),
-                    rng.gen_range(-self.config.emitter_size.z..self.config.emitter_size.z),
+                    rng.gen_range(-hx..hx),
+                    rng.gen_range(-hy..hy),
+                    rng.gen_range(-hz..hz),
                 )
             }
             EmitterShape::Cone => {
@@ -326,7 +371,9 @@ impl ParticleEmitter {
                 let mut rng = rand::thread_rng();
                 let theta: f32 = rng.gen_range(0.0..2.0 * std::f32::consts::PI);
                 let rr: f32 = rng.gen_range(0.0..self.config.emitter_size.x.max(0.001));
-                let h: f32 = rng.gen_range(-self.config.emitter_size.y..self.config.emitter_size.y);
+                // Bug №189: the height range is empty when the extent is 0.0.
+                let hy = self.config.emitter_size.y.abs().max(0.001);
+                let h: f32 = rng.gen_range(-hy..hy);
                 Vec3::new(rr * theta.cos(), h, rr * theta.sin())
             }
             EmitterShape::Line => {
@@ -397,6 +444,12 @@ impl ParticleEmitter {
         self.time = 0.0;
         self.active_particles.clear();
         self.free_particles.clear();
+        // Bug №236: a reset starts a fresh run — the leftover fractional
+        // emission charge and the burst timer of the old run would fire
+        // within the first tick of the new one.
+        self.emission_accumulator = 0.0;
+        self.burst_timer = 0.0;
+        self.bursts_fired = 0;
 
         for i in 0..self.config.max_particles as usize {
             self.free_particles.push(i);
@@ -496,5 +549,143 @@ impl ParticleEmitterBuilder {
 
     pub fn build(self) -> ParticleEmitter {
         ParticleEmitter::new(self.config)
+    }
+}
+
+#[cfg(test)]
+mod bug_234_235_236_189 {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    fn burst_config(rate: f32) -> ParticleEmitterConfig {
+        let mut config = ParticleEmitterConfig::default();
+        config.emission_rate = rate;
+        config.burst_count = 7;
+        config.burst_interval = 0.1;
+        config
+    }
+
+    // Bug №234: set_scale wrote a value emit_particle never read.
+    #[test]
+    fn emitter_scale_grows_the_emission_volume() {
+        let mut config = ParticleEmitterConfig::default();
+        config.max_particles = 400;
+        config.emission_rate = 40_000.0;
+        config.emitter_shape = EmitterShape::Box;
+        config.emitter_size = Vec3::new(1.0, 1.0, 1.0);
+
+        let mut emitter = ParticleEmitter::new(config);
+        emitter.set_scale(Vec3::new(5.0, 5.0, 5.0));
+        emitter.update(Duration::from_millis(1));
+
+        let mut max_offset = 0.0_f32;
+        let mut min_offset = f32::MAX;
+        for particle in emitter.live_particles() {
+            let offset = (particle.position - emitter.position()).length();
+            max_offset = max_offset.max(offset);
+            min_offset = min_offset.min(offset);
+        }
+        // The unscaled box reaches sqrt(3) ~1.73; with the scale applied the
+        // same shape reaches 5·sqrt(3) ~8.66. A value past the unscaled
+        // envelope proves the scale is read at all.
+        assert!(
+            max_offset > 2.5,
+            "largest offset {max_offset} — the scale never grew the volume (RED \
+             of №234 stays under 1.74)"
+        );
+        // ...and nothing may leave the scaled envelope.
+        assert!(
+            max_offset <= 5.0 * 3.0f32.sqrt() + 0.1,
+            "offset {max_offset} is outside the scaled box"
+        );
+    }
+
+    // Bug №235: particles carried the pool slot as their emitter_id, and
+    // one emitter's particles disagreed about who emitted them.
+    #[test]
+    fn all_particles_of_one_emitter_share_one_stable_id() {
+        let mut emitter = ParticleEmitter::default();
+        emitter.update(Duration::from_millis(200));
+
+        let live = emitter.live_particles();
+        assert!(!live.is_empty(), "the default config must spawn particles");
+        let ids: BTreeSet<u32> = live.iter().map(|p| p.emitter_id).collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "one emitter must own one id, got {ids:?}"
+        );
+        assert_eq!(*ids.iter().next().unwrap(), emitter.emitter_id);
+    }
+
+    // Bug №236: burst_count/burst_interval were never read in update.
+    #[test]
+    fn burst_schedule_fires_on_its_interval() {
+        let mut emitter = ParticleEmitter::new(burst_config(0.0));
+        assert_eq!(emitter.particle_count(), 0);
+
+        emitter.update(Duration::from_millis(100));
+        assert_eq!(emitter.particle_count(), 7, "the first interval fires a burst");
+        emitter.update(Duration::from_millis(100));
+        assert_eq!(emitter.particle_count(), 14, "the second interval fires again");
+    }
+
+    #[test]
+    fn reset_clears_the_burst_schedule() {
+        let mut emitter = ParticleEmitter::new(burst_config(0.0));
+        emitter.update(Duration::from_millis(100));
+        assert_eq!(emitter.particle_count(), 7);
+
+        emitter.reset();
+        assert_eq!(emitter.particle_count(), 0);
+
+        // Half an interval after the reset the schedule has not fired yet; a
+        // carry-over timer from the old run would have.
+        emitter.update(Duration::from_millis(95));
+        assert_eq!(emitter.particle_count(), 0, "the reset must clear the burst timer");
+        emitter.update(Duration::from_millis(5));
+        assert_eq!(emitter.particle_count(), 7, "then the next interval fires");
+    }
+
+    #[test]
+    fn bursts_respect_set_emitting_false() {
+        let mut config = burst_config(0.0);
+        config.max_particles = 5; // the burst clamp holds: 7 requested, 5 free
+        let mut emitter = ParticleEmitter::new(config);
+
+        emitter.set_emitting(false);
+        emitter.update(Duration::from_millis(100));
+        assert_eq!(emitter.particle_count(), 0, "a stopped emitter must not burst");
+    }
+
+    // Bug №189: zero extents reached gen_range(-0..0), which panics.
+    #[test]
+    fn zero_sized_box_and_cylinder_configs_spawn_without_panic() {
+        for shape in [EmitterShape::Box, EmitterShape::Cylinder] {
+            let mut config = ParticleEmitterConfig::default();
+            config.max_particles = 100;
+            config.emission_rate = 100.0;
+            config.emitter_shape = shape;
+            config.emitter_size = Vec3::ZERO;
+
+            let mut emitter = ParticleEmitter::new(config);
+            emitter.update(Duration::from_millis(16));
+            assert!(
+                emitter.particle_count() > 0,
+                "shape {shape:?} must still spawn with zero extents"
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_spawns_without_panic() {
+        let mut emitter = ParticleEmitter::default();
+        emitter.update(Duration::from_millis(200));
+        assert_eq!(
+            emitter.particle_count(),
+            2,
+            "rate 10/s over 0.2 s must spawn 2 particles"
+        );
     }
 }

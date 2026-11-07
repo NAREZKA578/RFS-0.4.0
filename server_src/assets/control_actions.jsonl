@@ -1,0 +1,34 @@
+{"ts":"2026-11-07T10:21:00.792Z","source":"door","command":"say \"Тест объявления от сервера\"","outcome":"queued"}
+{"ts":"2026-11-07T10:21:00.812Z","source":"loop","command":"say \"Тест объявления от сервера\"","outcome":"announced to every connected player"}
+{"ts":"2026-11-07T10:21:00.865Z","source":"door","command":"reload","outcome":"applied=0 restart_required=0 rejected=0"}
+{"ts":"2026-11-07T10:59:46.098Z","source":"door","command":"ban 127.0.0.1:12345 \"test ban\"","outcome":"queued; new ban written to the list file"}
+{"ts":"2026-11-07T10:59:46.131Z","source":"loop","command":"ban 127.0.0.1:12345 \"test ban\"","outcome":"queued; ban list file updated, reconnect refused at connect"}
+{"ts":"2026-11-07T10:59:46.505Z","source":"door","command":"unban 127.0.0.1:12345","outcome":"queued; removed from the ban list file"}
+{"ts":"2026-11-07T10:59:46.516Z","source":"loop","command":"unban 127.0.0.1:12345","outcome":"queued; removed from the ban list file"}
+{"ts":"2026-11-07T10:59:55.680Z","source":"door","command":"end_match","outcome":"queued; the loop moves the match to ending"}
+{"ts":"2026-11-07T10:59:55.695Z","source":"loop","command":"end_match","outcome":"queued; match ending, all clients to be disconnected"}
+{"ts":"2026-11-07T11:02:54.645Z","source":"door","command":"end_match","outcome":"queued; the loop moves the match to ending"}
+{"ts":"2026-11-07T11:02:54.666Z","source":"loop","command":"end_match","outcome":"queued; match ending announced"}
+{"ts":"2026-11-07T11:02:54.872Z","source":"door","command":"start_match","outcome":"queued; the loop moves the match to in_progress"}
+{"ts":"2026-11-07T11:02:54.899Z","source":"loop","command":"start_match","outcome":"queued; match is now in progress"}
+{"ts":"2026-11-07T11:02:55.084Z","source":"door","command":"restart_match","outcome":"queued; the loop resets the match to waiting"}
+{"ts":"2026-11-07T11:02:55.097Z","source":"loop","command":"restart_match","outcome":"queued; match reset to waiting"}
+{"ts":"2026-11-07T11:03:40.004Z","source":"door","command":"end_match","outcome":"queued; the loop moves the match to ending"}
+{"ts":"2026-11-07T11:03:40.015Z","source":"loop","command":"end_match","outcome":"queued; match ending announced"}
+{"ts":"2026-11-07T11:04:46.408Z","source":"door","command":"end_match","outcome":"queued; the loop moves the match to ending"}
+{"ts":"2026-11-07T11:04:46.440Z","source":"loop","command":"end_match","outcome":"queued; match ending announced"}
+{"ts":"2026-11-07T11:04:46.649Z","source":"door","command":"start_match","outcome":"queued; the loop moves the match to in_progress"}
+{"ts":"2026-11-07T11:04:46.668Z","source":"loop","command":"start_match","outcome":"queued; match is now in progress"}
+{"ts":"2026-11-07T11:39:45.838Z","source":"door","command":"say \"Тест объявления\"","outcome":"queued"}
+{"ts":"2026-11-07T11:39:45.846Z","source":"loop","command":"say \"Тест объявления\"","outcome":"announced to every connected player"}
+{"ts":"2026-11-07T11:39:45.847Z","source":"door","command":"reload","outcome":"applied=0 restart_required=0 rejected=0"}
+{"ts":"2026-11-07T11:39:45.857Z","source":"door","command":"ban 127.0.0.1:99999 \"тест бан\"","outcome":"queued; new ban written to the list file"}
+{"ts":"2026-11-07T11:39:45.876Z","source":"door","command":"unban 127.0.0.1:99999","outcome":"queued; removed from the ban list file"}
+{"ts":"2026-11-07T11:39:45.883Z","source":"loop","command":"ban 127.0.0.1:99999 \"тест бан\"","outcome":"queued; ban list file updated, reconnect refused at connect"}
+{"ts":"2026-11-07T11:39:45.883Z","source":"loop","command":"unban 127.0.0.1:99999","outcome":"queued; removed from the ban list file"}
+{"ts":"2026-11-07T11:39:59.511Z","source":"door","command":"end_match","outcome":"queued; the loop moves the match to ending"}
+{"ts":"2026-11-07T11:39:59.544Z","source":"loop","command":"end_match","outcome":"queued; match ending announced"}
+{"ts":"2026-11-07T11:39:59.567Z","source":"door","command":"start_match","outcome":"queued; the loop moves the match to in_progress"}
+{"ts":"2026-11-07T11:39:59.575Z","source":"loop","command":"start_match","outcome":"queued; match is now in progress"}
+{"ts":"2026-11-07T11:39:59.601Z","source":"door","command":"restart_match","outcome":"queued; the loop resets the match to waiting"}
+{"ts":"2026-11-07T11:39:59.609Z","source":"loop","command":"restart_match","outcome":"queued; match reset to waiting"}

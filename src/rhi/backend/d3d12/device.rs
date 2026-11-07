@@ -25,15 +25,18 @@ use crate::types::{ClearValue, Extent2D, Format, GraphicsApi, IndexType, Offset2
     TextureDimensions, TextureUsage};
 
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY, ID3DBlob};
-use windows::Win32::Graphics::Direct3D::Fxc::D3DGetInputSignatureBlob;
-use windows::Win32::Graphics::Direct3D11::D3D11_SIGNATURE_PARAMETER_DESC;
+use windows::Win32::Graphics::Direct3D::{D3D10_NAME_UNDEFINED, D3D_PRIMITIVE_TOPOLOGY, ID3DBlob};
+use windows::Win32::Graphics::Direct3D::Fxc::D3DReflect;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_SHADER_DESC, D3D11_SIGNATURE_PARAMETER_DESC, ID3D11ShaderReflection,
+};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_BLEND_DESC, D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO,
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D_ROOT_SIGNATURE_VERSION_1_0,
     D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COLOR_WRITE_ENABLE_ALL,
     D3D12_CONSTANT_BUFFER_VIEW_DESC, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
-    D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_CULL_MODE_NONE,
+    D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+    D3D12_CULL_MODE_NONE,
     D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_STENCILOP_DESC,
     D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DEPTH_WRITE_MASK_ZERO,
     D3D12_DESCRIPTOR_RANGE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
@@ -1485,27 +1488,68 @@ impl D3D12Device {
     /// element per location the shader reads, fed from the pipeline's input
     /// declaration. A shader that reads nothing (SV_VertexID only) carries
     /// an empty signature, and then no layout is set at all.
+    ///
+    /// The reflection goes through `D3DReflect` and the returned
+    /// `ID3D11ShaderReflection`, not through `D3DGetInputSignatureBlob`:
+    /// that blob is a finished DXBC container (36-byte header + the ISGN
+    /// chunk with its string table), and casting its bytes to an
+    /// array of descriptors fed raw container bytes to `Register` — the
+    /// shader-map read ASCII (`"TECO"…`) where a location had to be. The
+    /// reflection interface hands the parameters out one at a time, which
+    /// is the only honest contract here.
+    ///
+    /// The reflector comes back with the elements on purpose: the semantic
+    /// names of the elements are `PCSTR`s into its string table, and the
+    /// pipeline creation reads them when it builds the PSO. A local
+    /// reflector dropped at this function's end would free the strings
+    /// before the PSO creation read them — the caller binds the returned
+    /// reflector so it outlives `CreateGraphicsPipelineState`.
     pub(crate) fn vertex_input_elements(
         vs_code: &[u8],
         input: &crate::pipeline::graphics::VertexInputState,
-    ) -> RhiResult<Vec<D3D12_INPUT_ELEMENT_DESC>> {
-        let blob = unsafe {
-            D3DGetInputSignatureBlob(
+    ) -> RhiResult<(
+        Vec<D3D12_INPUT_ELEMENT_DESC>,
+        Option<ID3D11ShaderReflection>,
+    )> {
+        let mut reflector: Option<ID3D11ShaderReflection> = None;
+        unsafe {
+            D3DReflect(
                 vs_code.as_ptr() as *const core::ffi::c_void,
                 vs_code.len(),
+                &ID3D11ShaderReflection::IID,
+                &mut reflector as *mut _ as *mut *mut core::ffi::c_void,
             )
         }
         .map_err(|e| {
-            RhiError::PipelineCreationError(format!("input signature blob: {e}"))
+            RhiError::PipelineCreationError(format!("vertex signature reflection: {e}"))
         })?;
-        let params = unsafe {
-            std::slice::from_raw_parts(
-                blob.GetBufferPointer() as *const D3D11_SIGNATURE_PARAMETER_DESC,
-                blob.GetBufferSize() / std::mem::size_of::<D3D11_SIGNATURE_PARAMETER_DESC>(),
+        let reflector = reflector.ok_or_else(|| {
+            RhiError::PipelineCreationError(
+                "the vertex signature reflection returned no reflector".into(),
             )
-        };
+        })?;
+        let mut shader_desc = D3D11_SHADER_DESC::default();
+        unsafe { reflector.GetDesc(&mut shader_desc) }.map_err(|e| {
+            RhiError::PipelineCreationError(format!("vertex shader description: {e}"))
+        })?;
         let mut elements = Vec::new();
-        for param in params {
+        for parameter in 0..shader_desc.InputParameters {
+            let mut param = D3D11_SIGNATURE_PARAMETER_DESC::default();
+            unsafe { reflector.GetInputParameterDesc(parameter, &mut param) }.map_err(
+                |e| {
+                    RhiError::PipelineCreationError(format!(
+                        "vertex shader input parameter {parameter}: {e}"
+                    ))
+                },
+            )?;
+            // System-value inputs (SV_VertexID and friends) sit in the
+            // signature without consuming a vertex-buffer attribute: they
+            // must not swallow a real attribute's location (SV_VertexID
+            // occupies register 0), and a system semantic is not a
+            // vertex-buffer element.
+            if param.SystemValueType != D3D10_NAME_UNDEFINED {
+                continue;
+            }
             let attribute = input
                 .attributes
                 .iter()
@@ -1550,7 +1594,7 @@ impl D3D12Device {
                 InstanceDataStepRate: if instance { 1 } else { 0 },
             });
         }
-        Ok(elements)
+        Ok((elements, Some(reflector)))
     }
 }
 
@@ -2454,18 +2498,30 @@ impl BackendResource for D3D12Device {
                                         .into(),
                                 ));
                             }
-                            if *offset as u64 + *size as u64 > buffer_entry.size() {
+                            let range_end = *offset + *size;
+                            if range_end > buffer_entry.size() {
                                 return Err(RhiError::BackendError(format!(
                                     "the constant buffer view covers {}..{} of a \
                                      {}-byte buffer",
                                     *offset,
-                                    *offset as u64 + *size as u64,
+                                    range_end,
                                     buffer_entry.size()
                                 )));
                             }
                             let view_desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                                 BufferLocation: buffer_entry.resource().GetGPUVirtualAddress(),
-                                SizeInBytes: *size as u32,
+                                // D3D12 requires a constant buffer view's
+                                // SizeInBytes to be a multiple of 256; a
+                                // smaller view faults the device (the
+                                // removed-device error surfaces on the next
+                                // pipeline creation as 0x887A0005). The view
+                                // rounds the declared byte range up: the
+                                // shader reads the same first bytes, the
+                                // trailing range is the alignment padding.
+                                SizeInBytes: (range_end.div_ceil(
+                                    D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64,
+                                ) * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64)
+                                    as u32,
                             };
                             self.device.0.CreateConstantBufferView(
                                 Some(&view_desc),
@@ -2990,11 +3046,15 @@ impl BackendResource for D3D12Device {
             },
         };
         // Vertex input: elements reflected straight out of the VS input
-        // signature — an SV_VertexID-only shader carries none.
-        let elements = match &desc.vertex_input_state {
+        // signature — an SV_VertexID-only shader carries none. The returned
+        // reflector is bound right here: the elements' semantic names are
+        // pointers into its string table, and the PSO creation below reads
+        // them; the binding holds the reflector to this function's end.
+        let (elements, vs_reflector) = match &desc.vertex_input_state {
             Some(input) => Self::vertex_input_elements(vs_entry.code(), input)?,
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
+        let _vs_reflector_alive_to_pso = vs_reflector;
         let input_layout = if elements.is_empty() {
             D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: core::ptr::null(),
@@ -3632,6 +3692,107 @@ mod texture_desc_contract {
                 resource, want,
                 "{format:?} is not a depth format: it must keep {want:?}, not {resource:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod vertex_signature_contract {
+    //! BUGS №758: the D3D12 input-signature reflection used to read a
+    //! `D3DGetInputSignatureBlob` blob's raw bytes as a descriptor array —
+    //! but the blob is a finished DXBC container (a 36-byte header and the
+    //! ISGN chunk with its string table), so `Register` read ASCII bytes
+    //! (`2104404263`, `1332475536`, …) and the shader-map named garbage
+    //! locations (the live symptom: a real draw pipeline was refused, then a
+    //! descriptor-table pipeline panicked the same way). The D3D11 sibling
+    //! got the mirrored contract at №759; the two backends keep one shape on
+    //! purpose.
+    //!
+    //! These contracts pin the honest reflection: true locations, no
+    //! system-value inputs, and refusals that name the shader's location.
+    use super::*;
+    use crate::backend::d3d11::compile::compile_hlsl;
+
+    const TWO_INPUT_VS: &[u8] = b"struct VSIn { float3 pos : TEXCOORD0; float4 col : TEXCOORD1; };\n\
+         struct VOut { float4 pos : SV_Position; float4 col : COLOR0; };\n\
+         VOut main(VSIn input) { VOut o = (VOut)0; o.pos = float4(input.pos, 1.0); \
+         o.col = input.col; return o; }\n";
+
+    const VERTEX_ID_VS: &[u8] =
+        b"struct VOut { float4 pos : SV_Position; };\n\
+         VOut main(uint id : SV_VertexID) { \
+         VOut o = (VOut)0; float2 xy = float2(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0); \
+         o.pos = float4(xy, 0.0, 1.0); return o; }\n";
+
+    fn two_location_input() -> crate::pipeline::graphics::VertexInputState {
+        crate::pipeline::graphics::VertexInputState::from_formats(&[
+            (0, crate::types::Format::R32G32B32_SFLOAT),
+            (1, crate::types::Format::RGBA32_SFLOAT),
+        ])
+    }
+
+    #[test]
+    fn a_spanning_signature_reflects_true_locations() {
+        let code = match compile_hlsl(TWO_INPUT_VS, "main", "vs_5_0") {
+            Ok(code) => code,
+            Err(e) => panic!("compile: {e:?}"),
+        };
+        let (elements, reflector) =
+            D3D12Device::vertex_input_elements(&code, &two_location_input()).unwrap();
+        assert!(
+            reflector.is_some(),
+            "the elements borrow the reflection object's string table: the \
+             reflector must come back so the pipeline creation keeps it \
+             alive past the PSO build"
+        );
+        assert_eq!(
+            elements.len(),
+            2,
+            "a two-input vertex shader reflects two elements, saw {elements:?}"
+        );
+        // TEXCOORD0 at offset 0 and TEXCOORD1 at offset 12 — the declared
+        // attribute offsets of the pipeline's first binding.
+        assert_eq!(elements[0].AlignedByteOffset, 0);
+        assert_eq!(elements[1].AlignedByteOffset, 12);
+        assert_eq!(elements[0].InputSlot, 0);
+        assert_eq!(elements[1].InputSlot, 0);
+    }
+
+    #[test]
+    fn a_vertex_id_only_shader_reflects_no_inputs() {
+        let code = match compile_hlsl(VERTEX_ID_VS, "main", "vs_5_0") {
+            Ok(code) => code,
+            Err(e) => panic!("compile: {e:?}"),
+        };
+        let (elements, reflector) =
+            D3D12Device::vertex_input_elements(&code, &two_location_input()).unwrap();
+        assert!(
+            elements.is_empty(),
+            "SV_VertexID-only shaders carry no vertex-buffer elements: the \
+             system value occupies register 0 and must not swallow a real \
+             attribute's location; saw {elements:?}"
+        );
+        assert!(reflector.is_some(), "empty still reflects through an object");
+    }
+
+    #[test]
+    fn a_missing_attribute_names_the_true_location() {
+        let code = match compile_hlsl(TWO_INPUT_VS, "main", "vs_5_0") {
+            Ok(code) => code,
+            Err(e) => panic!("compile: {e:?}"),
+        };
+        let result = D3D12Device::vertex_input_elements(
+            &code,
+            &crate::pipeline::graphics::VertexInputState::default(),
+        );
+        match result {
+            Err(RhiError::PipelineCreationError(text)) => assert!(
+                text.contains("location 0"),
+                "the reflection must name the shader's first input location; \
+                 got {text:?} — garbage register words are the old blob-cast \
+                 bug (№758) back"
+            ),
+            other => panic!("a missing attribute must be a refusal, saw {other:?}"),
         }
     }
 }

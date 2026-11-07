@@ -9,6 +9,7 @@
 //! (stage 2, А.2 item 6), `server` — the listener and its caps. This file
 //! stays the module's root and keeps the tick-cadence machinery.
 
+pub mod banlist;
 pub mod commands;
 pub mod journal;
 pub mod proto;

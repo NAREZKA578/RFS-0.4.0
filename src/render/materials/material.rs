@@ -149,6 +149,17 @@ impl Material {
             // This is a placeholder - actual implementation would create
             // a pipeline with the appropriate shader stages, vertex input, etc.
 
+            // Bug №231: the opaque blend state must carry exactly as many
+            // no-blend attachments as the pass has colour attachments, or the
+            // blend info's attachmentCount is 0 while the pass draws into
+            // colour targets (invalid on the Vulkan side).
+            let colour_attachment_count = render_pass
+                .desc()
+                .attachments
+                .iter()
+                .filter(|a| !a.format.is_depth() && !a.format.is_stencil())
+                .count();
+
             let pipeline_desc = crate::rhi::PipelineDesc {
                 shader_stages: vec![crate::rhi::PipelineShaderStage {
                     stage: crate::rhi::ShaderStage::VERTEX,
@@ -178,7 +189,7 @@ impl Material {
                     ..Default::default()
                 }),
                 color_blend_state: Some(match self.blend_mode {
-                    BlendMode::Opaque => crate::rhi::BlendDesc::disabled(),
+                    BlendMode::Opaque => crate::rhi::BlendDesc::disabled(colour_attachment_count),
                     BlendMode::Alpha => crate::rhi::BlendDesc::alpha(),
                     BlendMode::Additive => crate::rhi::BlendDesc::additive(),
                     BlendMode::Multiplicative => crate::rhi::BlendDesc::multiplicative(),

@@ -237,26 +237,12 @@ impl GraphResource {
                 if self.usage.contains(ResourceUsage::STORAGE) {
                     rhi_usage |= BufferUsage::STORAGE;
                 }
-                if self.usage.contains(ResourceUsage::RENDER_TARGET)
-                    || self.usage.contains(ResourceUsage::COLOR_ATTACHMENT)
-                    || self.usage.contains(ResourceUsage::DEPTH_STENCIL)
-                {
-                    // Attachments are textures, never buffers. Saying so beats the
-                    // `unreachable!()` the old code had here, which would abort
-                    // the process on a data-driven mistake rather than on a bug.
-                    eprintln!(
-                        "[render] graph: buffer {:?} declares an attachment usage \
-                         ({}) but buffers cannot be attachments; not creating it",
-                        self.name, self.usage
-                    );
-                    return;
-                }
-                if rhi_usage.is_empty() {
-                    eprintln!(
-                        "[render] graph: buffer {:?} has no usage declared; \
-                         not creating a buffer",
-                        self.name
-                    );
+
+                // Bug №208: the refusal reasons live in `creation_error` and
+                // are shared with the CPU-side test. A data-driven mistake is
+                // a logged refusal, not an abort and not a silent no-op.
+                if let Some(reason) = self.creation_error() {
+                    eprintln!("[render] graph: {reason}");
                     return;
                 }
 
@@ -273,7 +259,12 @@ impl GraphResource {
                 }
             }
             ResourceType::Sampler => {
-                // Samplers are created separately
+                // Bug №208: this branch was a silent no-op — the constructor
+                // made not creating look like a decision nobody made. The
+                // refusal goes through the same channel as the buffer branch.
+                if let Some(reason) = self.creation_error() {
+                    eprintln!("[render] graph: {reason}");
+                }
             }
         }
     }
@@ -323,5 +314,97 @@ impl GraphResource {
     /// Check if resource should be destroyed (for transient resources)
     pub fn should_destroy(&self) -> bool {
         self.transient && self.lifetime > 1
+    }
+
+    /// CPU-side refusal reasons for `create`, so graph tests can probe the
+    /// paths that used to be an `unreachable!()` without owning a device.
+    /// `create` reports these and does not materialize the resource. Bug №208.
+    pub(crate) fn creation_error(&self) -> Option<String> {
+        match self.resource_type {
+            ResourceType::Buffer => {
+                if self.usage.contains(ResourceUsage::RENDER_TARGET)
+                    || self.usage.contains(ResourceUsage::COLOR_ATTACHMENT)
+                    || self.usage.contains(ResourceUsage::DEPTH_STENCIL)
+                {
+                    // Attachments are textures, never buffers.
+                    return Some(format!(
+                        "buffer {:?} declares an attachment usage ({}) but \
+                         buffers cannot be attachments; not creating it",
+                        self.name, self.usage
+                    ));
+                }
+                if !self.usage.contains(ResourceUsage::SAMPLED)
+                    && !self.usage.contains(ResourceUsage::STORAGE)
+                {
+                    return Some(format!(
+                        "buffer {:?} has no usage declared; not creating a buffer",
+                        self.name
+                    ));
+                }
+                None
+            }
+            ResourceType::Texture => {
+                // The texture branch refuses only inside `create` (its usage
+                // set is accumulated there); no CPU-side reason here.
+                None
+            }
+            ResourceType::Sampler => {
+                // A sampler is created by a device, never by the graph; the
+                // constructor must not make that look like a working branch.
+                Some(format!(
+                    "sampler {:?} is not created by the graph; samplers belong \
+                     to the device, so buffer() and texture() will stay None",
+                    self.name
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bug_208 {
+    use super::*;
+
+    // Bug №208 (NC): a buffer with an attachment usage hit an `unreachable!()`
+    // on a reachable public-API path.
+    #[test]
+    fn buffer_with_attachment_usage_is_refused_not_aborted() {
+        let resource =
+            GraphResource::new_buffer("probe".to_string(), 64, ResourceUsage::DepthStencil);
+        assert!(
+            resource.creation_error().is_some(),
+            "an attachment usage on a buffer must be refused"
+        );
+    }
+
+    #[test]
+    fn buffer_without_any_usage_is_refused() {
+        let resource =
+            GraphResource::new_buffer("probe".to_string(), 64, ResourceUsage::NONE);
+        assert!(resource.creation_error().is_some());
+    }
+
+    #[test]
+    fn buffer_with_data_usage_passes_the_cpu_gate() {
+        let resource =
+            GraphResource::new_buffer("probe".to_string(), 64, ResourceUsage::Sampled);
+        assert!(resource.creation_error().is_none());
+    }
+
+    // Bug №208 (NC): a sampler resource used to be a silent no-op — the caller
+    // had no way to learn that nothing was made.
+    #[test]
+    fn sampler_creation_is_reported_not_silent() {
+        let resource = GraphResource::new(
+            "probe".to_string(),
+            ResourceType::Sampler,
+            ResourceUsage::Sampled,
+            1,
+            1,
+        );
+        let reason = resource
+            .creation_error()
+            .expect("a sampler must be refused with a reason");
+        assert!(reason.contains("sampler"));
     }
 }

@@ -325,6 +325,7 @@ impl TrackedShip {
             heading: state.heading,
             rudder_angle: state.rudder_angle,
             throttle: state.throttle,
+            half_size: Vec3f::new(50.0, 30.0, 150.0),
             compartments: self.compartment_entities(state),
             stations: self.station_entities(state),
             team: 0,

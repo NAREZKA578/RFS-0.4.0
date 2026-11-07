@@ -29,6 +29,11 @@ pub struct ShipEntity {
     pub heading: f32,
     pub rudder_angle: f32,
     pub throttle: f32,
+    /// Half-extent of the ship's world-frame AABB for interest filtering and
+    /// broadphase collision. A fixed `50x30x150` box made every hull — from a
+    /// cutter to a line-of-battle ship — occupy the same cell range. When a
+    /// `ShipClass` supplies dimensions they should replace this default here.
+    pub half_size: Vec3f,
     pub compartments: Vec<CompartmentEntity>,
     pub stations: Vec<StationEntity>,
     pub team: u8,
@@ -66,10 +71,9 @@ impl SpatialEntity for ShipEntity {
     }
 
     fn bounds(&self) -> Bounds {
-        let half_size = Vec3f::new(50.0, 30.0, 150.0);
         Bounds::new(
-            self.transform.position - half_size,
-            self.transform.position + half_size,
+            self.transform.position - self.half_size,
+            self.transform.position + self.half_size,
         )
     }
 

@@ -330,6 +330,23 @@ impl PbrMaterial {
         material.set_metallic(0.0);
         material.set_roughness(0.1);
         material.set_blend_mode(BlendMode::Alpha);
+        // Bug №117: the type stayed MaterialType::Pbr, so anything routing
+        // materials by type never saw a water factory product as water.
+        material.base.material_type = MaterialType::Water;
         material
+    }
+}
+
+#[cfg(test)]
+mod bug_117 {
+    use super::*;
+
+    // Bug №117: the water factory left the type as Pbr.
+    #[test]
+    fn water_factory_sets_water_material_type() {
+        assert_eq!(
+            PbrMaterial::water("probe_water").base.material_type,
+            MaterialType::Water
+        );
     }
 }

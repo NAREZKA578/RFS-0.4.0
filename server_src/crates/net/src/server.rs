@@ -81,7 +81,7 @@ pub struct NetServer {
     /// rounds are pruned by the admission stage instead of being admitted
     /// into a dead base.
     first_full_queue: Arc<Mutex<FirstFullQueue>>,
-    /// Bug №274: deltas actually sent, per layer. The send-side half of the
+    /// Bug №175: deltas actually sent, per layer. The send-side half of the
     /// delivery measurement — the client's `applied_delta_count_by_layer` is
     /// the receive half, and a per-layer shortfall means different things on
     /// each side.
@@ -297,6 +297,18 @@ fn apply_resync_request(conn: &Connection, payload: &[u8]) -> bool {
 struct ClientLayerTrack {
     /// Per layer, the queued-but-unconfirmed sends, oldest first.
     pending: [VecDeque<LayerBase>; LAYER_COUNT],
+    /// Bug №757: the confirmed copy, advanced in the SAME `pending_confirms`
+    /// lock window that consumes ring entries. The `client_layers` mirror is
+    /// written a moment later under its own lock (№79 keeps the two maps in
+    /// separate hands), and that inter-lock split is a window the publish
+    /// pass could fall into: a report had just drained the ring, the row had
+    /// not moved yet, and the pass anchored its next delta on the OLD row —
+    /// a base two sends behind what the client had already applied. The
+    /// dropped delta stalled its layer until the resync. With the copy here,
+    /// the pass's fallback order is ring-back → this copy → the first-contact
+    /// row, all decided under one lock, so a drained ring hands the pass the
+    /// freshly confirmed base and the window is gone.
+    confirmed: [Option<LayerBase>; LAYER_COUNT],
     /// Per layer, the tick of the last self-shield firing (its cooldown stamp).
     last_self_resync: [u64; LAYER_COUNT],
 }
@@ -306,6 +318,7 @@ impl Default for ClientLayerTrack {
     fn default() -> Self {
         Self {
             pending: std::array::from_fn(|_| VecDeque::with_capacity(MAX_PENDING_CONFIRMS)),
+            confirmed: std::array::from_fn(|_| None),
             last_self_resync: [0; LAYER_COUNT],
         }
     }
@@ -367,6 +380,25 @@ fn take_confirmed_base(pending: &mut VecDeque<LayerBase>, applied: u64) -> Optio
     confirmed
 }
 
+/// Bug №757: one `pending_confirms` window does both halves of an applied
+/// report — take the exact-matched ring entry out AND advance the per-track
+/// confirmed copy. The publish pass reads the copy under the same lock, so
+/// the two-map split (№79 keeps `client_layers` in a separate hand) can no
+/// longer show a pass a drained ring with an unmoved confirmed view — the
+/// window that anchored a pass on the old row and stamped its delta with a
+/// base two sends behind the client's applied clock, the "+2" stall.
+fn install_confirmed_base(
+    track: &mut ClientLayerTrack,
+    layer: usize,
+    applied: u64,
+) -> Option<LayerBase> {
+    let confirmed = take_confirmed_base(&mut track.pending[layer], applied);
+    if let Some(entry) = confirmed.as_ref() {
+        track.confirmed[layer] = Some(entry.clone());
+    }
+    confirmed
+}
+
 /// Bug №742: the applied-lag rows behind the stats surface. One current-tick
 /// stamp and one read lock: every row's lag is measured against the SAME
 /// server tick, so the rows stay comparable to each other — per-connection
@@ -409,13 +441,21 @@ fn apply_layer_sync_report(
                 // report arriving out of order must not take an entry for a
                 // tick the connection has already confirmed.
                 let applied = conn.reported_applied(layer);
+                // Bug №757: the take and the confirmed-copy install share ONE
+                // `pending_confirms` window. №79 still keeps `client_layers`
+                // in the other hand, so its mirror update happens after the
+                // guard is dropped — a reader cannot use the pair of locks to
+                // observe a drained ring with an unmoved row, because the
+                // authoritative copy now lives inside the same lock the ring
+                // itself is drained under.
                 let confirmed = {
                     let mut confirms = pending_confirms.lock();
-                    confirms
+                    let confirmed = confirms
                         .get_mut(&client_id)
-                        .and_then(|track| take_confirmed_base(&mut track.pending[layer], applied))
+                        .and_then(|track| install_confirmed_base(track, layer, applied));
                     // Released before `client_layers` is touched — the two
                     // maps are never held in one hand (bug №79 discipline).
+                    confirmed
                 };
                 if let Some(entry) = confirmed {
                     if let Some(row) = client_layers.write().get_mut(&client_id) {
@@ -763,7 +803,7 @@ impl NetServer {
             snapshot_packets: Arc::new(AtomicU64::new(0)),
             first_fulls_built: Arc::new(AtomicU64::new(0)),
             first_full_queue: Arc::new(Mutex::new(FirstFullQueue::default())),
-            // Bug №274: per-layer send counter, see the field.
+            // Bug №175: per-layer send counter, see the field.
             sent_deltas_by_layer: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             delta_compressor: Arc::new(DeltaCompressor::new()),
             client_layers: Arc::new(RwLock::new(HashMap::with_capacity(CONNECT_TABLE_CAP))),
@@ -1866,7 +1906,7 @@ impl NetServer {
         // Bug №266: counted so the publication rate is measurable, not assumed.
         let snapshot_rounds = self.snapshot_rounds.clone();
         let snapshot_packets = self.snapshot_packets.clone();
-        // Bug №274: shared per-layer send counter.
+        // Bug №175: shared per-layer send counter.
         let sent_deltas_by_layer = self.sent_deltas_by_layer.clone();
         let delta_compressor = self.delta_compressor.clone();
         let interest_manager = self.interest_manager.clone();
@@ -2265,7 +2305,7 @@ impl NetServer {
         limit_enabled: bool,
         current_tick: Tick,
         snapshot_packets: &Arc<AtomicU64>,
-        // Bug №274: passed so the send path can record what it actually put on
+        // Bug №175: passed so the send path can record what it actually put on
         // the wire, per layer.
         sent_deltas_by_layer: &Arc<[AtomicU64; LAYER_COUNT]>,
         // Bug №700: the last hop of the seal, from the send loop.
@@ -2403,7 +2443,12 @@ impl NetServer {
                     // While the ring is unconfirmed, its newest entry REPLACES
                     // the confirmed copy as the diff source (same chain the
                     // old per-queue write built, now kept visibly apart from
-                    // the confirmed base). `shield` is (oldest unconfirmed
+                    // the confirmed base). When the ring is DRY, the anchor is
+                    // the confirmed copy `ClientLayerTrack.confirmed` —
+                    // advanced in the same lock window that drained the ring
+                    // (bug №757) — and only for a client whose first report
+                    // has not landed yet does the anchor fall back to the
+                    // first-contact row above. `shield` is (oldest unconfirmed
                     // age, ticks since the shield last fired) — None when the
                     // ring is dry: nothing awaits confirmation, nothing stalls.
                     let (base_entities, base_projectiles, last_sent_tick, shield) = {
@@ -2424,7 +2469,15 @@ impl NetServer {
                                             tick.saturating_sub(track.last_self_resync[layer]),
                                         )),
                                     ),
-                                    None => (base_entities, base_projectiles, base_tick, None),
+                                    None => match track.confirmed.get(layer) {
+                                        Some(Some(confirmed)) => (
+                                            confirmed.entities.clone(),
+                                            confirmed.projectiles.clone(),
+                                            confirmed.base_tick,
+                                            None,
+                                        ),
+                                        _ => (base_entities, base_projectiles, base_tick, None),
+                                    },
                                 }
                             }
                             None => (base_entities, base_projectiles, base_tick, None),
@@ -2542,7 +2595,7 @@ impl NetServer {
                         // ring exactly like the fresh branch. (The compressor's
                         // private ring advance is gone: queued is not applied,
                         // and only the client's report moves a base.)
-                        // Bug №274: a cached payload is still a delta that went on
+                        // Bug №175: a cached payload is still a delta that went on
                         // the wire to THIS client. It was left uncounted at first,
                         // which made the send-side figure disagree with the
                         // client's apply count by 4-8x on the layers that hit the
@@ -2602,7 +2655,7 @@ impl NetServer {
                         for packet in conn.send_state_delta_bytes(bytes) {
                             out.push((conn.clone(), packet));
                         }
-                        // Bug №274: count deltas actually put on the wire, per
+                        // Bug №175: count deltas actually put on the wire, per
                         // layer. The client's `applied_delta_count_by_layer` is the
                         // matching receive-side number, and the two are only
                         // comparable as a pair. Without the send side, a per-layer
@@ -3114,7 +3167,7 @@ impl NetServer {
         )
     }
 
-    /// Bug №274: deltas actually sent, per layer. Read together with the
+    /// Bug №175: deltas actually sent, per layer. Read together with the
     /// client's `applied_delta_count_by_layer`: sent-vs-applied separates "the
     /// server had nothing new to send" from "the client dropped it".
     pub fn sent_deltas_by_layer(&self) -> Vec<u64> {
@@ -3485,6 +3538,30 @@ mod layer_confirm_tests {
     }
 
     #[test]
+    fn a_taken_entry_advances_the_tracks_confirmed_copy() {
+        // Bug №757: the publish pass's dry-ring fallback anchors on the
+        // track's confirmed copy, so the copy install shares ONE
+        // `pending_confirms` window with the take. A copy left at the old
+        // row hands a pass the base two sends behind the client's applied
+        // clock — the "+2" stall this bug pins.
+        let mut track = ClientLayerTrack::default();
+        track.pending[0] = ring(&[445, 447]);
+
+        let taken = install_confirmed_base(&mut track, 0, 447);
+        let entry = taken.expect("the applied tick exactly names a ring entry");
+        assert_eq!(entry.base_tick, 447);
+        assert!(
+            track.pending[0].is_empty(),
+            "the exact match and the superseded entry are both consumed"
+        );
+        assert_eq!(
+            track.confirmed[0].as_ref().map(|e| e.base_tick),
+            Some(447),
+            "the copy is advanced in the same window, not left at the old row"
+        );
+    }
+
+    #[test]
     fn a_report_without_an_exact_match_moves_nothing() {
         let conn = conn();
         let pending = pending_map();
@@ -3733,6 +3810,7 @@ mod first_full_admission_tests {
             heading: 0.0,
             rudder_angle: 0.0,
             throttle: 0.0,
+            half_size: Vec3f::new(50.0, 30.0, 150.0),
             last_hit: None,
             compartments: Vec::new(),
             stations: Vec::new(),
@@ -3926,6 +4004,7 @@ mod event_interest_tests {
             heading: 0.0,
             rudder_angle: 0.0,
             throttle: 0.0,
+            half_size: Vec3f::new(50.0, 30.0, 150.0),
             last_hit: None,
             compartments: Vec::new(),
             stations: Vec::new(),

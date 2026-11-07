@@ -114,7 +114,7 @@ pub struct PlayerSnapshotData {
     pub name: String,
     pub team: u8,
     pub current_station: Option<EntityId>,
-    /// Bug №274: which ship this player is on.
+    /// Which ship this player is on.
     ///
     /// The player's position is derived from the ship's transform
     /// (`local_to_world`), so without this a client cannot tell which ship it
@@ -996,7 +996,7 @@ impl From<&PlayerEntity> for EntitySnapshot {
                 name: player.name.clone(),
                 team: player.team,
                 current_station: player.current_station,
-                // Bug №274: the ship this player rides, so a client can tell
+                // The ship this player rides, so a client can tell
                 // which ship it is on without reverse-engineering station lists.
                 current_ship: player.current_ship,
                 posture: player.posture,
@@ -1171,7 +1171,7 @@ impl From<&PlayerStateData> for PlayerSnapshotData {
             name: s.name.clone(),
             team: s.team,
             current_station: s.current_station,
-            // Bug №274: symmetric with `From<&PlayerEntity>`.
+            // Symmetric with `From<&PlayerEntity>` (wire ↔ snapshot).
             current_ship: s.current_ship,
             posture: s.posture,
             health: s.health,
@@ -1424,7 +1424,7 @@ impl PlayerSnapshotData {
             name: self.name.clone(),
             team: self.team,
             current_station: self.current_station,
-            // Bug №274: symmetric with `From<&PlayerEntity>` — a field dropped
+            // Symmetric with `From<&PlayerEntity>` — a field dropped
             // here would silently vanish on a full-state rebuild.
             current_ship: self.current_ship,
             posture: self.posture,

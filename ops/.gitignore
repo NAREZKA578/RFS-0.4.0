@@ -1,0 +1,24 @@
+# RFS Supervisor (ops) build artifacts
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+vendor/
+test.bin
+
+# Binaries
+rfs-orchestrator
+rfs-orchestrator.exe
+
+# Local state
+profiles/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

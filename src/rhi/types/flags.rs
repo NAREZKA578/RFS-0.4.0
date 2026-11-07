@@ -63,7 +63,28 @@ bitflags! {
         const CLOSEST_HIT = 1 << 5;
         const MISS = 1 << 6;
         const INTERSECTION = 1 << 7;
-        const ALL_GRAPHICS = (1 << 0) | (1 << 1);
+        /// Bug №126: geometry and tessellation stages were unnameable —
+        /// features.rs declares `geometry_shader` / `tessellation_shader` /
+        /// `mesh_shader`, but no `ShaderStage` bit could say "I run in that
+        /// stage", so a mesh- or geometry-stage pipeline could not be
+        /// described at all.
+        const GEOMETRY = 1 << 8;
+        const TESSELLATION_CONTROL = 1 << 9;
+        const TESSELLATION_EVALUATION = 1 << 10;
+        const MESH = 1 << 11;
+        const TASK = 1 << 12;
+        /// Callable shaders run in a ray pipeline (SBT calls), not raster.
+        const CALLABLE = 1 << 13;
+        /// The graphics-family stage set. Mesh stages replace the vertex
+        /// stage inside a graphics pipeline, so they belong here;
+        /// INTERSECTION/CALLABLE are ray-pipeline stages and stay out.
+        const ALL_GRAPHICS = (1 << 0)
+            | (1 << 1)
+            | (1 << 8)
+            | (1 << 9)
+            | (1 << 10)
+            | (1 << 11)
+            | (1 << 12);
     }
 }
 
@@ -155,5 +176,43 @@ bitflags! {
         const G = 1 << 1;
         const B = 1 << 2;
         const A = 1 << 3;
+    }
+}
+
+#[cfg(test)]
+mod bug_126 {
+    use super::*;
+
+    // Bug №126: geometry / tessellation / mesh / task / callable stages
+    // used to be unnameable — no `ShaderStage` bit existed for any of them.
+    #[test]
+    fn extended_stage_bits_are_distinct_and_nonzero() {
+        assert_ne!(ShaderStage::GEOMETRY, ShaderStage::empty());
+        assert_ne!(ShaderStage::TESSELLATION_CONTROL, ShaderStage::empty());
+        assert_ne!(ShaderStage::TESSELLATION_EVALUATION, ShaderStage::empty());
+        assert_ne!(ShaderStage::MESH, ShaderStage::empty());
+        assert_ne!(ShaderStage::TASK, ShaderStage::empty());
+        assert_ne!(ShaderStage::CALLABLE, ShaderStage::empty());
+
+        let combined = ShaderStage::GEOMETRY
+            | ShaderStage::TESSELLATION_CONTROL
+            | ShaderStage::TESSELLATION_EVALUATION
+            | ShaderStage::MESH
+            | ShaderStage::TASK
+            | ShaderStage::CALLABLE;
+        assert_eq!(combined.bits().count_ones(), 6);
+    }
+
+    #[test]
+    fn all_graphics_covers_mesh_family_and_excludes_ray_stages() {
+        let all = ShaderStage::ALL_GRAPHICS;
+        assert!(all.contains(ShaderStage::VERTEX));
+        assert!(all.contains(ShaderStage::FRAGMENT));
+        assert!(all.contains(ShaderStage::GEOMETRY));
+        assert!(all.contains(ShaderStage::MESH));
+        assert!(all.contains(ShaderStage::TASK));
+        // Ray-pipeline stages stay out of the raster family.
+        assert!(!all.contains(ShaderStage::INTERSECTION));
+        assert!(!all.contains(ShaderStage::CALLABLE));
     }
 }

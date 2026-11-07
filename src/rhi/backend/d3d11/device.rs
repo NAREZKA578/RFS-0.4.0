@@ -49,7 +49,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
     D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RTV_DIMENSION_TEXTURE2D,
     D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC,
-    D3D11_SIGNATURE_PARAMETER_DESC, D3D11_TEX2D_DSV,
+    D3D11_SHADER_DESC, D3D11_SIGNATURE_PARAMETER_DESC, D3D11_TEX2D_DSV,
     D3D11_TEX2D_RTV, D3D11_TEX2D_SRV, D3D11_TEX2D_UAV, D3D11_TEX3D_SRV, D3D11_TEXTURE2D_DESC,
     D3D11_TEXTURE3D_DESC, D3D11_UNORDERED_ACCESS_VIEW_DESC, D3D11_UAV_DIMENSION_BUFFER,
     D3D11_UAV_DIMENSION_TEXTURE2D, D3D11_USAGE, D3D11_USAGE_DYNAMIC, D3D11_USAGE_DEFAULT,
@@ -58,11 +58,13 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
     ID3D11InputLayout, ID3D11Multithread, ID3D11PixelShader, ID3D11Query,
     ID3D11RasterizerState,
-    ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState, ID3D11ShaderResourceView,
+    ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState, ID3D11ShaderReflection,
+    ID3D11ShaderResourceView,
     ID3D11Texture2D, ID3D11Texture3D, ID3D11UnorderedAccessView, ID3D11VertexShader,
 };
+use windows::Win32::Graphics::Direct3D::D3D10_NAME_UNDEFINED;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DGetInputSignatureBlob;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DReflect;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC,
 };
@@ -2341,23 +2343,97 @@ impl D3D11Device {
         vs_code: &[u8],
         input: &VertexInputState,
     ) -> RhiResult<Option<DxCom<ID3D11InputLayout>>> {
-        let blob = unsafe {
-            D3DGetInputSignatureBlob(
+        let (elements, reflector) = Self::vertex_input_elements(vs_code, input)?;
+        // The element semantic names are PCSTRs into the reflection object's
+        // string table; `CreateInputLayout` reads and copies them, so the
+        // reflector must be alive until the call below returns.
+        let _reflector_alive_to_layout = reflector;
+        if elements.is_empty() {
+            // A vertex shader that reads nothing but SV_VertexID carries no
+            // input signature. D3D11 has no layout to make for that: the
+            // feed state stays NULL and the draw pulls from the vertex id
+            // alone, which `record.rs` already handles by not binding one.
+            return Ok(None);
+        }
+        let mut out: Option<ID3D11InputLayout> = None;
+        unsafe {
+            self.device
+                .0
+                .CreateInputLayout(&elements, vs_code, Some(&mut out))
+        }
+        .map_err(|e| {
+            RhiError::PipelineCreationError(format!("CreateInputLayout: {e}"))
+        })?;
+        Ok(Some(DxCom(out.ok_or_else(|| {
+            RhiError::PipelineCreationError("CreateInputLayout returned no layout".into())
+        })?)))
+    }
+
+    /// The vertex-input elements from the VS input signature reflection: one
+    /// element per location the shader reads, fed from the pipeline's input
+    /// declaration (BUGS №759; the D3D12 sibling is №758, same contract —
+    /// the two backends stay shaped identically on purpose).
+    ///
+    /// The reflection goes through `D3DReflect` and the returned
+    /// `ID3D11ShaderReflection`, not through `D3DGetInputSignatureBlob`:
+    /// that blob is a finished DXBC container (a 36-byte header and the ISGN
+    /// chunk with its string table), and casting its bytes to a descriptor
+    /// array fed raw container bytes to `Register` — the shader-map read
+    /// ASCII (`2104404263`, `1332475536`, …) where a location had to be.
+    /// The reflection object hands the parameters out one at a time, which
+    /// is the only honest contract here.
+    ///
+    /// The reflector comes back with the elements: the semantic names of the
+    /// elements are `PCSTR`s into its string table, and the layout creation
+    /// reads them. `vertex_input_layout` holds the reflector until its
+    /// `CreateInputLayout` has copied the names — after that the layout
+    /// object owns its own copies and the reflector may drop.
+    pub(crate) fn vertex_input_elements(
+        vs_code: &[u8],
+        input: &VertexInputState,
+    ) -> RhiResult<(
+        Vec<D3D11_INPUT_ELEMENT_DESC>,
+        Option<ID3D11ShaderReflection>,
+    )> {
+        let mut reflector: Option<ID3D11ShaderReflection> = None;
+        unsafe {
+            D3DReflect(
                 vs_code.as_ptr() as *const core::ffi::c_void,
                 vs_code.len(),
+                &ID3D11ShaderReflection::IID,
+                &mut reflector as *mut _ as *mut *mut core::ffi::c_void,
             )
         }
         .map_err(|e| {
-            RhiError::PipelineCreationError(format!("input signature blob: {e}"))
+            RhiError::PipelineCreationError(format!("vertex signature reflection: {e}"))
         })?;
-        let params = unsafe {
-            std::slice::from_raw_parts(
-                blob.GetBufferPointer() as *const D3D11_SIGNATURE_PARAMETER_DESC,
-                blob.GetBufferSize() / std::mem::size_of::<D3D11_SIGNATURE_PARAMETER_DESC>(),
+        let reflector = reflector.ok_or_else(|| {
+            RhiError::PipelineCreationError(
+                "the vertex signature reflection returned no reflector".into(),
             )
-        };
+        })?;
+        let mut shader_desc = D3D11_SHADER_DESC::default();
+        unsafe { reflector.GetDesc(&mut shader_desc) }.map_err(|e| {
+            RhiError::PipelineCreationError(format!("vertex shader description: {e}"))
+        })?;
         let mut elements = Vec::new();
-        for param in params {
+        for parameter in 0..shader_desc.InputParameters {
+            let mut param = D3D11_SIGNATURE_PARAMETER_DESC::default();
+            unsafe { reflector.GetInputParameterDesc(parameter, &mut param) }.map_err(
+                |e| {
+                    RhiError::PipelineCreationError(format!(
+                        "vertex shader input parameter {parameter}: {e}"
+                    ))
+                },
+            )?;
+            // System-value inputs (SV_VertexID and friends) sit in the
+            // signature without consuming a vertex-buffer attribute: they
+            // must not swallow a real attribute's location (SV_VertexID
+            // occupies register 0), and an SV_ semantic is refused by
+            // `CreateInputLayout` outright.
+            if param.SystemValueType != D3D10_NAME_UNDEFINED {
+                continue;
+            }
             let attribute = input
                 .attributes
                 .iter()
@@ -2401,25 +2477,7 @@ impl D3D11Device {
                 InstanceDataStepRate: if instance { 1 } else { 0 },
             });
         }
-        if elements.is_empty() {
-            // A vertex shader that reads nothing but SV_VertexID carries no
-            // input signature. D3D11 has no layout to make for that: the
-            // feed state stays NULL and the draw pulls from the vertex id
-            // alone, which `record.rs` already handles by not binding one.
-            return Ok(None);
-        }
-        let mut out: Option<ID3D11InputLayout> = None;
-        unsafe {
-            self.device
-                .0
-                .CreateInputLayout(&elements, vs_code, Some(&mut out))
-        }
-        .map_err(|e| {
-            RhiError::PipelineCreationError(format!("CreateInputLayout: {e}"))
-        })?;
-        Ok(Some(DxCom(out.ok_or_else(|| {
-            RhiError::PipelineCreationError("CreateInputLayout returned no layout".into())
-        })?)))
+        Ok((elements, Some(reflector)))
     }
 }
 
@@ -2517,5 +2575,98 @@ mod wait_idle_event_contract {
             "a broken device must surface as an error, not as a claim that \
              the GPU went idle"
         );
+    }
+}
+
+#[cfg(test)]
+mod vertex_signature_contract {
+    //! BUGS №759: the D3D11 input-signature reflection used to read a
+    //! `D3DGetInputSignatureBlob` blob's raw bytes as a descriptor array —
+    //! but the blob is a finished DXBC container (a 36-byte header and the
+    //! ISGN chunk with its string table), so `Register` read ASCII bytes
+    //! (`2104404263`, `1332475536`, …) and the shader-map named garbage
+    //! locations. The D3D12 sibling got the same contract at №758; the two
+    //! backends keep one shape on purpose.
+    //!
+    //! These contracts pin the honest reflection and would go RED on the old
+    //! blob-cast path: garbage register words cannot match true locations.
+    use super::*;
+    use crate::backend::d3d11::compile::compile_hlsl;
+
+    const TWO_INPUT_VS: &[u8] = b"struct VSIn { float3 pos : TEXCOORD0; float4 col : TEXCOORD1; };\n\
+         struct VOut { float4 pos : SV_Position; float4 col : COLOR0; };\n\
+         VOut main(VSIn input) { VOut o = (VOut)0; o.pos = float4(input.pos, 1.0); \
+         o.col = input.col; return o; }\n";
+
+    const VERTEX_ID_VS: &[u8] =
+        b"struct VOut { float4 pos : SV_Position; };\n\
+         VOut main(uint id : SV_VertexID) { \
+         VOut o = (VOut)0; float2 xy = float2(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0); \
+         o.pos = float4(xy, 0.0, 1.0); return o; }\n";
+
+    fn two_location_input() -> VertexInputState {
+        VertexInputState::from_formats(&[
+            (0, crate::types::Format::R32G32B32_SFLOAT),
+            (1, crate::types::Format::RGBA32_SFLOAT),
+        ])
+    }
+
+    #[test]
+    fn a_spanning_signature_reflects_true_locations() {
+        let code = match compile_hlsl(TWO_INPUT_VS, "main", "vs_5_0") {
+            Ok(code) => code,
+            Err(e) => panic!("compile: {e:?}"),
+        };
+        let (elements, reflector) =
+            D3D11Device::vertex_input_elements(&code, &two_location_input()).unwrap();
+        assert!(
+            reflector.is_some(),
+            "the elements borrow the reflection object's string table: the \
+             reflector must come back so the caller keeps it alive"
+        );
+        assert_eq!(
+            elements.len(),
+            2,
+            "a two-input vertex shader reflects two elements, saw {elements:?}"
+        );
+        // TEXCOORD0 at offset 0 and TEXCOORD1 at offset 12 — the declared
+        // attribute offsets of the pipeline's first binding.
+        assert_eq!(elements[0].AlignedByteOffset, 0);
+        assert_eq!(elements[1].AlignedByteOffset, 12);
+        assert_eq!(elements[0].InputSlot, 0);
+        assert_eq!(elements[1].InputSlot, 0);
+    }
+
+    #[test]
+    fn a_vertex_id_only_shader_reflects_no_inputs() {
+        let code = match compile_hlsl(VERTEX_ID_VS, "main", "vs_5_0") {
+            Ok(code) => code,
+            Err(e) => panic!("compile: {e:?}"),
+        };
+        let (elements, reflector) =
+            D3D11Device::vertex_input_elements(&code, &two_location_input()).unwrap();
+        assert!(
+            elements.is_empty(),
+            "SV_VertexID-only shaders carry no vertex inputs; saw {elements:?}"
+        );
+        assert!(reflector.is_some(), "empty still reflects through an object");
+    }
+
+    #[test]
+    fn a_missing_attribute_names_the_true_location() {
+        let code = match compile_hlsl(TWO_INPUT_VS, "main", "vs_5_0") {
+            Ok(code) => code,
+            Err(e) => panic!("compile: {e:?}"),
+        };
+        let result = D3D11Device::vertex_input_elements(&code, &VertexInputState::default());
+        match result {
+            Err(RhiError::PipelineCreationError(text)) => assert!(
+                text.contains("location 0"),
+                "the reflection must name the shader's first input location; \
+                 got {text:?} — garbage register words are the old blob-cast \
+                 bug (№759) back"
+            ),
+            other => panic!("a missing attribute must be a refusal, saw {other:?}"),
+        }
     }
 }

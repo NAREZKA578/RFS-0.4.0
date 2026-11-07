@@ -357,6 +357,10 @@ pub enum DisconnectReason {
     Timeout = 2,
     ServerShutdown = 3,
     Error = 4,
+    /// Stage 3: the player was banned by an operator through the control
+    /// port. Added last so the positional coding of every earlier variant
+    /// stays where it was (bug №60).
+    Banned = 5,
 }
 
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
@@ -550,11 +554,14 @@ impl WireTransform {
         }
     }
 
-    /// Decode from the wire. `rot_axis` rides as two bits of a u8 and the
-    /// accumulator masks it mod 4; the restore uses the unit constraint —
-    /// stored shares are `q_i / |q_axis|`, so `Σ share² = (1 − q_axis²)/
-    /// q_axis²` and `q_axis = 1/sqrt(1 + Σ share²)`.
+    /// Decode from the wire. `rot_axis` rides as two bits of a u8 — any value
+    /// >= 4 is corrupt or forged data (the encoder can only emit 0..3). Masking
+    /// it silently hides bad packets; fall back to IDENTITY instead, the same
+    /// way a degenerate quaternion normalizes to IDENTITY.
     pub fn into_transform(self) -> Transform {
+        if self.rot_axis >= 4 {
+            return Transform::IDENTITY;
+        }
         let axis = (self.rot_axis % 4) as usize;
         let mut sum_sq = 0.0f32;
         for share in &self.rot_others {
@@ -701,7 +708,7 @@ pub struct PlayerStateData {
     pub name: String,
     pub team: u8,
     pub current_station: Option<EntityId>,
-    /// Bug №274: which ship this player rides. The player's position is derived
+    /// Which ship this player rides. The player's position is derived
     /// from the ship's transform, so without this a client cannot tell which
     /// ship it is on — it has to reverse-engineer the ship's station list.
     pub current_ship: Option<EntityId>,
@@ -1137,4 +1144,53 @@ pub fn deserialize_packet(data: &[u8]) -> Result<(PacketHeader, &[u8]), bincode:
     }
 
     Ok((header, payload))
+}
+
+#[cfg(test)]
+mod wire_transform_tests {
+    use super::*;
+    use crate::math::{Quatf, Transform, Vec3f};
+
+    /// `rot_axis >= 4` is corrupt or forged data — the encoder can only emit
+    /// 0..3. Decoding falls back to IDENTITY instead of masking silently.
+    #[test]
+    fn into_transform_with_rot_axis_over_3_returns_identity() {
+        let wire = WireTransform {
+            position: [1.0, 2.0, 3.0],
+            rot_axis: 7,
+            rot_others: [0, 0, 0],
+            non_uniform_scale: None,
+        };
+        assert_eq!(wire.into_transform(), Transform::IDENTITY);
+    }
+
+    /// `rot_axis` in range decodes normally.
+    #[test]
+    fn into_transform_with_valid_rot_axis_decodes() {
+        let wire = WireTransform {
+            position: [0.0, 0.0, 0.0],
+            rot_axis: 3,
+            rot_others: [0, 0, 0],
+            non_uniform_scale: None,
+        };
+        let t = wire.into_transform();
+        assert_eq!(t.position, Vec3f::ZERO);
+        // rot_axis 3 = w component largest, all shares zero → identity quat.
+        assert_eq!(t.rotation, Quatf::IDENTITY);
+    }
+
+    /// Round-trip: Transform → WireTransform → Transform preserves position.
+    #[test]
+    fn wire_transform_round_trip_preserves_position() {
+        let t = Transform::new(
+            Vec3f::new(100.0, -200.0, 300.0),
+            Quatf::IDENTITY,
+            Vec3f::ONE,
+        );
+        let wire = WireTransform::from_transform(&t);
+        let back = wire.into_transform();
+        assert_eq!(back.position, t.position);
+        assert_eq!(back.rotation, Quatf::IDENTITY);
+        assert_eq!(back.scale, Vec3f::ONE);
+    }
 }
