@@ -28,6 +28,20 @@ const TITLE_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const ITEM_TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const TRACK_COLOR: [f32; 4] = [0.15, 0.15, 0.15, 1.0];
 
+/// A full-screen dim layer drawn behind a menu panel.
+///
+/// The menu itself only knows its own rectangle; the scrim is what makes a
+/// menu readable over a live scene. It is optional because `Menu::new` is also
+/// used for panels that should not dim the picture (the scoreboard, debug
+/// menus), and an absent scrim must compile to exactly the commands it did
+/// before this field existed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MenuScrim {
+    pub position: Vec2,
+    pub size: Vec2,
+    pub color: Vec4,
+}
+
 /// Menu type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[derive(Default)]
@@ -51,6 +65,8 @@ pub struct Menu {
     pub size: Vec2,
     pub background_color: Vec4,
     pub background_texture: Option<Arc<Texture>>,
+    /// Optional full-screen dim layer behind the panel.
+    pub scrim: Option<MenuScrim>,
     pub visible: bool,
     pub items: Vec<MenuItem>,
     pub selected_index: usize,
@@ -130,6 +146,7 @@ impl Menu {
             size: Vec2::new(400.0, 600.0),
             background_color: Vec4::new(0.1, 0.1, 0.1, 0.9),
             background_texture: None,
+            scrim: None,
             visible: true,
             items,
             selected_index: 0,
@@ -229,6 +246,11 @@ impl Menu {
         self.background_texture = Some(texture);
     }
 
+    /// Draw (or stop drawing) a full-screen dim layer behind the panel.
+    pub fn set_scrim(&mut self, scrim: Option<MenuScrim>) {
+        self.scrim = scrim;
+    }
+
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
     }
@@ -307,6 +329,19 @@ impl Menu {
             self.size.x,
             self.size.y,
         );
+
+        // Behind everything, including the panel: a menu over a live scene is
+        // unreadable without the dim, and the panel is what has to stay crisp.
+        if let Some(scrim) = self.scrim {
+            batch.commands.push(UiCommand::Rectangle {
+                x: scrim.position.x,
+                y: scrim.position.y,
+                width: scrim.size.x,
+                height: scrim.size.y,
+                color: rgba(scrim.color),
+                corner_radius: 0.0,
+            });
+        }
 
         if let Some(texture) = &self.background_texture {
             let id = batch.push_texture(texture);

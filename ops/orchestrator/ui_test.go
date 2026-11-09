@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rivo/tview"
 )
 
 func TestPrintProfiles(t *testing.T) {
@@ -60,8 +62,8 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(out, "--auto-restart") {
 		t.Error("usage should mention --auto-restart")
 	}
-	if !strings.Contains(out, "http-addr") {
-		t.Error("usage should mention --http-addr")
+	if !strings.Contains(out, "--ui") {
+		t.Error("usage should mention --ui")
 	}
 	if !strings.Contains(out, "say-all") {
 		t.Error("usage should mention say-all")
@@ -256,3 +258,45 @@ func TestDashboard(t *testing.T) {
 }
 
 var _ = time.Second
+
+// TestUIWidgetTree builds the interactive dashboard's widget tree and renders
+// one snapshot without a terminal. It guards against panics in construction
+// and in the render helpers that the live dashboard calls every two seconds.
+func TestUIWidgetTree(t *testing.T) {
+	ui := NewUI()
+	ui.app = tview.NewApplication()
+	ui.buildUI()
+
+	statuses := map[string]*StatusInfo{
+		"main": {
+			Name: "main", State: "running", PID: 4242,
+			Addr: "0.0.0.0:7777", ControlPort: 7778,
+			Uptime: 90 * time.Second, MemMB: 128.5, CPUPercent: 7.5,
+			HealthOK: true, MatchState: "Running", Tick: 12345, TickRate: 30.0,
+			Players: 3, Ships: 3, Connections: 4, Entities: 120,
+		},
+	}
+	rows := []ProfileRow{
+		{Name: "main", State: "running", PID: 4242, MemMB: 128.5, CPU: 7.5, ControlPort: 7778},
+		{Name: "beta", State: "stopped", ControlPort: 7779},
+	}
+	ui.UpdateProfiles(rows, statuses)
+	ui.renderAll()
+	ui.renderHeader()
+	ui.renderDetails()
+	ui.renderLog()
+	ui.renderStatus()
+	ui.AddLog("hello from the log pane")
+	ui.SetOK("started")
+	ui.SetError("boom")
+	ui.SetStatus("info")
+
+	if got := ui.profileList.GetItemCount(); got != 2 {
+		t.Errorf("profile list should have 2 items, got %d", got)
+	}
+	if ui.SelectedProfile() != "main" {
+		t.Errorf("first profile should be selected, got %q", ui.SelectedProfile())
+	}
+}
+
+var _ = tview.NewApplication

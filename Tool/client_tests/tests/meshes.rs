@@ -209,19 +209,20 @@ fn sphere_counts_and_radius() {
     assert_eq!(sphere.index_count(), 288);
     assert_eq!(sphere.index_count() / 3, 96);
 
-    // With sectors=6 the x samples only reach sin(60deg)=0.866; phi spans
-    // 0..=PI so y stays in [0, 1], while z reaches +/-1.0.
+    // With sectors=6 the x samples only reach sin(60deg)=0.866; the poles
+    // sit on the Y axis (Bug №114), so y spans the full [-1, 1] and z
+    // reaches +/-1.0 at the equator.
     let bounds = sphere.bounding_box();
     let hx = 3.0_f32.sqrt() / 2.0;
     assert!((bounds.min.x + hx).abs() < 0.001);
     assert!((bounds.max.x - hx).abs() < 0.001);
-    assert!((bounds.min.y).abs() < 0.001);
+    assert!((bounds.min.y + 1.0).abs() < 0.001);
     assert!((bounds.max.y - 1.0).abs() < 0.001);
     assert!((bounds.min.z + 1.0).abs() < 0.001);
     assert!((bounds.max.z - 1.0).abs() < 0.001);
 
-    // bounding_sphere_radius is half the AABB diagonal = sqrt(8)/2.
-    assert!((sphere.bounding_sphere_radius() - 2.0_f32.sqrt()).abs() < 0.001);
+    // bounding_sphere_radius is half the AABB diagonal = sqrt(11)/2.
+    assert!((sphere.bounding_sphere_radius() - 11.0_f32.sqrt() / 2.0).abs() < 0.001);
 }
 
 #[test]

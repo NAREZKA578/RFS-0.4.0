@@ -3,10 +3,15 @@
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
 pub mod interaction;
+pub mod ocean;
 pub mod surface;
 pub mod waves;
 
 pub use interaction::WaterInteraction;
+pub use ocean::{
+    Ocean, OceanMesh, OCEAN_CREST_COLOR, OCEAN_DEEP_COLOR, OCEAN_LEVEL, OCEAN_SEGMENTS,
+    OCEAN_SIZE,
+};
 pub use surface::WaterSurface;
 pub use waves::{WaveConfig, WaveMethod, WaveSystem};
 

@@ -28,6 +28,7 @@ use super::meshes::Mesh;
 use super::scene::components::{CameraComponent, MeshComponent};
 use super::scene::entity::Entity;
 use super::scene::{Scene, Transform};
+use super::water::ocean::{Ocean, OceanMesh};
 
 // ------------------------------------------------------------------ camera
 
@@ -112,6 +113,17 @@ pub struct SceneRig {
     pub camera_id: usize,
     /// The entity id of the drawn object, if a scene was assembled at all.
     pub ship_id: Option<usize>,
+    /// Where the ship's transform started. Buoyancy moves the ship relative to
+    /// this, not relative to its previous frame — adding a bob to the current
+    /// position every frame is a drift, not a wave.
+    pub ship_base_position: Vec3,
+    /// The ship's authored rotation, before the water tilts it.
+    pub ship_base_rotation: Quat,
+    /// The entity id of the ocean plane, when the water was built.
+    pub water_id: Option<usize>,
+    /// The wave field and its drawable mesh. `None` only when the GPU buffers
+    /// could not be created; the rest of the scene still draws.
+    pub ocean: Option<OceanMesh>,
     /// The model path that actually loaded, or `None` for the cube fallback.
     pub used_model_path: Option<PathBuf>,
     /// Everything the assembly decided along the way, for the run log.
@@ -179,13 +191,40 @@ pub fn build_scene(device: &Arc<crate::rhi::Device>, model_path: Option<&Path>) 
     let mut scene = Scene::new("main loop");
 
     // The drawn object, centred on the origin at the target size.
+    let ship_base_position = -fit.center * fit.scale;
+    let ship_base_rotation = Quat::IDENTITY;
     let mut ship = Entity::new("ship");
     let mut ship_transform = Transform::new();
-    ship_transform.set_position(-fit.center * fit.scale);
+    ship_transform.set_position(ship_base_position);
+    ship_transform.set_rotation(ship_base_rotation);
     ship_transform.set_scale(Vec3::splat(fit.scale));
     ship.add_component(ship_transform);
     ship.add_component(MeshComponent::new(mesh));
     let ship_id = scene.add_entity(ship);
+
+    // The sea. Its vertices are already in world space, so the entity's
+    // transform stays identity and `height_at` answers in the same space the
+    // ship's transform uses.
+    let (ocean, water_id) = match OceanMesh::new(device, Ocean::default()) {
+        Ok(ocean) => {
+            let mesh = ocean.mesh();
+            notes.push(format!(
+                "ocean: {} vertices, {} indices, level {}",
+                mesh.vertex_count(),
+                mesh.index_count(),
+                ocean.ocean().level()
+            ));
+            let mut water = Entity::new("ocean");
+            water.add_component(Transform::new());
+            water.add_component(MeshComponent::new(mesh));
+            let id = scene.add_entity(water);
+            (Some(ocean), Some(id))
+        }
+        Err(e) => {
+            notes.push(format!("the ocean could not be built: {e}"));
+            (None, None)
+        }
+    };
 
     // The camera. The mirror starts as a copy of this camera; every frame
     // the controller rewrites it (see `sync_camera_mirror`).
@@ -208,6 +247,10 @@ pub fn build_scene(device: &Arc<crate::rhi::Device>, model_path: Option<&Path>) 
         scene,
         camera_id,
         ship_id: Some(ship_id),
+        ship_base_position,
+        ship_base_rotation,
+        water_id,
+        ocean,
         used_model_path,
         notes,
     }

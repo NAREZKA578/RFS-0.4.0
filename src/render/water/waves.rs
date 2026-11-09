@@ -46,6 +46,11 @@ pub struct WaveSystem {
     config: WaveConfig,
     time: f32,
     waves: Vec<Wave>,
+    /// Multiplier applied to every wave's amplitude and slope. `1.0` is the
+    /// authored sea; `0.0` is glass. Added for the settings slider, which must
+    /// change the water the ship floats on and the water that is drawn with
+    /// one value — two independent knobs would drift apart immediately.
+    height_scale: f32,
 }
 
 impl WaveSystem {
@@ -75,6 +80,7 @@ impl WaveSystem {
             },
             time: 0.0,
             waves,
+            height_scale: 1.0,
         }
     }
 
@@ -84,6 +90,37 @@ impl WaveSystem {
 
     pub fn config_mut(&mut self) -> &mut WaveConfig {
         &mut self.config
+    }
+
+    /// The multiplier that turns the authored waves into the current sea.
+    pub fn height_scale(&self) -> f32 {
+        self.height_scale
+    }
+
+    /// Set the amplitude multiplier. Negative values would flip the sea
+    /// upside down for no useful effect, so they clamp to flat.
+    pub fn set_height_scale(&mut self, scale: f32) {
+        self.height_scale = if scale.is_finite() {
+            scale.clamp(0.0, 8.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// The largest absolute height the current sea can reach, for colouring
+    /// crests and for sanity checks. `Flat` and the still-unimplemented FFT
+    /// path are zero.
+    pub fn max_height(&self) -> f32 {
+        let base = match self.config.method {
+            WaveMethod::Flat | WaveMethod::FFT => 0.0,
+            WaveMethod::Simple => self.waves.iter().map(|wave| wave.amplitude).sum(),
+            WaveMethod::Gerstner => self
+                .waves
+                .iter()
+                .map(|wave| wave.amplitude * wave.steepness.powi(2))
+                .sum(),
+        };
+        base * self.height_scale
     }
 
     pub fn update(&mut self, delta_time: Duration) {
@@ -121,7 +158,8 @@ impl WaveSystem {
             let dir = Vec2::new(wave.direction.x, wave.direction.z);
             let pos = Vec2::new(position.x, position.z);
             height += wave.amplitude
-                * (dir.dot(pos) * wave.frequency + self.time * wave.speed).sin();
+                * (dir.dot(pos) * wave.frequency + self.time * wave.speed).sin()
+                * self.height_scale;
         }
         height
     }
@@ -148,7 +186,7 @@ impl WaveSystem {
             let dir = Vec2::new(wave.direction.x, wave.direction.z);
             let pos = Vec2::new(position.x, position.z);
             let theta = dir.dot(pos) * wave.frequency + self.time * wave.speed;
-            height += wave.amplitude * wave.steepness.powi(2) * theta.sin();
+            height += wave.amplitude * wave.steepness.powi(2) * theta.sin() * self.height_scale;
         }
         height
     }
@@ -162,7 +200,7 @@ impl WaveSystem {
             let theta = dir.dot(pos) * wave.frequency + self.time * wave.speed;
             let c = theta.cos();
             let s = theta.sin();
-            let qa = wave.amplitude * wave.steepness;
+            let qa = wave.amplitude * wave.steepness * self.height_scale;
 
             let kx = wave.direction.x * wave.frequency * qa * c;
             let kz = wave.direction.z * wave.frequency * qa * c;
@@ -171,7 +209,14 @@ impl WaveSystem {
             normal += Vec3::new(-kx, ky, -kz);
         }
 
-        normal.normalize()
+        // A flat sea has a zero gradient; `normalize` would answer NaN and the
+        // NaN would reach the vertex buffer. This is not hypothetical — the
+        // settings slider can set the scale to exactly zero.
+        if normal.length_squared() < 1e-12 || !normal.is_finite() {
+            Vec3::Y
+        } else {
+            normal.normalize()
+        }
     }
 
     fn get_fft_height(&self, _position: Vec3) -> f32 {
@@ -228,5 +273,42 @@ impl Wave {
 impl Default for Wave {
     fn default() -> Self {
         Self::new(1.0, 0.5, 0.1, Vec3::X)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_height_scale_multiplies_both_height_and_slope() {
+        let mut waves = WaveSystem::new(WaveMethod::Gerstner);
+        let point = Vec3::new(3.0, 0.0, 7.0);
+        let height = waves.get_height(point);
+        let max_height = waves.max_height();
+        let normal = waves.get_normal(point);
+        assert!(height.abs() > 1e-4, "the sample point must be on a slope");
+
+        waves.set_height_scale(2.0);
+        assert!((waves.get_height(point) - height * 2.0).abs() < 1e-5);
+        assert!((waves.max_height() - max_height * 2.0).abs() < 1e-5);
+        assert!(normal.is_finite() && normal.y > 0.0);
+    }
+
+    #[test]
+    fn a_zero_scale_is_flat_and_has_an_up_normal() {
+        let mut waves = WaveSystem::new(WaveMethod::Gerstner);
+        waves.set_height_scale(0.0);
+        assert_eq!(waves.get_height(Vec3::new(1.0, 0.0, 1.0)), 0.0);
+        assert_eq!(waves.get_normal(Vec3::new(1.0, 0.0, 1.0)), Vec3::Y);
+        assert_eq!(waves.max_height(), 0.0);
+    }
+
+    #[test]
+    fn a_non_finite_scale_becomes_flat_instead_of_poisoning_the_grid() {
+        let mut waves = WaveSystem::new(WaveMethod::Simple);
+        waves.set_height_scale(f32::NAN);
+        assert_eq!(waves.height_scale(), 0.0);
+        assert!(waves.get_height(Vec3::new(1.0, 0.0, 1.0)).is_finite());
     }
 }

@@ -736,7 +736,18 @@ impl D3D12Device {
                 .0
                 .Reset(&self.allocator.0, None)
                 .map_err(|e| RhiError::BackendError(format!("command list Reset: {e}")))?;
-            record(&self.command_list.0)?;
+            let outcome = record(&self.command_list.0);
+            // BUGS №760: an aborted record leaves the list in the recording
+            // state. The next call's `allocator Reset` then fails with
+            // 0x80004005, and every later refusal comes back as that garbage
+            // allocator error instead of the honest one — even passes that
+            // happened before the first failure walked through it. Close the
+            // discarded list and clear the allocator's pending state; the
+            // caller's own error goes back untouched.
+            if let Err(record_error) = outcome {
+                Self::discard_aborted_list(&self.command_list.0, &self.allocator.0);
+                return Err(record_error);
+            }
             self.command_list
                 .0
                 .Close()
@@ -748,6 +759,32 @@ impl D3D12Device {
             self.wait_idle()?;
         }
         Ok(())
+    }
+
+    /// BUGS №760's cleanup: close a command list whose `record` wrote only
+    /// part of itself, and reset the allocator it sits on. Without this the
+    /// list stays in the recording state and the next submit's allocator
+    /// reset fails with 0x80004005 — masking every later refusal with that
+    /// garbage error. Both calls are best-effort: the honest outcome here is
+    /// the caller's own error, not a newer one about the scavenger.
+    fn discard_aborted_list(
+        command_list: &ID3D12GraphicsCommandList,
+        allocator: &ID3D12CommandAllocator,
+    ) {
+        unsafe {
+            let _ = command_list.Close();
+            let _ = allocator.Reset();
+        }
+    }
+
+    /// BUGS №761's rule: D3D12 requires a constant buffer view's
+    /// `SizeInBytes` to be a multiple of 256 — a non-multiple faults the
+    /// device. The declared byte range rounds up to the hardware's
+    /// alignment; the shader reads the same first bytes and the trailing
+    /// range is padding.
+    fn cbv_view_size(bytes: u64) -> u32 {
+        let alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64;
+        (bytes.div_ceil(alignment) * alignment) as u32
     }
 
     /// A transition barrier from `before` to `after` on all subresources.
@@ -2510,18 +2547,15 @@ impl BackendResource for D3D12Device {
                             }
                             let view_desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                                 BufferLocation: buffer_entry.resource().GetGPUVirtualAddress(),
-                                // D3D12 requires a constant buffer view's
-                                // SizeInBytes to be a multiple of 256; a
-                                // smaller view faults the device (the
-                                // removed-device error surfaces on the next
-                                // pipeline creation as 0x887A0005). The view
-                                // rounds the declared byte range up: the
-                                // shader reads the same first bytes, the
-                                // trailing range is the alignment padding.
-                                SizeInBytes: (range_end.div_ceil(
-                                    D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64,
-                                ) * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64)
-                                    as u32,
+                                // BUGS №761: D3D12 requires the view's size
+                                // to be a multiple of 256; the declared
+                                // byte range alone faults the device (the
+                                // removal surfaces on the next pipeline
+                                // creation as 0x887A0005). The view rounds
+                                // the range up: the shader reads the same
+                                // first bytes, the trailing range is the
+                                // alignment padding.
+                                SizeInBytes: Self::cbv_view_size(range_end),
                             };
                             self.device.0.CreateConstantBufferView(
                                 Some(&view_desc),
@@ -3794,5 +3828,102 @@ mod vertex_signature_contract {
             ),
             other => panic!("a missing attribute must be a refusal, saw {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod aborted_submit_contract {
+    //! BUGS №760 contracts: an aborted `record` leaves the command list in
+    //! the recording state, and the next call's allocator reset fails with
+    //! 0x80004005 — every later refusal afterwards surfaces as that garbage
+    //! allocator error instead of the honest one. The cleanup closes the
+    //! discarded list and clears the allocator's pending state, and the
+    //! contracts here prove the pair survives an aborted record on a real
+    //! device.
+    use super::*;
+    use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+    use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0};
+
+    fn direct_trio() -> (ID3D12Device, ID3D12CommandAllocator, ID3D12GraphicsCommandList) {
+        let mut device: Option<ID3D12Device> = None;
+        unsafe {
+            D3D12CreateDevice::<_, ID3D12Device>(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+        }
+        .expect("the contract device must come up on feature level 12.0");
+        let device = device.expect("D3D12CreateDevice returned no device");
+        let allocator: ID3D12CommandAllocator = unsafe {
+            device.CreateCommandAllocator::<ID3D12CommandAllocator>(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+            )
+        }
+        .expect("the contract allocator must come up");
+        let list: ID3D12GraphicsCommandList = unsafe {
+            device.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )
+        }
+        .expect("the contract list must come up");
+        (device, allocator, list)
+    }
+
+    #[test]
+    fn an_aborted_list_must_not_poison_the_next_submit() {
+        let (device, allocator, list) = direct_trio();
+        let _ = device;
+        // A freshly created list sits in the recording state, the same state
+        // `submit_sequential` leaves after a refused `record`.
+        D3D12Device::discard_aborted_list(&list, &allocator);
+        unsafe { allocator.Reset() }.expect(
+            "the scavenged iterator must leave the allocator reusable: the \
+             0x80004005 of a poisoned allocator is the mask that turns every \
+             later refusal into garbage (BUGS №760)",
+        );
+        unsafe { list.Reset(&allocator, None) }.expect(
+            "the next submit's command list reset must succeed after an \
+             aborted record was cleaned up",
+        );
+    }
+}
+
+#[cfg(test)]
+mod cbv_alignment_contract {
+    //! BUGS №761's rule: D3D12 requires a constant buffer view's
+    //! `SizeInBytes` to be a multiple of 256. A sixteen-byte cbuffer range
+    //! written raw faulted the device — the removal surfaced on the next
+    //! pipeline creation as 0x887A0005 in the descriptor-table pixel test.
+    //! The rounded view covers the padding, the shader reads the same first
+    //! bytes.
+    use super::*;
+
+    #[test]
+    fn the_view_size_rounds_declared_bytes_up_to_the_alignment() {
+        assert_eq!(
+            D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, 256,
+            "the D3D12 constant buffer alignment this rule adjusts to is 256"
+        );
+        assert_eq!(
+            D3D12Device::cbv_view_size(16),
+            256,
+            "a 16-byte cbuffer range must write a 256-byte view — the raw 16 \
+             is the fault D3D12 names (BUGS №761)"
+        );
+        assert_eq!(
+            D3D12Device::cbv_view_size(255),
+            256,
+            "one byte under the alignment rounds up to a full window"
+        );
+        assert_eq!(
+            D3D12Device::cbv_view_size(256),
+            256,
+            "an already aligned range stays itself"
+        );
+        assert_eq!(
+            D3D12Device::cbv_view_size(257),
+            512,
+            "one byte over the alignment grows the window by one more"
+        );
     }
 }

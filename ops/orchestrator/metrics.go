@@ -88,15 +88,6 @@ func sysconfCLKTCK() int64 {
 	return 100
 }
 
-// readWindowsProcessMetrics uses Windows-specific APIs via os package.
-// Since we have no external deps, return zeros (caller can extend with syscall).
-func readWindowsProcessMetrics(pid int) (float64, float64) {
-	// Windows process metrics would require syscall to GetProcessMemoryInfo
-	// and GetProcessTimes. Without external deps this is complex; return 0.
-	_ = pid
-	return 0, 0
-}
-
 // readDarwinProcessMetrics reads /proc on macOS (not available) — return 0.
 func readDarwinProcessMetrics(pid int) (float64, float64) {
 	_ = pid

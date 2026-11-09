@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -87,17 +88,26 @@ const (
 
 // StatusInfo is a snapshot of a running instance for the panel.
 type StatusInfo struct {
-	Name         string    `json:"name"`
-	State        string    `json:"state"`
-	PID          int       `json:"pid"`
-	Addr         string    `json:"addr"`
-	ControlPort  uint16    `json:"control_port"`
+	Name         string        `json:"name"`
+	State        string        `json:"state"`
+	PID          int           `json:"pid"`
+	Addr         string        `json:"addr"`
+	ControlPort  uint16        `json:"control_port"`
 	Uptime       time.Duration `json:"uptime"`
-	MemMB        float64   `json:"mem_mb"`
-	CPUPercent   float64   `json:"cpu_percent"`
-	RestartCount int       `json:"restart_count"`
-	HealthFails  int       `json:"health_fails"`
-	HealthOK     bool      `json:"health_ok"`
+	MemMB        float64       `json:"mem_mb"`
+	CPUPercent   float64       `json:"cpu_percent"`
+	RestartCount int           `json:"restart_count"`
+	HealthFails  int           `json:"health_fails"`
+	HealthOK     bool          `json:"health_ok"`
+
+	// Fields mirrored from the control port's `status` answer.
+	MatchState  string  `json:"match_state,omitempty"`
+	Tick        uint64  `json:"tick,omitempty"`
+	TickRate    float64 `json:"tick_rate,omitempty"`
+	Players     int     `json:"players,omitempty"`
+	Ships       int     `json:"ships,omitempty"`
+	Connections int     `json:"connections,omitempty"`
+	Entities    int     `json:"entities,omitempty"`
 }
 
 // Supervisor manages server processes and their control-port clients.
@@ -106,8 +116,12 @@ type Supervisor struct {
 	profileDir string
 	verbose    bool
 
-	mu       sync.RWMutex
+	out    io.Writer
+	errOut io.Writer
+
+	mu        sync.RWMutex
 	instances map[string]*Instance
+	restarts  map[string]int
 }
 
 // New creates a Supervisor. binPath is the default RFS server binary;
@@ -122,8 +136,23 @@ func New(binPath, profileDir string, verbose bool) (*Supervisor, error) {
 		binPath:    binPath,
 		profileDir: profileDir,
 		verbose:    verbose,
+		out:        os.Stdout,
+		errOut:     os.Stderr,
 		instances:  make(map[string]*Instance),
+		restarts:   make(map[string]int),
 	}, nil
+}
+
+// SetOutput redirects the output of server processes started from now on.
+// The interactive dashboard uses it to show server logs in its log pane.
+func (s *Supervisor) SetOutput(out io.Writer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if out == nil {
+		out = io.Discard
+	}
+	s.out = out
+	s.errOut = out
 }
 
 // Close shuts down all managed instances gracefully.
@@ -191,44 +220,78 @@ func (s *Supervisor) Start(name string, p *Profile) error {
 		Proc:      cmd.Process,
 		PID:       cmd.Process.Pid,
 		StartTime: time.Now(),
-		State:     StateStarting,
+		State:     StateRunning,
 		stdout:    stdout,
 		stderr:    stderr,
 	}
 	s.instances[name] = inst
+	s.writePID(name, PIDInfo{
+		PID:       inst.PID,
+		LogFile:   s.LogFile(name),
+		StartedAt: inst.StartTime,
+	})
 
-	go inst.pump(stdout, os.Stdout, "[stdout] ")
-	go inst.pump(stderr, os.Stderr, "[stderr] ")
+	out := s.out
+	errOut := s.errOut
+	inst.wg.Add(2)
+	go inst.pump(stdout, out, "[stdout] ")
+	go inst.pump(stderr, errOut, "[stderr] ")
 
 	// Wait-loop: when the process exits, decide whether to auto-restart.
 	go func() {
 		inst.wg.Wait()
 		inst.mu.Lock()
 		inst.State = StateStopped
+		stopRequested := inst.stopRequested
+		exitInfo := ""
+		if inst.Cmd != nil && inst.Cmd.ProcessState != nil {
+			exitInfo = fmt.Sprintf(", exit %d", inst.Cmd.ProcessState.ExitCode())
+		}
 		inst.mu.Unlock()
+
+		fmt.Fprintf(out, "[supervisor] profile %q exited%s\n", name, exitInfo)
 
 		s.mu.Lock()
 		delete(s.instances, name)
 		s.mu.Unlock()
+		_ = os.Remove(s.PIDFile(name))
 
 		// Auto-restart logic.
-		if !inst.stopRequested && p.AutoRestart {
-			if p.MaxRestarts == 0 || inst.restartCount < p.MaxRestarts {
-				delay := p.RestartDelay
-				if delay == 0 {
-					delay = 5 * time.Second
-				}
-				time.Sleep(delay)
-				inst.restartCount++
-				s.mu.Lock()
-				inst.State = StateUnhealthy
-				s.mu.Unlock()
+		if !stopRequested && p.AutoRestart {
+			profile := inst.Profile
+			s.mu.Lock()
+			attempts := s.restarts[name]
+			s.mu.Unlock()
+
+			if p.MaxRestarts > 0 && attempts >= p.MaxRestarts {
+				fmt.Fprintf(out, "[supervisor] %q reached the restart limit (%d)\n", name, p.MaxRestarts)
+				return
+			}
+
+			delay := p.RestartDelay
+			if delay == 0 {
+				delay = 5 * time.Second
+			}
+			fmt.Fprintf(out, "[supervisor] restarting %q in %s (attempt %d)\n", name, delay, attempts+1)
+			time.Sleep(delay)
+
+			s.mu.Lock()
+			_, exists := s.instances[name]
+			if !exists {
+				s.restarts[name] = attempts + 1
+			}
+			s.mu.Unlock()
+			if exists {
+				return
+			}
+			if err := s.Start(name, &profile); err != nil {
+				fmt.Fprintf(out, "[supervisor] restart of %q failed: %v\n", name, err)
 			}
 		}
 	}()
 
 	if s.verbose {
-		fmt.Printf("[supervisor] started profile %q (pid %d)\n", name, inst.PID)
+		fmt.Fprintf(out, "[supervisor] started profile %q (pid %d)\n", name, inst.PID)
 	}
 	return nil
 }
@@ -355,23 +418,24 @@ func (s *Supervisor) Status(name string) (StatusInfo, error) {
 		info.CPUPercent = cpu
 	}
 
-	// Query the control port for address/state if we know the port.
+	// Query the control port for the live server status if we know the port.
 	if controlPort > 0 {
 		token, err := readToken(tokenFile)
 		if err == nil {
 			if c, err := dialControl(controlPort); err == nil {
-				defer c.Close()
-				addr, stateWord := queryControl(c, token, "status")
-				if addr != "" {
-					info.Addr = addr
+				data, statusErr := queryStatus(c, token)
+				c.Close()
+				if statusErr == nil {
+					applyStatusData(&info, data)
+					inst.mu.Lock()
+					inst.healthLastOK = time.Now()
+					inst.healthFails = 0
+					inst.mu.Unlock()
+				} else {
+					inst.mu.Lock()
+					inst.healthFails++
+					inst.mu.Unlock()
 				}
-				if stateWord != "" {
-					info.State = stateWord
-				}
-				inst.mu.Lock()
-				inst.healthLastOK = time.Now()
-				inst.healthFails = 0
-				inst.mu.Unlock()
 			} else {
 				inst.mu.Lock()
 				inst.healthFails++
@@ -385,6 +449,37 @@ func (s *Supervisor) Status(name string) (StatusInfo, error) {
 	}
 
 	return info, nil
+}
+
+// applyStatusData copies the control port's status answer into info.
+func applyStatusData(info *StatusInfo, data map[string]interface{}) {
+	if s, ok := data["state"].(string); ok && s != "" {
+		info.State = s
+	}
+	if s, ok := data["match_state"].(string); ok {
+		info.MatchState = s
+	}
+	if s, ok := data["addr"].(string); ok && s != "" {
+		info.Addr = s
+	}
+	if v, ok := data["tick"].(float64); ok {
+		info.Tick = uint64(v)
+	}
+	if v, ok := data["tick_rate"].(float64); ok {
+		info.TickRate = v
+	}
+	if v, ok := data["players"].(float64); ok {
+		info.Players = int(v)
+	}
+	if v, ok := data["ships"].(float64); ok {
+		info.Ships = int(v)
+	}
+	if v, ok := data["connections"].(float64); ok {
+		info.Connections = int(v)
+	}
+	if v, ok := data["entities"].(float64); ok {
+		info.Entities = int(v)
+	}
 }
 
 // StatusAll returns status for all running instances.
@@ -411,6 +506,28 @@ func (s *Supervisor) Exec(name, command string, cmdArgs []string) error {
 		return fmt.Errorf("profile %q is not running", name)
 	}
 	return inst.Exec(command, cmdArgs)
+}
+
+// ExecCommand runs a control command and returns the parsed response data.
+// It uses a managed instance when the profile is running in this process and
+// otherwise falls back to the profile's control port.
+func (s *Supervisor) ExecCommand(name, command string, cmdArgs []string) (map[string]interface{}, error) {
+	s.mu.RLock()
+	inst, ok := s.instances[name]
+	s.mu.RUnlock()
+	if ok {
+		return inst.ExecCommand(command, cmdArgs)
+	}
+
+	store, err := NewStore(s.profileDir)
+	if err != nil {
+		return nil, err
+	}
+	p, err := store.Load(name)
+	if err != nil {
+		return nil, fmt.Errorf("profile %q not found: %w", name, err)
+	}
+	return CommandOnProfile(&p, command, cmdArgs)
 }
 
 // ExecAll runs a control command on all running instances.
@@ -510,57 +627,22 @@ func (inst *Instance) wait() error {
 	}
 }
 
+// ExecCommand sends one control command and returns the parsed response.
+func (inst *Instance) ExecCommand(command string, cmdArgs []string) (map[string]interface{}, error) {
+	inst.mu.RLock()
+	p := inst.Profile
+	inst.mu.RUnlock()
+	return CommandOnProfile(&p, command, cmdArgs)
+}
+
 // Exec sends a single control command and prints the response.
 func (inst *Instance) Exec(command string, cmdArgs []string) error {
-	inst.mu.RLock()
-	port := inst.Profile.ControlPort
-	tokenFile := inst.Profile.TokenFile
-	inst.mu.RUnlock()
-
-	if port == 0 {
-		return fmt.Errorf("control port not known for profile %q", inst.Profile.Name)
-	}
-
-	token, err := readToken(tokenFile)
+	data, err := inst.ExecCommand(command, cmdArgs)
 	if err != nil {
-		return fmt.Errorf("reading control token: %w", err)
+		return err
 	}
-
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		return fmt.Errorf("connecting to control port %s: %w", addr, err)
-	}
-	defer c.Close()
-
-	// Perform token hello.
-	br := bufio.NewReader(c)
-	hello := fmt.Sprintf(`{"hello":{"token":"%s","proto":1}}\n`, token)
-	if _, err := c.Write([]byte(hello)); err != nil {
-		return fmt.Errorf("writing hello: %w", err)
-	}
-	if _, err := br.ReadString('\n'); err != nil {
-		return fmt.Errorf("reading hello ack: %w", err)
-	}
-
-	// Build the command.
-	cmd := map[string]interface{}{"id": 1, "cmd": command}
-	if len(cmdArgs) > 0 {
-		cmd["args"] = map[string]interface{}{}
-		for i, a := range cmdArgs {
-			cmd["args"].(map[string]interface{})[fmt.Sprintf("arg%d", i)] = a
-		}
-	}
-	data, _ := json.Marshal(cmd)
-	data = append(data, '\n')
-	if _, err := c.Write(data); err != nil {
-		return fmt.Errorf("writing command: %w", err)
-	}
-	line, err := br.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("reading response: %w", err)
-	}
-	fmt.Print(strings.TrimSpace(line))
+	out, _ := json.Marshal(data)
+	fmt.Println(string(out))
 	return nil
 }
 
@@ -584,52 +666,10 @@ func (inst *Instance) Watch(w io.Writer) error {
 	return nil
 }
 
-// execControl sends a raw command to the control port (internal helper).
+// execControl sends a command to the control port (internal helper).
 func (inst *Instance) execControl(command string, args []string) error {
-	inst.mu.RLock()
-	port := inst.Profile.ControlPort
-	tokenFile := inst.Profile.TokenFile
-	inst.mu.RUnlock()
-
-	if port == 0 {
-		return fmt.Errorf("control port not known for profile %q", inst.Profile.Name)
-	}
-
-	token, err := readToken(tokenFile)
-	if err != nil {
-		return err
-	}
-
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	br := bufio.NewReader(c)
-	hello := fmt.Sprintf(`{"hello":{"token":"%s","proto":1}}\n`, token)
-	if _, err := c.Write([]byte(hello)); err != nil {
-		return err
-	}
-	if _, err := br.ReadString('\n'); err != nil {
-		return err
-	}
-	cmd := map[string]interface{}{"id": 1, "cmd": command}
-	if len(args) > 0 {
-		cmd["args"] = map[string]interface{}{}
-		for i, a := range args {
-			cmd["args"].(map[string]interface{})[fmt.Sprintf("arg%d", i)] = a
-		}
-	}
-	data, _ := json.Marshal(cmd)
-	data = append(data, '\n')
-	if _, err := c.Write(data); err != nil {
-		return err
-	}
-	if _, err := br.ReadString('\n'); err != nil {
-		return err
-	}
-	return nil
+	_, err := inst.ExecCommand(command, args)
+	return err
 }
 
 // dialControl connects to a control port.
@@ -637,35 +677,19 @@ func dialControl(port uint16) (net.Conn, error) {
 	return net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
 }
 
-// queryControl sends `status` and returns (addr, state).
-func queryControl(c net.Conn, token string, cmd string) (string, string) {
-	br := bufio.NewReader(c)
-	hello := fmt.Sprintf(`{"hello":{"token":"%s","proto":1}}`+"\n", token)
-	if _, err := c.Write([]byte(hello)); err != nil {
-		return "", ""
+// queryStatus performs the token hello and sends `status`.
+func queryStatus(c net.Conn, token string) (map[string]interface{}, error) {
+	client := &Client{conn: c, reader: bufio.NewReader(c), token: token, proto: 1}
+	if err := client.hello(); err != nil {
+		return nil, err
 	}
-	if _, err := br.ReadString('\n'); err != nil {
-		return "", ""
-	}
-	request := fmt.Sprintf(`{"id":1,"cmd":"%s"}`+"\n", cmd)
-	if _, err := c.Write([]byte(request)); err != nil {
-		return "", ""
-	}
-	line, err := br.ReadString('\n')
-	if err != nil {
-		return "", ""
-	}
-	var resp struct {
-		OK  bool   `json:"ok"`
-		Data struct {
-			State string `json:"state"`
-			Addr  string `json:"addr"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(line), &resp); err != nil || !resp.OK {
-		return "", ""
-	}
-	return resp.Data.Addr, resp.Data.State
+	return client.Command(1, "status", nil)
+}
+
+// ReadToken reads the control token from a token file. It is the exported
+// form of the helper used by status polling and command forwarding.
+func ReadToken(tokenFile string) (string, error) {
+	return readToken(tokenFile)
 }
 
 // readToken reads the control token from the token file next to the config.
@@ -688,6 +712,88 @@ func readToken(tokenFile string) (string, error) {
 		return "", fmt.Errorf("token file %q is empty", tokenFile)
 	}
 	return tf.Token, nil
+}
+
+// CommandArgs turns positional command-line arguments into the named JSON
+// object the control port expects. The server names its fields explicitly
+// (`text` for say, `player` for kick, `target` for ban, ...), so positional
+// forwarding (`arg0`, `arg1`) would be refused as bad arguments.
+func CommandArgs(command string, rest []string) (map[string]interface{}, error) {
+	switch command {
+	case "say":
+		if len(rest) == 0 {
+			return nil, fmt.Errorf("say needs text")
+		}
+		return map[string]interface{}{"text": strings.Join(rest, " ")}, nil
+
+	case "kick":
+		if len(rest) == 0 {
+			return nil, fmt.Errorf("kick needs a player connection id")
+		}
+		id, err := strconv.ParseUint(rest[0], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("kick: player must be a connection id, got %q", rest[0])
+		}
+		args := map[string]interface{}{"player": id}
+		if len(rest) > 1 {
+			args["reason"] = strings.Join(rest[1:], " ")
+		}
+		return args, nil
+
+	case "ban":
+		if len(rest) == 0 {
+			return nil, fmt.Errorf("ban needs a target (name or address)")
+		}
+		args := map[string]interface{}{"target": rest[0]}
+		if len(rest) > 1 {
+			args["reason"] = strings.Join(rest[1:], " ")
+		}
+		return args, nil
+
+	case "unban":
+		if len(rest) == 0 {
+			return nil, fmt.Errorf("unban needs a target")
+		}
+		return map[string]interface{}{"target": rest[0]}, nil
+
+	case "stop":
+		args := map[string]interface{}{}
+		if len(rest) > 0 {
+			delay, err := strconv.ParseUint(rest[0], 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("stop: delay must be a number of seconds, got %q", rest[0])
+			}
+			args["delay_s"] = delay
+		}
+		return args, nil
+
+	case "log", "audit", "banlist":
+		args := map[string]interface{}{}
+		if len(rest) > 0 && rest[0] != "" {
+			tail, err := strconv.ParseUint(rest[0], 10, 32)
+			if err != nil || tail == 0 {
+				return nil, fmt.Errorf("%s: tail must be a positive number, got %q", command, rest[0])
+			}
+			args["tail"] = tail
+		}
+		if command == "log" && len(rest) > 1 && rest[1] != "" {
+			args["level"] = rest[1]
+		}
+		return args, nil
+
+	case "watch":
+		args := map[string]interface{}{}
+		if len(rest) > 0 {
+			args["topics"] = rest
+		}
+		return args, nil
+
+	default:
+		// status, perf, net, players, config, reload, end_match,
+		// start_match, restart_match take no arguments; unknown commands
+		// are left to the server to refuse with its own message.
+		return nil, nil
+	}
 }
 
 // ResolveTokenPath resolves the token file path relative to the profile's

@@ -39,12 +39,18 @@ pub struct Renderer {
     /// Kept on the renderer rather than in the graph because it is a fact about
     /// the frame as a whole, and the graph is rebuilt while the renderer is not.
     stats: super::RenderStats,
-    /// The last execution summary that differed from the one before it.
+    /// The most recent execution summary, counters included.
     ///
-    /// Kept so a change in "which passes ran" is logged once instead of once per
-    /// frame — a per-frame log of an unchanged summary is noise, and the summary
-    /// only changes when the graph does.
+    /// Always current, so a caller can ask what the last frame did. It is not
+    /// the change-detection key: the counters in it advance every frame even
+    /// when nothing about the graph changed.
     last_execution_summary: String,
+    /// Which passes exist and which of them are idle or unreached.
+    ///
+    /// This, not the counter-laden summary, is what "the graph changed" means.
+    /// Comparing summaries made every frame count as a change whenever a pass
+    /// did nothing, so an idle overlay pass turned into one warning per frame.
+    last_execution_health: (Vec<String>, Vec<String>, Vec<(String, String)>),
     /// The real window presentation, when the renderer was given one.
     ///
     /// `None` means the renderer runs headless: the graph still records and
@@ -155,6 +161,7 @@ impl Renderer {
             running: true,
             stats: super::RenderStats::new(),
             last_execution_summary: String::new(),
+            last_execution_health: (Vec::new(), Vec::new(), Vec::new()),
             presentation: None,
         })
     }
@@ -450,14 +457,27 @@ impl Renderer {
         // the reasons are printed — "no framebuffer" and "no pipeline" are two
         // different bugs, and a list of names cannot tell them apart.
         let summary = self.render_graph.execution_summary();
-        if summary != self.last_execution_summary {
-            self.last_execution_summary = summary.clone();
+        let never = self.render_graph.never_executed();
+        let idle = self.render_graph.passes_without_work();
+        // Bug: the summary embeds per-frame dispatch counts (`uix120`), so it
+        // differs every frame even when the graph is unchanged. Comparing it
+        // made an idle pass log a warning every frame, which is the opposite of
+        // the "one line per change" this instrument promised. The graph's shape
+        // and health are the change to report; the counters are only payload.
+        let names: Vec<String> = self
+            .render_graph
+            .pass_execution_counts()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let health = (names, never.clone(), idle.clone());
+        self.last_execution_summary = summary.clone();
+        if health != self.last_execution_health {
+            self.last_execution_health = health;
             let line = format!(
                 "graph: {summary}; frame: {} draw(s), {} triangle(s), {} vertex/indices",
                 draws.draws, draws.triangles, draws.vertices
             );
-            let never = self.render_graph.never_executed();
-            let idle = self.render_graph.passes_without_work();
             if never.is_empty() && idle.is_empty() {
                 crate::info!("renderer", "{line}");
             } else {

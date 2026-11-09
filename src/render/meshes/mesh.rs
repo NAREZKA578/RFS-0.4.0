@@ -523,6 +523,12 @@ impl Mesh {
 
     /// Create a sphere mesh
     pub fn sphere(name: &str, radius: f32, stacks: usize, sectors: usize) -> Self {
+        // Bug №114: the old parameterization was `y = r·sin(phi)` with phi
+        // spanning 0..=PI — that squashed the sphere onto the upper half
+        // (y never went below 0, there was no south pole) and the lower
+        // rows were wound inward. Standard form instead: poles on the Y
+        // axis, y = r·cos(phi) over phi in 0..=PI, radial extent
+        // r·sin(phi) — a full sphere with the same vertex/index counts.
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
 
@@ -531,9 +537,9 @@ impl Mesh {
             for j in 0..=sectors {
                 let theta = 2.0 * std::f32::consts::PI * j as f32 / sectors as f32;
 
-                let x = radius * theta.sin() * phi.cos();
-                let y = radius * phi.sin();
-                let z = radius * theta.cos() * phi.cos();
+                let x = radius * phi.sin() * theta.sin();
+                let y = radius * phi.cos();
+                let z = radius * phi.sin() * theta.cos();
 
                 let nx = x / radius;
                 let ny = y / radius;
@@ -555,18 +561,19 @@ impl Mesh {
                 let first = i * (sectors + 1) + j;
                 let second = first + sectors + 1;
 
-                // Bug №114: this pair was (first, second, first+1), whose
-                // cross product (v1-v0) x (v2-v0) points to the INSIDE of the
-                // sphere — the whole surface was back-faced from outside.
-                // Swapped so both triangles wind outward; the unit test walks
-                // each geometric normal against the position direction.
+                // Bug №114: winding. With rows running north→south on the
+                // Y axis, (first, second, first+1) and (first+1, second,
+                // second+1) both cross-product outward; the swapped orders
+                // used to wind the surface inside, so the whole sphere was
+                // back-faced from outside. The unit test walks every
+                // geometric normal against the position direction.
                 indices.push(first as u32);
-                indices.push((first + 1) as u32);
                 indices.push(second as u32);
+                indices.push((first + 1) as u32);
 
                 indices.push((first + 1) as u32);
-                indices.push((second + 1) as u32);
                 indices.push(second as u32);
+                indices.push((second + 1) as u32);
             }
         }
 
@@ -717,10 +724,10 @@ mod bug_210_114 {
         mesh.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]])
     }
 
-    // NC-114-TEMP: the left cube face wound into the cube; every face must
+    // Bug №114 (NC): the left cube face wound into the cube; every face must
     // have its geometric normal agreeing with its vertex normals.
     #[test]
-    fn nc_114_temp_every_cube_face_normal_points_outward() {
+    fn every_cube_face_normal_points_outward() {
         let mesh = Mesh::cube("probe_cube", 2.0);
         for (i, tri) in triangles(&mesh).enumerate() {
             let [a, b, c] = tri;
@@ -734,14 +741,25 @@ mod bug_210_114 {
         }
     }
 
-    // NC-114-TEMP: the sphere was wound inside-out.
+    // Bug №114 (NC): the sphere was built as a lens and wound inside-out.
     #[test]
-    fn nc_114_temp_sphere_normals_point_outward() {
+    fn sphere_normals_point_outward() {
         let mesh = Mesh::sphere("probe_sphere", 3.0, 8, 12);
         for tri in triangles(&mesh) {
             let [a, b, c] = tri;
-            let geo = geometric_normal(&mesh, a, b, c);
-            let outward = mesh.vertices[a as usize].position.normalize_or_zero();
+            let va = mesh.vertices[a as usize].position;
+            let vb = mesh.vertices[b as usize].position;
+            let vc = mesh.vertices[c as usize].position;
+            let cross = (vb - va).cross(vc - va);
+            // Emission quads at the pole rows collapse into near-zero-area
+            // triangles: on the south pole sin(PI) leaves only floating-point
+            // residue in the cross product, so the orientation is
+            // meaningless. Skip them no matter how small the residue is.
+            if cross.length_squared() < 1e-12 {
+                continue;
+            }
+            let geo = cross.normalize();
+            let outward = va.normalize_or_zero();
             assert!(
                 geo.dot(outward) > 0.0,
                 "sphere triangle {tri:?} is wound inward at {:?}",
@@ -750,9 +768,9 @@ mod bug_210_114 {
         }
     }
 
-    // NC-210-TEMP: the caps connected the opposite ring.
+    // Bug №210 (NC): the caps connected the opposite ring.
     #[test]
-    fn nc_210_temp_cylinder_caps_use_their_own_ring_and_point_outward() {
+    fn cylinder_caps_use_their_own_ring_and_point_outward() {
         let mesh = Mesh::cylinder("probe_cyl", 1.0, 4.0, 16);
         for tri in triangles(&mesh) {
             let [a, b, c] = tri;
@@ -787,9 +805,9 @@ mod bug_210_114 {
         }
     }
 
-    // NC-210-TEMP: segments = 0 divided by zero (NaN vertices, `% 0` panic).
+    // Bug №210 (NC): segments = 0 divided by zero (NaN vertices, `% 0` panic).
     #[test]
-    fn nc_210_temp_cylinder_with_zero_segments_stays_finite() {
+    fn cylinder_with_zero_segments_stays_finite() {
         let mesh = Mesh::cylinder("probe_cyl0", 1.0, 4.0, 0);
         assert!(
             mesh.vertices
