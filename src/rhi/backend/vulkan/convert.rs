@@ -299,6 +299,10 @@ pub(crate) fn border_color(color: BorderColor) -> vk::BorderColor {
 }
 
 /// Convert RHI sharing mode to a Vulkan sharing mode.
+// Bug №788: the conversion is ready but buffer and image creation hardcode
+// EXCLUSIVE — wiring it means deciding the concurrent queue-family array.
+// Kept per the dead-is-not-removed policy.
+#[allow(dead_code)]
 pub(crate) fn sharing_mode(mode: SharingMode) -> vk::SharingMode {
     match mode {
         SharingMode::Exclusive => vk::SharingMode::EXCLUSIVE,

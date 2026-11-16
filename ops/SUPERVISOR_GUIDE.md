@@ -45,7 +45,7 @@
 ### Пример сессии
 
 ```
-Клиент:  {"hello":{"token":"faa37fd0453d0eee8814d767fc50615de0fd00b98671ff6ee17ccbdeb10924ab","proto":1}}
+Клиент:  {"hello":{"token":"REDACTED","proto":1}}
 Сервер:  {"hello":"ok","control_proto":1}
 
 Клиент:  {"id":1,"cmd":"status"}
@@ -97,7 +97,7 @@
 Пример файла токена:
 ```json
 {
-  "token": "faa37fd0453d0eee8814d767fc50615de0fd00b98671ff6ee17ccbdeb10924ab",
+  "token": "REDACTED",
   "created_unix_s": 1794046711
 }
 ```

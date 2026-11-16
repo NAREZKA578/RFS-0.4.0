@@ -105,6 +105,10 @@ pub struct WindowSurface {
 
 enum WindowSurfaceSource {
     Vulkan(vulkan_present::WindowSurface),
+    // Bug №788: the exhaustiveness arm for backends without a presentation
+    // path — `as_vulkan` matches it, nothing constructs it while only Vulkan
+    // presents. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     NotSupported,
 }
 
@@ -143,6 +147,10 @@ pub struct Swapchain {
 #[allow(clippy::large_enum_variant)]
 enum SwapchainSource {
     Vulkan(vulkan_present::Swapchain),
+    // Bug №788: the exhaustiveness arm — matched by the neutral dispatch,
+    // constructed by nothing while only Vulkan presents. Kept per the
+    // dead-is-not-removed policy.
+    #[allow(dead_code)]
     NotSupported,
 }
 

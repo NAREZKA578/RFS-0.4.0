@@ -518,14 +518,28 @@ func (s *Supervisor) StatusAll() map[string]StatusInfo {
 
 // Exec runs a control command on a profile's control port and prints the
 // response to stdout.
+//
+// Bug №789: this used to look only at `s.instances` — the profiles managed
+// by this very process. A CLI invocation is a fresh one-shot process whose
+// instance map is always empty, while `start` leaves a detached server
+// behind, so a perfectly live server was unreachable: every `exec` answered
+// `profile "…" is not running` while status/health/metrics saw it fine
+// through the control-port fallback. The command now goes through
+// ExecCommand, which falls back to the profile's control port when no
+// managed instance exists — the same path the dashboard's control commands
+// use. For a managed instance the behaviour is unchanged: that is
+// `inst.Exec`'s own implementation (ExecCommand + one JSON line).
 func (s *Supervisor) Exec(name, command string, cmdArgs []string) error {
-	s.mu.RLock()
-	inst, ok := s.instances[name]
-	s.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("profile %q is not running", name)
+	data, err := s.ExecCommand(name, command, cmdArgs)
+	if err != nil {
+		return err
 	}
-	return inst.Exec(command, cmdArgs)
+	out, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+	return nil
 }
 
 // ExecCommand runs a control command and returns the parsed response data.

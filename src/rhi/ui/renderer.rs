@@ -159,7 +159,11 @@ struct UiDrawBatches {
 struct UiBuildStats {
     commands: u32,
     elements: u32,
+    // Bug №788: counted alongside `commands`/`elements` — nothing prints the
+    // geometry counters yet. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     vertices: u32,
+    #[allow(dead_code)]
     indices: u32,
     /// Commands that produced no geometry because the feature is not built yet.
     skipped: u32,
@@ -182,6 +186,10 @@ struct UiTextDraw<'a> {
 /// GPU resources owned by the renderer.
 struct UiGpu {
     pipeline: GraphicsPipeline,
+    // Bug №788: kept alive so the descriptor set's layout outlives the set —
+    // teardown order reads it even though no code path dereferences it. Kept
+    // per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     descriptor_layout: DescriptorSetLayout,
     descriptor_set: DescriptorSet,
     /// Textured pipeline, for glyphs and images. `None` when no text SPIR-V was

@@ -13,6 +13,9 @@ pub struct ShaderLibraryDesc {
 
 /// Shader library
 pub struct ShaderLibrary {
+    // Bug №788: kept for the device-side build, which the library API does not
+    // have yet. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     desc: ShaderLibraryDesc,
     modules: Vec<ShaderModule>,
 }

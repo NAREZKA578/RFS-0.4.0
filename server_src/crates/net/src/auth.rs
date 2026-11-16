@@ -86,6 +86,21 @@ pub fn seal(key: Option<&[u8]>, direction: Direction, seq: u64, packet: &[u8], o
     out.extend_from_slice(packet);
 }
 
+/// Constant-time tag equality (bug №791): the fold runs over all TAG_LEN
+/// bytes before collapsing to a bool, so a forged tag costs the same work
+/// no matter which byte first differs and the refusal carries no timing
+/// hint about how many leading bytes a forger got right. The naive `!=`
+/// on slices short-circuits at the first differing byte — exactly the
+/// oracle a forger wants. Both arguments are TAG_LEN long at the call
+/// site, so there is no length leak either.
+fn tags_equal(a: &[u8; TAG_LEN], b: &[u8]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..TAG_LEN {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 /// Verifies and strips the block. `None` means the datagram is refused as
 /// forged, tampered, or shaped like nothing this layer ever sent — the
 /// caller drops it the same way it drops a packet too small to parse.
@@ -99,16 +114,20 @@ pub fn unseal<'a>(
     }
     let (block, packet) = datagram.split_at(AUTH_WIRE_LEN);
     let seq = u64::from_be_bytes(block[TAG_LEN..].try_into().expect("SEQ_LEN = 8"));
-    if tag(key, direction, seq, packet) != block[..TAG_LEN] {
+    if !tags_equal(&tag(key, direction, seq, packet), &block[..TAG_LEN]) {
         return None;
     }
     Some((seq, packet))
 }
 
-/// Removes the block without checking anything. The tests of neighboring
-/// modules speak the unsigned dialect, and the receive funnels take this
-/// helper where production verifies.
-pub fn unseal_unsigned(datagram: &[u8]) -> Option<&[u8]> {
+/// Removes the block without checking anything. Nothing in the crate
+/// calls it today (bug №792: the earlier comment claimed the receive
+/// funnels route test traffic through it — they verify with `unseal`
+/// instead), and `pub(crate)` keeps the verify-before-trust seam from
+/// growing a public bypass while the neighboring modules' unsigned-
+/// dialect tests can still reach it if they ever need to.
+#[allow(dead_code)]
+pub(crate) fn unseal_unsigned(datagram: &[u8]) -> Option<&[u8]> {
     datagram
         .len()
         .checked_sub(AUTH_WIRE_LEN)
@@ -230,6 +249,37 @@ mod auth_tests {
             )
             .is_none(),
             "a datagram whose tag was made under a different secret must refuse"
+        );
+    }
+
+    #[test]
+    fn a_wrong_tag_refuses_at_every_offset() {
+        // Bug №791: a forged tag must be refused no matter which byte is
+        // wrong. Flips one tag byte at a time over all TAG_LEN offsets and
+        // pins the refusal at each, then restores the datagram byte for
+        // byte and pins that it still opens. The constant-time property
+        // itself is by construction (the xor-fold in tags_equal), not by
+        // timing measurement.
+        let packet = b"packet bytes".as_slice();
+        let mut wire = Vec::new();
+        seal(
+            Some(&key()),
+            Direction::ClientToServer,
+            1,
+            packet,
+            &mut wire,
+        );
+        for offset in 0..TAG_LEN {
+            wire[offset] ^= 0x01;
+            assert!(
+                unseal(Some(&key()), Direction::ClientToServer, &wire).is_none(),
+                "a tag differing only at byte {offset} must be refused"
+            );
+            wire[offset] ^= 0x01;
+        }
+        assert!(
+            unseal(Some(&key()), Direction::ClientToServer, &wire).is_some(),
+            "the loop must leave the datagram byte-identical to the sealed form"
         );
     }
 

@@ -40,6 +40,10 @@ const DRAIN_TIMEOUT_NS: u64 = 1_000_000_000;
 pub struct WindowSurface {
     pub handle: vk::SurfaceKHR,
     surface: SurfaceLoader,
+    // Bug №788: the loader that created the surface; destruction goes through
+    // the instance-level `SurfaceLoader`, so the field has no reader after
+    // construction. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     win32: Win32SurfaceLoader,
     /// Keeps the owning instance alive at least as long as the surface.
     _instance: Arc<DestroyableInstance>,
@@ -71,6 +75,10 @@ impl WindowSurface {
         })
     }
 
+    // Bug №788: no caller — swapchain support queries go through the swapchain
+    // module against the raw surface handle. Kept per the
+    // dead-is-not-removed policy.
+    #[allow(dead_code)]
     fn surface(&self) -> &SurfaceLoader {
         &self.surface
     }

@@ -30,6 +30,14 @@ impl PipelineCache {
     }
     
     /// Merge external cache data into this cache
+    ///
+    /// Bug №788: `merge` and `data` are the persistence half of the cache API —
+    /// save `data()` to disk, `merge()` it back at the next device creation.
+    /// The file location and the write moment are their own piece of work;
+    /// №787 wired the create-and-use half. Kept per the
+    /// dead-is-not-removed policy, marked here instead of behind the
+    /// crate-level allow that used to hide them.
+    #[allow(dead_code)]
     pub(crate) fn merge(&self, data: &[u8]) -> crate::error::RhiResult<()> {
         if data.is_empty() {
             return Ok(());
@@ -55,27 +63,19 @@ impl PipelineCache {
     }
     
     /// Get cache data for persistence
+    ///
+    /// Bug №788: the persistence half — see the note on [`Self::merge`].
+    #[allow(dead_code)]
     pub(crate) fn data(&self) -> crate::error::RhiResult<Vec<u8>> {
-        // SAFETY: device and self.cache are valid; returned vector is owned by us.
-        let size = unsafe { self.device.get_pipeline_cache_data(self.cache) }
-            .map_err(|e| vk_fail(e, "get pipeline cache data size"))?;
-        
-        if size.is_empty() {
-            return Ok(Vec::new());
-        }
-        
-        let mut data = vec![0u8; size.len()];
-        // SAFETY: device and self.cache are valid; returned vector is owned by us.
-        // TODO(verify): the two get_pipeline_cache_data calls can in principle return different
-        // lengths (the cache is mutable between calls); copy_from_slice below panics if result_data
-        // is longer than `data`. Confirm the size is stable here or size `data` from result_data.
-        let result_data = unsafe { 
-            self.device.get_pipeline_cache_data(self.cache)
-        }
-        .map_err(|e| vk_fail(e, "get pipeline cache data"))?;
-        
-        data.copy_from_slice(&result_data);
-        Ok(data)
+        // SAFETY: device and self.cache are valid; the returned vector is owned by us.
+        // Bug №787: this used to call `get_pipeline_cache_data` twice — the
+        // first call only to pre-size a buffer for the second — and panicked in
+        // `copy_from_slice` if the two results differed in length (the cache
+        // may grow between calls; the TODO(verify) on record said the same).
+        // The ash binding already returns the data as one owned vector: one
+        // call, one owner.
+        unsafe { self.device.get_pipeline_cache_data(self.cache) }
+            .map_err(|e| vk_fail(e, "get pipeline cache data"))
     }
 }
 

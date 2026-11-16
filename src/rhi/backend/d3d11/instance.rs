@@ -42,10 +42,16 @@ struct AdapterInfo {
 /// factory and the adapter list, per the same split as the Vulkan backend's
 /// `VulkanBackend` + `DestroyableInstance`.
 pub struct D3D11Backend {
+    // Bug №788: the factory and the feature-level table have no reader yet —
+    // enumerate works off the adapter list, and the device paths that would
+    // consult the factory are not wired. Kept per the dead-is-not-removed
+    // policy.
+    #[allow(dead_code)]
     factory: DxCom<IDXGIFactory1>,
     adapters: Vec<AdapterInfo>,
     /// The levels advertise the features of the most advanced level actually
     /// reached; conservative FL 11_0 tables are what the reports claim.
+    #[allow(dead_code)]
     feature_levels: [D3D_FEATURE_LEVEL; 2],
 }
 

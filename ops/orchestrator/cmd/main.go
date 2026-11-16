@@ -322,6 +322,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: no command specified\n")
 			os.Exit(2)
 		}
+		// Bug №789: with `exec` reaching detached profiles through the control
+		// port, the streaming `watch` needs the same refusal the dashboard
+		// gives it: the exec helper reads exactly one response, so a stream
+		// would surface as a single truncated line, not as a stream. The CLI
+		// `watch` command tails the log file instead.
+		if cmdArgs[0] == "watch" {
+			fmt.Fprintf(os.Stderr, "error: watch streams events and is not available in exec; use watch (the log tail) instead\n")
+			os.Exit(2)
+		}
 		if err := sup.Exec(name, cmdArgs[0], cmdArgs[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)

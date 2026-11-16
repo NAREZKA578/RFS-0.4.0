@@ -51,7 +51,8 @@ pub struct NetBridgeConfig {
     pub server_addr: SocketAddr,
     pub player_name: String,
     /// `None` or blank is the unsigned dialect, which matches the shipped
-    /// `server_config.json` (`allow_unsigned: true`, no token).
+    /// `server_config.json` (`allow_unsigned: true`, blank token); a keyed
+    /// server wants the same secret here — see `server_src/README.md`.
     pub auth_token: Option<String>,
 }
 
@@ -166,9 +167,12 @@ impl NetBridge {
                     let net_config = ClientConfig {
                         server_addr: config.server_addr,
                         player_name: config.player_name.clone(),
-                        // The server's dialect check pairs this with what it
-                        // was started with; the shipped configs agree on
-                        // "0.1.0" unsigned.
+                        // The dialect must pair with what the server was
+                        // started with: the shipped config runs unsigned,
+                        // and a keyed operator supplies the same secret
+                        // through RFS_TOKEN (server_src/README.md). The
+                        // build_version is announced on the wire, not
+                        // enforced by a comparison.
                         build_version: env!("CARGO_PKG_VERSION").to_string(),
                         auth_token: config.auth_token.clone(),
                         ..ClientConfig::default()

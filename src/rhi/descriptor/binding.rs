@@ -17,6 +17,10 @@ pub struct BindlessDescriptorSetDesc {
 
 /// Bindless descriptor set
 pub struct BindlessDescriptorSet {
+    // Bug №788: kept for the device-side bindless allocation, which is not
+    // connected — creation is the neutral API's only live half today. Kept per
+    // the dead-is-not-removed policy.
+    #[allow(dead_code)]
     desc: BindlessDescriptorSetDesc,
 }
 

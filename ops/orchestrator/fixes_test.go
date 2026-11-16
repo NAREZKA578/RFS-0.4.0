@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -1396,5 +1397,95 @@ func TestFix780StatusAllDoesNotDeadlockStart(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("StatusAll did not finish within 5s")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// №789: CLI exec must reach detached profiles
+// ---------------------------------------------------------------------------
+
+// captureStdout runs f with os.Stdout redirected to a pipe and returns what
+// f printed. Exec prints through fmt.Println, which reads os.Stdout at call
+// time, so the swap is observable. The reader runs concurrently because f
+// may write more than the pipe buffer holds.
+func captureStdout(t *testing.T, f func() error) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	var buf bytes.Buffer
+	readDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&buf, r)
+		close(readDone)
+	}()
+	ferr := f()
+	os.Stdout = old
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stdout pipe: %v", err)
+	}
+	<-readDone
+	if err := r.Close(); err != nil {
+		t.Fatalf("close read pipe: %v", err)
+	}
+	if ferr != nil {
+		t.Fatalf("captured call failed: %v", ferr)
+	}
+	return buf.String()
+}
+
+// TestFix789ExecReachesDetachedProfile proves `Supervisor.Exec` — the path
+// behind the CLI `exec` command — works for a profile this process never
+// managed. A CLI invocation is a one-shot process whose instance map is
+// always empty, so the old Exec answered `profile "…" is not running` for
+// every detached server, however live it was, while status/health/metrics
+// saw it fine through the control-port fallback. The regression pins the
+// detached path and keeps the managed path printing the same way.
+func TestFix789ExecReachesDetachedProfile(t *testing.T) {
+	dir := t.TempDir()
+	sup, err := New("", dir, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	mock := newScriptMock(t, "tok789", 0)
+	defer mock.close()
+
+	// The profile exists only on disk — the way a detached server leaves it:
+	// no managed instance, just the store record and a live control port.
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	detached := Profile{Name: "det789", ControlPort: mock.port(), TokenFile: writeTokenFile(t, dir, "tok789")}
+	if err := store.Save(detached); err != nil {
+		t.Fatalf("save profile: %v", err)
+	}
+
+	data, err := sup.ExecCommand("det789", "status", nil)
+	if err != nil {
+		t.Fatalf("ExecCommand on a detached profile: %v", err)
+	}
+	if state, _ := data["state"].(string); state != "running" {
+		t.Errorf("state = %v, want running", data["state"])
+	}
+
+	// Exec itself: the old code failed here with `profile "det789" is not
+	// running`; now it must print the response.
+	if out := captureStdout(t, func() error { return sup.Exec("det789", "status", nil) }); !strings.Contains(out, `"state":"running"`) {
+		t.Errorf("detached Exec output = %q, want the status JSON", out)
+	}
+
+	// The managed path still works and prints the same way.
+	registerMockInstance(sup, "managed789", Profile{
+		Name:        "managed789",
+		ControlPort: mock.port(),
+		TokenFile:   writeTokenFile(t, dir, "tok789"),
+	}, StateRunning)
+	if out := captureStdout(t, func() error { return sup.Exec("managed789", "status", nil) }); !strings.Contains(out, `"state":"running"`) {
+		t.Errorf("managed Exec output = %q, want the status JSON", out)
 	}
 }

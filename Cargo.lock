@@ -1169,7 +1169,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rfs-client"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "ab_glyph",
  "glam",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "rfs_core"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "bitflags 2.13.2",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "rfs_net"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "rhi"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "ash",
  "bitflags 2.13.2",

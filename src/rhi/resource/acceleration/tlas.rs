@@ -39,7 +39,12 @@ bitflags! {
 /// TLAS resource
 #[derive(Debug, Clone)]
 pub struct Tlas {
+    // Bug №788: kept for the device-side build; the acceleration-structure
+    // track has not connected creation to a backend yet. Kept per the
+    // dead-is-not-removed policy.
+    #[allow(dead_code)]
     desc: TlasDesc,
+    #[allow(dead_code)]
     instances: Vec<TlasInstance>,
 }
 

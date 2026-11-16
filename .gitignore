@@ -29,3 +29,13 @@ Model/
 # business in the repository.
 /-1
 
+# Operator secrets and local state (bug №794): the wire secret and the
+# control token are per-machine operator data, not source. The shipped
+# `server_config.json` stays unsigned; keyed setups keep their secret in a
+# gitignored local file, and the control token file is generated on first
+# start. The patterns carry no leading slash, so they match at any depth —
+# `server_src` and its `assets/` copy included.
+control_token.json
+control_actions.jsonl
+server_config.local.json
+

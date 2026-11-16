@@ -2,24 +2,27 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
-//! High-level rendering system built on top of RHI (Rendering Hardware Interface).
-//! Supports Vulkan, Direct3D 12, Direct3D 11, and OpenGL backends.
+//! High-level rendering system built on top of RHI (Rendering Hardware
+//! Interface). One backend renders today — Vulkan, Windows-only; the
+//! D3D11/D3D12/OpenGL RHI backends are skeletons (bug №796).
 //!
 //! ## Architecture
 //!
-//! The render module uses a **RenderGraph** approach with the following passes:
-//! - GBuffer Pass (Deferred Rendering)
-//! - Shadow Pass (Cascaded Shadow Maps)
-//! - Lighting Pass (PBR Lighting)
-//! - Transparent Pass (Water, Smoke, Fire)
-//! - Water Pass (Reflections, Refractions)
-//! - Post-Process Pass (Bloom, HDR, FXAA, Motion Blur, DoF)
-//! - UI Pass (HUD, Menu)
+//! The render graph declares the passes below; the live frame is drawn by
+//! the geometry pass with the water and sky draws on top of it, the rest
+//! is scaffolding the live configuration does not execute yet:
+//! - Geometry Pass (live)
+//! - Water Pass (live)
+//! - Sky (live)
+//! - GBuffer / Shadow / Lighting / Transparent / Post-Process / UI —
+//!   declared, not executed in the live configuration
 //!
 //! ## Features
+//!
+//! Declared surface; what executes today is marked (bug №796):
+//! - Dynamic Water with Waves and Reflections (live)
 //! - PBR Materials
 //! - GPU-Driven Particle System
-//! - Dynamic Water with Waves and Reflections
 //! - Cascaded Shadow Mapping
 //! - Screen Space Effects (SSAO, SSR)
 //! - LOD System
@@ -28,8 +31,8 @@
 //!
 //! ## Settings
 //!
-//! All graphics settings can be toggled at runtime:
-//! - Ray Tracing (if supported by hardware)
+//! The toggles below are the declared settings surface; not every one
+//! drives a live pass today:
 //! - Shadow Quality (Low/Medium/High/Ultra)
 //! - Anti-Aliasing (None/FXAA/TAA)
 //! - Post-Processing Effects

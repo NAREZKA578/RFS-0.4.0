@@ -93,6 +93,9 @@ impl<T: Interface> Clone for DxCom<T> {
 #[derive(Clone)]
 pub(crate) struct BufferEntry {
     pub buffer: DxCom<ID3D11Buffer>,
+    // Bug №788: no reader yet — the D3D11 bind path will need it for size
+    // checks. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub size: u64,
     pub usage: BufferUsage,
     pub host_visible: bool,
@@ -118,6 +121,9 @@ pub(crate) struct TextureEntry {
 pub(crate) struct ViewEntry {
     pub srv: Option<DxCom<ID3D11ShaderResourceView>>,
     pub rtv: Option<DxCom<ID3D11RenderTargetView>>,
+    // Bug №788: the texture-view UAV role has no reader — the storage path
+    // binds `BufferEntry.uav` today. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub uav: Option<DxCom<ID3D11UnorderedAccessView>>,
     pub dsv: Option<DxCom<ID3D11DepthStencilView>>,
 }
@@ -134,6 +140,9 @@ pub(crate) struct GraphicsPipelineEntry {
     pub depth_stencil: Option<DxCom<ID3D11DepthStencilState>>,
     /// Stride per D3D slot, so `BindVertexBuffers` can fill the call.
     pub vertex_strides: HashMap<u32, u32>,
+    // Bug №788: layout ids for bind-time set validation — the D3D11 bind path
+    // is not wired. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub set_layouts: Vec<u64>,
 }
 
@@ -176,7 +185,12 @@ pub(crate) enum WriteKind {
 #[derive(Clone)]
 pub(crate) struct SetWrite {
     pub binding: u32,
+    // Bug №788: `base_element` has no consumer because D3D11 binds constant
+    // buffers whole (no offsets); `ty` is the declared type for the bind-check
+    // path. Both kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub base_element: u32,
+    #[allow(dead_code)]
     pub ty: DescriptorType,
     pub stages: ShaderStage,
     pub kind: WriteKind,
@@ -185,6 +199,10 @@ pub(crate) struct SetWrite {
 pub(crate) enum D3DObject {
     Buffer(BufferEntry),
     Texture(TextureEntry),
+    // Bug №788: no constructor yet — texture views reuse the source texture's
+    // entry (see the `TextureEntry.roles` comment), so the per-view table is
+    // never stored. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     View(ViewEntry),
     Sampler(DxCom<ID3D11SamplerState>),
     Shader(ShaderEntry),
@@ -192,6 +210,9 @@ pub(crate) enum D3DObject {
     ComputePipeline(ComputePipelineEntry),
     /// A render pass object is only its description: D3D11 has no render pass
     /// concept, so the emulation keeps the description.
+    // Bug №788: nothing reads the kept description yet — D3D11 pass execution
+    // is not wired. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     Pass(RenderPassDesc),
     Framebuffer(FramebufferEntry),
     /// Tracked for `ReleaseKind::DescriptorSetLayout` bookkeeping only.
@@ -205,6 +226,10 @@ pub(crate) struct HandleTable {
 
 /// Per-stage slot counts, from the feature level and the confirmed D3D10.x
 /// hardware option (compute with raw and structured buffers).
+// Bug №788: the slot numbers have no reader — they are meant for the bind-time
+// enforcement the D3D11 record path has not reached. Kept per the
+// dead-is-not-removed policy.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub(crate) struct StageCaps {
     pub constant_buffers: u32,
@@ -223,6 +248,10 @@ pub struct D3D11Device {
     handles: Mutex<HandleTable>,
     next_id: AtomicU64,
     sets: Mutex<HashMap<u64, Vec<SetWrite>>>,
+    // Bug №788: read today only by the also-dead `caps()` accessor below —
+    // the enforcement path that would use it is not wired. Kept per the
+    // dead-is-not-removed policy.
+    #[allow(dead_code)]
     caps: StageCaps,
     /// "Compute Shaders Plus Raw And Structured Buffers Via Shader 4.x": the
     /// gate for storage UAVs at FL 11_0/11_1.
@@ -313,15 +342,22 @@ impl D3D11Device {
         &self.context.0
     }
 
+    // Bug №788: accessors for the D3D11 record path, which the render layer
+    // has not started calling. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub(crate) fn device(&self) -> &ID3D11Device {
         &self.device.0
     }
 
+    #[allow(dead_code)]
     pub(crate) fn caps(&self) -> StageCaps {
         self.caps
     }
 
     /// Take an object by handle out of tracking.
+    // Bug №788: the D3D11 record path that would consume it is not wired.
+    // Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub(crate) fn take_object(&self, handle: u64, what: &str) -> RhiResult<D3DObject> {
         self.handles
             .lock()
@@ -362,6 +398,9 @@ impl D3D11Device {
     /// applied: only `ShaderFormat::Dxil` is accepted, which the RHI contract
     /// reads as "a finished DXBC/DXIL container" - what runtime `D3DCompile`
     /// (Fxc) or dxc produce.
+    // Bug №788: the D3D11 pipeline-creation path that would call it is not
+    // wired. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub(crate) fn shader_bytes<'a>(module: &'a ShaderModule, what: &str) -> RhiResult<&'a [u8]> {
         let desc = module.desc();
         if desc.format != ShaderFormat::Dxil {
@@ -434,6 +473,9 @@ impl D3D11Device {
         }
     }
 
+    // Bug №788: raw-buffer view element count — the UAV call site computes
+    // counts inline today. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     fn element_count(size: u64) -> u32 {
         // Raw buffer views count DWORDs: an empty buffer is never legal anyway
         // because `BufferDesc::is_valid` rejects zero size.

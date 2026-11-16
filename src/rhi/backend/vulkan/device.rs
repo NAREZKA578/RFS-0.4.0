@@ -6,6 +6,9 @@ use crate::backend::common::{BackendResource, ReleaseKind};
 use crate::backend::vulkan::convert;
 use crate::backend::vulkan::instance::{vk_fail, DestroyableInstance};
 use crate::backend::vulkan::memory::MemoryAllocator;
+// Bug №787: the pipeline cache module, wired in — both creation sites below
+// now receive its handle instead of `vk::PipelineCache::null()`.
+use crate::backend::vulkan::pipeline_cache;
 use crate::backend::vulkan::record;
 use crate::core::{DeviceDesc, MemoryProperties, PhysicalDevice, Queue};
 use crate::command::pass::render::{Framebuffer, FramebufferDesc, RenderPass, RenderPassDesc};
@@ -245,6 +248,10 @@ impl TrackedKind {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedObject {
     pub kind: TrackedKind,
+    // Bug №788: written null by `new()` and never read — `memory` below is the
+    // field with a reader; vestigial from an earlier shape. Kept per the
+    // dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub handle: vk::DeviceMemory,
     pub object: u64,
     pub memory: vk::DeviceMemory,
@@ -516,6 +523,11 @@ const TEARDOWN_ORDER: [TrackedKind; 12] = [
 /// Duplicated on purpose. Deriving it from the enum would need a derive and a
 /// registry, and the point of the test is to catch a hand-written list drifting,
 /// so the second list is written out and compared against the real one.
+///
+/// Bug №788: the list is consumed only by the `#[cfg(test)]` module (the №284
+/// coverage test), so it is compiled for tests only instead of warning as dead
+/// in every non-test build.
+#[cfg(test)]
 const ALL_TRACKED_KINDS: [TrackedKind; 12] = [
     TrackedKind::ImageView,
     TrackedKind::Image,
@@ -683,6 +695,17 @@ command_pool: vk::CommandPool,
       sampler_anisotropy: bool,
     /// Keeps the owning `VkInstance` alive for as long as this device lives.
     instance_guard: Arc<DestroyableInstance>,
+    /// The driver-level pipeline cache every pipeline creation call shares.
+    ///
+    /// Bug №787: the module existed on disk but was declared nowhere, and both
+    /// creation sites passed `vk::PipelineCache::null()` — which is "no cache":
+    /// every start-up recompiled every shader from SPIR-V to ISA. `Option`
+    /// because `Drop` below must destroy the cache *inside its body*, while the
+    /// device handle is still valid — a plain field would only run its own
+    /// `Drop` after this struct's manual `Drop` body, i.e. after
+    /// `vkDestroyDevice`, which is use after destroy. `take()` in `Drop`
+    /// handles it; `None` is unreachable while creation code can run.
+    pipeline_cache: Option<pipeline_cache::PipelineCache>,
 }
 
 impl VulkanLogicalDeviceResource {
@@ -695,6 +718,11 @@ impl VulkanLogicalDeviceResource {
         instance_guard: Arc<DestroyableInstance>,
     ) -> RhiResult<Self> {
         let allocator = MemoryAllocator::new(device.clone(), memory);
+        // Bug №787: the driver-level cache shared by every pipeline creation
+        // call. Created with the device, handed to `create_graphics_pipelines`
+        // and `create_compute_pipelines`, destroyed first in `Drop`.
+        // SAFETY: device is a valid logical device (freshly created above).
+        let pipeline_cache = Some(pipeline_cache::PipelineCache::new(device.clone())?);
         // SAFETY: device is valid; queue_family_index is a valid family for this device; index 0 is valid
         // as created by this device.
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
@@ -809,7 +837,22 @@ let allocate_info = vk::CommandPoolCreateInfo {
             // created without it.
             sampler_anisotropy,
             instance_guard,
+            pipeline_cache,
         })
+    }
+
+    /// The pipeline cache handle every pipeline creation call shares.
+    ///
+    /// Bug №787: both creation sites passed `vk::PipelineCache::null()`, which
+    /// is the same as running with no cache — the driver kept no compiled
+    /// pipeline state, so every start-up recompiled every shader from SPIR-V
+    /// to ISA. `None` is only the post-`Drop` state and cannot be observed by
+    /// creation code; the `null` fallback keeps the accessor total anyway.
+    fn pipeline_cache_handle(&self) -> vk::PipelineCache {
+        self.pipeline_cache
+            .as_ref()
+            .map(|cache| cache.handle())
+            .unwrap_or(vk::PipelineCache::null())
     }
 
     /// Record and submit a one-shot transfer on the graphics queue and block
@@ -2429,9 +2472,10 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
             ..Default::default()
         };
         // SAFETY: device valid; create_info valid (shader module and layout are live handles on this device).
+        // Bug №787: the device's pipeline cache, not `null()` — see `pipeline_cache_handle`.
         let mut pipeline = unsafe {
             self.device.create_compute_pipelines(
-                vk::PipelineCache::null(),
+                self.pipeline_cache_handle(),
                 &[create_info],
                 None,
             )
@@ -3238,9 +3282,10 @@ fn render_finished_semaphore(&self) -> vk::Semaphore {
         // SAFETY: device valid; create_info references live shader stages, pipeline layout and
         // render pass (all handles from this device); every sub-struct pointer is a reference
         // that outlives the call.
+        // Bug №787: the device's pipeline cache, not `null()` — see `pipeline_cache_handle`.
         let mut pipelines = unsafe {
             self.device.create_graphics_pipelines(
-                vk::PipelineCache::null(),
+                self.pipeline_cache_handle(),
                 &[create_info],
                 None,
             )
@@ -3512,6 +3557,10 @@ impl Drop for VulkanLogicalDeviceResource {
             // this device, and destroying any of them while the GPU still refers
             // to it is undefined.
             self.device.device_wait_idle().ok();
+            // Bug №787: the pipeline cache goes first, while the device handle
+            // is still valid — stored as a plain field it would only run its
+            // own `Drop` after this body, i.e. after `vkDestroyDevice` below.
+            drop(self.pipeline_cache.take());
             // Reported, not ignored. A nonzero count means the caller created
             // something this backend has no kind recorded for, and that leak is
             // then the backend's fault rather than the caller's.

@@ -56,6 +56,10 @@ impl Semaphore {
 
 /// Timeline semaphore
 pub struct TimelineSemaphore {
+    // Bug №788: kept for the device-side timeline path, which is not
+    // connected — the CPU-side signal/wait state is live, the descriptor is
+    // not read. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     desc: SemaphoreDesc,
     initial_value: u64,
     value: AtomicU64,

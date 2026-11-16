@@ -40,6 +40,11 @@ impl MemoryAllocator {
     /// Coherent memory needs neither [`flush`](Self::flush) nor
     /// [`invalidate`](Self::invalidate) around host access; non-coherent memory
     /// needs both, and skipping them is not a slow path but wrong data.
+    ///
+    /// Bug №788: no caller yet — the mapping paths flush unconditionally, which
+    /// is legal for coherent memory; the short-circuit is pending a
+    /// non-coherent platform. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub(crate) fn is_coherent(&self, index: u32) -> bool {
         self.types
             .get(index as usize)

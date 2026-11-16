@@ -349,11 +349,17 @@ impl SamplerEntry {
 /// A shader module: the DXBC container and its declared format.
 #[derive(Clone)]
 pub(crate) struct ShaderEntry {
+    // Bug №788: the format tag for the shader-type dispatch — creation feeds
+    // `code()` only today. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     format: crate::shader::ShaderFormat,
     code: Vec<u8>,
 }
 
 impl ShaderEntry {
+    // Bug №788: the reader of the format tag above; wired together when the
+    // shader-type dispatch lands. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub(crate) fn format(&self) -> crate::shader::ShaderFormat {
         self.format
     }
@@ -422,13 +428,20 @@ pub(crate) struct LayoutEntry {
     pub(crate) sampler_count: u32,
     /// The root-table kind classification: `None` means a sampler-only set
     /// (or an empty one — no tables at all).
+    // Bug №788: the classification bits feed the recorded bind path, which is
+    // not wired yet. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub(crate) cbv_srv_uav: bool,
+    #[allow(dead_code)]
     pub(crate) sampler: bool,
 }
 
 impl LayoutEntry {
     /// The declared-count roll of descriptors the binding consumes, for the
     /// set block foreign binding offset math.
+    // Bug №788: consumed by the same unwired bind path as the classification
+    // bits above. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub(crate) fn descriptor_offsets(&self) -> Vec<(u32, u32)> {
         let mut offsets = Vec::with_capacity(self.bindings.len());
         let mut running: u32 = 0;
@@ -498,7 +511,12 @@ pub(crate) struct FramebufferEntry {
     /// The depth texture's tracked handle, when it exists.
     pub(crate) dsv_handle: Option<u64>,
     /// Window of the framebuffer the render area pins.
+    // Bug №788: the recorded pass takes the render area from the pass
+    // descriptor today; these are the framebuffer-window source it was written
+    // for. Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     pub(crate) width: u32,
+    #[allow(dead_code)]
     pub(crate) height: u32,
 }
 

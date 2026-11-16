@@ -2,25 +2,21 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 //!
-//! This module provides a **cross-platform, high-performance** abstraction
-//! over modern graphics APIs for 3D rendering in client applications.
+//! A hardware abstraction for 3D rendering. Windows-only.
 //!
-//! ## Supported APIs
-//! - **Vulkan 1.3** (Primary)
-//! - **Direct3D 12** (Windows)
-//! - **Direct3D 11** (Legacy, Windows)
-//! - **OpenGL 4.6** (Legacy, cross-platform)
+//! ## Supported APIs (the honest list, bug №796)
+//! - **Vulkan 1.3** — the only backend that renders: instance, device,
+//!   memory, present, command recording, pipeline cache.
+//! - **Direct3D 12 / Direct3D 11** — skeletons; creation returns
+//!   `NotSupported`.
+//! - **OpenGL** — stub, slated for removal by owner decision (bug №719).
 //!
 //! ## Features
-//! - Cross-platform (Windows, Linux)
-//! - Modern rendering (Ray Tracing, Mesh Shading, VRS, Bindless)
-//! - High performance (minimal abstraction overhead)
-//! - Thread-safe (multi-threaded command recording)
-//! - Memory management (GPU allocators)
-//! - Debug tools (validation, markers, capture)
+//! - Memory management (GPU allocators, mapped buffers)
+//! - Debug tools (validation layer hookup, markers, capture)
+//! - Persistent pipeline cache (bugs №787-№788)
 
 #![allow(missing_docs)]
-#![allow(dead_code)]
 #![allow(clippy::needless_range_loop)]
 
 pub mod backend;

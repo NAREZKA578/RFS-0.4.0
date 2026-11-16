@@ -6,6 +6,7 @@ mod convert;
 mod device;
 mod instance;
 mod memory;
+mod pipeline_cache;
 pub(crate) mod present;
 mod record;
 

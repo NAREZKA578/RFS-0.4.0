@@ -139,8 +139,9 @@ fn release_camera_keys(controller: &mut CameraController) {
 /// Build the server-link configuration from the environment and start it.
 ///
 /// `RFS_SERVER` (`host:port`, default 127.0.0.1:7777), `RFS_PLAYER`,
-/// `RFS_TOKEN` (empty or unset is the unsigned dialect, which is what the
-/// shipped `server_config.json` accepts).
+/// `RFS_TOKEN` (empty or unset is the unsigned dialect; the shipped
+/// `server_config.json` runs unsigned, and a keyed server wants the same
+/// secret here — see `server_src/README.md`).
 fn start_net_bridge(address: &str) -> Result<NetBridge, String> {
     let server_addr = resolve_server_addr(address)?;
     let config = NetBridgeConfig {

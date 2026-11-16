@@ -55,12 +55,6 @@ const ALLOWED_DEAD: &[AllowedDead] = &[
         path: "src/rhi/backend/opengl/device.rs",
         reason: "OpenGL backend stub, same as D3D11/D3D12.",
     },
-    AllowedDead {
-        path: "src/rhi/backend/vulkan/pipeline_cache.rs",
-        reason: "Both pipeline creation sites pass `vk::PipelineCache::null()`, so this \
-                 is 76 lines that never execute. Every start-up recompiles every \
-                 shader from SPIR-V to ISA.",
-    },
 ];
 
 fn repo_root() -> PathBuf {

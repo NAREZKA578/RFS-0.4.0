@@ -10,20 +10,16 @@
 //!   server (`crate::net`); the only place in this crate that speaks the
 //!   server protocol. Everything else stays client-side.
 //!
-//! ## Supported Graphics APIs
-//! - Vulkan 1.3 (Primary, cross-platform)
-//! - Direct3D 12 (Windows primary)
-//! - Direct3D 11 (Windows fallback)
-//! - OpenGL 4.6 (Fallback)
+//! ## Supported Graphics APIs (the honest list, bug №796)
+//! - Vulkan 1.3 — the only backend that renders; Windows-only.
+//! - Direct3D 12 / Direct3D 11 — skeletons returning NotSupported.
+//! - OpenGL — stub, slated for removal by owner decision (bug №719).
 //!
 //! ## Architecture
-//! The rendering system uses a RenderGraph approach with multiple render passes:
-//! - Forward Pass (Forward+: light from the clustered light buffer, cascaded shadows)
-//! - Shadow Pass (Cascaded Shadow Maps)
-//! - Transparent Pass (Water, Smoke, Fire)
-//! - Water Pass (Reflections, Refractions)
-//! - Post-Process Pass (Bloom, HDR, FXAA, Motion Blur, DoF)
-//! - UI Pass (HUD, Menu)
+//! The render graph declares many passes; the live frame today is drawn
+//! by the geometry pass with the water and sky draws on top of it. The
+//! other passes listed in `src/render/mod.rs` are declared scaffolding
+//! the live configuration does not execute yet.
 
 // Re-export RHI module
 pub mod rhi;

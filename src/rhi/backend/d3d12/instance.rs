@@ -43,6 +43,10 @@ struct AdapterInfo {
 
 /// The D3D12 backend.
 pub struct D3D12Backend {
+    // Bug №788: no reader yet — enumerate works off the adapter list; the
+    // device-creation paths that would consult the factory are not wired.
+    // Kept per the dead-is-not-removed policy.
+    #[allow(dead_code)]
     factory: DxCom<IDXGIFactory1>,
     adapters: Vec<AdapterInfo>,
 }

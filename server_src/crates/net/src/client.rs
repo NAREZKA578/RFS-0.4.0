@@ -499,7 +499,7 @@ impl Default for ClientConfig {
             max_bandwidth_bps: 512.0 * 1024.0,
             enable_bandwidth_limit: false,
             player_name: "Player".to_string(),
-            build_version: "0.1.0".to_string(),
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
             auth_token: None,
         }
     }

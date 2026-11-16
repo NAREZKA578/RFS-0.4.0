@@ -8,3 +8,13 @@
 {"ts":"2026-11-16T17:09:45.665Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
 {"ts":"2026-11-16T18:08:14.617Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
 {"ts":"2026-11-16T18:08:14.631Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
+{"ts":"2026-11-16T21:35:27.554Z","source":"door","command":"say \"probe-after-fix\"","outcome":"queued"}
+{"ts":"2026-11-16T21:35:27.578Z","source":"loop","command":"say \"probe-after-fix\"","outcome":"announced to every connected player"}
+{"ts":"2026-11-16T22:09:08.339Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T22:09:08.359Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
+{"ts":"2026-11-16T22:15:47.124Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T22:15:47.133Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
+{"ts":"2026-11-16T22:16:21.491Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T22:16:21.501Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
+{"ts":"2026-11-16T22:18:08.776Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T22:18:08.787Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
