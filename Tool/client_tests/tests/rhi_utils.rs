@@ -147,10 +147,10 @@ fn format_conversion_stable_and_known() {
     use rhi::Format;
     assert_eq!(Format::RGBA8_UNORM.to_dxgi(), 28);
     assert_eq!(Format::RGBA8_UNORM.to_gl(), 0x8058);
-    // Bug №178: this asserted 129, which is VK_FORMAT_S8_UINT — a different
-    // format with a different layout. VK_FORMAT_D24_UNORM_S8_UINT is 131.
-    assert_eq!(Format::D24_UNORM_S8_UINT.to_vulkan(), 131);
-    assert_eq!(Format::S8_UINT.to_vulkan(), 129);
+    // Vulkan spec: D24_UNORM_S8_UINT is 129 and S8_UINT is 127. The previous
+    // expectations were the +2-shifted table from before bug №178.
+    assert_eq!(Format::D24_UNORM_S8_UINT.to_vulkan(), 129);
+    assert_eq!(Format::S8_UINT.to_vulkan(), 127);
     assert_ne!(
         Format::D24_UNORM_S8_UINT.to_vulkan(),
         Format::S8_UINT.to_vulkan(),
@@ -163,9 +163,12 @@ fn format_conversion_stable_and_known() {
 fn format_conversion_unknown_returns_zero() {
     use rhi::utils::conversion::FormatConversion;
     use rhi::Format;
-    // A format without a defined host mapping returns 0.
+    // ETC2/EAC have no DXGI enumerant, so DXGI reports UNDEFINED explicitly,
+    // while Vulkan has a real spec code (bug №178 added the EAC rows).
     assert_eq!(Format::ETC2_R8G8B8_UNORM.to_dxgi(), 0);
-    assert_eq!(Format::EAC_R11_UNORM.to_vulkan(), 0);
+    assert_eq!(Format::EAC_R11_UNORM.to_vulkan(), 153);
+    // A Vulkan code that is not in the RHI table maps back to nothing.
+    assert_eq!(Format::from_vulkan(9999), None);
 }
 
 /// A window surface negotiates its own format, and it is almost always
@@ -179,7 +182,8 @@ fn presentation_formats_map_to_the_spec_codes() {
     use rhi::utils::conversion::FormatConversion;
     use rhi::Format;
     assert_eq!(Format::B8G8R8A8_UNORM.to_vulkan(), 44); // VK_FORMAT_B8G8R8A8_UNORM
-    assert_eq!(Format::B8G8R8A8_SRGB.to_vulkan(), 43); // VK_FORMAT_B8G8R8A8_SRGB
+    // 43 is R8G8B8A8_SRGB (RGBA layout); the BGR sRGB format is 50.
+    assert_eq!(Format::B8G8R8A8_SRGB.to_vulkan(), 50); // VK_FORMAT_B8G8R8A8_SRGB
     assert_eq!(Format::B8G8R8A8_UNORM.to_dxgi(), 87); // DXGI_FORMAT_B8G8R8A8_UNORM
     assert_eq!(Format::B8G8R8A8_SRGB.to_dxgi(), 91); // DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
 

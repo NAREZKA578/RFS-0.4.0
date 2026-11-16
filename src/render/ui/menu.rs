@@ -54,6 +54,10 @@ pub enum MenuType {
     Pause,
     InGame,
     Scoreboard,
+    /// The full-screen loading screen shown while the client connects to
+    /// the server and waits for the world (the Squad-style takeover, not a
+    /// floating panel).
+    Loading,
 }
 
 
@@ -137,6 +141,7 @@ impl Menu {
                     MenuItem::new("Back", MenuItemType::Button),
                 ],
             ),
+            MenuType::Loading => ("Loading".to_string(), vec![]),
         };
 
         Self {
@@ -223,6 +228,7 @@ impl Menu {
                     MenuItem::new("Back", MenuItemType::Button),
                 ],
             ),
+            MenuType::Loading => ("Loading".to_string(), vec![]),
         };
 
         self.title = title;
@@ -487,19 +493,24 @@ fn rect(at: Vec2, size: Vec2, color: [f32; 4]) -> UiCommand {
     }
 }
 
-/// An item's label, centred vertically inside its own row height.
+/// An item's label, centred vertically inside its own row height. The size
+/// and colour default to the shared values every menu got before the
+/// per-item overrides existed.
 fn push_item_text(batch: &mut UiBatch, item: &MenuItem, at: Vec2) {
     let content = Menu::item_content(item);
     if content.is_empty() {
         return;
     }
+    let size = item.text_size.unwrap_or(ITEM_TEXT_SIZE);
     batch.commands.push(UiCommand::Text {
         content,
         x: at.x + BOX_PAD,
-        y: at.y + (item.size.y - ITEM_TEXT_SIZE) * 0.5,
-        size: ITEM_TEXT_SIZE,
-        color: ITEM_TEXT_COLOR,
-        font: None,
+        y: at.y + (item.size.y - size) * 0.5,
+        size,
+        color: rgba(item.text_color.unwrap_or(Vec4::from(ITEM_TEXT_COLOR))),
+        // The item's own face, or the renderer default (the placeholder)
+        // when the menu did not opt into the real one.
+        font: item.font.clone(),
     });
 }
 
@@ -522,7 +533,6 @@ pub enum MenuItemType {
     TextInput,
 }
 
-
 /// Menu item
 #[derive(Debug, Clone)]
 pub struct MenuItem {
@@ -536,6 +546,19 @@ pub struct MenuItem {
     pub disabled_color: Vec4,
     pub enabled: bool,
     pub selected: bool,
+    /// Per-item text size. `None` is the shared `ITEM_TEXT_SIZE` every
+    /// caller got before this field existed, so the default keeps every
+    /// existing menu pixel-identical; the loading screen's logo and map
+    /// name are what need a bigger type.
+    pub text_size: Option<f32>,
+    /// Per-item text colour. `None` is the shared white; the loading
+    /// screen's sub-line is the muted case.
+    pub text_color: Option<Vec4>,
+    /// Per-item typeface, by registered name (`src/render/ui/fonts.rs`
+    /// registers the real faces). `None` keeps the renderer's default —
+    /// the 8×8 placeholder — so every menu that does not opt in stays
+    /// pixel-identical; the loading screen is what opted in.
+    pub font: Option<String>,
     /// For sliders
     pub value: f32,
     pub min_value: f32,
@@ -563,6 +586,9 @@ impl MenuItem {
             disabled_color: Vec4::new(0.5, 0.5, 0.5, 0.5),
             enabled: true,
             selected: false,
+            text_size: None,
+            text_color: None,
+            font: None,
             value: 0.5,
             min_value: 0.0,
             max_value: 1.0,
@@ -598,6 +624,25 @@ impl MenuItem {
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    /// Override this item's text size (see [`MenuItem::text_size`]).
+    pub fn with_text_size(mut self, size: f32) -> Self {
+        self.text_size = Some(size.max(1.0));
+        self
+    }
+
+    /// Override this item's text colour (see [`MenuItem::text_color`]).
+    pub fn with_text_color(mut self, color: Vec4) -> Self {
+        self.text_color = Some(color);
+        self
+    }
+
+    /// Set this item's typeface by registered name
+    /// (see [`MenuItem::font`]).
+    pub fn with_font(mut self, font: &str) -> Self {
+        self.font = Some(font.to_string());
         self
     }
 

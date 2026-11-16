@@ -185,11 +185,15 @@ pub struct Connection {
     pub remote_ack: Mutex<u32>,
     pub remote_ack_bitfield: Mutex<u32>,
     pub pending_acks: Mutex<VecDeque<u32>>,
-    /// Bug №272: how many entries `pending_acks` has dropped to its window cap.
+    /// How many entries `pending_acks` has dropped to its window cap. Bug №786
+    /// (the count itself was introduced under the canceled warnings registry,
+    /// which called this №272 — .DOC/BUGS.md's №272 is an unrelated render
+    /// defect).
     ///
-    /// The drop itself cannot be avoided today — nothing acks a reliable
-    /// packet, because there is no retransmit layer (see `track_reliable`) —
-    /// but LOGGING each drop was costing more than the work it described. At
+    /// The drop itself is not data loss — the reliable send ledger (bug №215,
+    /// 2026-10-20) holds the packet bytes and retransmits independently of
+    /// this mirror; `pending_acks` is pure GC bookkeeping under the window cap
+    /// (bug №14). What was costing real money was LOGGING each drop: at
     /// 200 bots one 30 s run produced 20127 of these lines, all from the tick
     /// loop, and the `sim` phase grew 5.5 -> 14.9 ms with a constant 8 ships
     /// and 200 players. Same reasoning already applied to layer stalls in
@@ -197,6 +201,11 @@ pub struct Connection {
     /// generator. The count stays exact and is read by the caller that reports
     /// it; the log is gone.
     pub pending_ack_drops: AtomicU64,
+    /// Bug №786: the drops total the once-a-second sweep has already
+    /// reported. The sweep reads NEW drops through this mark — a cumulative
+    /// read repeated the same total every second for the rest of the session
+    /// once any entry had aged out (228 lines for one acceptance client).
+    pub drop_report_mark: AtomicU64,
     /// First dropped sequence, kept so a periodic summary can say which window
     /// overflowed rather than only how often.
     pub first_pending_ack_drop: Mutex<Option<u32>>,
@@ -302,6 +311,7 @@ impl Connection {
             remote_ack_bitfield: Mutex::new(0),
             pending_acks: Mutex::new(VecDeque::with_capacity(64)), // №755 prealloc
             pending_ack_drops: AtomicU64::new(0),
+            drop_report_mark: AtomicU64::new(0),
             first_pending_ack_drop: Mutex::new(None),
             last_received: Mutex::new(Instant::now()),
             last_sent: Mutex::new(Instant::now()),
@@ -556,7 +566,7 @@ impl Connection {
                 // client (№30 (B) reports every ~100 ms), so a single second of
                 // the shutdown flood carried ~1000 warn lines — a storm that
                 // teaches the log reader to ignore WARN entirely (the same
-                // lesson №272 already fixed for Disconnect on the normal exit
+                // lesson №272 (canceled warnings registry) already fixed for Disconnect on the normal exit
                 // path).
                 Vec::new()
             }
@@ -572,7 +582,7 @@ impl Connection {
                 Vec::new()
             }
             Some(PacketType::Disconnect) => {
-                // Bug №272: handled one level up, in
+                // Bug №272 (canceled warnings registry): handled one level up, in
                 // `NetServer::handle_received_packet`, which removes the
                 // connection. It used to fall into `Some(_)` and log
                 // "Unhandled packet type" for every client that left cleanly —
@@ -640,10 +650,12 @@ impl Connection {
     }
 
     /// Record a reliable sequence number, keeping the queue within
-    /// `reliable_window` (bug §14). Dropped entries are unrecoverable anyway
-    /// (no retransmit layer exists yet) — this is pure GC.
+    /// `reliable_window` (bug №14). The queue is a bounded mirror of the
+    /// reliable send ledger (bug №215), so an aged-out entry is GC bookkeeping
+    /// here, not a lost packet.
     ///
-    /// Bug §272: this used to `warn!` on every dropped entry. At 200 bots the
+    /// Bug №786 (was cited as №272 under the canceled warnings registry):
+    /// this used to `warn!` on every dropped entry. At 200 bots the
     /// tick loop emitted 20127 of those lines in a 30 s run, and the log
     /// writing was itself a measurable share of the tick budget. The count is
     /// now exact and cheap; `log_pending_ack_summary` reports it in bulk.
@@ -662,7 +674,8 @@ impl Connection {
         }
     }
 
-    /// Bug №272: drops recorded since `since`, for callers that keep their own
+    /// Bug №786 (was cited as №272 under the canceled warnings registry):
+    /// drops recorded since `since`, for callers that keep their own
     /// high-water mark and do the reporting in bulk. Does not log — the
     /// per-occurrence log this replaced was itself costing more than the work
     /// it described (see `track_reliable`).
@@ -672,7 +685,19 @@ impl Connection {
             .saturating_sub(since)
     }
 
-    /// Bug №272: the first sequence that aged out, for a summary that says
+    /// Bug №786: the drops that happened since the last report, moving the
+    /// report mark. `pending_ack_drops_since(0)` handed the cumulative total
+    /// to a caller that re-read it every second, so after the first aged-out
+    /// entry the same total was re-warned once a second for the rest of the
+    /// session (228 lines for one acceptance client). This is the
+    /// high-water-mark half that API was built for.
+    pub fn pending_ack_drops_unreported(&self) -> u64 {
+        let now = self.pending_ack_drops.load(Ordering::Relaxed);
+        let mark = self.drop_report_mark.swap(now, Ordering::Relaxed);
+        now.saturating_sub(mark)
+    }
+
+    /// Bug №272 (canceled warnings registry): the first sequence that aged out, for a summary that says
     /// which window overflowed rather than only how often.
     pub fn first_pending_ack_drop(&self) -> Option<u32> {
         *self.first_pending_ack_drop.lock()
@@ -851,7 +876,7 @@ impl Connection {
 
         if serialized.len() <= max_payload_len(&self.config) {
             let seq = self.next_sequence();
-            // Bug №272: events go out UNRELIABLE, and enter no ledger.
+            // Bug №272 (canceled warnings registry): events go out UNRELIABLE, and enter no ledger.
             //
             // Making them reliable was possible once №215 wired the
             // retransmit layer — it would have bought nothing: events are
@@ -980,7 +1005,7 @@ impl Connection {
 
         if serialized.len() <= max_payload_len(&self.config) {
             let seq = self.next_sequence();
-            // Bug №272: unreliable, and NOT tracked — it was the one send path
+            // Bug №272 (canceled warnings registry): unreliable, and NOT tracked — it was the one send path
             // that declared `ReliableOrdered` without calling
             // `track_reliable`, so the channel promised a guarantee the
             // bookkeeping never recorded. That is the worst of both: no
@@ -1038,12 +1063,12 @@ impl Connection {
             // packet's channel, and register the reliable sequences so the
             // peer's queue can be garbage-collected.
             //
-            // Bug №215: `Event` and `InputAck` left this list — №272 made
+            // Bug №215: `Event` and `InputAck` left this list — №272 (canceled warnings registry) made
             // them unreliable on the small-packet path, and this mapping
             // quietly resurrected the oversized ones into the reliable
             // bucket. With the retransmit ledger live that is no longer a
             // bookkeeping nicety: every dropped chunk of every event would
-            // be re-sent, exactly the churn №272 removed.
+            // be re-sent, exactly the churn №272 (canceled warnings registry) removed.
             let channel = match packet_type {
                 PacketType::Command
                 | PacketType::CommandAck
@@ -1893,7 +1918,7 @@ mod sack_tests {
         let conn = test_connection();
 
         // Events (small and fragmenting — lent to CompartmentSealed, the
-        // smallest packet variant) go out UNRELIABLE since №272; the retransmit
+        // smallest packet variant) go out UNRELIABLE since №272 (canceled warnings registry); the retransmit
         // ledger must never resurrect them.
         //
         // NLLINE-CHECK-TEMP: with the Event/InputAck exclusion removed from
@@ -2112,6 +2137,64 @@ mod quiet_client_traffic_tests {
         assert!(
             warned.is_empty(),
             "no WARN may attach to an ordinary ResyncRequest: {warned:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_ack_report_tests {
+    //! Bug №786: the once-a-second sweep must report NEW pending-ack drops,
+    //! not re-announce the cumulative total. The old read
+    //! (`pending_ack_drops_since(0)`) repeated the same total every second for
+    //! the rest of the session once any entry had aged out — 228 lines for one
+    //! acceptance client.
+
+    use super::*;
+
+    fn test_connection() -> Connection {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        Connection::new(1, addr, ConnectionConfig::default())
+    }
+
+    /// `track_reliable` is the only writer of the drop counter; overflowing
+    /// the window cap (32) is how a drop happens in production.
+    fn age_out(conn: &Connection, count: u32) {
+        for i in 0..count {
+            conn.track_reliable(1000 + i);
+        }
+    }
+
+    #[test]
+    fn each_report_carries_only_the_drops_since_the_last_one() {
+        let conn = test_connection();
+        assert_eq!(
+            conn.pending_ack_drops_unreported(),
+            0,
+            "a fresh connection has nothing to report"
+        );
+
+        age_out(&conn, MAX_RELIABLE_WINDOW + 8);
+        assert_eq!(
+            conn.pending_ack_drops_unreported(),
+            8,
+            "the first report must carry exactly the aged-out entries"
+        );
+        assert_eq!(
+            conn.pending_ack_drops_unreported(),
+            0,
+            "the second report must not re-announce what the first carried"
+        );
+
+        age_out(&conn, 2);
+        assert_eq!(
+            conn.pending_ack_drops_unreported(),
+            2,
+            "only the fresh drops ride the next report"
+        );
+        assert_eq!(
+            conn.pending_ack_drops_since(0),
+            10,
+            "the cumulative counter keeps its own meaning for other readers"
         );
     }
 }

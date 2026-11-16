@@ -482,6 +482,13 @@ async fn main() -> Result<()> {
     let tick_period = Duration::from_millis(TICK_DURATION_MS);
 
     let mut players: HashMap<u32, PlayerMeta> = HashMap::new();
+    // Bug №783: the two throttle trackers for the flap hunt. `published_throttle`
+    // watches the value the interest grid is handed (what ship_data.throttle on
+    // the wire is built from); `input_reject` watches the accepted→rejected
+    // transitions a client cannot see (its ack counter counts refusals too).
+    // Both log on CHANGE only, so a steady fleet stays silent.
+    let mut published_throttle: HashMap<EntityId, f32> = HashMap::new();
+    let mut input_reject: HashMap<u32, bool> = HashMap::new();
     // Bug №630: shots that wait for their turret. Match-scoped state next to
     // the players map — the same kind of plumbing the projectile id counter is.
     let mut deferred_shots: Vec<DeferredShot> = Vec::new();
@@ -913,6 +920,17 @@ async fn main() -> Result<()> {
                         }
                         None => false,
                     };
+                    if input_reject.get(&connection_id).copied() != Some(accepted) {
+                        input_reject.insert(connection_id, accepted);
+                        if !accepted {
+                            info!(
+                                "input rejected: connection {connection_id} has no resolvable \
+                                 target (input tick {}); the ack still flows, so the client's \
+                                 counter cannot see this",
+                                input.tick
+                            );
+                        }
+                    }
                     net.send_input_ack(
                         connection_id,
                         InputAckPacket {
@@ -1042,6 +1060,20 @@ async fn main() -> Result<()> {
                 continue;
             };
             let state = ship.get_state();
+            // Bug №783: publish tracker — change-only (see the declaration by
+            // the players map). The reading here is exactly what the wire's
+            // ship_data.throttle is built from, so a flap the client sees must
+            // appear here first, or nowhere.
+            let previous = published_throttle.insert(entry.id, state.throttle);
+            if previous.map_or(true, |p| (p - state.throttle).abs() > f32::EPSILON) {
+                info!(
+                    "throttle published: ship {:?} {:?} -> {:+.3} (tick {})",
+                    entry.id.0,
+                    previous,
+                    state.throttle,
+                    result.tick.0
+                );
+            }
             let ship_entity = entry.tracked.ship_entity(&state);
             for compartment in ship_entity.compartments.iter() {
                 interest.update_compartment(compartment.clone());

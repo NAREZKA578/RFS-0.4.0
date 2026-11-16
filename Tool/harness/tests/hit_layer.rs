@@ -33,6 +33,9 @@ fn ship_with_hit(hit: Option<HitMark>) -> ShipEntity {
         heading: 0.0,
         rudder_angle: 0.0,
         throttle: 0.0,
+        // The fixed default every producer starts from (the field's own doc
+        // comment); a class-supplied hull replaces it on spawn.
+        half_size: Vec3f::new(50.0, 30.0, 150.0),
         compartments: vec![],
         stations: vec![],
         team: 0,

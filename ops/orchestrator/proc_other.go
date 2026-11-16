@@ -25,3 +25,13 @@ func processAlive(pid int) bool {
 	}
 	return p.Signal(syscall.Signal(0)) == nil
 }
+
+// processStartTimeMatches reports whether the process behind pid was created
+// close to startedAt. There is no portable way to read the creation time
+// here, so the PID-reuse check degrades to the alive check only
+// (Bug №775 is closed properly on Windows; elsewhere it stays best-effort).
+func processStartTimeMatches(pid int, startedAt time.Time) bool {
+	_ = pid
+	_ = startedAt
+	return true
+}

@@ -584,6 +584,77 @@ func startProfile(sup *supervisor.Supervisor, store *supervisor.Store, name stri
 	return sup.Start(name, &p)
 }
 
+// startDetached launches a stored profile (creating "default" from the
+// global flags on first use, like startProfile) as an independent detached
+// process that outlives this program.
+func startDetached(sup *supervisor.Supervisor, store *supervisor.Store, name string, opts options) (supervisor.PIDInfo, error) {
+	if info, err := sup.ReadPID(name); err == nil {
+		return info, fmt.Errorf("profile %q is already running (pid %d)", name, info.PID)
+	}
+
+	p, err := store.Load(name)
+	if err != nil {
+		if opts.serverBin == "" {
+			return supervisor.PIDInfo{}, fmt.Errorf("profile %q not found and no server binary configured (--server)", name)
+		}
+		p = supervisor.DefaultProfile(name, opts.serverBin)
+		p.Config = opts.configFile
+		p.AutoRestart = opts.autoRestart
+		if opts.maxRestarts > 0 {
+			p.MaxRestarts = opts.maxRestarts
+		}
+		if opts.restartDelay > 0 {
+			p.RestartDelay = opts.restartDelay
+		}
+	}
+
+	if err := prepareProfile(&p); err != nil {
+		return supervisor.PIDInfo{}, err
+	}
+	if err := store.Save(p); err != nil {
+		return supervisor.PIDInfo{}, fmt.Errorf("saving profile: %w", err)
+	}
+	return sup.StartDetached(name, &p, "")
+}
+
+// stopProfile stops a profile whether this process manages it or it was
+// started detached by a previous run.
+func stopProfile(sup *supervisor.Supervisor, store *supervisor.Store, name string) error {
+	if sup.IsRunning(name) {
+		return sup.Stop(name)
+	}
+	if _, err := sup.ReadPID(name); err != nil {
+		return fmt.Errorf("profile %q is not running", name)
+	}
+	p, err := store.Load(name)
+	if err != nil {
+		return fmt.Errorf("profile %q not found: %w", name, err)
+	}
+	return sup.StopDetached(&p, 30*time.Second)
+}
+
+// killProfile kills the profile's process whether managed or detached.
+func killProfile(sup *supervisor.Supervisor, name string) error {
+	if sup.IsRunning(name) {
+		return sup.Kill(name)
+	}
+	return sup.KillDetached(name)
+}
+
+// fatal prints an error and exits nonzero.
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	os.Exit(1)
+}
+
+// uptimeOrDash formats an uptime, or "-" when there is none.
+func uptimeOrDash(d time.Duration) string {
+	if d <= 0 {
+		return "-"
+	}
+	return d.Round(time.Second).String()
+}
+
 // runDashboard wires the supervisor to the interactive dashboard.
 func runDashboard(sup *supervisor.Supervisor, store *supervisor.Store, opts options) error {
 	ui := supervisor.NewUI()

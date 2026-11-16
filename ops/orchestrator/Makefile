@@ -1,6 +1,7 @@
 # Makefile for the RFS server supervisor (надзиратель).
 #
-# Requires Go 1.22+. No external dependencies.
+# Requires Go 1.22+. The dependencies (tview, tcell, golang.org/x/sys) are
+# fetched by go build from the module cache.
 #
 # Usage:
 #   make build      Build the rfs-orchestrator binary
@@ -10,7 +11,6 @@
 #   make run        Build and run with --server <path> start default
 
 BINARY := rfs-orchestrator
-SRC    := ./...
 
 .PHONY: build test vet clean run help
 
@@ -23,7 +23,7 @@ help:
 	@echo "  make run     Build and start a profile (requires --server)"
 
 build:
-	@go build -o $(BINARY) .
+	@go build -o $(BINARY) ./cmd
 
 test:
 	@go test -v ./...

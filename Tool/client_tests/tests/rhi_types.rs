@@ -218,7 +218,12 @@ fn shader_stage_ops() {
     assert!(both.contains(ShaderStage::VERTEX));
     assert!(both.contains(ShaderStage::FRAGMENT));
     assert!(!both.contains(ShaderStage::COMPUTE));
-    assert_eq!(both, ShaderStage::ALL_GRAPHICS);
+    // `ALL_GRAPHICS` is the whole raster family (vertex, fragment, geometry,
+    // tessellation, mesh/task), so two stages are a subset of it rather than
+    // equal to it. The old equality predates the mesh-stage bits.
+    assert_eq!(both, ShaderStage::VERTEX | ShaderStage::FRAGMENT);
+    assert!(ShaderStage::ALL_GRAPHICS.contains(both));
+    assert!(!ShaderStage::ALL_GRAPHICS.contains(ShaderStage::COMPUTE));
 }
 
 #[test]

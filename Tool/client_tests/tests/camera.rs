@@ -150,7 +150,10 @@ fn camera_controller_defaults() {
     assert_eq!(controller.move_speed, 5.0);
     assert_eq!(controller.rotate_speed, 1.5);
     assert_eq!(controller.zoom_speed, 1.0);
-    assert_eq!(controller.mouse_sensitivity, 0.1);
+    // 0.0012 rad per raw mouse count is about 5 inches per full turn on a
+    // 1000 DPI mouse. The old 0.003 was tuned for pixel deltas, which are not
+    // what `DeviceEvent::MouseMotion` reports.
+    assert_eq!(controller.mouse_sensitivity, 0.0012);
     assert!(!controller.invert_y);
     assert!(controller.enabled);
 }
@@ -258,6 +261,6 @@ fn camera_controller_mouse_input() {
     let forward_before = controller.camera().forward();
     controller.handle_mouse(20.0, 0.0);
     // yaw -= dx * sensitivity => yaw becomes negative.
-    assert!((controller.yaw - (-20.0 * 0.1)).abs() < 0.001);
+    assert!((controller.yaw - (-20.0 * 0.0012)).abs() < 0.001);
     assert!((controller.camera().forward() - forward_before).length() > 0.01);
 }

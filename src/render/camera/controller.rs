@@ -1,8 +1,11 @@
 //! Camera Controller
 //!
-//! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
+//! **CLIENT-SIDE; THE MOVEMENT SNAPSHOT IS WHAT THE SERVER SIMULATES**
 //!
-//! Handles camera movement and control.
+//! Handles camera movement and control. The controller itself never touches
+//! the wire: the game loop reads [`CameraController::movement`] every frame
+//! and feeds it to the net bridge's input packet, so the ship moves on the
+//! server the way the camera moves here.
 
 use super::camera::{Camera, CameraMode, OrthographicCamera, PerspectiveCamera};
 use glam::{Quat, Vec3};
@@ -21,7 +24,7 @@ pub struct CameraController {
     /// Current rotation (for FPS-style control)
     pub yaw: f32,
     pub pitch: f32,
-    /// Mouse sensitivity
+    /// Mouse sensitivity, in radians per raw mouse count (not per pixel)
     pub mouse_sensitivity: f32,
     /// Invert Y axis
     pub invert_y: bool,
@@ -61,7 +64,10 @@ impl CameraController {
             zoom_speed: 1.0,
             yaw: 0.0,
             pitch: 0.0,
-            mouse_sensitivity: 0.1,
+            // Raw counts, not cursor pixels: 0.0012 rad/count is roughly
+            // 5 inches per full turn on a 1000 DPI mouse. The old 0.003 was
+            // tuned for pixel deltas and spins far too fast for raw input.
+            mouse_sensitivity: 0.0012,
             invert_y: false,
             movement: CameraMovement::default(),
             enabled: true,
@@ -109,6 +115,15 @@ impl CameraController {
     /// Get mutable camera
     pub fn camera_mut(&mut self) -> &mut Box<dyn Camera> {
         &mut self.camera
+    }
+
+    /// A snapshot of the held movement keys.
+    ///
+    /// The server input packet has to mirror what the player sees the camera
+    /// do — the same flags this controller integrates — so the loop reads
+    /// them here instead of tracking a second, drifting set.
+    pub fn movement(&self) -> CameraMovement {
+        self.movement.clone()
     }
 
     /// Update the camera based on input and time

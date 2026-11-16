@@ -1255,6 +1255,28 @@ impl UiRenderer {
         self.atlas.is_some()
     }
 
+    /// Creates the R8 coverage texture an atlas lives in. Shared by every
+    /// font installer: glyph coverage is single-channel, the fragment shader
+    /// samples it as alpha, and `R8` keeps three quarters of the bytes from
+    /// being replicated colour.
+    fn create_atlas_texture(&self, pixels: &[u8], width: u32, height: u32) -> UiResult<Arc<crate::resource::Texture>> {
+        let texture = self
+            .device
+            .create_texture(
+                width,
+                height,
+                1,
+                crate::types::Format::R8_UNORM,
+                crate::types::TextureUsage::SAMPLED | crate::types::TextureUsage::TRANSFER_DST,
+                1,
+            )
+            .map_err(|e| UiError::BackendError(format!("UI atlas texture: {e}")))?;
+        self.device
+            .upload_texture(&texture, pixels)
+            .map_err(|e| UiError::BackendError(format!("UI atlas upload: {e}")))?;
+        Ok(Arc::new(texture))
+    }
+
     /// Rasterises `font`'s atlas to a texture and registers it, as `name`.
     ///
     /// Why this is one call: `register_font` and `set_atlas` are two halves of
@@ -1274,24 +1296,33 @@ impl UiRenderer {
     pub fn install_bitmap_font(&mut self, name: &str) -> UiResult<()> {
         let font = super::bitmap_font::UiBitmapFont::new();
         let (w, h) = (font.atlas_width(), font.atlas_height());
-
-        let texture = self
-            .device
-            .create_texture(
-                w,
-                h,
-                1,
-                crate::types::Format::R8_UNORM,
-                crate::types::TextureUsage::SAMPLED | crate::types::TextureUsage::TRANSFER_DST,
-                1,
-            )
-            .map_err(|e| UiError::BackendError(format!("UI atlas texture: {e}")))?;
-        self.device
-            .upload_texture(&texture, font.atlas_pixels())
-            .map_err(|e| UiError::BackendError(format!("UI atlas upload: {e}")))?;
-
+        let texture = self.create_atlas_texture(font.atlas_pixels(), w, h)?;
         self.register_font(name, Box::new(font));
-        self.set_atlas(Arc::new(texture), w, h);
+        self.set_atlas(texture, w, h);
+        Ok(())
+    }
+
+    /// The rasterised-font form of [`Self::install_bitmap_font`]: registers
+    /// `font` under `name` and uploads the atlas its glyph rectangles live
+    /// in — any `R8` coverage image the caller rasterised outside `rhi`.
+    ///
+    /// The uploaded image becomes THE one atlas the text path samples, so
+    /// every font registered against it must point its rectangles inside
+    /// this image. That is the composite-atlas arrangement: several faces,
+    /// one texture, and the draw path re-writes the descriptor set from
+    /// `self.atlas` every frame text is drawn, so a later swap is picked up
+    /// immediately.
+    pub fn install_font_atlas(
+        &mut self,
+        name: &str,
+        font: Box<dyn super::text::UiFont>,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) -> UiResult<()> {
+        let texture = self.create_atlas_texture(pixels, width, height)?;
+        self.register_font(name, font);
+        self.set_atlas(texture, width, height);
         Ok(())
     }
 

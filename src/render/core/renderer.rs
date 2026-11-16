@@ -88,16 +88,79 @@ struct Presentation {
     surface: crate::rhi::present::WindowSurface,
 }
 
+/// Pick the adapter the renderer should run on.
+///
+/// Enumeration order is whatever the driver happens to return, so taking the
+/// first device can land the game on the integrated GPU of a hybrid laptop
+/// even when a discrete card is present. Rank by device type first (discrete
+/// over integrated over virtual over CPU) and use the largest device-local
+/// heap as the tie-breaker. `preferred` is a case-insensitive substring of the
+/// adapter name, usually from `RFS_GPU`; when it matches, it wins outright so a
+/// machine with two discrete cards can choose between them.
+fn select_physical_device(
+    mut devices: Vec<crate::rhi::core::PhysicalDevice>,
+    preferred: Option<&str>,
+) -> RhiResult<crate::rhi::core::PhysicalDevice> {
+    if devices.is_empty() {
+        return Err(RhiError::NoPhysicalDevices);
+    }
+
+    for device in &devices {
+        println!(
+            "[render] GPU candidate: {} ({:?}, vendor {:04x}, device {:04x})",
+            device.name, device.device_type, device.vendor_id, device.device_id
+        );
+    }
+
+    if let Some(needle) = preferred.map(str::trim).filter(|name| !name.is_empty()) {
+        let needle = needle.to_lowercase();
+        if let Some(index) = devices
+            .iter()
+            .position(|device| device.name.to_lowercase().contains(&needle))
+        {
+            let selected = devices.swap_remove(index);
+            println!("[render] GPU selected by RFS_GPU preference: {}", selected.name);
+            return Ok(selected);
+        }
+        println!(
+            "[render] preferred GPU '{needle}' not found; falling back to the device ranking"
+        );
+    }
+
+    let rank = |device_type: crate::rhi::core::PhysicalDeviceType| match device_type {
+        crate::rhi::core::PhysicalDeviceType::Discrete => 3,
+        crate::rhi::core::PhysicalDeviceType::Integrated => 2,
+        crate::rhi::core::PhysicalDeviceType::Virtual => 1,
+        crate::rhi::core::PhysicalDeviceType::Cpu => 0,
+    };
+    let device_local_bytes = |device: &crate::rhi::core::PhysicalDevice| {
+        device
+            .memory_properties
+            .memory_heaps
+            .iter()
+            .filter(|heap| heap.flags.contains(crate::rhi::types::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|heap| heap.size)
+            .max()
+            .unwrap_or(0)
+    };
+
+    let selected = devices
+        .into_iter()
+        .max_by_key(|device| (rank(device.device_type), device_local_bytes(device)))
+        .ok_or(RhiError::NoPhysicalDevices)?;
+    println!("[render] GPU selected: {}", selected.name);
+    Ok(selected)
+}
+
 impl Renderer {
     /// Create a new renderer
     pub fn new(_window: *mut std::ffi::c_void, config: RhiConfig) -> RhiResult<Self> {
         // Create RHI device
         let backend = create_backend(&config)?;
-        let physical_device = backend
-            .enumerate_physical_devices()?
-            .into_iter()
-            .next()
-            .ok_or(RhiError::NoPhysicalDevices)?;
+        let physical_device = select_physical_device(
+            backend.enumerate_physical_devices()?,
+            config.preferred_gpu.as_deref(),
+        )?;
         // The particle pass's shader reads its system's storage buffer in the
         // VERTEX stage (one quad per particle, picked by
         // `@builtin(instance_index)`). Vulkan gates vertex-stage storage reads

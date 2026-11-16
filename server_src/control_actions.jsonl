@@ -1,0 +1,10 @@
+{"ts":"2026-11-16T16:55:15.252Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T16:55:15.265Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
+{"ts":"2026-11-16T17:00:31.209Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T17:00:31.222Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
+{"ts":"2026-11-16T17:06:03.515Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T17:06:03.540Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
+{"ts":"2026-11-16T17:09:45.628Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T17:09:45.665Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}
+{"ts":"2026-11-16T18:08:14.617Z","source":"door","command":"stop 0","outcome":"queued; the loop stops immediately"}
+{"ts":"2026-11-16T18:08:14.631Z","source":"loop","command":"stop 0","outcome":"stopping immediately (empty server or zero delay)"}

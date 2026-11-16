@@ -207,14 +207,13 @@ impl UIPass {
 
         match ui.initialize(format, width, height, UI_GEOM_SPV, Some(UI_TEX_SPV)) {
             Ok(()) => {
-                // A font and its atlas are one fact, and neither half was ever
-                // wired: with no atlas the textured pipeline cannot run, so every
-                // string was counted as skipped and nothing said why.
-                //
+                // Fonts: the placeholder plus the client's real faces (see
+                // `render::ui::fonts`) — both are one atlas fact, and
+                // neither half was ever wired until `install_bitmap_font`.
                 // Failure is reported once and is not fatal — geometry is
-                // independent of glyphs, and a renderer that cannot rasterise a
-                // font should still draw its panels.
-                if let Err(e) = ui.install_bitmap_font("bitmap8") {
+                // independent of glyphs, and a renderer that cannot
+                // rasterise a font should still draw its panels.
+                if let Err(e) = crate::render::ui::fonts::UiFonts::install(&mut ui) {
                     eprintln!("[ui] font install failed, text will be skipped: {e}");
                 }
                 // The image pipeline rides along with the font: both are the

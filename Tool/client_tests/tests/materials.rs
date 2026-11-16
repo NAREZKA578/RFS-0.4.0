@@ -169,6 +169,23 @@ fn water_material_presets_construct() {
 }
 
 #[test]
+fn water_wake_radius_defaults_to_the_showcase_fallback_and_clamps() {
+    // The showcase hull (a 3 m model) owns the collar by default: `0` is
+    // what the geometry pass reads as "use the showcase radius".
+    let water = WaterMaterial::ocean("wake default");
+    assert_eq!(water.wake_radius, 0.0);
+
+    // A server-scale hull sets its own collar, in world metres.
+    let mut water = WaterMaterial::ocean("wake set");
+    water.set_wake_radius(12.0);
+    assert_eq!(water.wake_radius, 12.0);
+
+    // A negative radius is refused, not propagated.
+    water.set_wake_radius(-3.0);
+    assert_eq!(water.wake_radius, 0.0);
+}
+
+#[test]
 fn material_library_crud() {
     let mut library = MaterialLibrary::new();
     assert_eq!(library.material_count(), 0);

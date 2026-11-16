@@ -60,10 +60,10 @@ pub struct ShipSnapshotData {
     pub heading: f32,
     pub rudder_angle: f32,
     pub throttle: f32,
-    /// Bug №272: the most recent hit this ship took, so the hit effect does
+    /// Bug №272 (canceled warnings registry): the most recent hit this ship took, so the hit effect does
     /// not depend on the `ShipHit` EVENT arriving.
     ///
-    /// This exists because variant A of bug №272 makes events unreliable, and
+    /// This exists because variant A of bug №272 (canceled warnings registry) makes events unreliable, and
     /// the impact normal plus the struck compartment were the ONLY parts of an
     /// event that no layer carried. Everything else an event reports — health,
     /// flooding, occupancy, projectile position — was already in a layer, so
@@ -1117,7 +1117,7 @@ impl From<&ShipStateData> for ShipSnapshotData {
             heading: s.heading,
             rudder_angle: s.rudder_angle,
             throttle: s.throttle,
-            // Bug §272: the wire type carries the hit, so it MUST survive the
+            // Bug №272 (canceled warnings registry): the wire type carries the hit, so it MUST survive the
             // conversion in both directions. Dropping it here broke the
             // `updated` path: `apply_state_update` rebuilds `ShipSnapshotData`
             // through this `From`, so a hit arriving in an update was silently

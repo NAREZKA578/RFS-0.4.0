@@ -14,31 +14,54 @@ import (
 	"time"
 )
 
+// controlReadTimeout bounds every read from the control port. The dial has
+// its own 2 second timeout, but without a read deadline a server that
+// accepts the connection and then never answers hung Stop, Status and
+// health checks forever (Bug №767).
+const controlReadTimeout = 5 * time.Second
+
 // Client is a connection to a server's control port.
 type Client struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	token  string
-	proto  uint32
+	conn    net.Conn
+	reader  *bufio.Reader
+	token   string
+	proto   uint32
+	timeout time.Duration // per-read deadline; zero means none (streaming)
 }
 
 // Dial connects to the control port and performs the token hello.
 func Dial(addr, token string, proto uint32) (*Client, error) {
+	return DialWithTimeout(addr, token, proto, controlReadTimeout)
+}
+
+// DialWithTimeout is Dial with an explicit per-read timeout. A non-positive
+// timeout removes the read deadline entirely (streaming use).
+func DialWithTimeout(addr, token string, proto uint32, timeout time.Duration) (*Client, error) {
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to control port %s: %w", addr, err)
 	}
 	c := &Client{
-		conn:   conn,
-		reader: bufio.NewReader(conn),
-		token:  token,
-		proto:  proto,
+		conn:    conn,
+		reader:  bufio.NewReader(conn),
+		token:   token,
+		proto:   proto,
+		timeout: timeout,
 	}
 	if err := c.hello(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("hello: %w", err)
 	}
 	return c, nil
+}
+
+// armRead bounds the next reads with the client's timeout.
+func (c *Client) armRead() {
+	if c.timeout > 0 {
+		_ = c.conn.SetReadDeadline(time.Now().Add(c.timeout))
+		return
+	}
+	_ = c.conn.SetReadDeadline(time.Time{})
 }
 
 // Close closes the connection.
@@ -52,6 +75,7 @@ func (c *Client) hello() error {
 	if _, err := c.conn.Write([]byte(req)); err != nil {
 		return err
 	}
+	c.armRead()
 	line, err := c.reader.ReadString('\n')
 	if err != nil {
 		return err
@@ -87,6 +111,7 @@ func (c *Client) Command(id uint64, cmd string, args map[string]interface{}) (ma
 	if _, err := c.conn.Write(data); err != nil {
 		return nil, err
 	}
+	c.armRead()
 	line, err := c.reader.ReadString('\n')
 	if err != nil {
 		return nil, err
@@ -99,6 +124,7 @@ func (c *Client) CommandRaw(line string) (string, error) {
 	if _, err := c.conn.Write([]byte(line + "\n")); err != nil {
 		return "", err
 	}
+	c.armRead()
 	resp, err := c.reader.ReadString('\n')
 	if err != nil {
 		return "", err
@@ -153,6 +179,10 @@ func (c *Client) Watch(id uint64, topics []string, handler func(map[string]inter
 	if _, err := c.Command(id, "watch", args); err != nil {
 		return err
 	}
+	// Streaming: events may be arbitrarily far apart, so the read deadline
+	// is dropped for the stream loop. A dead connection still ends the loop
+	// with a read error.
+	_ = c.conn.SetReadDeadline(time.Time{})
 	for {
 		line, err := c.reader.ReadString('\n')
 		if err != nil {
@@ -270,12 +300,17 @@ func parseEvent(line string) (map[string]interface{}, error) {
 
 // HealthCheck performs a lightweight health check: connects, sends hello,
 // sends `status`, and returns true if the server answers OK.
+//
+// Every read and write below is bounded by the same deadline: without it a
+// server that accepts the connection and goes silent hung the check
+// forever (Bug №767).
 func HealthCheck(addr, token string, proto uint32, timeout time.Duration) bool {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 	br := bufio.NewReader(conn)
 	hello := fmt.Sprintf(`{"hello":{"token":"%s","proto":%d}}`+"\n", token, proto)
 	if _, err := conn.Write([]byte(hello)); err != nil {
@@ -299,4 +334,9 @@ func HealthCheck(addr, token string, proto uint32, timeout time.Duration) bool {
 		return false
 	}
 	return resp.OK
+}
+
+// ClientHealthCheck is the panel-facing alias of HealthCheck.
+func ClientHealthCheck(addr, token string, proto uint32, timeout time.Duration) bool {
+	return HealthCheck(addr, token, proto, timeout)
 }

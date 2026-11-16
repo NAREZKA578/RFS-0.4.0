@@ -1,11 +1,14 @@
 //! # RFS Client Library
 //!
-//! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
+//! **CLIENT-SIDE, WITH ONE SERVER LINK**
 //!
-//! This library contains the client-side rendering system for the RFS naval combat game.
-//! It includes:
+//! This library contains the client-side systems for the RFS naval combat
+//! game. It includes:
 //! - RHI (Rendering Hardware Interface) - Low-level graphics API abstraction
 //! - Render Module - High-level rendering system built on RHI
+//! - Net Module - The bridge that connects the game loop to the dedicated
+//!   server (`crate::net`); the only place in this crate that speaks the
+//!   server protocol. Everything else stays client-side.
 //!
 //! ## Supported Graphics APIs
 //! - Vulkan 1.3 (Primary, cross-platform)
@@ -27,6 +30,14 @@ pub mod rhi;
 
 // Re-export Render module
 pub mod render;
+
+// The server link: a bridge between the game loop and `rfs_net`'s client.
+// The render thread never awaits; the net thread owns the reactor.
+pub mod net;
+
+// The server's world as the render loop sees it: the snapshot -> scene
+// mapping that makes connecting actually change what is on the screen.
+pub mod net_world;
 
 // Re-export common types from render for convenience
 pub use render::{

@@ -98,6 +98,19 @@ pub trait UiFont {
         0.0
     }
 
+    /// Whether the font's glyph *pixels* scale with the requested size.
+    ///
+    /// The metrics always scale — advances, kerning, line boxes, and the
+    /// placed pen positions. The ink is the font's own answer: the 8×8
+    /// placeholder draws its blocks at their natural texel size whatever
+    /// the metrics do (the spaced retro look every shipped menu shows),
+    /// while a rasterised face's ink must scale — otherwise a 16 px
+    /// request paints 48 px glyphs onto a 16 px pitch and the line
+    /// becomes a pile-up.
+    fn glyph_pixels_scale_with_size(&self) -> bool {
+        false
+    }
+
     /// Glyph substituted for `ch` when the font has none.
     ///
     /// Returning `None` means the character is dropped entirely.
@@ -376,6 +389,10 @@ fn place_line(
     let mut glyphs = Vec::with_capacity(text.chars().count());
     let mut pen = origin[0];
     let mut previous: Option<char> = None;
+    // Asked once: whether this font's ink scales with the request. The
+    // metrics below scale regardless; only the drawn pixel size follows
+    // the font's answer.
+    let scale_pixels = font.glyph_pixels_scale_with_size();
 
     for ch in text.chars() {
         let Some(glyph) = font.glyph(ch).or_else(|| font.fallback_glyph(ch)) else {
@@ -393,10 +410,15 @@ fn place_line(
         let x = pen + glyph.offset[0] * scale;
         let y = origin[1] + ascent - glyph.offset[1] * scale;
 
+        let mut drawn = glyph;
+        if scale_pixels {
+            drawn.size = [drawn.size[0] * scale, drawn.size[1] * scale];
+        }
+
         glyphs.push(UiPlacedGlyph {
             ch,
             position: [x, y],
-            glyph,
+            glyph: drawn,
         });
 
         pen += glyph.advance * scale;
@@ -855,6 +877,60 @@ mod tests {
         let with_fallback = UiTextLayout::layout("aЖ", &f, &style(), [0.0, 0.0]);
         assert_eq!(with_fallback.glyph_count(), 2, "the fallback was dropped");
         assert!(with_fallback.lines()[0].width >= 16.0);
+    }
+
+    #[test]
+    fn a_scaling_font_scales_its_drawn_pixels_but_not_its_atlas_rect() {
+        #[derive(Debug)]
+        struct Scaling;
+        impl UiFont for Scaling {
+            fn glyph(&self, _ch: char) -> Option<UiGlyph> {
+                Some(UiGlyph {
+                    atlas_rect: [0.0, 0.0, 8.0, 8.0],
+                    offset: [0.0, 0.0],
+                    size: [8.0, 8.0],
+                    advance: 8.0,
+                })
+            }
+            fn natural_size(&self) -> f32 {
+                16.0
+            }
+            fn ascent(&self) -> f32 {
+                12.0
+            }
+            fn descent(&self) -> f32 {
+                4.0
+            }
+            fn glyph_pixels_scale_with_size(&self) -> bool {
+                true
+            }
+        }
+
+        let s = UiTextStyle { size: 32.0, ..style() };
+        let layout = UiTextLayout::layout("ab", &Scaling, &s, [0.0, 0.0]);
+        let glyphs: Vec<_> = layout.glyphs().collect();
+        // The metrics double (advance 8 -> 16), and the drawn ink doubles
+        // with them — otherwise a small request paints natural-size glyphs
+        // onto a small pitch and the line piles up.
+        assert_eq!(glyphs[0].glyph.size, [16.0, 16.0]);
+        assert_eq!(glyphs[1].position[0], 16.0);
+        // The atlas rectangle is texels, not screen pixels: it stays put.
+        assert_eq!(glyphs[0].glyph.atlas_rect, [0.0, 0.0, 8.0, 8.0]);
+    }
+
+    #[test]
+    fn a_non_scaling_font_keeps_its_drawn_pixels_at_natural_size() {
+        // UiBlockFont opts out by default: whatever the metrics do, its
+        // blocks are drawn at their natural texel size — the retro look
+        // the shipped menus show, which a layout fix must not disturb.
+        let f = font();
+        let s = UiTextStyle { size: 32.0, ..style() };
+        let layout = UiTextLayout::layout("ab", &f, &s, [0.0, 0.0]);
+        let glyphs: Vec<_> = layout.glyphs().collect();
+        // The drawn block stays at its natural texel size...
+        assert_eq!(glyphs[0].glyph.size[0], f.advance * 0.75);
+        // ...while the metrics above it still scale.
+        assert_eq!(glyphs[1].position[0], 16.0);
     }
 
     #[test]

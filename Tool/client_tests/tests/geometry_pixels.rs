@@ -28,7 +28,9 @@ const EXTENT: u32 = 256;
 const SHADER: &[u8] = include_bytes!("../assets/shaders/geometry.spv");
 
 /// The colour the pass clears to, in the same order `ClearValue::color` takes.
-const CLEAR: [f32; 3] = [0.05, 0.06, 0.08];
+/// Mirrors `CLEAR_COLOR` in `render/passes/geometry.rs` — the horizon haze the
+/// water fades into and `sky.wgsl`'s `HORIZON`; the three move together.
+const CLEAR: [f32; 3] = [0.34, 0.40, 0.46];
 
 fn open_device() -> Arc<rhi::Device> {
     // Validation on, not `RhiConfig::default()` (which is `validation: false`).

@@ -1207,7 +1207,26 @@ impl NetClient {
                     }
                     Err(e) => {
                         if *running.lock() {
-                            error!("Receive error: {}", e);
+                            // Windows UDP: a send to a port nobody answers
+                            // makes the NEXT recv_from return the ICMP
+                            // verdict instead of a datagram — WSAECONNRESET
+                            // (10054, port unreachable), WSAENETRESET (10052,
+                            // net unreachable), WSAETIMEDOUT (10060, TTL
+                            // exceeded) and WSAEHOSTUNREACH (10065) surface
+                            // the same way. Linux says ECONNREFUSED (111).
+                            // For the client the same class is the echo of a
+                            // server that died between our send and its
+                            // reply — the disconnect path reports that through
+                            // its own events (timeout, session reject), so a
+                            // flood of ERROR lines here would say nothing the
+                            // events do not. Bug №785.
+                            match e.raw_os_error() {
+                                Some(10054) | Some(10052) | Some(10060)
+                                | Some(10065) | Some(111) => {
+                                    debug!("Receive error (peer unreachable): {}", e);
+                                }
+                                _ => error!("Receive error: {}", e),
+                            }
                         }
                     }
                 }

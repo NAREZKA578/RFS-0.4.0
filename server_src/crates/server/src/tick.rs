@@ -12,7 +12,7 @@ use rfs_ship::ship::Ship;
 use rfs_ship::station::FireResult;
 use rfs_sim::ballistics::{BallisticsCalculator, ProjectileConfig, TrajectoryPoint};
 use rfs_sim::tick::{GameEvent as SimGameEvent, Projectile, TickSystem};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::match_::{current_helm_occupant, new_projectile_id};
 use crate::net::handle_station_interaction;
@@ -33,7 +33,19 @@ pub fn apply_input(sim: &TickSystem, ship: &Ship, player_id: EntityId, input: &I
     // ship is un-manned). This replaces "last packet of the tick wins".
     let helm = current_helm_occupant(ship);
     if helm.is_none() || helm == Some(player_id) {
-        ship.set_throttle(clamp_axis(input.move_forward));
+        // Bug №783: the flap hunt needs the wire value to name its writer.
+        // Change-only: a steady helm is silent, every flip is one line with
+        // the previous value, the new one and the input's own tick.
+        let applied = clamp_axis(input.move_forward);
+        let previous = ship.throttle();
+        if (previous - applied).abs() > f32::EPSILON {
+            info!(
+                "helm write: player {:?} input tick {} throttle {previous:+.3} -> {applied:+.3}",
+                player_id.0,
+                input.tick
+            );
+        }
+        ship.set_throttle(applied);
         let rudder = (clamp_axis(input.move_right) + clamp_axis(input.yaw) * 0.5).clamp(-1.0, 1.0);
         ship.set_rudder(rudder);
     }

@@ -565,7 +565,7 @@ mod tests {
             rudder_angle: 0.0,
             throttle: 0.0,
             half_size: Vec3f::new(50.0, 30.0, 150.0),
-            // Bug №272: layer-0 hit mark; irrelevant to interest filtering.
+            // Bug №272 (canceled warnings registry): layer-0 hit mark; irrelevant to interest filtering.
             last_hit: None,
             compartments: Vec::new(),
             stations: Vec::new(),

@@ -2,6 +2,7 @@
 //!
 //! **CLIENT-SIDE ONLY - NOT CONNECTED TO SERVER CODE**
 
+pub mod fonts;
 pub mod hud;
 pub mod menu;
 pub mod minimap;

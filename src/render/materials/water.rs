@@ -52,6 +52,13 @@ pub struct WaterMaterial {
     pub fresnel_bias: f32,
     /// Fresnel power
     pub fresnel_power: f32,
+    /// The radius of the wake collar the water shader draws around the hull's
+    /// waterline point (`focus_position`). The showcase hull is a 3 m model,
+    /// so its collar is 2.6 m; a hull drawn at server scale (a ~100 m
+    /// frigate) needs a collar measured in metres of beam, set by whoever
+    /// knows the hull it is drawing. `0` is treated as the showcase default
+    /// by the geometry pass.
+    pub wake_radius: f32,
 }
 
 impl WaterMaterial {
@@ -82,7 +89,13 @@ impl WaterMaterial {
             fresnel_factor: 0.02,
             fresnel_bias: 0.1,
             fresnel_power: 5.0,
+            wake_radius: 0.0,
         }
+    }
+
+    /// Set the wake collar's radius in world metres (see the field's doc).
+    pub fn set_wake_radius(&mut self, radius: f32) {
+        self.wake_radius = radius.max(0.0);
     }
 
     /// Set water color
@@ -313,15 +326,18 @@ impl WaterMaterial {
     /// Create ocean water material
     pub fn ocean(name: &str) -> Self {
         let mut material = Self::new(name);
-        material.set_color([0.0, 0.05, 0.2, 0.8]);
-        material.set_deep_color([0.0, 0.02, 0.15, 0.8]);
-        material.set_shallow_color([0.0, 0.15, 0.35, 0.7]);
+        // Linear values: the surface is lit by the water shader, which mixes
+        // these with Fresnel sky reflection, sun glitter and crest foam.
+        material.set_color([0.008, 0.05, 0.10, 1.0]);
+        material.set_deep_color([0.005, 0.034, 0.086, 1.0]);
+        material.set_shallow_color([0.016, 0.118, 0.166, 1.0]);
         material.set_depth(1000.0);
         material.set_clarity(0.8);
         material.set_wave_speed(0.3);
         material.set_wave_scale(0.05);
         material.set_wave_height(0.5);
-        material.set_fresnel(0.02, 0.1, 5.0);
+        material.set_foam_intensity(0.90);
+        material.set_fresnel(0.02, 0.02, 5.0);
         material
     }
 

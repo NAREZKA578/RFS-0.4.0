@@ -1,5 +1,6 @@
 # Build script for the RFS server supervisor (Windows PowerShell).
-# Requires Go 1.22+. No external dependencies.
+# Requires Go 1.22+. Dependencies (tview, tcell, golang.org/x/sys) are
+# fetched by go build from the module cache.
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -7,7 +8,7 @@ Set-Location $scriptDir
 
 function Build {
     Write-Host "Building rfs-orchestrator..." -ForegroundColor Cyan
-    go build -o rfs-orchestrator.exe .
+    go build -o rfs-orchestrator.exe ./cmd
     Write-Host "Build complete: rfs-orchestrator.exe" -ForegroundColor Green
 }
 

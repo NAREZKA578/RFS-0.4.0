@@ -29,15 +29,21 @@ processes. Part of the server management interface per
 
 ```
 ops/orchestrator/
-├── go.mod              # Go module (no external deps — builds with plain go)
-├── main.go             # CLI entry point (all commands)
-├── supervisor.go       # Process management, auto-restart, health-check,
-│                       # control-port client, metrics
+├── go.mod              # Go module (dependencies: tview, tcell, x/sys)
+├── cmd/main.go         # CLI entry point (all commands) and dashboard wiring
+├── supervisor.go       # Process management, auto-restart, health monitoring,
+│                       # instance lifecycle
 ├── client.go           # Control-port protocol client (token hello + JSON commands,
 │                       # per-command helpers: Status, Perf, Net, Players, ...)
 ├── profile.go          # Profile store (JSON profiles on disk, DefaultProfile)
-├── metrics.go          # OS-specific process memory/CPU reading
-├── ui.go               # Terminal UI (tables, status, metrics, health, boxes)
+├── profile_runtime.go  # Detached profiles: PID files, start/stop/kill by
+│                       # control port, log tailing
+├── metrics.go          # OS-specific process memory/CPU reading (Linux stubs)
+├── metrics_windows.go  # Process memory/CPU reading on Windows
+├── proc_windows.go     # Detached process creation and PID liveness on Windows
+├── ui.go               # Interactive tview dashboard
+├── ui_text.go          # Plain-text output helpers for the CLI (tables, status,
+│                       # metrics, health, boxes, usage)
 ├── Makefile            # Build and test targets
 ├── build.ps1           # Windows PowerShell build script
 ├── README.md           # This file
@@ -45,16 +51,19 @@ ops/orchestrator/
 │                       # ClientHealthCheck
 ├── client_test.go      # Tests: hello, command, wrong token, unknown command
 ├── profile_test.go     # Tests: save/load/list/delete/exists/DefaultProfile
-└── ui_test.go          # Tests: profile table, status, metrics, health, box
+├── ui_test.go          # Tests: profile table, status, metrics, health, box
+└── fixes_test.go       # Regression tests for the supervisor fix batch
+                        # (Bugs №764-780)
 ```
 
 ## Building and running
 
-Requires Go 1.22+. No external dependencies.
+Requires Go 1.22+. Dependencies (tview, tcell, golang.org/x/sys) are fetched
+by go build from the module cache.
 
 ```bash
 cd ops/orchestrator
-go build -o rfs-orchestrator .
+go build -o rfs-orchestrator ./cmd
 go test ./...
 
 # Basic usage

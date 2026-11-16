@@ -5,6 +5,17 @@
 use glam::{Vec2, Vec3};
 use std::time::Duration;
 
+/// How far a Gerstner wave pushes water sideways, in units of its effective
+/// amplitude. A pure sine is `0`; `1.8` gives the narrow crests and broad
+/// troughs of a real swell. The per-wave horizontal steepness is capped below
+/// one so the surface cannot fold over itself at the maximum height setting.
+pub const GERSTNER_CHOPPINESS: f32 = 1.8;
+
+/// Per-wave cap on `choppiness * k * amplitude`, the factor that controls how
+/// much a crest is compressed. Four waves each capped at 0.22 keep the sum
+/// under one, which is the fold-over limit.
+const MAX_HORIZONTAL_STEEPNESS: f32 = 0.22;
+
 /// Wave method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[derive(Default)]
@@ -65,10 +76,45 @@ impl WaveSystem {
                 waves.push(Wave::new(0.6, 0.7, 0.2, Vec3::new(0.0, 0.0, 1.0)));
             }
             WaveMethod::Gerstner => {
-                waves.push(Wave::new(1.0, 0.5, 0.1, Vec3::new(1.0, 0.0, 0.0)));
-                waves.push(Wave::new(0.8, 0.6, 0.15, Vec3::new(0.5, 0.0, 0.5)));
-                waves.push(Wave::new(0.6, 0.7, 0.2, Vec3::new(0.0, 0.0, 1.0)));
-                waves.push(Wave::new(0.4, 0.8, 0.25, Vec3::new(-0.5, 0.0, 0.5)));
+                // A sea is a spectrum, not four equal ripples. The old set put
+                // every wave at 8-13 m with nearly the same amplitude, so the
+                // surface read as one repeating chop. These follow deep-water
+                // dispersion (`speed = sqrt(g * k)`) and split the energy over
+                // a long swell and three shorter seas:
+                //
+                //   k = 0.052 -> 120 m, 8.8 s period, the dominant swell
+                //   k = 0.097 ->  65 m, 6.5 s
+                //   k = 0.165 ->  38 m, 4.9 s
+                //   k = 0.262 ->  24 m, 3.9 s
+                //
+                // Directions fan out by roughly 0-75 degrees, so the crests
+                // cross instead of running as parallel ridges. The shorter
+                // waves are what make the sea read as water rather than as a
+                // slowly breathing plane: at 24 m the 224-segment grid still
+                // has nine samples per wavelength.
+                //
+                // The steepness values are deliberately above the old uniform
+                // 0.65. Effective height is `A * steepness^2`, so this is the
+                // knob that turns a gentle swell into a sea with sharp crests;
+                // the per-wave horizontal displacement is capped separately in
+                // `get_horizontal_displacement`, which keeps the mesh from
+                // folding over.
+                waves.push(
+                    Wave::new(4.00, 0.0524, 0.717, Vec3::new(1.0, 0.0, 0.0))
+                        .with_steepness(0.80),
+                );
+                waves.push(
+                    Wave::new(2.60, 0.0967, 0.974, Vec3::new(0.88, 0.0, 0.48))
+                        .with_steepness(0.84),
+                );
+                waves.push(
+                    Wave::new(1.70, 0.1653, 1.274, Vec3::new(0.94, 0.0, -0.34))
+                        .with_steepness(0.86),
+                );
+                waves.push(
+                    Wave::new(1.05, 0.2618, 1.603, Vec3::new(0.38, 0.0, 0.925))
+                        .with_steepness(0.90),
+                );
             }
             _ => {}
         }
@@ -121,6 +167,52 @@ impl WaveSystem {
                 .sum(),
         };
         base * self.height_scale
+    }
+
+    /// The first four waves packed for the water shader's per-fragment normal.
+    ///
+    /// Each entry is `(direction.x, direction.z, frequency, amplitude)` and
+    /// `amplitude` already includes the method's shaping and the current
+    /// [`Self::height_scale`], so evaluating
+    ///
+    /// ```text
+    /// theta = dot(direction, position.xz) * frequency + time * speed
+    /// height = amplitude * sin(theta)
+    /// ```
+    ///
+    /// in the shader reproduces exactly what [`Self::get_height`] samples on
+    /// the CPU. `speeds` is separate because four more floats do not fit in the
+    /// same four vec4s. Missing waves are zeroed, and `Flat`/`FFT` return an
+    /// all-zero field — a flat sea.
+    ///
+    /// Four is the shader's limit. The drawn ocean has four waves; a scene that
+    /// adds more keeps the correct mesh silhouette but gets its normals from
+    /// the first four.
+    pub fn shader_waves(&self) -> ([[f32; 4]; 4], [f32; 4]) {
+        let mut packed = [[0.0; 4]; 4];
+        let mut speeds = [0.0; 4];
+
+        if matches!(self.config.method, WaveMethod::Flat | WaveMethod::FFT) {
+            return (packed, speeds);
+        }
+
+        for (slot, wave) in self.waves.iter().take(4).enumerate() {
+            let amplitude = match self.config.method {
+                WaveMethod::Gerstner => wave.amplitude * wave.steepness.powi(2),
+                WaveMethod::Simple => wave.amplitude,
+                WaveMethod::Flat | WaveMethod::FFT => 0.0,
+            } * self.height_scale;
+
+            packed[slot] = [
+                wave.direction.x,
+                wave.direction.z,
+                wave.frequency,
+                amplitude,
+            ];
+            speeds[slot] = wave.speed;
+        }
+
+        (packed, speeds)
     }
 
     pub fn update(&mut self, delta_time: Duration) {
@@ -191,24 +283,69 @@ impl WaveSystem {
         height
     }
 
+    /// Horizontal displacement of the surface point whose undisplaced grid
+    /// position is `position`.
+    ///
+    /// A height field alone describes a wavy plane. A Gerstner wave also moves
+    /// water sideways: `offset = -Q * A * direction * cos(theta)`. That
+    /// compression sharpens crests and broadens troughs, and it is why the
+    /// mesh stores the source XZ for the fragment shader: the displaced vertex
+    /// no longer maps one-to-one to the wave phase.
+    pub fn get_horizontal_displacement(&self, position: Vec3) -> Vec2 {
+        if !matches!(self.config.method, WaveMethod::Gerstner) {
+            return Vec2::ZERO;
+        }
+
+        let mut offset = Vec2::ZERO;
+        for wave in &self.waves {
+            let dir = Vec2::new(wave.direction.x, wave.direction.z);
+            let pos = Vec2::new(position.x, position.z);
+            let theta = dir.dot(pos) * wave.frequency + self.time * wave.speed;
+            let amplitude = wave.amplitude * wave.steepness.powi(2) * self.height_scale;
+            let displacement = (amplitude * GERSTNER_CHOPPINESS)
+                .min(MAX_HORIZONTAL_STEEPNESS / wave.frequency.max(1e-4));
+            offset -= dir * (displacement * theta.cos());
+        }
+        offset
+    }
+
     fn get_gerstner_normal(&self, position: Vec3) -> Vec3 {
-        let mut normal = Vec3::new(0.0, 1.0, 0.0);
+        // The normal of the *displaced* surface, not of the height field.
+        // With horizontal displacement the parameter tangents are no longer
+        // (1,0,0) and (0,0,1): a crest is compressed sideways, so the cross
+        // product of the true tangents is the only correct normal.
+        let mut tangent_x = Vec3::X;
+        let mut tangent_z = Vec3::Z;
 
         for wave in &self.waves {
             let dir = Vec2::new(wave.direction.x, wave.direction.z);
             let pos = Vec2::new(position.x, position.z);
             let theta = dir.dot(pos) * wave.frequency + self.time * wave.speed;
-            let c = theta.cos();
             let s = theta.sin();
-            let qa = wave.amplitude * wave.steepness * self.height_scale;
+            let c = theta.cos();
+            let k = wave.frequency;
+            let amplitude = wave.amplitude * wave.steepness.powi(2) * self.height_scale;
+            let qa = (amplitude * GERSTNER_CHOPPINESS)
+                .min(MAX_HORIZONTAL_STEEPNESS / k.max(1e-4));
+            let dx = dir.x;
+            let dz = dir.y;
 
-            let kx = wave.direction.x * wave.frequency * qa * c;
-            let kz = wave.direction.z * wave.frequency * qa * c;
-            let ky = wave.frequency * qa * s;
-
-            normal += Vec3::new(-kx, ky, -kz);
+            // dP/dx0 and dP/dz0 for
+            //   P = (x0 - qa*dx*cos(theta), A*sin(theta),
+            //        z0 - qa*dz*cos(theta)).
+            tangent_x += Vec3::new(
+                -qa * dx * dx * k * s,
+                amplitude * k * dx * c,
+                -qa * dx * dz * k * s,
+            );
+            tangent_z += Vec3::new(
+                -qa * dx * dz * k * s,
+                amplitude * k * dz * c,
+                -qa * dz * dz * k * s,
+            );
         }
 
+        let normal = tangent_z.cross(tangent_x);
         // A flat sea has a zero gradient; `normalize` would answer NaN and the
         // NaN would reach the vertex buffer. This is not hypothetical — the
         // settings slider can set the scale to exactly zero.
@@ -261,8 +398,16 @@ impl Wave {
             frequency,
             speed,
             direction: direction.normalize(),
-            steepness: 0.5,
+            steepness: 0.65,
         }
+    }
+
+    /// Set how sharply this component compresses its crests. `1.0` is the
+    /// fold-over limit for a single wave; the system caps the horizontal
+    /// displacement below that even at the maximum height slider.
+    pub fn with_steepness(mut self, steepness: f32) -> Self {
+        self.steepness = steepness.clamp(0.0, 1.0);
+        self
     }
 
     pub fn update(&mut self, _delta_time: Duration) {
@@ -293,6 +438,60 @@ mod tests {
         assert!((waves.get_height(point) - height * 2.0).abs() < 1e-5);
         assert!((waves.max_height() - max_height * 2.0).abs() < 1e-5);
         assert!(normal.is_finite() && normal.y > 0.0);
+    }
+
+    #[test]
+    fn the_shader_waves_reproduce_the_cpu_normal() {
+        let mut waves = WaveSystem::new(WaveMethod::Gerstner);
+        waves.update(Duration::from_secs_f32(1.0));
+        let point = Vec3::new(3.0, 0.0, 7.0);
+        let start = waves.time;
+
+        let (packed, speeds) = waves.shader_waves();
+        let mut tangent_x = Vec3::X;
+        let mut tangent_z = Vec3::Z;
+        for (wave, speed) in packed.iter().zip(speeds.iter()) {
+            let theta = (wave[0] * point.x + wave[1] * point.z) * wave[2] + start * speed;
+            let s = theta.sin();
+            let c = theta.cos();
+            let k = wave[2];
+            let amplitude = wave[3];
+            let qa = (amplitude * GERSTNER_CHOPPINESS)
+                .min(MAX_HORIZONTAL_STEEPNESS / k.max(1e-4));
+            let dx = wave[0];
+            let dz = wave[1];
+            tangent_x += Vec3::new(
+                -qa * dx * dx * k * s,
+                amplitude * k * dx * c,
+                -qa * dx * dz * k * s,
+            );
+            tangent_z += Vec3::new(
+                -qa * dx * dz * k * s,
+                amplitude * k * dz * c,
+                -qa * dz * dz * k * s,
+            );
+        }
+        let shader_normal = tangent_z.cross(tangent_x).normalize();
+
+        let cpu_normal = waves.get_normal(point);
+        assert!(
+            (shader_normal - cpu_normal).length() < 1e-5,
+            "shader normal {shader_normal:?} != CPU normal {cpu_normal:?}"
+        );
+    }
+
+    #[test]
+    fn the_horizontal_displacement_cannot_fold_the_surface() {
+        let mut waves = WaveSystem::new(WaveMethod::Gerstner);
+        // The steepest legal slider value: the sum of the per-wave horizontal
+        // steepness must stay below one or the mesh turns inside out.
+        waves.set_height_scale(8.0);
+        for x in [-40.0, -7.0, 0.0, 3.0, 19.0] {
+            for z in [-31.0, -2.0, 0.0, 11.0, 47.0] {
+                let normal = waves.get_normal(Vec3::new(x, 0.0, z));
+                assert!(normal.is_finite() && normal.y > 0.0);
+            }
+        }
     }
 
     #[test]

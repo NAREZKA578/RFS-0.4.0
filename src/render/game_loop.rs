@@ -25,7 +25,8 @@ use super::camera::controller::CameraKey;
 use super::camera::{Camera, CameraController, PerspectiveCamera};
 use super::meshes::loader::MeshLoader;
 use super::meshes::Mesh;
-use super::scene::components::{CameraComponent, MeshComponent};
+use super::materials::WaterMaterial;
+use super::scene::components::{CameraComponent, MaterialComponent, MeshComponent};
 use super::scene::entity::Entity;
 use super::scene::{Scene, Transform};
 use super::water::ocean::{Ocean, OceanMesh};
@@ -119,8 +120,17 @@ pub struct SceneRig {
     pub ship_base_position: Vec3,
     /// The ship's authored rotation, before the water tilts it.
     pub ship_base_rotation: Quat,
+    /// The ship's authored scale (the model fit). The server world hides the
+    /// showcase ship by collapsing its scale and restores this when the
+    /// connection ends — buoyancy owns position and rotation, so scale is
+    /// the one axis the takeover touches.
+    pub ship_base_scale: f32,
     /// The entity id of the ocean plane, when the water was built.
     pub water_id: Option<usize>,
+    /// The hull mesh the showcase ship draws, for the server world's hull
+    /// slots to share. `None` when the model did not load (the cube fallback
+    /// is the showcase ship's mesh then, and the server hulls draw that).
+    pub ship_mesh: Option<Arc<Mesh>>,
     /// The wave field and its drawable mesh. `None` only when the GPU buffers
     /// could not be created; the rest of the scene still draws.
     pub ocean: Option<OceanMesh>,
@@ -187,6 +197,9 @@ pub fn build_scene(device: &Arc<crate::rhi::Device>, model_path: Option<&Path>) 
         fit.center, fit.scale
     ));
     let mesh = Arc::new(mesh);
+    // The showcase ship's mesh is also what the server world's hull slots
+    // draw (see `net_world`): one hull model, two consumers, one `Arc`.
+    let ship_mesh = Some(mesh.clone());
 
     let mut scene = Scene::new("main loop");
 
@@ -217,6 +230,13 @@ pub fn build_scene(device: &Arc<crate::rhi::Device>, model_path: Option<&Path>) 
             let mut water = Entity::new("ocean");
             water.add_component(Transform::new());
             water.add_component(MeshComponent::new(mesh));
+            // This component is how the geometry pass recognises the surface
+            // and chooses the water pipeline for it. `WaterMaterial::ocean`
+            // also carries the deep/shallow colours the shader reads.
+            let water_material = WaterMaterial::ocean("ocean");
+            water.add_component(
+                MaterialComponent::new(water_material.base.clone()).with_water(water_material),
+            );
             let id = scene.add_entity(water);
             (Some(ocean), Some(id))
         }
@@ -249,7 +269,9 @@ pub fn build_scene(device: &Arc<crate::rhi::Device>, model_path: Option<&Path>) 
         ship_id: Some(ship_id),
         ship_base_position,
         ship_base_rotation,
+        ship_base_scale: fit.scale,
         water_id,
+        ship_mesh,
         ocean,
         used_model_path,
         notes,

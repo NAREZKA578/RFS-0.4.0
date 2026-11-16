@@ -5,6 +5,7 @@ package supervisor
 import (
 	"os/exec"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -38,4 +39,27 @@ func processAlive(pid int) bool {
 		return false
 	}
 	return event == uint32(windows.WAIT_TIMEOUT)
+}
+
+// processStartTimeMatches reports whether the process behind pid was created
+// close to startedAt. PID reuse hands an old record a live but unrelated
+// process; the creation time is what tells them apart (Bug №775).
+// startedAt is recorded just after the process was created, so the creation
+// time is at or slightly before it; the comparison allows a small skew.
+func processStartTimeMatches(pid int, startedAt time.Time) bool {
+	if pid <= 0 || startedAt.IsZero() {
+		return false
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var creation, exit, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &creation, &exit, &kernel, &user); err != nil {
+		return false
+	}
+	created := time.Unix(0, creation.Nanoseconds())
+	diff := created.Sub(startedAt)
+	return diff >= -2*time.Second && diff <= 2*time.Second
 }

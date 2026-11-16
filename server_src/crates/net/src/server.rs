@@ -1155,7 +1155,29 @@ impl NetServer {
                     }
                     Err(e) => {
                         if *running.lock() {
-                            error!("Receive error: {}", e);
+                            // Windows UDP: a send to a port nobody answers
+                            // makes the NEXT recv_from return the ICMP
+                            // verdict instead of a datagram — WSAECONNRESET
+                            // (10054, port unreachable), WSAENETRESET (10052,
+                            // net unreachable), WSAETIMEDOUT (10060, TTL
+                            // exceeded) and WSAEHOSTUNREACH (10065) surface
+                            // the same way. Linux says ECONNREFUSED (111).
+                            // This is the everyday echo of a peer that died
+                            // between our send and its reply — a killed
+                            // client, a closed NAT mapping — not a server
+                            // fault: one acceptance session logged 4088 of
+                            // these at ERROR for a single client stopped
+                            // mid-run. They go to the debug channel
+                            // (observable when asked for, silent at the
+                            // shipped INFO level); every other error keeps
+                            // its level. Bug №785.
+                            match e.raw_os_error() {
+                                Some(10054) | Some(10052) | Some(10060)
+                                | Some(10065) | Some(111) => {
+                                    debug!("Receive error (peer unreachable): {}", e);
+                                }
+                                _ => error!("Receive error: {}", e),
+                            }
                         }
                     }
                 }
@@ -2112,16 +2134,29 @@ impl NetServer {
                 .map(|(id, conn)| (*id, conn.addr))
                 .collect()
         };
-        // Bug №272: this sweep runs once a second, so it is also where the
-        // per-connection reliable-window overflow gets reported — in bulk,
-        // once per connection, instead of once per dropped entry. See
-        // `Connection::log_pending_ack_summary` for why that moved.
+        // Bug №786 (this pass was introduced under the canceled warnings
+        // registry, which called it №272 — .DOC/BUGS.md's №272 is an unrelated
+        // render defect): this sweep runs once a second, so it is also where
+        // the per-connection reliable-window overflow gets reported — in bulk,
+        // once per connection, instead of once per dropped entry.
+        //
+        // Bug №786, the two fixes on top of that shape: (1) the pass used to
+        // read the CUMULATIVE counter with `since = 0`, so after the first
+        // aged-out entry the same total was re-warned every second for the
+        // rest of the session — 228 lines for one acceptance client; the
+        // per-connection report mark makes each second's line carry only NEW
+        // drops. (2) the message claimed "no retransmit layer exists, so these
+        // were never recoverable" — stale since №215 (2026-10-20): the
+        // reliable send ledger retransmits lost packets independently of this
+        // bounded mirror queue (bug №14), which is GC bookkeeping, not the
+        // delivery truth. A non-zero delta repeated every second is now the
+        // signal the line is for: the peer's acks have stopped arriving.
         {
             let conns = connections.read();
             let mut dropped_total = 0u64;
             let mut worst: Option<(u32, u64)> = None;
             for (id, conn) in conns.iter() {
-                let drops = conn.pending_ack_drops_since(0);
+                let drops = conn.pending_ack_drops_unreported();
                 if drops > 0 {
                     dropped_total += drops;
                     if worst.is_none_or(|(_, d)| drops > d) {
@@ -2131,9 +2166,9 @@ impl NetServer {
             }
             if let Some((id, _)) = worst {
                 warn!(
-                    "reliable windows: {dropped_total} unacked entries aged out across {} \
-                     connections (worst: conn {id}); no retransmit layer exists, so these \
-                     were never recoverable — see bug №272",
+                    "reliable windows: {dropped_total} pending-ack entries aged out in the \
+                     last second across {} connections (worst: conn {id}); the reliable \
+                     send ledger retransmits independently of this mirror (bugs №14, №215)",
                     conns.len(),
                 );
             }
@@ -3008,7 +3043,7 @@ impl NetServer {
     /// Connected state (a connection still handshaking gets nothing), the
     /// interest rule, and the same enqueue path, so the announcement and any
     /// `Disconnect` leave this socket in enqueue order. The delivery itself
-    /// rides the unreliable event channel (bug №272: notifications, not
+    /// rides the unreliable event channel (bug №272 — canceled warnings registry: notifications, not
     /// state), so "the player read why" is best effort — the reason also
     /// lives in the journal where it cannot be lost.
     ///

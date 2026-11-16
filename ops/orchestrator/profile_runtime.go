@@ -45,7 +45,9 @@ func (s *Supervisor) writePID(name string, info PIDInfo) error {
 }
 
 // ReadPID returns the recorded process for a profile and verifies that it is
-// still alive. A stale PID file is removed.
+// still alive AND that it is the process the record was written for: a live
+// PID alone can be an unrelated process that reused the number
+// (Bug №775). A stale or mismatched PID file is removed.
 func (s *Supervisor) ReadPID(name string) (PIDInfo, error) {
 	data, err := os.ReadFile(s.PIDFile(name))
 	if err != nil {
@@ -61,6 +63,12 @@ func (s *Supervisor) ReadPID(name string) (PIDInfo, error) {
 	if !processAlive(info.PID) {
 		_ = os.Remove(s.PIDFile(name))
 		return PIDInfo{}, fmt.Errorf("process %d is not running", info.PID)
+	}
+	// Records written before the StartedAt field existed carry no timestamp;
+	// for them only the alive check is possible.
+	if !info.StartedAt.IsZero() && !processStartTimeMatches(info.PID, info.StartedAt) {
+		_ = os.Remove(s.PIDFile(name))
+		return PIDInfo{}, fmt.Errorf("process %d is running but was not started by this record (PID reuse?)", info.PID)
 	}
 	return info, nil
 }
@@ -148,7 +156,11 @@ func (s *Supervisor) KillDetached(name string) error {
 }
 
 // StopDetached asks a running profile to stop through its control port and
-// waits (up to timeout) for the process to exit.
+// waits (up to timeout) for the process to exit. If the process is still
+// running when the timeout expires, that is reported as an error and the
+// PID file is left in place: the old behaviour removed the file and
+// returned nil, which reported a still-running server as stopped and made
+// it unreachable for KillDetached (Bug №771).
 func (s *Supervisor) StopDetached(p *Profile, timeout time.Duration) error {
 	if _, err := CommandOnProfile(p, "stop", []string{"0"}); err != nil {
 		return err
@@ -156,13 +168,17 @@ func (s *Supervisor) StopDetached(p *Profile, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if _, err := s.ReadPID(p.Name); err != nil {
+			// The process is gone; the PID file it leaves behind is stale.
 			_ = os.Remove(s.PIDFile(p.Name))
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	_ = os.Remove(s.PIDFile(p.Name))
-	return nil
+	pid := 0
+	if info, err := s.ReadPID(p.Name); err == nil {
+		pid = info.PID
+	}
+	return fmt.Errorf("profile %q did not stop within %s (pid %d still running); it was NOT stopped", p.Name, timeout, pid)
 }
 
 // QueryControlStatus asks a running server for its `status` answer.

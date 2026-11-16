@@ -21,7 +21,10 @@ use std::collections::HashMap;
 use crate::render::core::RenderContext;
 use crate::render::graph::node::{PassDependency, PassOutcome, RenderPass};
 use crate::render::graph::resource::GraphResource;
+use crate::render::materials::WaterMaterial;
+use crate::render::scene::components::MaterialComponent;
 use crate::render::scene::Scene;
+use crate::render::water::waves::{WaveSystem, GERSTNER_CHOPPINESS};
 use crate::rhi::command::commands::Command;
 use crate::rhi::command::pass::render::RenderPassBeginInfo;
 use crate::rhi::{
@@ -146,9 +149,75 @@ pub struct GeometryPassState {
     // stale-size mistake impossible to reintroduce.
 }
 
-/// Uniform block layout, matching `geometry.wgsl`:
-/// `mat4 mvp` + `vec4 light_dir` + `vec4 light_color` + `vec4 ambient` = 112 bytes.
-const UNIFORM_SIZE: u64 = 16 * 4 * 4;
+/// Uniform block layout.
+///
+/// The first 112 bytes are exactly what `geometry.wgsl` declares:
+/// `mat4 mvp` + `vec4 light_dir` + `vec4 light_color` + `vec4 ambient`.
+/// `water_surface.wgsl` declares the same prefix and then the water-only
+/// fields, which is why one buffer layout serves both pipelines:
+///
+/// ```text
+///   0  mat4  mvp
+///  64  vec4  light_dir        (view space)
+///  80  vec4  light_color
+///  96  vec4  ambient
+/// 112  mat4  model
+/// 176  vec4  camera_position
+/// 192  vec4  sun_direction    (world space, towards the sun)
+/// 208  vec4  water_params     (time, clarity, foam, reserved)
+/// 224  vec4  fog_color        (rgb, density)
+/// 240  vec4  sky_color        (rgb, reflection strength)
+/// 256  vec4  deep_color
+/// 272  vec4  shallow_color
+/// 288  vec4  water_extra      (fresnel bias, spec exponent, ripple, reserved)
+/// 304  vec4  wave0            (direction.x, direction.z, frequency, amplitude)
+/// 320  vec4  wave1
+/// 336  vec4  wave2
+/// 352  vec4  wave3
+/// 368  vec4  wave_speeds      (phase speed of each wave)
+/// 384  vec4  sky_right        (camera right xyz, aspect)
+/// 400  vec4  sky_up           (camera up xyz, tan(half fov))
+/// 416  vec4  sky_forward      (camera forward xyz, reserved)
+/// 432  vec4  focus_position   (ship xyz, wake radius)
+/// 448  vec4  effect_params    (wake strength, spray, wave envelope, reserved)
+/// ```
+///
+/// The four wave entries and their speeds let the fragment shader evaluate the
+/// same sine field the CPU grid sampled, so its normal varies smoothly inside a
+/// triangle instead of being interpolated between three coarse grid vertices.
+/// The camera basis turns the fullscreen sky triangle into a view-dependent
+/// skybox, and the focus position lets the water shader draw the hull's wake.
+const UNIFORM_SIZE: u64 = 32 * 16;
+
+/// The colours used when a water item has no `WaterMaterial` attached. They
+/// match [`WaterMaterial::ocean`], so a scene that forgets the component still
+/// gets the intended sea rather than a second, hidden palette.
+const DEFAULT_WATER_DEEP: [f32; 4] = [0.005, 0.034, 0.086, 1.0];
+const DEFAULT_WATER_SHALLOW: [f32; 4] = [0.016, 0.118, 0.166, 1.0];
+
+/// What the pass clears to. The water shader fades into the same colour at the
+/// horizon, so this constant is the one place the sky/sea boundary is decided.
+///
+/// The value is the horizon *haze*: on this overcast-bright sky the sea must
+/// fade into a light grey-blue that matches the sky's own horizon band
+/// (`HORIZON` in `sky.wgsl` — the seam rule requires the two to move together).
+/// The old near-black navy made the sea darken with distance instead of
+/// brightening into the haze, which is what gave the horizon its hard, painted
+/// dark strip between the lit clouds and the water.
+const CLEAR_COLOR: [f32; 3] = [0.34, 0.40, 0.46];
+/// How quickly the sea fades into [`CLEAR_COLOR`] with distance.
+const WATER_FOG_DENSITY: f32 = 0.0075;
+/// The zenith colour reflected by the water surface at grazing angles. This is
+/// the sky's own zenith (`ZENITH` in `sky.wgsl`): the reflected sky is mixed
+/// with the haze by the same altitude curve the sky renders with, so the two
+/// gradients agree by construction.
+const WATER_SKY_COLOR: [f32; 3] = [0.10, 0.17, 0.28];
+/// How much of the sky reflection is mixed in by the Fresnel term.
+const WATER_REFLECTION_STRENGTH: f32 = 0.82;
+/// Direction towards the sun in world space. Lower than a noon sun on purpose:
+/// the glitter path then lands inside a level camera's view instead of below
+/// the bottom edge. Not normalised here because `const fn` cannot do it.
+const WORLD_SUN: [f32; 3] = [0.34, 0.30, 1.0];
 
 /// Shared handle to the pass state.
 ///
@@ -203,6 +272,17 @@ impl GeometryPassState {
 
 pub struct GeometryPass {
     state: Option<SharedState>,
+    /// A second pipeline for entities carrying a `MaterialComponent` whose
+    /// `WaterMaterial` is set.
+    ///
+    /// It shares the vertex layout, the render pass and the uniform layout
+    /// with `state.pipeline`; only the shader differs. Keeping it on the pass
+    /// rather than in `GeometryPassState` leaves the state's public struct
+    /// literal (used by tests and examples) unchanged.
+    water_pipeline: Option<GraphicsPipeline>,
+    /// A fullscreen gradient drawn before the items. Depth test is off, so it
+    /// only fills the pixels no item covers: the sky.
+    sky_pipeline: Option<GraphicsPipeline>,
     name: String,
     dependencies: Vec<PassDependency>,
     outputs: Vec<String>,
@@ -326,6 +406,8 @@ impl GeometryPass {
     pub fn new() -> Self {
         Self {
             state: None,
+            water_pipeline: None,
+            sky_pipeline: None,
             name: "geometry".to_string(),
             dependencies: Vec::new(),
             outputs: vec!["swapchain".to_string()],
@@ -342,6 +424,8 @@ impl GeometryPass {
         let shared: SharedState = std::sync::Arc::new(std::sync::Mutex::new(state));
         let pass = Self {
             state: Some(shared.clone()),
+            water_pipeline: None,
+            sky_pipeline: None,
             name: "geometry".to_string(),
             dependencies: Vec::new(),
             outputs: vec!["swapchain".to_string()],
@@ -398,6 +482,96 @@ impl GeometryPass {
         render_pass: crate::rhi::RenderPass,
         spirv: &[u8],
     ) -> crate::rhi::error::RhiResult<(Self, SharedState)> {
+        let (uniform_buffers, descriptor_layout, descriptor_sets) =
+            build_uniforms(device, items.len())?;
+        let pipeline =
+            Self::build_pipeline(device, &render_pass, &descriptor_layout, spirv, "geometry")?;
+
+        Ok(Self::with_state(GeometryPassState::with_resources(
+            pipeline,
+            descriptor_layout,
+            descriptor_sets,
+            uniform_buffers,
+            render_pass,
+            items,
+        )))
+    }
+
+    /// As `create`, but also builds the water pipeline from `water_spirv`.
+    ///
+    /// The two pipelines share the vertex input, the render pass and the
+    /// uniform layout. Only the shader differs: the ordinary geometry shader
+    /// half-Lambert-shades everything, which turns a broad ocean into a sheet
+    /// of uniform cyan, while the water shader adds Fresnel reflection,
+    /// procedural ripple normals, sun glitter, crest foam and distance fog.
+    pub fn create_with_water_pipeline(
+        device: &crate::rhi::Device,
+        items: Vec<GeometryItem>,
+        color_format: Format,
+        spirv: &[u8],
+        water_spirv: &[u8],
+        sky_spirv: &[u8],
+    ) -> crate::rhi::error::RhiResult<(Self, SharedState)> {
+        let render_pass =
+            device.presentation_render_pass_with_depth(color_format, Self::DEPTH_FORMAT)?;
+        Self::create_with_render_pass_water_and_sky(
+            device,
+            items,
+            render_pass,
+            spirv,
+            water_spirv,
+            sky_spirv,
+        )
+    }
+
+    /// As [`Self::create_with_water_pipeline`], with a caller-supplied render
+    /// pass. Also installs the fullscreen sky gradient, which is drawn before
+    /// the items with depth testing off.
+    pub fn create_with_render_pass_water_and_sky(
+        device: &crate::rhi::Device,
+        items: Vec<GeometryItem>,
+        render_pass: crate::rhi::RenderPass,
+        spirv: &[u8],
+        water_spirv: &[u8],
+        sky_spirv: &[u8],
+    ) -> crate::rhi::error::RhiResult<(Self, SharedState)> {
+        let (uniform_buffers, descriptor_layout, descriptor_sets) =
+            build_uniforms(device, items.len())?;
+        let pipeline =
+            Self::build_pipeline(device, &render_pass, &descriptor_layout, spirv, "geometry")?;
+        let water_pipeline = Self::build_pipeline(
+            device,
+            &render_pass,
+            &descriptor_layout,
+            water_spirv,
+            "water_surface",
+        )?;
+        let sky_pipeline = Self::build_sky_pipeline(device, &render_pass, &descriptor_layout, sky_spirv)?;
+
+        let (mut pass, state) = Self::with_state(GeometryPassState::with_resources(
+            pipeline,
+            descriptor_layout,
+            descriptor_sets,
+            uniform_buffers,
+            render_pass,
+            items,
+        ));
+        pass.water_pipeline = Some(water_pipeline);
+        pass.sky_pipeline = Some(sky_pipeline);
+        Ok((pass, state))
+    }
+
+    /// The sky has no vertex buffer and no depth state: a fullscreen triangle
+    /// whose fragment shader rebuilds a view ray from the camera basis packed
+    /// into the shared uniform block. Because that basis lives in the same
+    /// buffer as the items, the sky pipeline reuses the geometry descriptor
+    /// layout rather than owning a second set of buffers.
+    fn build_sky_pipeline(
+        device: &crate::rhi::Device,
+        render_pass: &crate::rhi::RenderPass,
+        descriptor_layout: &DescriptorSetLayout,
+        spirv: &[u8],
+    ) -> crate::rhi::error::RhiResult<GraphicsPipeline> {
         use crate::rhi::error::RhiError;
         use crate::rhi::pipeline::graphics::PrimitiveTopology;
         use crate::rhi::{
@@ -406,17 +580,124 @@ impl GeometryPass {
             RasterizerState, ShaderFormat, ShaderModuleDesc,
         };
 
+        let module = device
+            .create_shader_module(&ShaderModuleDesc {
+                code: spirv.to_vec(),
+                format: ShaderFormat::SpirV,
+                entry_point: Some("vs_main".into()),
+                name: Some("sky".into()),
+            })
+            .map_err(|e| RhiError::BackendError(format!("the sky shader module: {e}")))?;
+
+        let desc = GraphicsPipelineDesc {
+            shader_stages: vec![
+                PipelineShaderStage {
+                    stage: ShaderStage::VERTEX,
+                    module: module.clone(),
+                    entry_point: "vs_main".into(),
+                },
+                PipelineShaderStage {
+                    stage: ShaderStage::FRAGMENT,
+                    module,
+                    entry_point: "fs_main".into(),
+                },
+            ],
+            vertex_input_state: None,
+            input_assembly_state: InputAssemblyState {
+                topology: PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            rasterizer_state: Some(RasterizerState::double_sided()),
+            multisample_state: MultisampleState {
+                sample_count: crate::rhi::SampleCount::X1,
+                ..Default::default()
+            },
+            color_blend_state: Some(ColorBlendState {
+                attachments: vec![ColorBlendAttachment {
+                    color_write_mask: ColorComponentFlags::R
+                        | ColorComponentFlags::G
+                        | ColorComponentFlags::B
+                        | ColorComponentFlags::A,
+                    ..ColorTargetDesc::default()
+                }],
+                ..Default::default()
+            }),
+            // No depth test and no depth write: the sky must cover the cleared
+            // colour, and every item drawn afterwards must cover the sky.
+            depth_stencil_state: None,
+            ..Default::default()
+        };
+
+        let pipeline = device.create_gpu_graphics_pipeline(&desc, render_pass, &[descriptor_layout])?;
+        if !pipeline.has_gpu_backing() {
+            return Err(RhiError::BackendError(
+                "the sky graphics pipeline was not created on the device".into(),
+            ));
+        }
+        Ok(pipeline)
+    }
+
+    /// As [`Self::create_with_water_pipeline`], with a caller-supplied render
+    /// pass (needed by offscreen tests).
+    pub fn create_with_render_pass_and_water(
+        device: &crate::rhi::Device,
+        items: Vec<GeometryItem>,
+        render_pass: crate::rhi::RenderPass,
+        spirv: &[u8],
+        water_spirv: &[u8],
+    ) -> crate::rhi::error::RhiResult<(Self, SharedState)> {
         let (uniform_buffers, descriptor_layout, descriptor_sets) =
             build_uniforms(device, items.len())?;
+        let pipeline =
+            Self::build_pipeline(device, &render_pass, &descriptor_layout, spirv, "geometry")?;
+        let water_pipeline = Self::build_pipeline(
+            device,
+            &render_pass,
+            &descriptor_layout,
+            water_spirv,
+            "water_surface",
+        )?;
+
+        let (mut pass, state) = Self::with_state(GeometryPassState::with_resources(
+            pipeline,
+            descriptor_layout,
+            descriptor_sets,
+            uniform_buffers,
+            render_pass,
+            items,
+        ));
+        pass.water_pipeline = Some(water_pipeline);
+        Ok((pass, state))
+    }
+
+    /// Build one graphics pipeline against a render pass and uniform layout.
+    ///
+    /// Both pipelines are deliberately identical apart from the shader module:
+    /// a vertex layout or blend state that differed between them would make an
+    /// item change appearance merely by being marked as water.
+    fn build_pipeline(
+        device: &crate::rhi::Device,
+        render_pass: &crate::rhi::RenderPass,
+        descriptor_layout: &DescriptorSetLayout,
+        spirv: &[u8],
+        name: &str,
+    ) -> crate::rhi::error::RhiResult<GraphicsPipeline> {
+        use crate::rhi::error::RhiError;
+        use crate::rhi::pipeline::graphics::PrimitiveTopology;
+        use crate::rhi::{
+            ColorBlendAttachment, ColorBlendState, ColorComponentFlags, ColorTargetDesc,
+            GraphicsPipelineDesc, InputAssemblyState, MultisampleState, PipelineShaderStage,
+            RasterizerState, ShaderFormat, ShaderModuleDesc,
+        };
 
         let module = device
             .create_shader_module(&ShaderModuleDesc {
                 code: spirv.to_vec(),
                 format: ShaderFormat::SpirV,
                 entry_point: Some("vs_main".into()),
-                name: Some("geometry".into()),
+                name: Some(name.into()),
             })
-            .map_err(|e| RhiError::BackendError(format!("the geometry shader module: {e}")))?;
+            .map_err(|e| RhiError::BackendError(format!("the {name} shader module: {e}")))?;
 
         let mut desc = GraphicsPipelineDesc {
             shader_stages: vec![
@@ -457,25 +738,16 @@ impl GeometryPass {
         };
         // Depth test and write only when the render pass actually has a depth
         // attachment; the two must agree or the pipeline is invalid.
-        desc.depth_stencil_state = Self::render_pass_has_depth(&render_pass)
+        desc.depth_stencil_state = Self::render_pass_has_depth(render_pass)
             .then(crate::rhi::DepthStencilState::enabled);
 
-        let pipeline =
-            device.create_gpu_graphics_pipeline(&desc, &render_pass, &[&descriptor_layout])?;
+        let pipeline = device.create_gpu_graphics_pipeline(&desc, render_pass, &[descriptor_layout])?;
         if !pipeline.has_gpu_backing() {
-            return Err(RhiError::BackendError(
-                "the geometry graphics pipeline was not created on the device".into(),
-            ));
+            return Err(RhiError::BackendError(format!(
+                "the {name} graphics pipeline was not created on the device"
+            )));
         }
-
-        Ok(Self::with_state(GeometryPassState::with_resources(
-            pipeline,
-            descriptor_layout,
-            descriptor_sets,
-            uniform_buffers,
-            render_pass,
-            items,
-        )))
+        Ok(pipeline)
     }
 
     /// Whether a render pass declares a depth attachment.
@@ -748,6 +1020,10 @@ impl GeometryPass {
     /// Returns whether the GPU now holds this frame's uniforms. A failure on
     /// one item fails the whole frame: a partial update leaves some items
     /// drawn with the previous frame's matrix.
+    ///
+    /// Water animation time is zero here. The main loop calls
+    /// [`Self::update_uniforms_with_water`] so the ripples move; callers that
+    /// do not draw water do not need to know that the field exists.
     #[must_use]
     pub fn update_uniforms(
         state: &SharedState,
@@ -755,12 +1031,101 @@ impl GeometryPass {
         view: Mat4,
         projection: Mat4,
     ) -> bool {
+        Self::update_uniforms_with_water(state, device, view, projection, 0.0, None, None, None)
+    }
+
+    /// As [`Self::update_uniforms`], with the water animation clock, the
+    /// scene's water material and the wave field the surface was built from.
+    ///
+    /// `water` is optional because a scene can contain no water at all: the
+    /// defaults then match [`WaterMaterial::ocean`], and the water shader (if
+    /// the pass has one) still produces a usable sea.
+    ///
+    /// `waves` is optional for the same reason. When it is present the water
+    /// shader receives the four Gerstner waves and computes the surface normal
+    /// per fragment; without it the water still draws, but the normal is the
+    /// one interpolated from the mesh vertices.
+    ///
+    /// `focus` is the world-space point the water should churn around — the
+    /// ship's hull at the waterline. It drives the foam ring and the radial
+    /// wake ripples; `None` leaves undisturbed open sea.
+    #[must_use]
+    pub fn update_uniforms_with_water(
+        state: &SharedState,
+        device: &crate::rhi::Device,
+        view: Mat4,
+        projection: Mat4,
+        water_time: f32,
+        water: Option<&WaterMaterial>,
+        waves: Option<&WaveSystem>,
+        focus: Option<Vec3>,
+    ) -> bool {
         let Ok(state) = state.lock() else {
             return false;
         };
 
-        // A directional light in view space, normalised so the shader need not be.
+        // The geometry light stays in view space, as the geometry shader
+        // expects. The water's sun is fixed in world space instead: a glitter
+        // path that swung with the camera would read as a spotlight following
+        // the player, not as the sun.
         let light = Vec3::new(0.4, 0.7, 1.0).normalize();
+        let inverse_view = view.inverse();
+        let camera_position = inverse_view.transform_point3(Vec3::ZERO);
+        let sun = Vec3::from(WORLD_SUN).normalize();
+
+        // Camera basis for the skybox. The sky shader rebuilds a world-space
+        // view ray from these, so the gradient and clouds rotate with the
+        // camera instead of being painted onto the screen.
+        let camera_right = inverse_view.transform_vector3(Vec3::X).normalize();
+        let camera_up = inverse_view.transform_vector3(Vec3::Y).normalize();
+        let camera_forward = inverse_view.transform_vector3(-Vec3::Z).normalize();
+        let tan_half_fov = 1.0 / projection.y_axis.y.abs().max(1e-6);
+        let aspect = (projection.y_axis.y / projection.x_axis.x)
+            .abs()
+            .max(1e-6);
+
+        // The hull is stationary in this scene, so the wake is only a thin
+        // waterline collar. A wide ring reads as a white puddle glued to the
+        // ship; once the hull actually moves, scale this by its speed. The
+        // radius belongs to the hull being drawn, so it comes from the water
+        // material; a material that never set one gets the showcase hull's
+        // 2.6 m collar.
+        const SHOWCASE_WAKE_RADIUS: f32 = 2.6;
+        let (focus_point, wake_strength, wake_radius) = match focus {
+            Some(point) => (
+                point,
+                0.30,
+                water.map_or(SHOWCASE_WAKE_RADIUS, |w| {
+                    let radius = w.wake_radius;
+                    if radius > 1e-3 {
+                        radius
+                    } else {
+                        SHOWCASE_WAKE_RADIUS
+                    }
+                }),
+            ),
+            None => (Vec3::ZERO, 0.0, 0.0),
+        };
+
+        let (deep, shallow, clarity, foam_intensity, fresnel_bias) = match water {
+            Some(water) => (
+                water.deep_color,
+                water.shallow_color,
+                water.clarity.clamp(0.0, 1.0),
+                water.foam_intensity.clamp(0.0, 1.0),
+                water.fresnel_bias.clamp(0.0, 1.0),
+            ),
+            None => (DEFAULT_WATER_DEEP, DEFAULT_WATER_SHALLOW, 0.8, 0.4, 0.02),
+        };
+
+        // Sin/cos lose their useful precision once the argument is huge; a
+        // client left running for hours must not slowly turn the ripples into
+        // a staircase.
+        let time = water_time.rem_euclid(3600.0);
+        let (packed_waves, wave_speeds) = match waves {
+            Some(waves) => waves.shader_waves(),
+            None => ([[0.0; 4]; 4], [0.0; 4]),
+        };
         let mut all_ok = true;
 
         for (index, item) in state.items.iter().enumerate() {
@@ -777,11 +1142,80 @@ impl GeometryPass {
 
             // Column-major, so the 16 floats of the matrix go down unchanged.
             let mvp = projection * view * item.model;
-            let mut data: [f32; 28] = [0.0; 28];
+            let mut data = [0.0f32; 128];
             data[..16].copy_from_slice(&mvp.to_cols_array());
             data[16..20].copy_from_slice(&[light.x, light.y, light.z, 0.0]);
             data[20..24].copy_from_slice(&[1.0, 0.96, 0.9, 1.0]);
             data[24..28].copy_from_slice(&[0.18, 0.2, 0.24, 1.0]);
+
+            // Water-only fields. The ordinary geometry shader declares a
+            // 112-byte struct and simply never reads past `ambient`.
+            data[28..44].copy_from_slice(&item.model.to_cols_array());
+            data[44..47].copy_from_slice(&[camera_position.x, camera_position.y, camera_position.z]);
+            data[47] = 1.0;
+            data[48..51].copy_from_slice(&[sun.x, sun.y, sun.z]);
+            data[51] = 0.0;
+            data[52..56].copy_from_slice(&[time, clarity, foam_intensity, 0.0]);
+            data[56..60].copy_from_slice(&[
+                CLEAR_COLOR[0],
+                CLEAR_COLOR[1],
+                CLEAR_COLOR[2],
+                WATER_FOG_DENSITY,
+            ]);
+            data[60..64].copy_from_slice(&[
+                WATER_SKY_COLOR[0],
+                WATER_SKY_COLOR[1],
+                WATER_SKY_COLOR[2],
+                WATER_REFLECTION_STRENGTH,
+            ]);
+            data[64..68].copy_from_slice(&deep);
+            data[68..72].copy_from_slice(&shallow);
+            // Fresnel bias, sun specular exponent, ripple strength, Gerstner
+            // choppiness. The shader needs the same horizontal-displacement
+            // factor the CPU mesh used, or its normals stop matching the
+            // surface.
+            data[72..76].copy_from_slice(&[fresnel_bias, 220.0, 2.2, GERSTNER_CHOPPINESS]);
+
+            // The wave field the mesh was displaced by, so the fragment
+            // shader can differentiate it and place a smooth normal inside a
+            // cell. All zeros (no wave system) leaves a flat normal.
+            for (slot, wave) in packed_waves.iter().enumerate() {
+                let base = 76 + slot * 4;
+                data[base..base + 4].copy_from_slice(wave);
+            }
+            data[92..96].copy_from_slice(&wave_speeds);
+
+            // Camera basis and projection constants, used by `sky.wgsl` to
+            // turn screen coordinates into a world-space direction.
+            data[96..100].copy_from_slice(&[
+                camera_right.x,
+                camera_right.y,
+                camera_right.z,
+                aspect,
+            ]);
+            data[100..104].copy_from_slice(&[
+                camera_up.x,
+                camera_up.y,
+                camera_up.z,
+                tan_half_fov,
+            ]);
+            data[104..108].copy_from_slice(&[
+                camera_forward.x,
+                camera_forward.y,
+                camera_forward.z,
+                0.0,
+            ]);
+            // The hull's waterline contact point: foam ring and radial ripples.
+            data[108..112].copy_from_slice(&[
+                focus_point.x,
+                focus_point.y,
+                focus_point.z,
+                wake_radius,
+            ]);
+            // The wave envelope lets the water shader normalise a per-fragment
+            // crest height by the same maximum the CPU mesh used.
+            let wave_envelope = waves.map_or(0.0, |waves| waves.max_height());
+            data[112..116].copy_from_slice(&[wake_strength, 1.0, wave_envelope, 0.0]);
 
             // A failed uniform upload leaves the previous frame's MVP on the
             // GPU, which would draw the mesh under the old camera. Report it
@@ -827,7 +1261,7 @@ impl RenderPass for GeometryPass {
         &mut self,
         encoder: &mut CommandEncoder,
         context: &mut RenderContext,
-        _scene: &mut Scene,
+        scene: &mut Scene,
         _resources: &HashMap<String, GraphResource>,
     ) -> PassOutcome {
         // Bug №653: the pass reports what it did, so the graph can tell "was
@@ -912,7 +1346,12 @@ impl RenderPass for GeometryPass {
         // is invalid, so the depth attachment needs one too: far plane, which
         // makes every fragment pass the `Less` test on the first frame.
         let has_depth = Self::render_pass_has_depth(&state.render_pass);
-        let mut clear_values = vec![crate::rhi::ClearValue::color(0.05, 0.06, 0.08, 1.0)];
+        let mut clear_values = vec![crate::rhi::ClearValue::color(
+            CLEAR_COLOR[0],
+            CLEAR_COLOR[1],
+            CLEAR_COLOR[2],
+            1.0,
+        )];
         if has_depth {
             clear_values.push(crate::rhi::ClearValue::depth_stencil(1.0, 0));
         }
@@ -940,7 +1379,49 @@ impl RenderPass for GeometryPass {
             offset: Offset2D { x: 0, y: 0 },
             extent: Extent2D { width, height },
         }));
-        commands.push(Command::BindGraphicsPipeline(state.pipeline.clone()));
+
+        // The sky is one fullscreen triangle drawn before every item. It has
+        // no vertex buffer and no depth state, so the items below simply paint
+        // over it; the water is opaque in this slice, so no blending is
+        // involved either. It borrows item zero's descriptor set: the sky only
+        // reads the camera basis, which every item's uniform buffer carries.
+        if let Some(sky) = self.sky_pipeline.as_ref() {
+            if let Some(descriptor_set) = state.descriptor_sets.first() {
+                commands.push(Command::BindGraphicsPipeline(sky.clone()));
+                commands.push(Command::BindDescriptorSets {
+                    pipeline: sky.clone(),
+                    first_set: 0,
+                    sets: vec![descriptor_set.clone()],
+                });
+                commands.push(Command::Draw {
+                    vertex_count: 3,
+                    instance_count: 1,
+                    first_vertex: 0,
+                    first_instance: 0,
+                });
+            }
+        }
+
+        // Water is drawn after every solid, even though this slice writes it
+        // as an opaque surface: the submerged part of a hull must be covered
+        // by the water in front of it. Sorting here, rather than in
+        // `items_for_scene`, keeps one draw order for both the water-aware and
+        // the plain geometry constructors. The sort is stable, so two water
+        // items keep the scene's order.
+        let mut draw_order: Vec<(usize, bool)> = state
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let is_water = item
+                    .entity_id
+                    .and_then(|id| scene.get_entity(id))
+                    .and_then(|entity| entity.get_component::<MaterialComponent>())
+                    .is_some_and(|material| material.get_water().is_some());
+                (index, is_water)
+            })
+            .collect();
+        draw_order.sort_by_key(|(_, is_water)| *is_water);
 
         // Bug №654: the descriptor set is bound **per item**, immediately
         // before that item's draw.
@@ -950,7 +1431,9 @@ impl RenderPass for GeometryPass {
         // the same matrix and `GeometryItem::model` was inert. The model
         // matrix is part of the MVP now, and the MVP lives in the item's own
         // uniform buffer, so the set has to change with the item.
-        for (index, item) in state.items.iter().enumerate() {
+        let mut bound_water: Option<bool> = None;
+        for (index, is_water) in draw_order {
+            let item = &state.items[index];
             let Some(descriptor_set) = state.descriptor_sets.get(index) else {
                 crate::error!(
                     "geometry",
@@ -961,8 +1444,27 @@ impl RenderPass for GeometryPass {
                 );
                 continue;
             };
+
+            // A scene can mark water without the pass having a water shader —
+            // the plain `create` constructors and the examples do exactly
+            // that. Fall back to the geometry pipeline rather than skipping
+            // the item.
+            let water = is_water && self.water_pipeline.is_some();
+            let pipeline = if water {
+                self.water_pipeline
+                    .as_ref()
+                    .expect("checked immediately above")
+                    .clone()
+            } else {
+                state.pipeline.clone()
+            };
+            if bound_water != Some(water) {
+                commands.push(Command::BindGraphicsPipeline(pipeline.clone()));
+                bound_water = Some(water);
+            }
+
             commands.push(Command::BindDescriptorSets {
-                pipeline: state.pipeline.clone(),
+                pipeline: pipeline.clone(),
                 first_set: 0,
                 sets: vec![descriptor_set.clone()],
             });

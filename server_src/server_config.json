@@ -5,6 +5,6 @@
     "majority": 0.6,
     "window_ticks": 600
   },
-  "auth_token": "",
-  "allow_unsigned": true
+  "auth_token": "229db8cd05571dcd9c414b184ce3f8367c3d92bb819083afbc53738618b5fafa",
+  "allow_unsigned": false
 }
